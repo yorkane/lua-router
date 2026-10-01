@@ -29,7 +29,6 @@
 #   e2e_effort     integration/e2e_effort.py
 #   head_routes    integration/test_head_routes.py (HEAD mirror of the GET surface)
 #   mesh_http      integration/test_mesh_http.py (mesh enabled over real HTTP)
-#   e2e_otel       integration/e2e_otel.py (W3C trace propagation + OTLP/HTTP export)
 #   e2e_policy_parity prefix_hash/bucket/power_of_two/random quantitative parity
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
@@ -50,8 +49,6 @@
 #   head_routes    the HEAD mirror (Rust axum answers HEAD on every GET route).
 #   mesh_http      mesh enablement over real HTTP: peer apply/sync, worker
 #                  mirror, /ha/policies, /_mesh/internal/{state,apply}.
-#   e2e_otel       trace-context generation/inheritance, OTLP export, batching,
-#                  sampling and the dead-collector path have no other gate.
 #   mesh_two       two-real-router mesh convergence/hold/partition/heal/retire has no
 #                  other gate: a fake peer cannot reproduce the seed-vs-self address spelling that
 #                  produced the phantom member, so a roster regression would ship unnoticed.
@@ -88,7 +85,7 @@ mkdir -p "$LOG_DIR"
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort head_routes mesh_http
-            e2e_otel e2e_policy_parity mesh_two e2e_tls_chain)
+            e2e_policy_parity mesh_two e2e_tls_chain)
 
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
@@ -237,7 +234,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_mesh test_otel; do
+    for t in test_tree test_policies test_hash test_mesh; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
@@ -265,7 +262,6 @@ gate_e2e_errors()    { run_integration e2e_errors.py; }
 gate_e2e_effort()    { run_integration e2e_effort.py; }
 gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
-gate_e2e_otel()      { run_integration e2e_otel.py 1500; }
 gate_e2e_policy_parity() { run_integration e2e_policy_parity.py 1800; }
 gate_mesh_two()        { run_integration test_mesh_two.py 900; }
 gate_e2e_tls_chain()   { run_integration e2e_tls_chain.py 1500; }
@@ -289,7 +285,6 @@ gate e2e_errors
 gate e2e_effort
 gate head_routes
 gate mesh_http
-gate e2e_otel
 gate e2e_policy_parity
 gate mesh_two
 gate e2e_tls_chain

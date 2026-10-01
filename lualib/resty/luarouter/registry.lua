@@ -656,10 +656,11 @@ function _M.add(req, cfg)
             connection_mode = mode,
             api_key = req.api_key,
             labels = type(req.labels) == "table" and req.labels or {},
-            -- The model-card capability fields (tokenizer_path / tool_parser /
-            -- reasoning_parser / vocab_size) went with the proxy plane they were
-            -- read by (doc/scope-trim.md). A POST /workers body that still
-            -- carries them ignores them: they are not stored and not echoed.
+            -- The four model-card capability fields (token-counting path, tool
+            -- and reasoning parser names, vocab size) went with the proxy plane
+            -- that read them (doc/scope-trim.md). A POST /workers body that
+            -- still carries them ignores them: they are not stored and not
+            -- echoed.
             disable_health_check = (req.disable_health_check and true)
                 or (cfg.disable_health_check and true)
                 or false,
@@ -1397,10 +1398,10 @@ end
 
 -- ---------------------------------------------------------- DP-aware ranks
 
--- The three pure decisions below lived in resty.luarouter.service_discovery and
--- moved here when the Kubernetes poller was removed (doc/scope-trim.md). The DP
--- expansion is the scheduler's own feature: a data-parallel engine is stored as
--- one registry entry per rank regardless of how the worker was discovered.
+-- The three pure decisions below lived in the Kubernetes poller module and
+-- moved here when it was removed (doc/scope-trim.md). The DP expansion is the
+-- scheduler's own feature: a data-parallel engine is stored as one registry
+-- entry per rank regardless of how the worker was discovered.
 
 -- A worker that never answers /server_info stays a single-entry worker after
 -- this many probes. The metadata-discovery attempt ceiling in discover() is the

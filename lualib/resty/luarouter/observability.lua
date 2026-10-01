@@ -1036,13 +1036,6 @@ local HELP = {
     smg_worker_routing_keys_active = "Active routing keys per worker",
     -- Lua-side superset: the Rust cache_aware tree exposes no tenant gauge.
     smg_cache_aware_tenant_count = "Tenants tracked by the cache_aware policy trees",
-    -- OTLP export bookkeeping (resty.luarouter.otel). The Rust gateway exports no
-    -- tracing-self metrics, so this family is Lua-side; the names keep the smg_
-    -- prefix to stay one vocabulary with the rest of the scrape.
-    smg_otel_requests_total = "Requests that got a trace context by sampled and source (inherited, generated)",
-    smg_otel_spans_total = "Spans handled by the exporter by result (exported, dropped)",
-    smg_otel_exports_total = "OTLP export attempts by result (success, failure)",
-    smg_otel_export_failures_total = "OTLP export failures by stage (connect, send, collector, encode, ...)",
 }
 
 ---Pool membership labels for one worker record, in the spelling Rust uses.

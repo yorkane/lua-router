@@ -16,13 +16,13 @@
 -- a status for JSON with an explicit code, and return '' once the response has
 -- been written by hand. A number in 100..599 with no result is a bare status.
 --
--- Kubernetes discovery, OTel tracing and cluster mesh are all wired: the first
--- behind its own knob (SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with
--- SMG_ENABLE_MESH off, /ha/* answers the fixed 503, which is the contract for a
--- node that has not opted in. The gRPC transport plane, the prefill/decode pool
--- split, the conversation/response store and the tokenize/parse proxy plane
--- were removed (doc/scope-trim.md): this gateway speaks plain HTTP to its
--- workers, /v1/responses is a pure inference route, and the token-counting and
+-- Cluster mesh is wired behind SMG_MESH_PEERS - with SMG_ENABLE_MESH off, /ha/*
+-- answers the fixed 503, which is the contract for a node that has not opted
+-- in. The gRPC transport plane, the prefill/decode pool split, the
+-- conversation/response store, the tokenize/parse proxy plane, the Kubernetes
+-- service discovery and the OTel trace exporter were removed
+-- (doc/scope-trim.md): this gateway speaks plain HTTP to its workers,
+-- /v1/responses is a pure inference route, and the token-counting and
 -- tool-parser proxy family answers from the 404 sink.
 --
 -- What is genuinely not implemented is tracked in doc/feature-gap.md: wasm
@@ -35,7 +35,6 @@ local router_class = require "klib.router"
 
 local hb = require "resty.luarouter.hb"
 local observability = require "resty.luarouter.observability"
-local otel = require "resty.luarouter.otel"
 local policy_mod = require "resty.luarouter.policy"
 local registry = require "resty.luarouter.registry"
 -- Wired gap module: cluster mesh (doc/gap-mesh.md). It is load-safe without ngx
@@ -54,9 +53,8 @@ local mesh_mod = require "resty.luarouter.mesh"
 ---brace depth, which costs one forward scan with an escape-aware string state
 ---machine - the same cost class as the router's "model" rewrite.
 ---
----(This pair of helpers lived in resty.luarouter.service_discovery and moved
----here with the DP rank injection when the Kubernetes poller was removed,
----doc/scope-trim.md.)
+---(This pair of helpers lived in the Kubernetes poller module and moved here
+---with the DP rank injection when it was removed, doc/scope-trim.md.)
 ---@param raw string
 ---@param field string
 ---@param start number @ 1-based byte offset of the object's opening brace
@@ -454,30 +452,6 @@ local function request_id()
     ngx.ctx.lr_request_id = id
     return id
 end
-
----Open the OTel request span and answer the client with its context.
----
----Two jobs in one call, both cheap no-ops when SMG_ENABLE_TRACE is off:
----  * otel.begin() extracts the caller's traceparent (or generates a trace) - the
----    step Rust's TraceLayer does implicitly through the global propagator;
----  * the response header hands our own context back so a client can correlate.
----    Rust never answers with a traceparent, so this header is the one deliberate
----    addition on the propagation side (doc/gap-otel.md "与 Rust 的差异").
----@return table|nil trace
-local function begin_trace()
-    local trace = otel.begin()
-    if trace and trace.traceparent then
-        local sent = pcall(function()
-            ngx.header["traceparent"] = trace.traceparent
-        end)
-        if not sent then
-            observability.log_debug("could not set the traceparent response header")
-        end
-    end
-    return trace
-end
-
-_M.begin_trace = begin_trace
 
 -- ------------------------------------------------------------------ text extract
 
@@ -969,12 +943,10 @@ local function collect_forward_headers(worker)
     if worker and worker.api_key and not out["authorization"] then
         out["authorization"] = "Bearer " .. worker.api_key
     end
-    -- W3C propagation towards the worker (Rust inject_trace_context_http at
-    -- routers/http/router.rs:382). Insert semantics: a traceparent the client sent
-    -- is replaced by this router's own span id, so the worker sees us as its
-    -- parent. With tracing off the call is a no-op and the caller's header is
-    -- forwarded untouched, which is the pre-trace contract the 659-check suite pins.
-    return otel.inject(out)
+    -- W3C traceparent/tracestate simply ride along: the module that used to
+    -- replace them with the router's own span was removed (doc/scope-trim.md),
+    -- which is the pass-through contract the header suite pins.
+    return out
 end
 
 -- ------------------------------------------------------------------ labels
@@ -1620,69 +1592,9 @@ local function apply_response_headers(headers)
         end
     end
     ngx.header["X-Request-Id"] = request_id()
-    -- The worker echoes nothing back that we would forward as traceparent (it is
-    -- not in DROP_RESPONSE_HEADERS, but its value is the *worker's* span, not
-    -- ours): stamp our own so the client always sees the router's context.
-    local trace = otel.current()
-    if trace and trace.traceparent then
-        pcall(function()
-            ngx.header["traceparent"] = trace.traceparent
-        end)
-    end
     -- Upstream can emit its own CORS headers (a worker behind its own gateway),
     -- which would replace what cors_apply set for this response.
     cors_apply()
-end
-
----Is the per-attempt child span wanted? Default on; SMG_TRACE_UPSTREAM_CHILD=0
----turns it off. Read with os.getenv per request (the name is declared via `env` in
----all three shipped configs), so a typo can never break the request path.
-local function upstream_child_enabled()
-    local value = os.getenv("SMG_TRACE_UPSTREAM_CHILD")
-    if value == nil or value == "" then
-        return true
-    end
-    value = string.lower(value)
-    return not (value == "0" or value == "false" or value == "no" or value == "off")
-end
-
----Open the attempt child span. Returns nil whenever there is nothing to record, so
----the retry loop never has to branch on the tracing feature.
----@param worker table
----@param route string
----@param attempt number
----@return table|nil child
-local function otel_upstream_child(worker, route, attempt)
-    if not otel.is_enabled() or not upstream_child_enabled() then
-        return nil
-    end
-    local child = otel.child_start("upstream_forward")
-    if not child then
-        return nil
-    end
-    child.attrs = {
-        otel.attr_string("worker", worker.url),
-        otel.attr_string("worker_id", worker.id or ""),
-        otel.attr_string("method", "POST"),
-        otel.attr_string("path", route),
-        otel.attr_int("attempt", attempt),
-    }
-    return child
-end
-
----Close the attempt span. A connect failure has no status, so the error text is
----recorded instead - that is what makes a dead worker visible inside a trace.
----@param child table|nil
----@param status number|nil
----@param conn_err string|nil
-local function otel_upstream_child_end(child, status, conn_err)
-    if not child then
-        return
-    end
-    if not status and conn_err then
-        child.attrs[#child.attrs + 1] = otel.attr_string("error", tostring(conn_err))
-    end
-    otel.child_end(child, child.attrs, status)
 end
 
 ---Forward one inference request with retries. Returns status, buffered_body_or_nil.
@@ -1749,7 +1661,6 @@ local function forward(route, body, raw_body, model, text, incoming)
 
         ngx.ctx.lr_worker = worker
         hold_load(worker)
-        local otel_child = otel_upstream_child(worker, route, attempt)
 
         local payload = rewrite_model(raw_body, worker.model_id)
         -- A DP-aware engine needs to know which shard a call belongs to, so the
@@ -1765,15 +1676,8 @@ local function forward(route, body, raw_body, model, text, incoming)
         local forward_headers = collect_forward_headers(worker)
         forward_headers["content-length"] = tostring(#payload)
 
-        -- The child span for this attempt is opened above (after the worker is
-        -- picked) and closed on the line after send_attempt. Rust's HTTP plane
-        -- creates no child span here - it emits RequestSentEvent /
-        -- RequestReceivedEvent inside the parent span, and only its non-HTTP
-        -- plane has a real child span - so this is a documented addition,
-        -- switchable with SMG_TRACE_UPSTREAM_CHILD.
         local response, conn_err = send_attempt(worker, "POST", route, payload,
             forward_headers, is_stream and "stream" or "forward")
-        otel_upstream_child_end(otel_child, response and response.status, conn_err)
         if not response then
             release_load(worker)
             hb.record_outcome(worker.id, false)
@@ -2097,7 +2001,6 @@ local function ui_pipeline(route, body, raw_body)
     local method = ngx.req.get_method()
     local path = ngx.var.uri or route
     observability.record_http_request(method, path)
-    begin_trace()
 
     -- Forward the caller's bytes whenever they exist. Re-encoding the decoded
     -- table is the last resort only: cjson cannot tell [] from {}, so a UI body
@@ -3104,9 +3007,6 @@ end
 ---aliases call it directly because ui.conf bypasses the klib dispatcher.
 finish_request = function(started, method, path)
     local duration = ngx.now() - started
-    -- Span close first: it wants the same `duration` the layer-1 histogram gets,
-    -- and it must happen before anything that could error out of this function.
-    otel.finish(duration, { method = method, path = path, status = ngx.status })
     -- Hand the concurrency slot back here rather than at the end of the handler:
     -- every entry point (handle, the /_ui aliases, early error returns) funnels
     -- through this function, and it is the only place that knows the response was
@@ -3255,11 +3155,6 @@ _M.handle = function()
     local method = ngx.req.get_method()
     local path = ngx.var.uri or "/"
     observability.record_http_request(method, path)
-    begin_trace()
-    -- A route that opens no span (health, /workers, the control plane) has no
-    -- context of its own, so the caller's valid traceparent is echoed back unchanged
-    -- rather than a random id that no collector would ever have a span for.
-    otel.echo_request_traceparent()
     -- The Rust gateway stamps x-request-id in its middleware, so the header is
     -- on every response, including the ones this router answers itself (health,
     -- models, error bodies). Proxied responses re-apply the same cached value.

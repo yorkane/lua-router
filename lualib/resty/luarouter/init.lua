@@ -22,14 +22,6 @@ local seeded = false
 local mesh_configured = false
 local mesh_state = { enabled = false, captured = false }
 
--- Tracing knobs, captured in the master process for the same reason SMG_MESH_* is:
--- nginx rebuilds the worker environment from its `env` whitelist, so a name that is
--- not declared there is invisible to os.getenv after the fork. The three shipped
--- configs all declare the SMG_ENABLE_TRACE / SMG_OTLP_TRACES_ENDPOINT / SMG_TRACE_*
--- names, and this snapshot makes the module correct even if a hand-written config
--- forgets one. Resty.luarouter.config is owned by another module, so the values are
--- handed to otel.configure() explicitly instead of being added to that table.
-local trace_state = { captured = false, configured = false }
 
 ---@return table @ router config (nil before init)
 function _M.config()
@@ -45,7 +37,7 @@ end
 ---
 ---The two LR_INFLIGHT_* names are read here, before the fork, and handed to
 ---observability.configure_inflight() explicitly (the same reason SMG_MESH_* and
----SMG_TRACE_* are snapshotted). Defaults match the Rust tracker: sample every
+---SMG_MESH_* are snapshotted). Defaults match the Rust tracker: sample every
 ---20 s (server.rs:1559 start_sampler(20)), slot TTL 3600 s. The names are also
 ---declared with `env` in the three confs so a request-phase os.getenv sees them.
 ---LR_INFLIGHT_SAMPLE_SECS=0 switches the tracker off entirely (no timer, no slot
@@ -102,89 +94,6 @@ local function start_inflight_sampler()
     return true
 end
 
----Capture the SMG_ENABLE_TRACE / SMG_OTLP_TRACES_ENDPOINT / SMG_TRACE_* names and
----configure resty.luarouter.otel. Disabled by default (SMG_ENABLE_TRACE unset means
----off), and a broken endpoint turns tracing off by itself rather than failing the
----boot: the router does not stop routing over an observability typo.
----@return boolean configured
-local function wire_otel()
-    if trace_state.captured then
-        return trace_state.configured
-    end
-    trace_state.captured = true
-    local getenv = os.getenv
-    local function take(name)
-        local value = getenv(name)
-        if value == nil or value == "" then
-            return nil
-        end
-        return value
-    end
-    local ok_otel, otel = pcall(require, "resty.luarouter.otel")
-    if not ok_otel or type(otel) ~= "table" or type(otel.configure) ~= "function" then
-        ngx.log(ngx.ERR, "luarouter: otel module unavailable: ", tostring(otel))
-        return false
-    end
-    local opts = {}
-    for key, name in pairs({
-        enable = "SMG_ENABLE_TRACE",
-        endpoint = "SMG_OTLP_TRACES_ENDPOINT",
-        batch_size = "SMG_TRACE_BATCH_SIZE",
-        interval_ms = "SMG_TRACE_BATCH_INTERVAL_MS",
-        timeout_ms = "SMG_TRACE_TIMEOUT_MS",
-        sample_ratio = "SMG_TRACE_SAMPLE_RATIO",
-        max_queue = "SMG_TRACE_MAX_QUEUE",
-    }) do
-        local value = take(name)
-        if value ~= nil then
-            opts[key] = value
-        end
-    end
-    local ok, conf = pcall(otel.configure, opts)
-    if not ok then
-        ngx.log(ngx.ERR, "luarouter: otel configure failed: ", tostring(conf))
-        return false
-    end
-    trace_state.configured = true
-    if conf.invalid_reason then
-        ngx.log(ngx.WARN, "luarouter: SMG_OTLP_TRACES_ENDPOINT is unusable (",
-            conf.invalid_reason, "); tracing is off")
-    elseif conf.enabled then
-        ngx.log(ngx.NOTICE, "luarouter: tracing on, ", conf.transport,
-            " export to ", conf.normalized, " (batch ", conf.batch_size,
-            " / ", conf.interval_ms, "ms, sample ", conf.sample_ratio, ")",
-            "-- Rust exports OTLP/gRPC to localhost:4317 instead")
-        local warning = otel.transport_warning and otel.transport_warning(conf)
-        if warning then
-            ngx.log(ngx.WARN, "luarouter: ", warning)
-        end
-    end
-    return true
-end
-
----Start the per-worker batch exporter. Every process needs one (a span lives in
----the process that recorded it), and a worker with tracing off starts nothing.
----@return boolean started
-local function start_trace_exporter()
-    if not trace_state.configured then
-        return false
-    end
-    local ok_otel, otel = pcall(require, "resty.luarouter.otel")
-    if not ok_otel then
-        return false
-    end
-    if not otel.is_enabled() then
-        return false
-    end
-    local ok, started_or_err, reason = pcall(otel.start_timer)
-    if not ok or started_or_err ~= true then
-        ngx.log(ngx.WARN, "luarouter: otel batch timer not started: ",
-            tostring(reason or started_or_err))
-        return false
-    end
-    return true
-end
-
 ---Parse and validate the environment. Safe to call from init_by_lua.
 ---
 --- Also snapshots the LMR_* names for the config store: nginx rebuilds the
@@ -209,11 +118,6 @@ function _M.init()
     -- In-flight request ages (doc/gap-inflight-age.md): same reason as tracing -
     -- the numbers are read once here and the module keeps them.
     wire_inflight_tracker()
-
-    -- Tracing: read the knobs while the real environment is still visible.
-    -- configure() only stores values (no cosockets, no timers), so init_by_lua is
-    -- the right place; the exporter timer is started per worker in worker_init.
-    wire_otel()
 
     -- Cluster mesh: build the process-visible instance from the captured values.
     -- Every worker needs the object (the /ha/* handlers read its tables), but only
@@ -352,9 +256,6 @@ function _M.worker_init()
         ngx.log(ngx.ERR, "luarouter: policy eviction timer not started: ",
             tostring(err_timer))
     end
-    -- Tracing exporter: one batch timer per worker, because the buffer it drains
-    -- is that worker's own Lua state.
-    start_trace_exporter()
     -- The age sampler reads the shared slot table, so exactly one process runs it.
     if ngx.worker.id() == 0 then
         start_inflight_sampler()
@@ -413,14 +314,6 @@ end
 ---aborted between reserving and releasing (a Lua error, or the client going away
 ---while an attempt was in flight). log_by_lua still runs in those cases.
 function _M.on_log()
-    -- Same leak story for the request span: a handler that died (or a client that
-    -- vanished) before finish_request still has an open span, and log_by_lua is the
-    -- only phase that reliably runs. otel.finish is idempotent per request, so the
-    -- normal path - where finish_request already closed the span - is unaffected.
-    local ok_otel, otel = pcall(require, "resty.luarouter.otel")
-    if ok_otel and otel then
-        pcall(otel.finish, nil, { status = ngx.status })
-    end
     -- Same leak story for the concurrency token: a client that disappears
     -- mid-stream stops the handler before finish_request, and log_by_lua is the
     -- only phase that still runs. release() is idempotent, so the normal path
