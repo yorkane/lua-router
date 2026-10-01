@@ -476,46 +476,13 @@ end
 -- ------------------------------------------------------------------ CRUD
 
 -- The Rust worker spec models both knobs as enums (core/worker.rs:423-436 and
--- :514-525): WorkerType is Regular | Prefill{bootstrap_port} | Decode and
--- ConnectionMode is the internally-tagged {type:"http"} / {type:"grpc",port:n}.
---
--- The gRPC/PD variants are only accepted when the gRPC plane is enabled
--- (SMG_GRPC=1, which is also what makes the entrypoint render the gRPC
--- listener). With the plane off they answer 400 exactly as before, so a
--- deployment that cannot serve them never stores a worker it would then have to
--- ignore - and the shipped contract suite, which pins those 400s, keeps its
--- meaning. When the plane is on both variants are stored, the value domain stays
--- strict (an unknown type is a 400 rather than Rust's silent collapse to
--- Regular), and the HTTP inference plane still only ever selects
--- http + regular (see _M.is_available / _M.pool_records).
-_M.WORKER_TYPES = { regular = true, prefill = true, decode = true }
-_M.CONNECTION_MODES = { http = true, grpc = true, grpcs = true }
-
----Is the gRPC plane enabled? Read through the router config when available so a
----runtime toggle is picked up, and fall back to the environment for the pure-Lua
----unit runs (no ngx, no init phase).
----@return boolean
-function _M.grpc_enabled()
-    local ok, lr = pcall(require, "resty.luarouter")
-    if ok and lr and lr.config then
-        local good, conf = pcall(lr.config)
-        -- Only trust the config snapshot when it actually carries the knob: the
-        -- router config belongs to another agent's file, so the environment is the
-        -- source of truth until (if ever) enable_grpc joins it.
-        if good and conf and type(conf.enable_grpc) == "boolean" then
-            return conf.enable_grpc
-        end
-    end
-    local raw = os.getenv("SMG_GRPC")
-    if raw == nil then
-        raw = os.getenv("SMG_GRPC_PORT")
-    end
-    if raw == nil or raw == "" or raw == "0" then
-        return false
-    end
-    local lowered = string.lower(raw)
-    return lowered == "1" or lowered == "true" or lowered == "yes" or lowered == "on"
-end
+-- :514-525), with two extra worker-type variants and a tagged non-HTTP
+-- connection mode. This gateway serves the regular HTTP plane only (scope-trim.md
+-- removed the transport and pool-splitting planes), so the other enum variants
+-- answer 400 rather than being silently collapsed to Regular -- the same
+-- deviation from Rust that the contract suite pins (doc/impl-core.md deviation 3).
+_M.WORKER_TYPES = { regular = true }
+_M.CONNECTION_MODES = { http = true }
 
 ---Lower-case a knob to its canonical spelling, or nil when unrecognised.
 local function keyword(value, allowed)
@@ -540,144 +507,50 @@ function _M.parse_worker_type(value)
     if type(value) ~= "string" then
         return nil, 'worker_type must be a string (only "regular" is supported)'
     end
-    local kind = keyword(value, _M.WORKER_TYPES)
-    if not kind then
+    if keyword(value, _M.WORKER_TYPES) ~= "regular" then
         return nil, 'unsupported worker_type "' .. value
             .. '" (only "regular" is supported by the Lua router)'
     end
-    if kind == "regular" then
-        return nil
-    end
-    if not _M.grpc_enabled() then
-        return nil, 'unsupported worker_type "' .. value
-            .. '" (only "regular" is supported by the Lua router)'
-    end
-    return kind
+    return nil
 end
 
----Bootstrap port for a prefill worker: the enum field of the Rust
----WorkerType::Prefill, accepted either as a top-level `bootstrap_port` or inside
----`labels` (what llm-watcher writes). pd.bootstrap_port_of reads the label form.
----@param req table
----@return number|nil port
----@return string|nil err
-function _M.parse_bootstrap_port(req)
-    local labels = type(req.labels) == "table" and req.labels or {}
-    local raw = req.bootstrap_port
-    if raw == nil or raw == cjson.null then
-        raw = labels.bootstrap_port
-    end
-    if raw == nil or raw == cjson.null or raw == "" then
-        return nil
-    end
-    local port = tonumber(raw)
-    if not port or port ~= math.floor(port) or port < 1 or port > 65535 then
-        return nil, "bootstrap_port must be an integer port in 1-65535"
-    end
-    return port
-end
-
----Normalised connection mode plus the gRPC target it implies.
+---Normalised connection mode for a POST /workers body.
 ---
----Accepted spellings (all three come from the wild):
----  * serde tagged object  {"type":"grpc","port":20000}
----  * plain string         "http" | "grpc" | "grpcs"
----  * url scheme           grpc://h:p / grpcs://h:p (Rust config accepts those)
----The record always keeps an http(s) url - every existing plane (health probe,
----/v1/loads, /flush_cache, the UI) concatenates onto it - and the gRPC address
----lives in grpc_port/grpc_tls, which is also what grpc_proxy.target_for reads.
+---The accepted spellings come from the Rust wire spec: a plain string, the serde
+---internally-tagged object {"type":"http","port":n}, or a scheme carried by the
+---url. Only "http" is served by this gateway, so every other spelling is a 400;
+---a non-http(s) *url scheme* is rejected by _M.parse_spec_url instead.
 ---@param value any @ req.connection_mode
----@param url string|nil @ raw req.url, for the scheme form
----@return string mode @ "http" | "grpc" | "grpcs"
----@return number|nil grpc_port
+---@return string mode @ always "http"
 ---@return string|nil err
-function _M.parse_connection_mode(value, url)
-    local kind, port
+function _M.parse_connection_mode(value)
+    local kind
     if value == nil or value == cjson.null then
         kind = nil
     elseif type(value) == "string" then
         kind = value
     elseif type(value) == "table" then
-        -- serde internally-tagged shape: {"type":"http"} or {"type":"grpc",...}
+        -- serde internally-tagged shape: {"type":"http",...}
         kind = value.type or value["mode"]
-        port = value.port
         if type(kind) ~= "string" then
-            return "http", nil, 'connection_mode object must carry a string "type"'
+            return "http", 'connection_mode object must carry a string "type"'
         end
     else
-        return "http", nil,
+        return "http",
             "connection_mode must be a string or an object with a type key"
     end
 
-    local mode
-    if kind == nil then
-        mode = "http"
-    else
-        mode = keyword(kind, _M.CONNECTION_MODES)
-        if not mode then
-            return "http", nil, "unsupported connection_mode \"" .. kind
-                .. "\" (only \"http\" is supported by the Lua router)"
-        end
-        if mode ~= "http" and not _M.grpc_enabled() then
-            return "http", nil, "unsupported connection_mode \"" .. mode
-                .. "\" (only \"http\" is supported by the Lua router)"
-        end
+    if kind ~= nil and keyword(kind, _M.CONNECTION_MODES) ~= "http" then
+        return "http", "unsupported connection_mode \"" .. kind
+            .. "\" (only \"http\" is supported by the Lua router)"
     end
-
-    -- grpc:// and grpcs:// in the url carry both the mode and the port.
-    local scheme = type(url) == "string" and url:match("^(%a[%w+.-]*)://") or nil
-    if scheme then
-        scheme = string.lower(scheme)
-        if scheme == "grpc" or scheme == "grpcs" then
-            if kind ~= nil and mode ~= "grpc" and mode ~= "grpcs" then
-                return "http", nil, "connection_mode \"" .. tostring(kind)
-                    .. "\" contradicts the " .. scheme .. ":// url scheme"
-            end
-            if not _M.grpc_enabled() then
-                return "http", nil, "unsupported connection_mode \"" .. scheme
-                    .. "\" (only \"http\" is supported by the Lua router)"
-            end
-            mode = scheme
-        end
-    end
-    if mode ~= "grpc" and mode ~= "grpcs" then
-        return "http", nil
-    end
-
-    -- The port may also arrive as labels.grpc_port (sglang exposes gRPC on its
-    -- own port beside the HTTP one); that fallback lives in _M.add, where the
-    -- labels table is validated, and a grpc(s):// url carries it implicitly.
-    local target = port
-    if target == cjson.null then
-        target = nil
-    end
-    if target ~= nil then
-        local number = tonumber(target)
-        if not number or number ~= math.floor(number) or number < 1 or number > 65535 then
-            return "http", nil, "connection_mode port must be an integer in 1-65535"
-        end
-        target = number
-    end
-    if not target and type(url) == "string"
-        and (url:lower():match("^grpc") or url:lower():match("^grpcs")) then
-        -- Only a grpc(s):// url carries the gRPC port implicitly: the port of an
-        -- http:// url is the *HTTP* face, and reading it as a gRPC target would
-        -- dial the wrong service (an http url with no grpc port anywhere is a
-        -- registration error, answered 400 below).
-        local authority = url:match("^[^:/?#]+://([^/?#]+)")
-        if authority then
-            local port_text = authority:match(":([%d]+)$")
-            if port_text then
-                target = tonumber(port_text)
-            end
-        end
-    end
-    return mode, target
+    return "http", nil
 end
 
----Store-ready url: grpc:// / grpcs:// are rewritten into the http(s) form the
----rest of the router speaks, because the record url doubles as the health-probe
----and control-plane target. The gRPC address survives in grpc_port/grpc_tls.
+---Store-ready url. This gateway speaks HTTP to its workers, so a scheme other
+---than http(s) is not rewritten but rejected: the record url is also the
+---health-probe and control-plane target, and a target the router cannot dial
+---must never enter the pool.
 ---@param url string
 ---@return string|nil normalized, string|nil err
 function _M.parse_spec_url(url)
@@ -687,10 +560,9 @@ function _M.parse_spec_url(url)
     local scheme = url:match("^(%a[%w+.-]*)://")
     if scheme then
         scheme = string.lower(scheme)
-        if scheme == "grpc" then
-            url = "http://" .. url:sub(#scheme + 4)
-        elseif scheme == "grpcs" then
-            url = "https://" .. url:sub(#scheme + 4)
+        if scheme ~= "http" and scheme ~= "https" then
+            return nil, "unsupported worker url scheme \"" .. scheme
+                .. "\" (only http and https are proxied)"
         end
     end
     return _M.normalize_url(url)
@@ -766,67 +638,14 @@ function _M.add(req, cfg)
     if type_err then
         return nil, type_err, "validation"
     end
-    local mode, grpc_port, mode_err = _M.parse_connection_mode(req.connection_mode, req.url)
+    local mode, mode_err = _M.parse_connection_mode(req.connection_mode)
     if mode_err then
         return nil, mode_err, "validation"
-    end
-    local grpc_only_scheme = false
-    do
-        local scheme = type(req.url) == "string"
-            and string.lower(req.url:match("^(%a[%w+.-]*)://") or "") or ""
-        grpc_only_scheme = (scheme == "grpc" or scheme == "grpcs")
-    end
-    local bootstrap_port, berr = _M.parse_bootstrap_port(req)
-    if berr then
-        return nil, berr, "validation"
-    end
-    if worker_type == "decode" and bootstrap_port then
-        -- Rust's WorkerType::Decode carries no bootstrap port, so a decode worker
-        -- that names one is a spec error rather than an ignored field.
-        return nil, "bootstrap_port is only valid for worker_type=\"prefill\"",
-            "validation"
-    end
-    if worker_type and grpc_only_scheme and mode ~= "http" then
-        -- A prefill/decode worker that cannot be probed would leave /readiness
-        -- unable to answer the one question PD mode asks ("is each pool alive"):
-        -- this gateway cannot speak grpc.health.v1, and a decode worker receives no
-        -- traffic of its own, so the circuit breaker never learns anything about it
-        -- either. Registered with an http(s) url (plus connection_mode.port or
-        -- labels.grpc_port for the gRPC face), the normal sweep supplies the signal.
-        return nil, "worker_type " .. worker_type .. " needs an http(s) url to be "
-            .. "health-probed: register the engine url and put the gRPC port in "
-            .. "connection_mode.port or labels.grpc_port", "validation"
-    end
-    -- A grpc worker with no usable target would be registered but unreachable, so
-    -- the port has to come from somewhere: the tagged object, the url scheme, or
-    -- labels.grpc_port (the sglang convention: one http url, gRPC on its own port).
-    local labels_in = type(req.labels) == "table" and req.labels or {}
-    if (mode == "grpc" or mode == "grpcs") and not grpc_port then
-        local labelled = tonumber(labels_in.grpc_port)
-        if labelled and labelled == math.floor(labelled)
-            and labelled >= 1 and labelled <= 65535 then
-            grpc_port = labelled
-        end
-    end
-    if (mode == "grpc" or mode == "grpcs") and not grpc_port
-        and not (type(req.url) == "string" and req.url:match("^grpc"))
-        and not (type(req.url) == "string" and req.url:match("^grpcs")) then
-        return nil, "connection_mode grpc needs a port: connection_mode.port, "
-            .. "a grpc(s):// url, or labels.grpc_port", "validation"
     end
     local url, err = _M.parse_spec_url(req.url)
     if not url then
         return nil, err, "validation"
     end
-    -- A worker registered as grpc:// or grpcs:// has no HTTP face at all, and the
-    -- health sweep (hb.check_all) speaks HTTP/1.1 GET <url><endpoint>. Left as is,
-    -- such a worker would fail every probe and never become selectable, so the
-    -- bare-gRPC-scheme form is registered without a probe: reachability is then
-    -- judged by the circuit breaker from real calls (grpc_proxy.on_log charges it),
-    -- which is what a TCP-open-but-dead endpoint can be judged by at all. Only a
-    -- *regular* worker may take that form - see the PD rule above, which needs a
-    -- probe because a decode worker never receives a call of its own. The sglang
-    -- convention (an http url plus labels.grpc_port) keeps the HTTP probe.
 
     local id = _M.worker_id_for_url(url)
 
@@ -848,12 +667,6 @@ function _M.add(req, cfg)
             cost = tonumber(req.cost) or 1.0,
             worker_type = worker_type or "regular",
             connection_mode = mode,
-            -- Only set on grpc workers: the address grpc_pass dials. Kept beside
-            -- the record (rather than only in labels) so pd/grpc_proxy do not
-            -- have to re-parse the tag on every request.
-            grpc_port = grpc_port,
-            grpc_tls = (mode == "grpcs") or nil,
-            bootstrap_port = bootstrap_port,
             api_key = req.api_key,
             labels = type(req.labels) == "table" and req.labels or {},
             -- Model-card capabilities (core/model_card.rs, previously
@@ -867,10 +680,7 @@ function _M.add(req, cfg)
             vocab_size = tonumber(req.vocab_size),
             disable_health_check = (req.disable_health_check and true)
                 or (cfg.disable_health_check and true)
-                or grpc_only_scheme or false,
-            -- Set only on the grpc-only form, so /workers can explain why a
-            -- worker reports healthy without ever having been probed.
-            health_probe = grpc_only_scheme and "none" or nil,
+                or false,
             registered_at = ngx.time(),
             -- Discovery provenance and DP identity. Both are copied onto the
             -- record (rather than inferred from labels) because they are read on
@@ -1026,13 +836,6 @@ function _M.info(record, d)
         is_healthy = (d:get(K_HEALTH .. id) or 0) == 1,
         load = d:get(K_LOAD .. id) or 0,
         connection_mode = record.connection_mode or "http",
-        -- gRPC transport detail (nil on the overwhelmingly common http record, so
-        -- the WorkerInfo shape is unchanged there). Rust carries the port inside
-        -- the tagged connection_mode; it is broken out here because grpc_proxy and
-        -- the PD pair both read it per request.
-        grpc_port = record.grpc_port,
-        grpc_tls = record.grpc_tls,
-        bootstrap_port = record.bootstrap_port,
         metadata = metadata,
         disable_health_check = record.disable_health_check or false,
         job_status = job,
@@ -1089,9 +892,9 @@ end
 ---
 ---The router's candidate filter (router.lua `candidates_for`, shared by every
 ---HTTP route) asks only `registry.is_available(id)`, so the pool rule lives here
----rather than in the router: a gRPC or PD worker must never be handed an OpenAI
----HTTP request, and it cannot be reached over HTTP on its gRPC port anyway. Only
----`connection_mode = "http"` **and** `worker_type = "regular"` may.
+---rather than in the router: a record that is not a plain HTTP worker must never
+---be handed an OpenAI HTTP request. Only `connection_mode = "http"` **and**
+---`worker_type = "regular"` may, which is every record this build can store.
 ---@param record table|nil
 ---@return boolean
 function _M.record_http_selectable(record)
@@ -1128,87 +931,6 @@ function _M.http_selectable(id)
     local selectable = _M.record_http_selectable(json_decode(raw)) and 1 or 0
     d:set(K_HSEL .. id, selectable)
     return selectable == 1
-end
-
----Health + breaker, with no pool filter: what the PD pair and the gRPC plane use
----to decide a worker may be dialed. Deliberately not named `is_available` so the
----HTTP plane cannot pick it up by accident.
----@param id string
----@return boolean
-function _M.pd_available(id)
-    if (shdict():get(K_HEALTH .. id) or 0) ~= 1 then
-        return false
-    end
-    return _M.breaker_available(id)
-end
-
----Records in one PD pool, each carrying the live `healthy`/`load` snapshot the
----policies read (same shape candidates_for hands out).
----@param pool string|nil @ "regular"|"prefill"|"decode"; nil = every pool
----@param opts table|nil @ {available=fn(id)->bool, connection_mode=string|false}
----@return table[]
-function _M.pool_records(pool, opts)
-    opts = opts or {}
-    local available = opts.available or _M.pd_available
-    local want_mode = opts.connection_mode
-    if want_mode == nil then
-        -- gRPC and PD pools are reached over gRPC by default; pass false for
-        -- "any transport".
-        want_mode = "grpc"
-    end
-    local pd = require "resty.luarouter.pd"
-    local records = _M.records()
-    local out = {}
-    for i = 1, #records do
-        local record = records[i]
-        local mode = record.connection_mode or "http"
-        local mode_ok = (want_mode == false)
-            or (want_mode == "grpc" and (mode == "grpc" or mode == "grpcs"))
-            or (want_mode == mode)
-        if mode_ok and (not pool or pd.pool_of(record) == pool)
-            and available(record.id) then
-            record.load = _M.load(record.id)
-            record.healthy = true
-            out[#out + 1] = record
-        end
-    end
-    return out
-end
-
----Every gRPC-capable record (transport grpc/grpcs, any pool) that is available.
----@param opts table|nil @ {available=fn(id)->bool}
----@return table[]
-function _M.grpc_records(opts)
-    return _M.pool_records(nil, { available = opts and opts.available,
-                                 connection_mode = "grpc" })
-end
-
----Readiness verdict over the registry, PD-aware.
----
----router.lua's own /readiness handler counts "at least one healthy worker"
----(Rust's Regular-mode rule). Once a fleet registers a prefill or decode worker
----that answer is wrong: PD routing needs one healthy worker in **each** pool,
----which is Rust's PrefillDecode-mode rule (server.rs readiness). The decision is
----delegated to pd.readiness so both gateways read one implementation, and the
----available predicate stays is_healthy - the same predicate the existing handler
----uses - so a fleet with no PD worker answers byte-identically to before.
----@param opts table|nil @ {records=table[], enable_igw=boolean}
----@return boolean ready, table report @ {status, healthy_workers, total_workers, ...}
-function _M.readiness(opts)
-    opts = opts or {}
-    local pd = require "resty.luarouter.pd"
-    local records = opts.records or _M.records()
-    return pd.readiness(records, {
-        -- Availability, not just the health flag. Rust can health-check a gRPC
-        -- worker natively (grpc.health.v1); this gateway cannot speak the proto, so
-        -- a bare grpc:// record is registered probeless and the circuit breaker is
-        -- the only thing that ever notices it died. Judging readiness on health
-        -- alone would keep a PD fleet "ready" with a dead decode pool.
-        is_available = function(record)
-            return _M.pd_available(record.id)
-        end,
-        enable_igw = opts.enable_igw,
-    })
 end
 
 ---@return string[] @ distinct model ids with at least one worker
@@ -1275,8 +997,8 @@ end
 --- The CAS on the state key makes exactly one concurrent selector perform the
 --- transition, mirroring the compare_exchange in core/circuit_breaker.rs.
 ---Circuit-breaker availability, including the timed open -> half_open flip.
----Shared by the HTTP plane (is_available) and the gRPC/PD plane
----(pd_available) so a worker can only ever have one recovery clock.
+---Every selection path reads it through is_available, so a worker can only ever
+---have one recovery clock.
 ---@param id string
 ---@return boolean
 function _M.breaker_available(id)
@@ -1325,8 +1047,7 @@ function _M.is_available(id)
     if (shdict():get(K_HEALTH .. id) or 0) ~= 1 then
         return false
     end
-    -- Pool gate: a gRPC or PD worker is invisible to the HTTP inference plane
-    -- (it would be dialled on the wrong port with the wrong protocol), and
+    -- Pool gate: a non-HTTP record is invisible to the inference plane, and
     -- router.lua's candidate filter runs is_available on every route, so gating
     -- here keeps the HTTP surface byte-identical without touching router.lua.
     if not _M.http_selectable(id) then
@@ -1507,8 +1228,8 @@ local function patch_record(id, patch)
         d:set(K_WORKER .. id, encoded)
         -- The pool flag is derived from the record, so any write that can reach
         -- worker_type/connection_mode has to recompute it. Kept here rather than
-        -- at each call site (discovery, PUT, the gRPC control surface) so a new
-        -- writer cannot leave it stale.
+        -- at each call site (discovery and PUT) so a new writer cannot leave it
+        -- stale.
         d:set(K_HSEL .. id, _M.record_http_selectable(record) and 1 or 0)
         mesh_mirror(id)
     end

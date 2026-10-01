@@ -16,13 +16,15 @@
 -- a status for JSON with an explicit code, and return '' once the response has
 -- been written by hand. A number in 100..599 with no result is a bare status.
 --
--- gRPC, prefill/decode disaggregation, Kubernetes discovery, the conversations/
--- response store (resty.luarouter.history), the tokenizer and parser proxies
+-- Kubernetes discovery, the conversations/response store
+-- (resty.luarouter.history), the tokenizer and parser proxies
 -- (resty.luarouter.tokenizer / resty.luarouter.parse), OTel tracing and cluster
 -- mesh are all wired: the first three behind their own listeners/knobs
--- (SMG_GRPC_PORT, SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with
+-- (SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with
 -- SMG_ENABLE_MESH off, /ha/* answers the fixed 503, which is the contract for a
--- node that has not opted in.
+-- node that has not opted in. The transport plane and the prefill/decode pool
+-- split were removed (doc/scope-trim.md): this gateway speaks plain HTTP to its
+-- workers.
 --
 -- What is genuinely not implemented is tracked in doc/feature-gap.md: wasm
 -- middleware is a deferred TODO (doc/todo-deferred.md, feasibility in
@@ -2120,9 +2122,9 @@ local function forward(route, body, raw_body, model, text, incoming)
         -- The child span for this attempt is opened above (after the worker is
         -- picked) and closed on the line after send_attempt. Rust's HTTP plane
         -- creates no child span here - it emits RequestSentEvent /
-        -- RequestReceivedEvent inside the parent span, and otel_trace.rs only has
-        -- a real child span on the gRPC plane (`grpc_generate`) - so this is a
-        -- documented addition, switchable with SMG_TRACE_UPSTREAM_CHILD.
+        -- RequestReceivedEvent inside the parent span, and only its non-HTTP
+        -- plane has a real child span - so this is a documented addition,
+        -- switchable with SMG_TRACE_UPSTREAM_CHILD.
         local response, conn_err = send_attempt(worker, "POST", route, payload,
             forward_headers, is_stream and "stream" or "forward")
         otel_upstream_child_end(otel_child, response and response.status, conn_err)

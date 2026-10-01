@@ -1213,17 +1213,20 @@ if section workers; then
     # The Lua build only serves a regular HTTP worker, so the Rust enum variants
     # it does not implement are rejected rather than silently accepted (deviation 3).
     request "$BASE" POST /workers -H 'Content-Type: application/json' \
-        --data "{\"url\":\"http://$GW:1/\",\"worker_type\":\"prefill\"}"
-    assert_eq "POST /workers worker_type=prefill is 400" "$STATUS" "400"
+        --data "{\"url\":\"http://$GW:1/\",\"worker_type\":\"bogus\"}"
+    assert_eq "POST /workers unknown worker_type is 400" "$STATUS" "400"
     assert_json "POST /workers worker_type 400 code" '.error.code' "invalid_request"
     assert_contains "POST /workers worker_type message" "$BODY" "worker_type"
     request "$BASE" POST /workers -H 'Content-Type: application/json' \
-        --data "{\"url\":\"http://$GW:1/\",\"connection_mode\":\"grpc\"}"
-    assert_eq "POST /workers connection_mode=grpc is 400" "$STATUS" "400"
+        --data "{\"url\":\"http://$GW:1/\",\"connection_mode\":\"bogus\"}"
+    assert_eq "POST /workers unknown connection_mode is 400" "$STATUS" "400"
     assert_contains "POST /workers connection_mode message" "$BODY" "connection_mode"
     request "$BASE" POST /workers -H 'Content-Type: application/json' \
-        --data "{\"url\":\"http://$GW:1/\",\"connection_mode\":{\"type\":\"grpc\",\"port\":1}}"
-    assert_eq "POST /workers tagged grpc is 400" "$STATUS" "400"
+        --data "{\"url\":\"http://$GW:1/\",\"connection_mode\":{\"type\":\"bogus\",\"port\":1}}"
+    assert_eq "POST /workers tagged connection_mode with a bad type is 400" "$STATUS" "400"
+    request "$BASE" POST /workers -H 'Content-Type: application/json' \
+        --data "{\"url\":\"ftp://$GW:1/\",\"worker_type\":\"regular\"}"
+    assert_eq "POST /workers a non-HTTP url scheme is 400" "$STATUS" "400"
     request "$BASE" POST /workers -H 'Content-Type: application/json' \
         --data "{\"url\":\"http://$GW:1/\",\"worker_type\":\"regular\"}"
     assert_eq "POST /workers explicit regular is 202" "$STATUS" "202"
@@ -2004,10 +2007,6 @@ if section observability; then
         "$(curl -sS "$METRICS_BASE/workers" | jq '.workers | length')"
     # Rust only ever sets a combination it has seen, so an absent pool stays
     # absent; a rendered 0 would read as a live pool on a dashboard.
-    assert_not_contains "/metrics renders no prefill pool without prefill workers" \
-        "$(<"$TMP_DIR/body")" 'worker_type="prefill"'
-    assert_not_contains "/metrics renders no decode pool without decode workers" \
-        "$(<"$TMP_DIR/body")" 'worker_type="decode"'
     # Pool membership is read from the registry at scrape time, so a deregistered
     # worker disappears with no exporter-side bookkeeping.
     request "$METRICS_BASE" DELETE "/workers/$METRICS_SINK_ID" >/dev/null

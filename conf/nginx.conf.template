@@ -2,7 +2,7 @@
 # 由 docker-entrypoint.sh 用 envsubst 渲染成 nginx.conf
 # 变量: WORKER_PROCESSES WORKER_CONNECTIONS NOFILE_LIMIT ERROR_LOG_PATH LOG_LEVEL
 #       LISTEN_ADDR LUA_PACKAGE_PATH DNS_RESOLVER MAX_PAYLOAD_SIZE
-#       SERVER_EXTRA HTTP_EXTRA METRICS_EXTRA GRPC_EXTRA
+#       SERVER_EXTRA HTTP_EXTRA METRICS_EXTRA
 #       TLS_LISTEN_FLAGS TLS_SERVER_EXTRA (SMG_TLS_* 配置时由入口脚本渲染)
 # 其余运行参数（策略、熔断、健康检查、重试等）全部由
 # resty.luarouter.config 在 init 阶段直接读环境变量，不经过这里。
@@ -18,13 +18,7 @@
 # nginx rebuilds the environment it hands to the worker processes from this list,
 # so anything Lua reads at *request* time (as opposed to the init-phase snapshot in
 # resty.luarouter.config) has to be named here or os.getenv answers nil inside a
-# worker. SMG_GRPC is the gRPC-plane switch registry.grpc_enabled reads per POST
-# /workers, and LR_GRPC_PD_METADATA the PD metadata switch grpc_proxy reads per
-# call; SMG_GRPC_PORT is the fallback spelling for operators who set only the port.
-env SMG_GRPC;
-env SMG_GRPC_PORT;
-env LR_GRPC_PD_METADATA;
-# SMG_CONTROL_PLANE_API_KEYS is the id:name:role:key list (doc/gap-auth-tls.md):
+# worker. SMG_CONTROL_PLANE_API_KEYS is the id:name:role:key list (doc/gap-auth-tls.md):
 # the control-plane gate reads it per request, so it must survive into the worker
 # environment. SMG_DISABLE_AUDIT_LOGGING silences that gate's audit lines.
 env SMG_CONTROL_PLANE_API_KEYS;
@@ -193,11 +187,6 @@ ${TLS_SERVER_EXTRA}
     # 独立的 Prometheus 端口（可选，SMG_METRICS_PORT 设置后启用）
     ${METRICS_EXTRA}
 
-    # 可选的 gRPC 推理面（SMG_GRPC_PORT > 0 时由入口脚本渲染成独立 server）。
-    # 独立监听是必须的：grpc_pass 只能在 location{}，而 gRPC 请求的 :path 就是
-    # /<package>.<service>/<method>，不能和主 server 的 klib.router 路由表共用一个
-    # location /。详见 doc/gap-grpc-pd.md §7。
-    ${GRPC_EXTRA}
 
     # http{} 层追加配置
     ${HTTP_EXTRA}

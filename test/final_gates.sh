@@ -18,7 +18,7 @@
 # Gate ids, in run order (SKIP_ENV takes a comma/space separated list of these):
 #   build          docker build lua-router:integration (the e2e suites boot it)
 #   conf           openresty -t on test/conf/nginx-lua-router.conf + conf/lua-router.conf
-#   unit           tree / policies / hash / history / mesh / jwks (authz luajit)
+#   unit           tree / policies / hash / history / mesh (authz luajit)
 #                  + tree / policies / hash / integration / tokenizer_parse (apisix resty)
 #   contract       test_lua_router.sh, strict (first FAIL aborts the suite)
 #   probes         integration/probes.py (policy factory, knobs, re_split, json-edit)
@@ -31,7 +31,6 @@
 #   e2e_jwt        integration/e2e_jwt.py (JWT/JWKS control-plane gate)
 #   head_routes    integration/test_head_routes.py (HEAD mirror of the GET surface)
 #   mesh_http      integration/test_mesh_http.py (mesh enabled over real HTTP)
-#   e2e_grpc       integration/e2e_grpc.py (gRPC / PD plane over real nginx + grpcio)
 #   e2e_history_redis
 #                  integration/e2e_history_redis.py (redis history backend, run
 #                  with LR_REDIS_REQUIRED=1 so the gate FAILS when the shared
@@ -58,11 +57,6 @@
 #   head_routes    the HEAD mirror (Rust axum answers HEAD on every GET route).
 #   mesh_http      mesh enablement over real HTTP: peer apply/sync, worker
 #                  mirror, /ha/policies, /_mesh/internal/{state,apply}.
-#   e2e_grpc       the gRPC / PD plane has no other gate: registration tags,
-#                  streaming pacing, metadata pass-through, grpcs TLS, PD pool
-#                  selection and the smg_worker_pool_size census. The HTTP
-#                  surface can be fully green while grpc_pass is broken.
-#                  Needs python3 grpcio on the host (preflight checks it).
 #   e2e_history_redis the redis backend (shared-instance CRUD + cross-instance
 #                  read, config fallback to memory, 503 history_unavailable)
 #                  is unverified; test_history_redis.lua only drives the module
@@ -81,9 +75,9 @@
 # change; the run log records every skip so a green run cannot silently shrink.
 #
 # Requirements: docker (+ authz:latest, apache/apisix:3.11.0-debian, and the
-# built lua-router:integration), curl, jq, python3 (+ grpcio for e2e_grpc), and
-# a reachable Redis for e2e_history_redis; endpoint comes from env
-# prerequisites are checked: grpcio in preflight, Redis inside the gate).
+# built lua-router:integration), curl, jq, python3, and a reachable Redis for
+# e2e_history_redis; the endpoint comes from test/local.env and the Redis
+# reachability is checked inside the gate.
 # Concurrency with other container-heavy suites is allowed but roughly doubles
 # the wall time.
 set -uo pipefail
@@ -106,7 +100,7 @@ mkdir -p "$LOG_DIR"
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort e2e_discovery_dp e2e_jwt head_routes mesh_http
-            e2e_grpc e2e_history_redis e2e_otel e2e_responses_store e2e_policy_parity mesh_two
+            e2e_history_redis e2e_otel e2e_responses_store e2e_policy_parity mesh_two
             e2e_tls_chain)
 
 declare -A SKIP=()
@@ -211,16 +205,10 @@ preflight() {
             exit 2; }
     fi
     if is_selected e2e_stateful || is_selected head_routes || is_selected mesh_http ||
-       is_selected e2e_grpc || is_selected e2e_history_redis ||
-       is_selected e2e_tls_chain; then
+       is_selected e2e_history_redis || is_selected e2e_tls_chain; then
         docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || {
             printf 'image %s is not present (the e2e suites boot it; drop SKIP_ENV=build)\n' \
                 "$E2E_IMAGE" >&2
-            exit 2; }
-    fi
-    if is_selected e2e_grpc; then
-        python3 -c 'import grpc' >/dev/null 2>&1 || {
-            printf 'python3 grpcio is not importable (needed by e2e_grpc; skip it with SKIP_ENV=e2e_grpc)\n' >&2
             exit 2; }
     fi
 }
@@ -262,7 +250,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_history test_mesh test_pd \
+    for t in test_tree test_policies test_hash test_history test_mesh \
              test_service_discovery test_jwks test_otel; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
@@ -293,7 +281,6 @@ gate_e2e_discovery_dp() { run_integration e2e_discovery_dp.py 1500; }
 gate_e2e_jwt()       { run_integration e2e_jwt.py 900; }
 gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
-gate_e2e_grpc()      { run_integration e2e_grpc.py 900; }
 # LR_REDIS_REQUIRED makes the suite exit 1 instead of SKIP+exit 0 when the
 # shared Redis cannot be reached, so a green run really did exercise the
 # backend. Manual runs without the variable keep the old skip behaviour.
@@ -327,7 +314,6 @@ gate e2e_discovery_dp
 gate e2e_jwt
 gate head_routes
 gate mesh_http
-gate e2e_grpc
 gate e2e_history_redis
 gate e2e_otel
 gate e2e_responses_store

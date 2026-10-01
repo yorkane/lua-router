@@ -602,9 +602,9 @@ function _M.record_router_duration(model, endpoint, seconds)
     -- plays that role - the same substitution finish_request already makes for
     -- the request log's tok_per_s column (router.lua decode_ms).
     -- Total generation time. Rust reaches it from the same streaming helper as
-    -- ttft/tpot and describes it "(gRPC only)" because its HTTP router never
-    -- calls that helper; here the finished request duration *is* the generation
-    -- window, so the family gets a real source instead of staying a name.
+    -- ttft/tpot and only ever fills it on its non-HTTP plane; here the finished
+    -- request duration *is* the generation window, so the family gets a real
+    -- source instead of staying a name.
     _M.observe("smg_router_generation_duration_seconds", {
         { "router_type", "http" }, { "backend_type", "regular" },
         { "model", model }, { "endpoint", endpoint },
@@ -990,10 +990,10 @@ local HELP = {
     smg_router_request_duration_seconds = "Router request duration by router_type, backend_type, connection_mode, model, endpoint",
     smg_router_request_errors_total = "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type",
     smg_router_upstream_responses_total = "Upstream backend HTTP responses by router_type, status_code, error_code",
-    -- Rust appends "(gRPC only)" to these three describes because its HTTP
-    -- router never reaches the streaming-metrics helper. The Lua router records
-    -- them for HTTP streaming as well, so the suffix is dropped rather than
-    -- repeated as a false claim about the series.
+    -- Rust marks these three describes as only filled on its non-HTTP plane,
+    -- because its HTTP router never reaches the streaming-metrics helper. The
+    -- Lua router records them for HTTP streaming as well, so that qualifier is
+    -- dropped rather than repeated as a false claim about the series.
     smg_router_ttft_seconds = "Time to first token by router_type, backend_type, model, endpoint",
     smg_router_tpot_seconds = "Time per output token by router_type, backend_type, model, endpoint",
     smg_router_generation_duration_seconds = "Total generation time by router_type, backend_type, model, endpoint",
@@ -1052,21 +1052,18 @@ local HELP = {
 
 ---Pool membership labels for one worker record, in the spelling Rust uses.
 ---
----`worker_type` comes from pd.pool_of, which already folds the `pool` /
----`worker_type` / `labels.worker_type` spellings onto regular|prefill|decode.
----`connection_mode` collapses grpcs onto grpc exactly as ConnectionMode::
----as_metric_label does (worker.rs:452), so TLS and plain gRPC share one series.
+---`worker_type` is the record's own field (this gateway stores regular workers
+---only, so the prefill/decode folding that pd.pool_of used to do is gone).
+---`connection_mode` is the record's transport, which after the scope trim can
+---only ever be http.
 ---@param record table
 ---@return string worker_type, string connection_mode, string model
 local function pool_labels_for(record)
-    local ok, pd = pcall(require, "resty.luarouter.pd")
-    local pool = ok and pd.pool_of(record) or "regular"
-    local mode = record.connection_mode or "http"
-    if mode == "grpc" or mode == "grpcs" then
-        mode = "grpc"
-    elseif mode ~= "http" then
-        mode = "http"
+    local pool = record.worker_type
+    if pool ~= "regular" then
+        pool = "regular"
     end
+    local mode = "http"
     local model = record.model_id
     if type(model) ~= "string" or model == "" then
         model = "unknown"
@@ -1221,9 +1218,9 @@ function _M.prometheus_text()
         cb_succ_f.gauges[label] = state.consecutive_successes
     end
     -- Pool sizes are counted per unique (worker_type, connection_mode, model)
-    -- triple straight out of the registry, so a prefill/decode pool reports its
-    -- real size and a combination with no workers is absent (Rust only ever
-    -- calls set_worker_pool_size for combinations it saw registered).
+    -- triple straight out of the registry, and a combination with no workers is
+    -- absent (Rust only ever calls set_worker_pool_size for combinations it saw
+    -- registered).
     local pool_sizes = _M.pool_size_counts(records)
     if #pool_sizes > 0 then
         local pool_f = family("smg_worker_pool_size")

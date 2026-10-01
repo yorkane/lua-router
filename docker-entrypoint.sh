@@ -144,8 +144,8 @@ fi
 # does with rustls: the encrypted socket replaces the plain bind on the same
 # host:port instead of opening a second port, so a client that speaks plain http
 # to that port gets a handshake error rather than a router response. The separate
-# metrics listener and the gRPC listener stay plain (Rust shares their TLS
-# configuration with the main bind, so the difference is only cosmetic here).
+# metrics listener stays plain (Rust shares its TLS configuration with the main
+# bind, so the difference is only cosmetic here).
 TLS_LISTEN_FLAGS=""
 TLS_SERVER_EXTRA=""
 TLS_STATE="off"
@@ -173,11 +173,11 @@ if [ -n "${LR_HTTP_INCLUDE:-}" ] && [ -f "${LR_HTTP_INCLUDE}" ]; then
     HTTP_EXTRA="include ${LR_HTTP_INCLUDE};"
 fi
 
-TEMPLATE_VARIABLES='${WORKER_PROCESSES} ${WORKER_CONNECTIONS} ${NOFILE_LIMIT} ${LISTEN_ADDR} ${LUA_PACKAGE_PATH} ${DNS_RESOLVER} ${MAX_PAYLOAD_SIZE} ${ERROR_LOG_PATH} ${LOG_LEVEL} ${SERVER_EXTRA} ${HTTP_EXTRA} ${METRICS_EXTRA} ${GRPC_EXTRA} ${TLS_LISTEN_FLAGS} ${TLS_SERVER_EXTRA}'
+TEMPLATE_VARIABLES='${WORKER_PROCESSES} ${WORKER_CONNECTIONS} ${NOFILE_LIMIT} ${LISTEN_ADDR} ${LUA_PACKAGE_PATH} ${DNS_RESOLVER} ${MAX_PAYLOAD_SIZE} ${ERROR_LOG_PATH} ${LOG_LEVEL} ${SERVER_EXTRA} ${HTTP_EXTRA} ${METRICS_EXTRA} ${TLS_LISTEN_FLAGS} ${TLS_SERVER_EXTRA}'
 
 # render <template> <output> [variables] - envsubst is given an explicit whitelist,
-# so a fragment with its own knobs passes its own list (the gRPC server template
-# would otherwise ship a literal ${GRPC_LISTEN_ADDR} into the listen directive).
+# so a fragment with its own knobs can pass its own list instead of shipping
+# literal ${...} text into the render.
 render() {
     input_file="$1"
     output_file="$2"
@@ -186,59 +186,6 @@ render() {
     envsubst "$variables" < "$input_file" > "$temporary_file"
     mv "$temporary_file" "$output_file"
 }
-
-# ---------------------------------------------------------------- gRPC plane
-# SMG_GRPC_PORT (Rust: --grpc-port style opt-in) renders a second listener that
-# proxies gRPC to the registered grpc workers. 0 (the default) keeps the plane
-# entirely absent: nothing is rendered, nothing is included, and the registry
-# refuses grpc/prefill/decode registrations with a 400 (registry.grpc_enabled),
-# so an off deployment behaves exactly as it did before this feature.
-GRPC_PORT="${SMG_GRPC_PORT:-0}"
-case "$GRPC_PORT" in
-    ""|*[!0-9]*) echo "error: SMG_GRPC_PORT must be numeric" >&2; exit 1 ;;
-esac
-if [ "$GRPC_PORT" -gt 65535 ]; then
-    echo "error: SMG_GRPC_PORT must be 0-65535" >&2; exit 1
-fi
-GRPC_HOST="${SMG_GRPC_HOST:-$LISTEN_HOST}"
-GRPC_POLICY="${SMG_GRPC_POLICY:-round_robin}"
-GRPC_MAX_BODY_SIZE="$MAX_PAYLOAD_SIZE"
-GRPC_READ_TIMEOUT="${SMG_GRPC_READ_TIMEOUT_SECS:-1800}s"
-case "$GRPC_POLICY" in
-    round_robin|sticky|power_of_two) : ;;
-    *) echo "error: SMG_GRPC_POLICY must be round_robin|sticky|power_of_two" >&2
-       exit 1 ;;
-esac
-GRPC_SERVER_TEMPLATE="$TEMPLATE_DIR/grpc-server.conf.template"
-GRPC_READINESS_FRAGMENT="$TEMPLATE_DIR/grpc-readiness.conf"
-GRPC_EXTRA=""
-if [ "$GRPC_PORT" -gt 0 ]; then
-    if [ "$GRPC_PORT" = "$LISTEN_PORT" ] || [ "$GRPC_PORT" = "$METRICS_PORT" ]; then
-        echo "error: SMG_GRPC_PORT must differ from SMG_PORT and SMG_METRICS_PORT" >&2
-        exit 1
-    fi
-    if [ ! -s "$GRPC_SERVER_TEMPLATE" ]; then
-        echo "error: missing gRPC server template: $GRPC_SERVER_TEMPLATE" >&2
-        exit 1
-    fi
-    case "$LISTEN_HOST" in
-        *:*) GRPC_LISTEN_ADDR="[$GRPC_HOST]:$GRPC_PORT" ;;
-        *)   GRPC_LISTEN_ADDR="$GRPC_HOST:$GRPC_PORT" ;;
-    esac
-    export GRPC_LISTEN_ADDR GRPC_READ_TIMEOUT GRPC_MAX_BODY_SIZE GRPC_POLICY
-    render "$GRPC_SERVER_TEMPLATE" "$NGINX_CONF_DIR/grpc-server.conf" \
-        '$GRPC_LISTEN_ADDR $GRPC_READ_TIMEOUT $GRPC_MAX_BODY_SIZE $GRPC_POLICY'
-    # Declared here rather than in the fragment: log_format only parses in http{},
-    # where this variable lands. The per-call line names the selected worker, the
-    # pool it came from and the peer, which is the evidence that the dynamic
-    # selection actually moved (a static proxy log cannot show it).
-    GRPC_EXTRA="log_format lr_grpc '\$remote_addr \"\$request\" worker=[\$lr_grpc_worker] pool=[\$lr_grpc_pool] peer=[\$upstream_addr] grpc_status=[\$upstream_http_grpc_status] upstream_status=[\$upstream_status] status=\$status rt=\$request_time';
-include ${NGINX_CONF_DIR}/grpc-server.conf;"
-    # The plane being on is what makes the registry accept the grpc/prefill/decode
-    # enum variants, so the exported value is the one knob both halves read.
-    SMG_GRPC=1
-    export SMG_GRPC
-fi
 
 # The UI agent ships conf/ui.conf (all /_ui/* locations: API aliases plus the
 # static SPA). It is included when present so the router still boots without it;
@@ -255,15 +202,6 @@ if [ -n "${LR_SERVER_INCLUDE:-}" ] && [ -f "${LR_SERVER_INCLUDE}" ]; then
     SERVER_EXTRA="${SERVER_EXTRA}
 include ${LR_SERVER_INCLUDE};"
 fi
-# With the gRPC plane on, /readiness also has to judge the PD pools (Rust requires
-# one healthy worker per pool in PrefillDecode mode). The fragment overrides the
-# route with an exact location, which outranks the klib.router catch-all, so the
-# router module itself stays untouched.
-if [ "$GRPC_PORT" -gt 0 ] && [ -s "$GRPC_READINESS_FRAGMENT" ]; then
-    SERVER_EXTRA="${SERVER_EXTRA}
-include ${GRPC_READINESS_FRAGMENT};"
-fi
-
 case "$WORKER_CONNECTIONS" in
     ""|*[!0-9]*) echo "error: NGINX_WORKER_CONNECTIONS must be numeric" >&2; exit 1 ;;
 esac
@@ -282,7 +220,7 @@ fi
 
 export WORKER_PROCESSES WORKER_CONNECTIONS NOFILE_LIMIT LISTEN_ADDR LUA_PACKAGE_PATH \
        DNS_RESOLVER MAX_PAYLOAD_SIZE ERROR_LOG_PATH LOG_LEVEL \
-       SERVER_EXTRA HTTP_EXTRA METRICS_EXTRA GRPC_EXTRA \
+       SERVER_EXTRA HTTP_EXTRA METRICS_EXTRA \
        TLS_LISTEN_FLAGS TLS_SERVER_EXTRA
 
 render "$TEMPLATE_FILE" "$NGINX_CONF_DIR/nginx.conf"
@@ -303,11 +241,6 @@ if [ -n "$METRICS_EXTRA" ]; then
 else
     METRICS_STATE="off"
 fi
-if [ "$GRPC_PORT" -gt 0 ]; then
-    GRPC_STATE="on ${GRPC_LISTEN_ADDR} (policy: ${GRPC_POLICY})"
-else
-    GRPC_STATE="off"
-fi
-echo "==> lua-router listening on ${LISTEN_ADDR} (workers: ${WORKER_PROCESSES}, policy: ${SMG_POLICY:-cache_aware}, metrics: ${METRICS_STATE}, grpc: ${GRPC_STATE}, tls: ${TLS_STATE})"
+echo "==> lua-router listening on ${LISTEN_ADDR} (workers: ${WORKER_PROCESSES}, policy: ${SMG_POLICY:-cache_aware}, metrics: ${METRICS_STATE}, tls: ${TLS_STATE})"
 
 exec "$@"

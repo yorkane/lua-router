@@ -14,16 +14,9 @@ FROM authz:latest AS final
 
 # Project Lua: resty/luarouter/* lands next to klib/* in the site prefix, which
 # is first on the lua_package_path the template renders.
-# Whole lualib tree, so a module added later cannot be missing from the image
-# (grpc_proxy/pd are the newest and the entrypoint renders a listener that requires
-# them, so a partial COPY would only fail at the first gRPC call).
+# Whole lualib tree, so a module added later cannot be missing from the image.
 COPY lualib/ /usr/local/openresty/site/lualib/
 COPY conf/nginx.conf.template /usr/local/openresty/nginx/conf/nginx.conf.template
-# Rendered by docker-entrypoint.sh when SMG_GRPC_PORT > 0; the readiness fragment is
-# included into server{} by the same script. Both are read at container start, so
-# they have to live next to the main template (TEMPLATE_DIR).
-COPY conf/grpc-server.conf.template /usr/local/openresty/nginx/conf/grpc-server.conf.template
-COPY conf/grpc-readiness.conf /usr/local/openresty/nginx/conf/grpc-readiness.conf
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
@@ -34,9 +27,8 @@ RUN chmod +x /docker-entrypoint.sh
 COPY conf/ui.conf /usr/local/openresty/nginx/conf/lua-router/ui.conf
 COPY ui/ /usr/local/share/llama-ui/
 
-# 30000 inference, 29000 Prometheus, 50051 the conventional gRPC listener
-# (sglang's SGLANG_GRPC_PORT default) -- only bound when SMG_GRPC_PORT asks for it.
-EXPOSE 30000 29000 50051
+# 30000 inference, 29000 Prometheus.
+EXPOSE 30000 29000
 
 STOPSIGNAL SIGQUIT
 
