@@ -4,7 +4,7 @@
 # ============================================================================
 #仓库化的最终门禁（取代 /data/tmp/lr-core2/final_gates.sh 那个一次性脚本）。
 # 与旧脚本的差异：补齐了 probes.py、e2e_errors.py、e2e_effort.py、
-# 未接线模块的单测（history / mesh / tokenizer_parse）以及新增的两个
+# 未接线模块的单测（mesh / tokenizer_parse）以及新增的两个
 # HTTP 面集成测试（test_head_routes.py、test_mesh_http.py），并改成
 # 首个失败即退出。
 #
@@ -18,7 +18,7 @@
 # Gate ids, in run order (SKIP_ENV takes a comma/space separated list of these):
 #   build          docker build lua-router:integration (the e2e suites boot it)
 #   conf           openresty -t on test/conf/nginx-lua-router.conf + conf/lua-router.conf
-#   unit           tree / policies / hash / history / mesh (authz luajit)
+#   unit           tree / policies / hash / mesh (authz luajit)
 #                  + tree / policies / hash / integration / tokenizer_parse (apisix resty)
 #   contract       test_lua_router.sh, strict (first FAIL aborts the suite)
 #   probes         integration/probes.py (policy factory, knobs, re_split, json-edit)
@@ -31,12 +31,7 @@
 #   e2e_jwt        integration/e2e_jwt.py (JWT/JWKS control-plane gate)
 #   head_routes    integration/test_head_routes.py (HEAD mirror of the GET surface)
 #   mesh_http      integration/test_mesh_http.py (mesh enabled over real HTTP)
-#   e2e_history_redis
-#                  integration/e2e_history_redis.py (redis history backend, run
-#                  with LR_REDIS_REQUIRED=1 so the gate FAILS when the shared
-#                  Redis is unreachable instead of counting a skip as a PASS)
 #   e2e_otel       integration/e2e_otel.py (W3C trace propagation + OTLP/HTTP export)
-#   e2e_responses_store /v1/responses metadata patch + conditional stream persistence
 #   e2e_policy_parity prefix_hash/bucket/power_of_two/random quantitative parity
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
@@ -48,7 +43,7 @@
 # What skipping costs (read this before using SKIP_ENV):
 #   build          e2e_* and mesh_http then run against a possibly stale image.
 #   conf           nothing checks the two shipped configs still parse.
-#   unit           the pure-Lua modules (tree/hash/policies/history/mesh/
+#   unit           the pure-Lua modules (tree/hash/policies/mesh/
 #                  tokenizer_parse) have no other gate — router.lua only
 #                  exercises them through HTTP, so a regression can hide.
 #   contract       the whole 659-check wire contract is unverified.
@@ -57,10 +52,6 @@
 #   head_routes    the HEAD mirror (Rust axum answers HEAD on every GET route).
 #   mesh_http      mesh enablement over real HTTP: peer apply/sync, worker
 #                  mirror, /ha/policies, /_mesh/internal/{state,apply}.
-#   e2e_history_redis the redis backend (shared-instance CRUD + cross-instance
-#                  read, config fallback to memory, 503 history_unavailable)
-#                  is unverified; test_history_redis.lua only drives the module
-#                  against an in-process fake RESP.
 #   e2e_otel       trace-context generation/inheritance, OTLP export, batching,
 #                  sampling and the dead-collector path have no other gate.
 #   mesh_two       two-real-router mesh convergence/hold/partition/heal/retire has no
@@ -75,15 +66,14 @@
 # change; the run log records every skip so a green run cannot silently shrink.
 #
 # Requirements: docker (+ authz:latest, apache/apisix:3.11.0-debian, and the
-# built lua-router:integration), curl, jq, python3, and a reachable Redis for
-# e2e_history_redis; the endpoint comes from test/local.env and the Redis
-# reachability is checked inside the gate.
+# built lua-router:integration), curl, jq and python3. test/local.env is still
+# sourced for local overrides (none are required by the shipped gates).
 # Concurrency with other container-heavy suites is allowed but roughly doubles
 # the wall time.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# optional untracked local overrides (redis endpoint etc.)
+# optional untracked local overrides (see test/local.env.example)
 [ -f "$SCRIPT_DIR/local.env" ] && . "$SCRIPT_DIR/local.env"
 LUA_ROUTER=$(cd "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$LUA_ROUTER   # standalone repo: repo root == this dir
@@ -100,8 +90,7 @@ mkdir -p "$LOG_DIR"
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort e2e_discovery_dp e2e_jwt head_routes mesh_http
-            e2e_history_redis e2e_otel e2e_responses_store e2e_policy_parity mesh_two
-            e2e_tls_chain)
+            e2e_otel e2e_policy_parity mesh_two e2e_tls_chain)
 
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
@@ -205,7 +194,7 @@ preflight() {
             exit 2; }
     fi
     if is_selected e2e_stateful || is_selected head_routes || is_selected mesh_http ||
-       is_selected e2e_history_redis || is_selected e2e_tls_chain; then
+       is_selected e2e_tls_chain; then
         docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || {
             printf 'image %s is not present (the e2e suites boot it; drop SKIP_ENV=build)\n' \
                 "$E2E_IMAGE" >&2
@@ -250,7 +239,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_history test_mesh \
+    for t in test_tree test_policies test_hash test_mesh \
              test_service_discovery test_jwks test_otel; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
@@ -281,14 +270,7 @@ gate_e2e_discovery_dp() { run_integration e2e_discovery_dp.py 1500; }
 gate_e2e_jwt()       { run_integration e2e_jwt.py 900; }
 gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
-# LR_REDIS_REQUIRED makes the suite exit 1 instead of SKIP+exit 0 when the
-# shared Redis cannot be reached, so a green run really did exercise the
-# backend. Manual runs without the variable keep the old skip behaviour.
-gate_e2e_history_redis() {
-    LR_REDIS_REQUIRED=1 run_integration e2e_history_redis.py 900
-}
 gate_e2e_otel()      { run_integration e2e_otel.py 1500; }
-gate_e2e_responses_store() { run_integration e2e_responses_store.py 900; }
 gate_e2e_policy_parity() { run_integration e2e_policy_parity.py 1800; }
 gate_mesh_two()        { run_integration test_mesh_two.py 900; }
 gate_e2e_tls_chain()   { run_integration e2e_tls_chain.py 1500; }
@@ -314,9 +296,7 @@ gate e2e_discovery_dp
 gate e2e_jwt
 gate head_routes
 gate mesh_http
-gate e2e_history_redis
 gate e2e_otel
-gate e2e_responses_store
 gate e2e_policy_parity
 gate mesh_two
 gate e2e_tls_chain

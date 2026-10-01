@@ -29,9 +29,8 @@ Rust one, which is what section 6 below checks:
     anything that was not the literal "GET", so HEAD reached the POST handler and
     its empty body was rejected. The branch now reads ``GET or HEAD``, matching
     axum's ``get(handler)``, so HEAD answers 200 with the GET headers.
-  * /_ui/history — HEAD used to answer 404 because router.lua registered only
-    ``app:get("_ui/history")``; the ``app:head`` twin is what section 6 now
-    requires.
+  * /_ui/history went away with the conversation store (doc/scope-trim.md), so
+    section 6 now only pins the /_ui/config HEAD/GET fold.
 """
 import json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -124,13 +123,12 @@ for p in ("/_ui/v1/models", "/_ui/props", "/_ui/logs", "/_ui/stats", "/_ui/slots
 # A POST-only /_ui alias must refuse HEAD the same way it refuses GET.
 head_case(port, "/_ui/config/effort", get_status=405, chunked=True)
 
-# 6. The two routes that used to diverge (doc/gap-test-gates.md §3, doc/gap-http-semantics.md):
-# /_ui/config is read by ui.conf and /_ui/history by a router.lua app:head twin. Both
-# must now answer HEAD exactly as GET, so the parity check below is the regression gate.
+# 6. The route that used to diverge (doc/gap-test-gates.md §3, doc/gap-http-semantics.md):
+# /_ui/config is read by ui.conf, whose exact location now folds HEAD into the GET
+# branch. The check is the regression gate for that fold. (/_ui/history was pinned
+# here as well until the conversation store was removed by the scope trim.)
 head_case(port, "/_ui/config", get_status=200, chunked=True,
           label="/_ui/config HEAD follows the GET branch")
-head_case(port, "/_ui/history", get_status=200, chunked=True,
-          label="/_ui/history has an app:head twin")
 
 # 7. The 404 sink answers HEAD without a body. The sink's message embeds the
 # request method, so the body length differs by the length of "HEAD" - only

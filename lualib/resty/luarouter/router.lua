@@ -16,15 +16,15 @@
 -- a status for JSON with an explicit code, and return '' once the response has
 -- been written by hand. A number in 100..599 with no result is a bare status.
 --
--- Kubernetes discovery, the conversations/response store
--- (resty.luarouter.history), the tokenizer and parser proxies
+-- Kubernetes discovery, the tokenizer and parser proxies
 -- (resty.luarouter.tokenizer / resty.luarouter.parse), OTel tracing and cluster
--- mesh are all wired: the first three behind their own listeners/knobs
--- (SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with
--- SMG_ENABLE_MESH off, /ha/* answers the fixed 503, which is the contract for a
--- node that has not opted in. The transport plane and the prefill/decode pool
--- split were removed (doc/scope-trim.md): this gateway speaks plain HTTP to its
--- workers.
+-- mesh are all wired: the first two behind their own knobs
+-- (SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with SMG_ENABLE_MESH
+-- off, /ha/* answers the fixed 503, which is the contract for a node that has
+-- not opted in. The gRPC transport plane, the prefill/decode pool split and the
+-- conversation/response store were removed (doc/scope-trim.md): this gateway
+-- speaks plain HTTP to its workers, and /v1/responses is a pure inference
+-- route.
 --
 -- What is genuinely not implemented is tracked in doc/feature-gap.md: wasm
 -- middleware is a deferred TODO (doc/todo-deferred.md, feasibility in
@@ -39,11 +39,11 @@ local observability = require "resty.luarouter.observability"
 local otel = require "resty.luarouter.otel"
 local policy_mod = require "resty.luarouter.policy"
 local registry = require "resty.luarouter.registry"
--- Wired gap modules: the conversation/response store (doc/gap-history.md), the
--- tokenizer/parse proxies (doc/gap-tokenizer-parse.md) and cluster mesh
--- (doc/gap-mesh.md). All four are load-safe without ngx (they only read ngx inside
--- their handlers), so the init_by_lua syntax gate can require them.
-local history = require "resty.luarouter.history"
+-- Wired gap modules: the tokenizer/parse proxies (doc/gap-tokenizer-parse.md)
+-- and cluster mesh (doc/gap-mesh.md). Both are load-safe without ngx (they only
+-- read ngx inside their handlers), so the init_by_lua syntax gate can require
+-- them. The conversation/response store was removed with the history plane
+-- (doc/scope-trim.md): /v1/responses stays as a pure inference route.
 local mesh_mod = require "resty.luarouter.mesh"
 local parse_mod = require "resty.luarouter.parse"
 local tokenizer_mod = require "resty.luarouter.tokenizer"
@@ -66,8 +66,6 @@ end
 -- Declared here so the handlers below can reach it; the limiter itself is at
 -- resty/luarouter/limit.lua.
 local limit_mod
--- Defined with the conversation store handlers, called by route_inference.
-local persist_response
 -- Defined with the mesh handlers, called by the /workers control plane.
 local mesh_observe_worker
 local mesh_forget_worker
@@ -196,98 +194,6 @@ local function send_error(status, code, message)
         ngx.print(set_content_length(body))
     end
     return ""
-end
-
----Conversations-plane error body: routers/conversations/handlers.rs answers
----`{"error":"<message>"}` (a JSON *string*, not the gateway error object), so the
----history handlers use this shape for that endpoint family.
-local function send_plain_error(status, code, message)
-    ngx.status = status
-    ngx.header["Content-Type"] = "application/json"
-    ngx.header["X-SMG-Error-Code"] = code
-    local body = json_encode({ error = message })
-    if body then
-        ngx.print(set_content_length(body))
-    end
-    return ""
-end
-
----Responses-plane error body: routers/openai/router.rs::error_responses shapes
----(`{"error":{"message","type","param","code"}}`).
-local function send_openai_error(err)
-    ngx.status = err.status or 500
-    ngx.header["Content-Type"] = "application/json"
-    local code = err.code or (ngx.status == 404 and "not_found" or "internal_error")
-    ngx.header["X-SMG-Error-Code"] = code
-    local body = json_encode({
-        error = {
-            message = err.message,
-            ["type"] = (ngx.status >= 500) and "internal_server_error"
-                or "invalid_request_error",
-            param = err.param or cjson.null,
-            code = code,
-        },
-    })
-    if body then
-        ngx.print(set_content_length(body))
-    end
-    return ""
-end
-
----Hand a history-module result to the wire. `plane` picks the error shape of the
----corresponding Rust handler; a string value is the stored upstream bytes and is
----echoed verbatim (create_response keeps them so a later GET is byte-exact).
----@param value any
----@param err table|nil
----@param plane string @ "conversation" | "response"
-local function history_answer(value, err, plane)
-    if err then
-        if plane == "conversation" then
-            return send_plain_error(err.status or 500, err.code or "internal_error",
-                err.message or "internal error")
-        end
-        return send_openai_error(err)
-    end
-    if type(value) == "string" then
-        ngx.header["Content-Type"] = "application/json"
-        ngx.print(set_content_length(value))
-        return ""
-    end
-    return value
-end
-
----Encode a store result through the history module's own encoder. cjson cannot
----tell an empty array from an empty object, and the store marks its arrays
----(history.array) precisely so `data: []` and `content: []` survive the round
----trip; these routes therefore must not go through exact_json.
----@param func fun(params:table, ctx:any, req:any):any, number|nil
-local function history_json(func)
-    return function(params, ctx, req)
-        local result, status = func(params, ctx, req)
-        if type(result) ~= "table" then
-            return result, status
-        end
-        local text = history.encode(result)
-        if not text then
-            return send_error(500, "internal_error", "failed to encode response")
-        end
-        if status then
-            ngx.status = status
-        end
-        ngx.header["Content-Type"] = "application/json"
-        ngx.print(set_content_length(text))
-        return ""
-    end
-end
-
----Read an optional JSON body without failing on an empty one: the conversations
----handlers accept a body-less delete/cancel and a `{}` patch.
-local function optional_body(ctx, req)
-    local body, err = req.get_body(ctx)
-    if body == nil then
-        return nil, err
-    end
-    return body, nil
 end
 
 -- ------------------------------------------------------------------ CORS
@@ -1057,9 +963,9 @@ local function missing_or_empty(raw, field)
 end
 
 ---responses/utils.rs::patch_response_with_request_metadata, expressed as
----byte-preserving top-level edits. The buffered /v1/responses path uses the
----result both for storage and for the client body, exactly like Rust patches
----one Value and serializes it once.
+---byte-preserving top-level edits. With the response store removed this is the
+---client-facing half only: /v1/responses answers the upstream bytes with the
+---request's own metadata echoed back, which is the Rust wire shape.
 ---@param raw string @ upstream response bytes
 ---@param body table @ decoded request
 ---@return string raw
@@ -1099,11 +1005,8 @@ local function patch_response_metadata(raw, body)
     if safety_present and safety == cjson.null and type(body.user) == "string" then
         raw = set_top_field(raw, "safety_identifier", body.user)
     end
-    -- Attaches on Option<String>::is_some(), so "" produces {"id": ""} exactly as
-    -- Rust's json!({ "id": conv_id }) does for an empty id.
-    if type(body.conversation) == "string" then
-        raw = set_top_field(raw, "conversation", { id = body.conversation })
-    end
+    -- The conversation link is not echoed: it only ever meant "this stored
+    -- response belongs to that conversation", and the store is gone.
     return raw
 end
 
@@ -1611,133 +1514,21 @@ end
 
 -- ------------------------------------------------------------------ streaming
 
----Streaming /v1/responses persistence state, modelled on ChunkProcessor plus
----StreamingResponseAccumulator. Only requests with store=true or a conversation
----allocate one; every other stream keeps the zero-buffer fast path.
-local function new_response_accumulator()
-    return { carry = "", pending = "", initial = nil, completed = nil,
-        items = {}, error = nil }
-end
-
-local function accumulator_block(acc, block)
-    -- Rust's process_block trims the whole block before scanning lines, so a
-    -- block that only carries leading indentation still parses.
-    local event_name
-    local data = {}
-    for line in string.gmatch(block:gsub("^%s+", ""):gsub("%s+$", ""), "[^\n]+") do
-        local ev = string.match(line, "^event:%s*(.-)%s*$")
-        if ev then
-            event_name = ev
-        else
-            local datum = string.match(line, "^data:%s*(.-)$")
-            if datum then
-                data[#data + 1] = datum
-            end
-        end
-    end
-    if #data == 0 then
-        return
-    end
-    local parsed = json_decode(table.concat(data, "\n"))
-    if type(parsed) ~= "table" then
-        return
-    end
-    -- Event names follow the Rust constants (openai-protocol event_types.rs:
-    -- ResponseEvent::CREATED / COMPLETED, OutputItemEvent::DONE, all
-    -- "response."-prefixed), which is also what the real OpenAI SSE surface sends.
-    -- The bare "output_item.done" spelling is accepted as well: it is the name a
-    -- worker gets when it forwards the data payload without the event: line, and
-    -- get_event_type() falls back to data.type, so a router that only matched the
-    -- prefixed form would silently drop those items.
-    local kind = event_name or parsed.type
-    if kind == "response.created" then
-        if not acc.initial and type(parsed.response) == "table" then
-            acc.initial = parsed.response
-        end
-    elseif kind == "response.completed" then
-        if type(parsed.response) == "table" then
-            acc.completed = parsed.response
-        end
-    elseif kind == "response.output_item.done" or kind == "output_item.done" then
-        local index = tonumber(parsed.output_index)
-        if index and type(parsed.item) == "table" then
-            acc.items[#acc.items + 1] = { index = index, item = parsed.item }
-        end
-    elseif kind == "response.error" then
-        acc.error = parsed
-    end
-end
-
-local function accumulator_push(acc, text)
-    if type(text) ~= "string" or text == "" then
-        return
-    end
-    -- CRLF normalization with a cross-chunk carry: a chunk ending in \r cannot
-    -- be normalized until the next byte arrives, so the lone \r waits in
-    -- acc.carry instead of becoming a stray CR that splits blocks on \n\n.
-    local buf = acc.carry .. text
-    if buf:sub(-1) == "\r" then
-        acc.carry = "\r"
-        buf = buf:sub(1, -2)
-    else
-        acc.carry = ""
-    end
-    acc.pending = acc.pending .. (buf:gsub("\r\n", "\n"))
-    while true do
-        local from, to = string.find(acc.pending, "\n\n", 1, true)
-        if not from then
-            break
-        end
-        local block = acc.pending:sub(1, from - 1)
-        acc.pending = acc.pending:sub(to + 1)
-        if block:match("%S") then
-            accumulator_block(acc, block)
-        end
-    end
-end
-
-local function accumulator_finish(acc)
-    acc.pending = acc.pending .. acc.carry
-    acc.carry = ""
-    if acc.pending:match("%S") then
-        accumulator_block(acc, acc.pending)
-        acc.pending = ""
-    end
-    if type(acc.completed) == "table" then
-        return acc.completed
-    end
-    if type(acc.initial) ~= "table" then
-        return nil
-    end
-    table.sort(acc.items, function(a, b) return a.index < b.index end)
-    local output = {}
-    for i, entry in ipairs(acc.items) do
-        output[i] = entry.item
-    end
-    if #output == 0 then
-        setmetatable(output, cjson.empty_array_mt)
-    end
-    acc.initial.status = "completed"
-    acc.initial.output = output
-    return acc.initial
-end
-
 ---Pump an upstream body to the client without buffering it. The client-facing
 ---framing is decided here: keep an exact Content-Length, otherwise let nginx
 ---chunk the response. Returns ok, tail where tail carries the last bytes read
 ---(used to spot the SSE usage event).
 ---
----`ok` describes the UPSTREAM, not the client, once an accumulator is passed:
----with one, a client that hangs up stops the writes but not the reads, so the
----call keeps consuming the body until the upstream ends and returns true. Without
----an accumulator the old rule stands and a disconnect tears the pump down, which
----is what makes a dropped non-persisted stream stop spending upstream bandwidth.
+---`ok` describes the UPSTREAM and the client together: the pump has nothing to
+---keep once the client stops reading, so a failed write tears the pump down and
+---the upstream bandwidth stops being spent (Rust's non-persistence branch
+---cancels the request the same way, streaming.rs:661-722).
 ---@param sock table
 ---@param headers table
 ---@param kind string|nil @ pool class of the connection being pumped
 ---@param url string|nil @ worker url, so release() can size the pool
 ---@param conf table @ router config for the pool knobs
-local function stream_response(sock, headers, kind, url, conf, accumulator)
+local function stream_response(sock, headers, kind, url, conf)
     local chunked = is_chunked(headers)
     local length = tonumber(headers["content-length"])
     if not (length and not chunked) then
@@ -1812,35 +1603,13 @@ local function stream_response(sock, headers, kind, url, conf, accumulator)
         end
     end
 
-    -- drain: keep reading upstream after the client stopped reading. Rust does
-    -- exactly this on the persistence branch (streaming.rs:574-610): the moment
-    -- tx.send fails it sets receiver_connected = false and goes on consuming and
-    -- accumulating until the upstream ends, because the stored response has to be
-    -- complete even though nobody is watching any more. Without an accumulator
-    -- there is nothing to store, so a failed ngx.print keeps tearing the pump
-    -- down like every other stream (Rust's non-persistence branch cancels the
-    -- request the same way, streaming.rs:661-722, and the tool-interception
-    -- branch deliberately gives up, streaming.rs:737-749).
-    local drain = accumulator ~= nil
-    local client_gone = false
-
     local function emit(text)
-        if not client_gone and not ngx.print(text) then
-            if not drain then
-                ok = false
-                return false
-            end
-            -- The client is gone but the body still has to reach the accumulator:
-            -- stop writing, keep reading, and keep counting the stream as served.
-            client_gone = true
+        if not ngx.print(text) then
+            ok = false
+            return false
         end
-        if not client_gone then
-            ngx.flush(true)
-        end
+        ngx.flush(true)
         note(text)
-        if accumulator then
-            accumulator_push(accumulator, text)
-        end
         return true
     end
 
@@ -1852,7 +1621,7 @@ local function stream_response(sock, headers, kind, url, conf, accumulator)
     local reusable = false
     local remaining = length
     if length and not chunked then
-        while (ok or client_gone) and remaining > 0 do
+        while ok and remaining > 0 do
             local block = sock:receive(math.min(65536, remaining))
             if not block then
                 ok = false
@@ -1867,7 +1636,7 @@ local function stream_response(sock, headers, kind, url, conf, accumulator)
         -- an SSE stream has to reach the client chunk by chunk. The trailer block
         -- is consumed by hand for the same reason the pool needs it consumed.
         local complete = false
-        while ok or client_gone do
+        while ok do
             local size_line = sock:receive("*l")
             if not size_line then
                 ok = false
@@ -1890,7 +1659,7 @@ local function stream_response(sock, headers, kind, url, conf, accumulator)
             sock:receive(2)
             emit(block)
         end
-        if complete and (ok or client_gone) then
+        if complete and ok then
             while true do
                 local line = sock:receive("*l")
                 if line == nil or line == "" then
@@ -1903,7 +1672,7 @@ local function stream_response(sock, headers, kind, url, conf, accumulator)
         reusable = complete and ok
     else
         -- Connection-delimited upstream body.
-        while ok or client_gone do
+        while ok do
             local block, err = sock:receive(65536)
             if not block then
                 if err ~= "closed" and err ~= "timeout" then
@@ -2179,26 +1948,13 @@ local function forward(route, body, raw_body, model, text, incoming)
                     ngx.ctx.lr_ttft = seconds
                     observability.record_router_ttft(model or "unknown", endpoint, seconds)
                 end
-                -- C4 gate, Rust's `need_persistence = should_store ||
-                -- persist_needed` (streaming.rs:553-565): only store=true or a
-                -- conversation makes the router accumulate and persist a stream, and
-                -- only on a 2xx. Rust reads Option<String>::is_some(), which is true
-                -- for the empty string as well, so the Lua gate is "any non-null
-                -- string" with no emptiness test -- a JSON null decodes to
-                -- cjson.null here and is not a string, which matches Rust's None.
-                -- patch_response_metadata and persist_response use the same
-                -- is_some() reading, so "" lands conversation {"id": ""} on the
-                -- client body and conversation_id "" on the stored row, and the
-                -- item linking is skipped because no such conversation exists
-                -- (streaming.rs:613-618 warns over the same lookup miss).
-                local accumulator
-                if route == "/v1/responses" and status >= 200 and status < 300
-                    and (body.store == true or type(body.conversation) == "string") then
-                    accumulator = new_response_accumulator()
-                end
+                -- Every stream takes the zero-buffer fast path now (the
+                -- history plane used to allocate an accumulator for
+                -- store=true / conversation requests so the response could be
+                -- stored; scope-trim.md removed that plane).
                 local stream_ok, tail, prompt, completion, cached, reasoning =
                     stream_response(response.sock, response.headers,
-                        response.kind, worker.url, conf, accumulator)
+                        response.kind, worker.url, conf)
                 release_load(worker)
                 hb.record_outcome(worker.id, stream_ok and status < 400)
                 if not stream_ok then
@@ -2214,25 +1970,6 @@ local function forward(route, body, raw_body, model, text, incoming)
                     estimated and 1 or nil, reasoning or 0 }
                 if not stream_ok then
                     observability.note_error()
-                end
-                -- stream_ok now says "the upstream body ended cleanly": with an
-                -- accumulator the pump keeps reading after the client hangs up, so a
-                -- disconnect leaves stream_ok true and the response still persists
-                -- (Rust logs "continuing to drain upstream for storage" and stores
-                -- the same way). An upstream read error clears stream_ok and, like
-                -- Rust's upstream_failed branch, skips persistence.
-                if accumulator and stream_ok then
-                    local final = accumulator_finish(accumulator)
-                    if type(final) == "table" then
-                        local persisted = patch_response_metadata(json_encode(final), body)
-                        local pok, perr = pcall(persist_response, body, persisted)
-                        if not pok then
-                            ngx.log(ngx.WARN, "luarouter: failed to persist streamed response: ",
-                                tostring(perr))
-                        end
-                    else
-                        ngx.log(ngx.WARN, "luarouter: streamed response completed without a final payload")
-                    end
                 end
                 return status, nil
 
@@ -2419,15 +2156,11 @@ local function route_inference(route, body, raw)
     local status, response_body = forward(route, body, raw, resolved, text,
         ngx.req.get_headers())
     if route == "/v1/responses" and status >= 200 and status < 300 then
-        -- Rust patches the response Value before both storage and the client
-        -- body (non_streaming.rs:141-167); doing it on the buffered bytes keeps
-        -- the no-reencode invariant while making the two consumers identical.
+        -- Rust patches the response Value before it answers (non_streaming.rs:
+        -- 141-167). The response store is gone (scope-trim.md), so this is the
+        -- only consumer and the client sees the same byte-preserving echo of its
+        -- own request metadata.
         response_body = patch_response_metadata(response_body, body)
-        -- OpenAI-mode persistence (openai/router.rs -> persist_conversation_items),
-        -- which the non-streaming path runs unconditionally on a 2xx. Streaming
-        -- persistence is handled inside forward(), and only for store/conversation
-        -- requests so the ordinary SSE fast path stays unbuffered.
-        persist_response(body, response_body)
     end
     if response_body and response_body ~= "" then
         -- Upstream framing is dropped (content-length is in DROP_RESPONSE_HEADERS),
@@ -2696,212 +2429,6 @@ local function param_text(params, name)
         return nil
     end
     return ngx.unescape_uri(value)
-end
-
--- ------------------------------------------------------------- conversations plane
---
--- The conversation / response store is resty.luarouter.history (doc/gap-history.md).
--- Two things come from the Rust side of the wire format: the conversations handlers
--- answer errors as {"error":"<message>"} while the responses handlers answer the
--- gateway error object, so each family gets its own answer helper, and the auth
--- plane follows server.rs (both families live in `protected_routes`, i.e. the
--- data-plane api key).
-
----POST /v1/conversations
-local function create_conversation_handler(params, ctx, req)
-    if not check_data_auth() then
-        return ""
-    end
-    local body, err = optional_body(ctx, req)
-    if not body then
-        return send_plain_error(400, "invalid_json",
-            err or "request body must be a JSON object")
-    end
-    local opts
-    if body.id ~= nil then
-        opts = { id = body.id }
-    end
-    local value, err = history.create_conversation(body.metadata, opts)
-    return history_answer(value, err, "conversation")
-end
-
----GET /v1/conversations/{conversation_id}
-local function get_conversation_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.get_conversation(
-        param_text(params, "conversation_id"))
-    return history_answer(value, err, "conversation")
-end
-
----POST /v1/conversations/{conversation_id} - metadata patch, null deletes a key.
-local function update_conversation_handler(params, ctx, req)
-    if not check_data_auth() then
-        return ""
-    end
-    local body, err = optional_body(ctx, req)
-    if not body then
-        return send_plain_error(400, "invalid_json",
-            err or "request body must be a JSON object")
-    end
-    local value, perr = history.update_conversation(
-        param_text(params, "conversation_id"), body)
-    return history_answer(value, perr, "conversation")
-end
-
----DELETE /v1/conversations/{conversation_id}
-local function delete_conversation_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.delete_conversation(
-        param_text(params, "conversation_id"))
-    return history_answer(value, err, "conversation")
-end
-
----GET /v1/conversations/{conversation_id}/items?limit=&order=&after=
-local function list_conversation_items_handler(params, ctx, req)
-    if not check_data_auth() then
-        return ""
-    end
-    local query = req.get_query()
-    local value, err = history.list_items(
-        param_text(params, "conversation_id"),
-        { limit = query.limit, order = query.order, after = query.after })
-    return history_answer(value, err, "conversation")
-end
-
----POST /v1/conversations/{conversation_id}/items
-local function create_conversation_items_handler(params, ctx, req)
-    if not check_data_auth() then
-        return ""
-    end
-    local body, err = optional_body(ctx, req)
-    if not body then
-        return send_plain_error(400, "invalid_json",
-            err or "request body must be a JSON object")
-    end
-    local value, perr = history.create_items(
-        param_text(params, "conversation_id"), body.items)
-    return history_answer(value, perr, "conversation")
-end
-
----GET /v1/conversations/{conversation_id}/items/{item_id}
-local function get_conversation_item_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.get_item(param_text(params, "conversation_id"),
-        param_text(params, "item_id"))
-    return history_answer(value, err, "conversation")
-end
-
----DELETE /v1/conversations/{conversation_id}/items/{item_id}
-local function delete_conversation_item_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.delete_item(param_text(params, "conversation_id"),
-        param_text(params, "item_id"))
-    return history_answer(value, err, "conversation")
-end
-
--- ---------------------------------------------------------------- responses plane
---
--- GET / cancel / delete / input_items read this router's own store. The Rust
--- gateway only serves them from the OpenAI-mode router (routers/openai/router.rs);
--- the Regular HTTP router answers 501 (routers/mod.rs defaults, sampled on
--- <rust-box>:8800), so this is a superset of the mode this router mirrors.
-
----POST /v1/responses/{response_id} is not a Rust route; only cancel is.
-local function get_response_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.get_response(param_text(params, "response_id"))
-    return history_answer(value, err, "response")
-end
-
-local function cancel_response_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.cancel_response(param_text(params, "response_id"))
-    return history_answer(value, err, "response")
-end
-
-local function delete_response_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.delete_response(param_text(params, "response_id"))
-    return history_answer(value, err, "response")
-end
-
-local function list_input_items_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    local value, err = history.list_input_items(param_text(params, "response_id"))
-    return history_answer(value, err, "response")
-end
-
----Normalize the request's `input` into stored input items, the way
----persistence_utils.rs::extract_input_items does: a bare string becomes one
----completed user message with generated id and input_text content; an array is
----kept as-is (list_input_items fills in the missing ids on read).
-local function normalize_response_input(value)
-    if type(value) == "string" then
-        return { {
-            id = history.new_item_id("message"),
-            ["type"] = "message",
-            role = "user",
-            content = { { ["type"] = "input_text", text = value } },
-            status = "completed",
-        } }
-    end
-    if type(value) == "table" and #value > 0 then
-        return value
-    end
-    return {}
-end
-
----Mirror of persistence_utils.rs::persist_conversation_items for the buffered
----path: the response record is stored and, when the request named a conversation
----that exists, its input and output items are linked into it. Rust never fails
----the request over a persistence error (it warns), so neither does this.
-persist_response = function(body, response_bytes)
-    if type(response_bytes) ~= "string" or response_bytes == "" then
-        return
-    end
-    -- Splice the request-side fields into the upstream bytes rather than
-    -- re-encoding: history keeps the payload verbatim so a later GET echoes it,
-    -- and cjson would rewrite "tools":[] into {} on the way through.
-    local stored = response_bytes
-    -- Rust writes stored.conversation_id = original_body.conversation.clone(), an
-    -- Option<String>, so the empty string is a present value and reaches the
-    -- record; only the item-linking lookup then fails (get_conversation("") finds
-    -- nothing and persist_conversation_items warns and skips the link), which is
-    -- what the guard in history.create_response reproduces.
-    local conversation = body.conversation
-    if type(conversation) == "string" then
-        stored = set_top_field(stored, "conversation_id", conversation)
-    end
-    local input = normalize_response_input(body.input)
-    if #input > 0 then
-        stored = set_top_field(stored, "input", input)
-    end
-    local ok, value, err = pcall(history.create_response, stored)
-    if not ok then
-        ngx.log(ngx.WARN, "luarouter: failed to persist conversation items: ",
-            tostring(value))
-        return
-    end
-    if not value then
-        ngx.log(ngx.WARN, "luarouter: failed to persist conversation items: ",
-            tostring(err and err.message))
-    end
 end
 
 -- ------------------------------------------------------------------ metrics
@@ -3588,13 +3115,6 @@ local function ui_stats_handler()
     return observability.stats()
 end
 
----GET /_ui/history - conversation store occupancy (doc/gap-history.md suggests
----folding stats() into /_ui; /_ui/stats is answered by conf/ui.conf, so a separate
----route keeps the shape identical on both deployment shapes).
-local function ui_history_handler()
-    return history.stats()
-end
-
 ---Gate for the mesh surface. /ha/* follows the Rust placement: control-plane key
 ---(which falls back to the data key), and open when no key is configured at all.
 ---/_mesh/internal/* has no Rust equivalent on the business port (Rust keeps it on
@@ -3817,40 +3337,6 @@ local function build()
         end)
     end
 
-    -- Conversation / response store (doc/gap-history.md). Auth follows
-    -- server.rs: these axum routes live in `protected_routes`, so the data-plane
-    -- key applies. exact_json keeps the Content-Length discipline the other JSON
-    -- routes use; a handler that already wrote its answer returns '' untouched.
-    local conversation_routes = {
-        { "POST", "v1/conversations", create_conversation_handler },
-        { "GET", "v1/conversations/:conversation_id", get_conversation_handler },
-        { "POST", "v1/conversations/:conversation_id", update_conversation_handler },
-        { "DELETE", "v1/conversations/:conversation_id", delete_conversation_handler },
-        { "GET", "v1/conversations/:conversation_id/items",
-            list_conversation_items_handler },
-        { "POST", "v1/conversations/:conversation_id/items",
-            create_conversation_items_handler },
-        { "GET", "v1/conversations/:conversation_id/items/:item_id",
-            get_conversation_item_handler },
-        { "DELETE", "v1/conversations/:conversation_id/items/:item_id",
-            delete_conversation_item_handler },
-    }
-    for i = 1, #conversation_routes do
-        local r = conversation_routes[i]
-        app:register(r[2], history_json(r[3]), r[1])
-    end
-
-    local response_routes = {
-        { "GET", "v1/responses/:response_id", get_response_handler },
-        { "DELETE", "v1/responses/:response_id", delete_response_handler },
-        { "POST", "v1/responses/:response_id/cancel", cancel_response_handler },
-        { "GET", "v1/responses/:response_id/input_items", list_input_items_handler },
-    }
-    for i = 1, #response_routes do
-        local r = response_routes[i]
-        app:register(r[2], history_json(r[3]), r[1])
-    end
-
     -- Tokenizer / parse plane (doc/gap-tokenizer-parse.md). The module handlers
     -- write their own responses (byte-exact proxy passthrough), so they are
     -- registered raw rather than through exact_json. Auth is injected explicitly
@@ -3951,8 +3437,6 @@ local function build()
     app:get("_ui/logs", ui_logs_handler)
     app:get("_ui/stats", ui_stats_handler)
     app:get("_ui/logs/backends", ui_backends_handler)
-    app:get("_ui/history", exact_json(ui_history_handler))
-    app:head("_ui/history", exact_json(ui_history_handler))
 
     app:error_handle(404, function(ctx)
         -- Anchored prefixes (string.find with plain=true has no "^" magic, so the
@@ -4038,23 +3522,7 @@ _M.mesh_disabled_handler = mesh_disabled_handler
 _M.mesh_control_auth = mesh_control_auth
 _M.mesh_observe_worker = mesh_observe_worker
 _M.mesh_forget_worker = mesh_forget_worker
-_M.create_conversation_handler = create_conversation_handler
-_M.get_conversation_handler = get_conversation_handler
-_M.update_conversation_handler = update_conversation_handler
-_M.delete_conversation_handler = delete_conversation_handler
-_M.list_conversation_items_handler = list_conversation_items_handler
-_M.create_conversation_items_handler = create_conversation_items_handler
-_M.get_conversation_item_handler = get_conversation_item_handler
-_M.delete_conversation_item_handler = delete_conversation_item_handler
-_M.get_response_handler = get_response_handler
-_M.cancel_response_handler = cancel_response_handler
-_M.delete_response_handler = delete_response_handler
-_M.list_input_items_handler = list_input_items_handler
-_M.persist_response = function(body, bytes)
-    return persist_response(body, bytes)
-end
 _M.ui_logs_handler = ui_logs_handler
-_M.ui_history_handler = ui_history_handler
 _M.ui_stats_handler = ui_stats_handler
 _M.text_response = text_response
 

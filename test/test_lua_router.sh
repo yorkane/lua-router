@@ -1503,231 +1503,6 @@ if section mesh; then
 fi
 
 # ==========================================================================
-if section history_crud; then
-    # resty.luarouter.history on the memory backend (SMG_HISTORY_BACKEND
-    # default). Shapes sampled against the Rust gateway's semantics:
-    # conversations plane answers {"error":"<message>"} and responses plane
-    # answers {"error":{type,code,message}} + X-SMG-Error-Code.
-    ensure_workers
-
-    # -- conversations CRUD --------------------------------------------------
-    request "$MAIN_BASE" POST /v1/conversations -H 'Content-Type: application/json' \
-        --data '{"metadata":{"k":"v"}}'
-    assert_eq "create conversation is 200 (Rust uses OK, not 201)" "$STATUS" "200"
-    assert_json "conversation object" '.object' "conversation"
-    assert_json "conversation metadata" '.metadata.k' "v"
-    assert_matches "conversation id prefix" "$(jq -r '.id' "$TMP_DIR/body")" '^conv_'
-    CONV_ID=$(jq -r '.id' "$TMP_DIR/body")
-
-    request "$MAIN_BASE" POST /v1/conversations -H 'Content-Type: application/json' \
-        --data '{"id":"conv_ct_fixed","metadata":{"a":"b"}}'
-    assert_eq "explicit id is honoured" "$(jq -r '.id' "$TMP_DIR/body")" "conv_ct_fixed"
-    request "$MAIN_BASE" POST /v1/conversations -H 'Content-Type: application/json' \
-        --data 'nope'
-    assert_eq "create with an unreadable body is 400" "$STATUS" "400"
-    assert_eq "400 carries the plain error code header" "$(header_of X-SMG-Error-Code)" "invalid_json"
-    assert_json "400 body is {error:<message>}" '.error | startswith("invalid JSON body") | tostring' "true"
-    request "$MAIN_BASE" GET /v1/conversations/bad@@id
-    assert_eq "id with illegal characters is 400" "$STATUS" "400"
-    assert_eq "400 code for the bad id" "$(header_of X-SMG-Error-Code)" "invalid_request_error"
-
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID"
-    assert_eq "get conversation is 200" "$STATUS" "200"
-    assert_json "get returns the id" '.id' "$CONV_ID"
-
-    # Update with metadata null drops the key, other keys merge (Rust
-    # ConversationUpdater semantics).
-    request "$MAIN_BASE" POST "/v1/conversations/$CONV_ID" -H 'Content-Type: application/json' \
-        --data '{"metadata":{"k":null,"j":"w"}}'
-    assert_eq "update conversation is 200" "$STATUS" "200"
-    assert_json "null metadata value removed the key" '.metadata | has("k") | tostring' "false"
-    assert_json "other metadata applied" '.metadata.j' "w"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID"
-    assert_json "update persisted" '.metadata.j' "w"
-
-    # -- items and pagination -------------------------------------------------
-    request "$MAIN_BASE" POST "/v1/conversations/$CONV_ID/items" \
-        -H 'Content-Type: application/json' \
-        --data '{"items":[{"type":"message","role":"user","content":"one"},{"type":"message","role":"assistant","content":"two"},{"type":"message","role":"user","content":"three"},{"type":"message","role":"assistant","content":"four"}]}'
-    assert_eq "create items is 200" "$STATUS" "200"
-    assert_json "items envelope object" '.object' "list"
-    assert_json "items envelope count" '.data | length' "4"
-    assert_json "items envelope first_id" '.first_id' "$(jq -r '.data[0].id' "$TMP_DIR/body")"
-    assert_json "items envelope has_more" '.has_more | tostring' "false"
-    assert_json "item id prefix" '.data[0].id | startswith("msg_") | tostring' "true"
-    # The create envelope lists the accepted items in submission order.
-    ITEM_ID=$(jq -r '.data[0].id' "$TMP_DIR/body")
-
-    request "$MAIN_BASE" POST "/v1/conversations/$CONV_ID/items" \
-        -H 'Content-Type: application/json' --data '{}'
-    assert_eq "items without the items array is 400" "$STATUS" "400"
-
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items"
-    assert_eq "list items default order is newest first" "$(jq -r '.data[0].content' "$TMP_DIR/body")" "four"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items?order=asc&limit=2"
-    assert_eq "asc page one first item" "$(jq -r '.data[0].content' "$TMP_DIR/body")" "one"
-    assert_json "asc page one size" '.data | length' "2"
-    assert_json "asc page one has_more" '.has_more | tostring' "true"
-    AFTER=$(jq -r '.last_id' "$TMP_DIR/body")
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items?order=asc&limit=2&after=$AFTER"
-    assert_eq "after cursor advances the page" "$(jq -r '[.data[].content] | join(",")' "$TMP_DIR/body")" "three,four"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items?limit=0"
-    assert_eq "limit=0 is 400" "$STATUS" "400"
-    assert_json "limit 400 message" '.error' "limit must be a positive integer"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items?order=zzz"
-    assert_eq "an unknown order behaves as desc" "$(jq -r '.data[0].content' "$TMP_DIR/body")" "four"
-
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items/$ITEM_ID"
-    assert_eq "get one item is 200" "$STATUS" "200"
-    assert_json "item content" '.content' "one"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items/msg_nope"
-    assert_eq "unknown item is 404" "$STATUS" "404"
-    assert_json "item 404 message" '.error' "Item not found in this conversation"
-
-    # -- the responses plane --------------------------------------------------
-    for pair in "GET /v1/responses/resp_missing" "POST /v1/responses/resp_missing/cancel" \
-                "DELETE /v1/responses/resp_missing" "GET /v1/responses/resp_missing/input_items"; do
-        set -- $pair
-        request "$MAIN_BASE" "$1" "$2"
-        assert_eq "$2 unknown response is 404" "$STATUS" "404"
-        assert_json "$2 404 code" '.error.code' "not_found"
-        assert_json "$2 404 error type" '.error.type' "invalid_request_error"
-    done
-
-    request "$MAIN_BASE" POST /v1/responses -H 'Content-Type: application/json' \
-        -H "x-smg-target-worker: $MOCK_ID" \
-        --data '{"model":"test-model","input":"persist me","conversation":"'"$CONV_ID"'",'\
-'"store":false,"instructions":"be terse","previous_response_id":"prev-1",'\
-'"metadata":{"tag":"x"},"user":"u-contract"}'
-    assert_eq "responses inference is 200" "$STATUS" "200"
-    RESP_ID=$(jq -r '.id' "$TMP_DIR/body")
-    assert_matches "response id prefix" "$RESP_ID" '^resp_'
-    # C2 (utils.rs::patch_response_with_request_metadata) on the outbound bytes.
-    # The mock answers with instructions:null / previous_response_id:null /
-    # store:true / metadata:{}, so each rule is visible: the null members are
-    # filled, store is overwritten unconditionally, and an empty-object metadata
-    # counts as present for Rust's is_missing_or_empty and stays alone.
-    assert_json "responses patch fills null instructions" '.instructions' "be terse"
-    assert_json "responses patch fills null previous_response_id" \
-        '.previous_response_id' "prev-1"
-    assert_json "responses patch overwrites store with the request" \
-        '.store | tostring' "false"
-    assert_json "responses patch keeps a non-empty metadata object" \
-        '.metadata | length' "0"
-    assert_json "responses patch attaches the conversation id" \
-        '.conversation.id' "$CONV_ID"
-    assert_json "responses patch keeps empty arrays as arrays" \
-        '.tools | length' "0"
-    assert_json "responses patch model is the upstream model" '.model' "test-model"
-
-    request "$MAIN_BASE" GET "/v1/responses/$RESP_ID"
-    assert_eq "stored response is retrievable" "$STATUS" "200"
-    assert_json "stored response id" '.id' "$RESP_ID"
-    assert_json "stored response carries the conversation" '.conversation_id' "$CONV_ID"
-    assert_json "string input normalised to input_text" '.input[0].content[0].text' "persist me"
-    # The stored copy is the same patched bytes the client received.
-    assert_json "stored response keeps the patched store" '.store | tostring' "false"
-    assert_json "stored response keeps the patched instructions" '.instructions' "be terse"
-    request "$MAIN_BASE" GET "/v1/responses/$RESP_ID/input_items"
-    assert_eq "input_items is 200" "$STATUS" "200"
-    assert_json "input_items object" '.object' "list"
-    assert_json "input_items carries the prompt" '.data[0].content[0].text' "persist me"
-    request "$MAIN_BASE" POST "/v1/responses/$RESP_ID/cancel"
-    assert_eq "cancelling a completed response is 400" "$STATUS" "400"
-    assert_json "cancel 400 code" '.error.code' "response_not_cancellable"
-    # The response items were mirrored into the bound conversation.
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items?order=asc"
-    assert_json "conversation gained the response items" \
-        "[.data[] | select(.response_id == \"$RESP_ID\")] | length" "2"
-
-    request "$MAIN_BASE" DELETE "/v1/responses/$RESP_ID"
-    assert_eq "delete response is 200" "$STATUS" "200"
-    assert_json "deleted flag" '.deleted | tostring' "true"
-    assert_json "deleted object" '.object' "response.deleted"
-    request "$MAIN_BASE" GET "/v1/responses/$RESP_ID"
-    assert_eq "deleted response is gone" "$STATUS" "404"
-    assert_eq "404 error code header" "$(header_of X-SMG-Error-Code)" "not_found"
-
-    # C2/C4 with an empty conversation: Rust reads Option<String>::is_some(), so
-    # "" is a present value. It lands conversation {"id": ""} on the outbound
-    # bytes and conversation_id "" on the stored row, and nothing links because
-    # no conversation with an empty id exists (persist_conversation_items warns
-    # over the same lookup miss).
-    request "$MAIN_BASE" POST /v1/responses -H 'Content-Type: application/json' \
-        -H "x-smg-target-worker: $MOCK_ID" \
-        --data '{"model":"test-model","input":"empty conv","conversation":"","store":false}'
-    assert_eq "responses with an empty conversation is 200" "$STATUS" "200"
-    EMPTY_CONV_ID=$(jq -r '.id' "$TMP_DIR/body")
-    assert_json "empty conversation still attaches as {\"id\":\"\"}" \
-        '.conversation.id' ""
-    request "$MAIN_BASE" GET "/v1/responses/$EMPTY_CONV_ID"
-    assert_eq "empty-conversation response is stored" "$STATUS" "200"
-    assert_json "empty-conversation row keeps the empty id" '.conversation_id' ""
-    request "$MAIN_BASE" DELETE "/v1/responses/$EMPTY_CONV_ID"
-    assert_eq "empty-conversation response deleted" "$STATUS" "200"
-
-    # -- teardown -------------------------------------------------------------
-    request "$MAIN_BASE" DELETE "/v1/conversations/$CONV_ID/items/$ITEM_ID"
-    assert_eq "delete item is 200 and echoes the conversation" "$(jq -r '.id' "$TMP_DIR/body")" "$CONV_ID"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID/items/$ITEM_ID"
-    assert_eq "deleted item is 404" "$STATUS" "404"
-    request "$MAIN_BASE" DELETE "/v1/conversations/$CONV_ID/items/msg_nope"
-    assert_eq "deleting an unknown item is idempotent 200 (Rust ignores the unlink result)" "$STATUS" "200"
-    request "$MAIN_BASE" DELETE "/v1/conversations/$CONV_ID"
-    assert_eq "delete conversation is 200" "$STATUS" "200"
-    assert_json "conversation.deleted object" '.object' "conversation.deleted"
-    request "$MAIN_BASE" GET "/v1/conversations/$CONV_ID"
-    assert_eq "deleted conversation get is 404" "$STATUS" "404"
-    request "$MAIN_BASE" DELETE "/v1/conversations/$CONV_ID"
-    assert_eq "deleted conversation delete is 404" "$STATUS" "404"
-
-    # -- /_ui/history stats ---------------------------------------------------
-    # Exact location (ui.conf's ^~ /_ui/ prefix would otherwise eat it) and an
-    # open endpoint like logs/stats: no key needed.
-    request "$MAIN_BASE" GET /_ui/history
-    assert_eq "/_ui/history is 200" "$STATUS" "200"
-    assert_json "/_ui/history supported" '.supported | tostring' "true"
-    assert_json "/_ui/history backend" '.backend' "memory"
-    assert_json "/_ui/history counts conversations" '.conversations >= 1 | tostring' "true"
-    request "$MAIN_BASE" GET /_ui/history -H 'Authorization: Bearer nonsense'
-    assert_eq "/_ui/history ignores stray credentials" "$STATUS" "200"
-
-    # -- SMG_HISTORY_BACKEND=none ---------------------------------------------
-    # Rust NoOp memory backend: create synthesises a 200 object, everything
-    # that reads answers 404 (ensure_conversation_exists fires first), and the
-    # inference plane still serves normally - only the management plane is dark.
-    start_container lr-none-$SUIT "$BASE_CONF" SMG_HISTORY_BACKEND=none \
-        SMG_HEALTH_CHECK_INTERVAL_SECS=1
-    NONE_BASE=$BASE
-    register_worker "$NONE_BASE" "{\"url\":\"$MOCK_URL\",\"model_id\":\"test-model\"}"
-    NONE_MOCK_ID=$REG_ID
-    wait_healthy_worker "$NONE_BASE" 25 || fail "none-backend worker never became healthy"
-
-    request "$NONE_BASE" POST /v1/conversations -H 'Content-Type: application/json' --data '{}'
-    assert_eq "none backend create synthesises 200" "$STATUS" "200"
-    assert_json "none create still returns an object" '.object' "conversation"
-    for pair in "GET /v1/conversations/anyid" "DELETE /v1/conversations/anyid" \
-                "GET /v1/conversations/anyid/items" "GET /v1/responses/anyresp"; do
-        set -- $pair
-        request "$NONE_BASE" "$1" "$2"
-        assert_eq "none backend $2 is 404" "$STATUS" "404"
-    done
-    request "$NONE_BASE" POST /v1/conversations/anyid/items -H 'Content-Type: application/json' \
-        --data '{"items":[{"type":"message","role":"user","content":"x"}]}'
-    assert_eq "none backend item create is 404" "$STATUS" "404"
-    request "$NONE_BASE" POST /v1/responses -H 'Content-Type: application/json' \
-        -H "x-smg-target-worker: $NONE_MOCK_ID" --data '{"model":"test-model","input":"hi"}'
-    assert_eq "none backend still serves inference" "$STATUS" "200"
-    NONE_RESP=$(jq -r '.id' "$TMP_DIR/body")
-    request "$NONE_BASE" GET "/v1/responses/$NONE_RESP"
-    assert_eq "none backend stored nothing" "$STATUS" "404"
-    request "$NONE_BASE" GET /_ui/history
-    assert_json "/_ui/history reports the none backend" '.backend' "none"
-
-    BASE=$MAIN_BASE
-fi
-
-# ==========================================================================
 if section tokenizer_plane; then
     # resty.luarouter.{tokenizer,parse}: the router does not load tokenizers
     # itself, it proxies to a worker that advertises one. Fresh instance so the
@@ -1897,12 +1672,15 @@ if section tokenizer_plane; then
     request "$AUTH_BASE" POST /parse/function_call -H 'Content-Type: application/json' \
         -H 'Authorization: Bearer sk-tp-ct' --data '{"text":"x","tool_call_parser":"hermes"}'
     assert_eq "parse with the key reaches the factory error" "$STATUS" "503"
-    # The same key gates the history plane on this instance.
+    # The conversation/response store was removed with the history plane
+    # (doc/scope-trim.md): the family is no longer routed at all, so it lands in
+    # the 404 sink (key or no key).
     request "$AUTH_BASE" POST /v1/conversations -H 'Content-Type: application/json' --data '{}'
-    assert_eq "conversations without a key is 401" "$STATUS" "401"
-    request "$AUTH_BASE" POST /v1/conversations -H 'Content-Type: application/json' \
-        -H 'Authorization: Bearer sk-tp-ct' --data '{}'
-    assert_eq "conversations with the key is 200" "$STATUS" "200"
+    assert_eq "conversations is not routed" "$STATUS" "404"
+    request "$AUTH_BASE" GET /v1/conversations/anyid -H 'Authorization: Bearer sk-tp-ct'
+    assert_eq "conversations GET is not routed either" "$STATUS" "404"
+    request "$AUTH_BASE" GET /v1/responses/anyresp
+    assert_eq "response retrieval is gone with the store" "$STATUS" "404"
 
     # -- a backend that answers with an error ---------------------------------
     # 500 from the worker is handed back unchanged: the router only replaces the
@@ -1948,8 +1726,8 @@ if section not_found; then
     # Endpoints the Rust gateway serves (server.rs:1279-1364) but this build does
     # not wire: every one answers 501 rather than falling through to the 404 sink,
     # so a client can tell "not built yet" from "no such route". The conversations
-    # / responses / tokenizers / parse families used to live here; they are wired
-    # modules now (doc/gap-integration.md) and have real contract sections.
+    # plane and the response store are not here at all: they were removed
+    # (doc/scope-trim.md) and answer through the 404 sink like any unknown path.
     while read -r verb path; do
         [[ -z "$verb" ]] && continue
         request "$BASE" "$verb" "$path"
@@ -2820,7 +2598,7 @@ if section ui_auth; then
     assert_eq "/_ui chat alias 503 error code" "$(header_of X-SMG-Error-Code)" "no_available_workers"
 
     # unauthenticated surfaces (Rust ui_logs_routes / ui_config_routes)
-    for path in /_ui/logs /_ui/logs/backends /_ui/stats /_ui/config /_ui/history; do
+    for path in /_ui/logs /_ui/logs/backends /_ui/stats /_ui/config; do
         request "$UIA_BASE" GET "$path"
         assert_eq "$path stays open without a key" "$STATUS" "200"
     done

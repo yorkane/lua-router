@@ -250,7 +250,7 @@ check("[add worker] still no lua errors", "lua entry thread aborted" not in logs
       logs(name)[-500:])
 stop_router(name)
 
-# ---------- 5. /v1/responses C2 patch + C4 conditional stream persistence ----------
+# ---------- 5. /v1/responses C2 patch + pure pass-through ----------
 # A dedicated stdlib worker so the SSE shapes (event: lines, output_index, CRLF)
 # are under test control, not the shared mock's.
 import threading
@@ -386,19 +386,20 @@ check("[responses C2] non-stream patch on the outbound bytes",
       and doc.get("instructions") == "be terse"
       and doc.get("metadata", {}).get("tag") == "x"
       and doc.get("store") is False
-      and doc.get("safety_identifier") == "u-9"
-      and doc.get("conversation", {}).get("id") == "conv-c2",
+      and doc.get("safety_identifier") == "u-9",
       "%s %s" % (st, body[:300]))
+# The conversation link only ever meant "this stored response belongs to that
+# conversation"; with the store removed (doc/scope-trim.md) the router no longer
+# writes it back.
+check("[responses C2] the conversation link is not echoed",
+      "conversation" not in doc, json.dumps(doc)[:300])
 check("[responses C2] empty model falls back to the request model",
       doc.get("model") == RESP_MODEL, body[:200])
 check("[responses C2] empty arrays stay arrays through the patch",
       doc.get("tools") == [], json.dumps(doc.get("tools")))
-st, stored, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_c2" % port)
-sdoc = json.loads(stored) if st == 200 else {}
-check("[responses C2] stored copy is the patched bytes",
-      st == 200 and sdoc.get("previous_response_id") == "prev-7"
-      and sdoc.get("store") is False and sdoc.get("tools") == [],
-      "%s %s" % (st, stored[:300]))
+st, _, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_c2" % port)
+check("[responses C2] nothing is stored: the family answers from the 404 sink",
+      st == 404, st)
 
 # 5.2 C4: store=true stream is retrievable once it completes
 st, raw, hdrs = resp_post(port, stream_doc("resp_s1", store=True))
@@ -406,22 +407,12 @@ ctypes = [v for k, v in hdrs.items() if k.lower() == "content-type"]
 check("[responses C4] store=true stream passed through",
       st == 200 and any("text/event-stream" in v for v in ctypes)
       and raw.count("event: response.completed") == 1, "%s %r" % (st, raw[-120:]))
-st, got, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_s1" % port)
-check("[responses C4] store=true stream persisted",
-      st == 200 and json.loads(got).get("id") == "resp_s1", "%s %s" % (st, got[:200]))
+st, _, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_s1" % port)
+check("[responses C4] store=true persists nothing", st == 404, st)
 
-# 5.3 C4: conversation alone also enables persistence
-st, raw, _ = resp_post(port, stream_doc("resp_s2", conversation="conv-s2"))
-check("[responses C4] conversation-only stream persisted",
-      st == 200 and "response.completed" in raw, str(st))
-st, got, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_s2" % port)
-sdoc = json.loads(got) if st == 200 else {}
-check("[responses C4] conversation-only stream is retrievable",
-      st == 200 and sdoc.get("conversation", {}).get("id") == "conv-s2"
-      and sdoc.get("conversation_id") == "conv-s2", "%s %s" % (st, got[:250]))
-
-# 5.4 C4: store=false with no conversation keeps the zero-change pass-through,
-# including chunk-by-chunk arrival timing (the pump must not buffer).
+# 5.3 the zero-change pass-through, including chunk-by-chunk arrival timing (the
+# pump must not buffer). With the store gone this is the rule for EVERY stream,
+# whatever the client asked for.
 sock = socket.create_connection(("127.0.0.1", port), timeout=10)
 payload = json.dumps(stream_doc("resp_s3", store=False)).encode()
 sock.sendall(("POST /v1/responses HTTP/1.1\r\nHost: x\r\n"
@@ -458,11 +449,12 @@ elapsed = (arrivals[1] - arrivals[0]) if len(arrivals) == 2 else -1
 check("[responses C4] SSE chunks still arrive incrementally", elapsed >= 0.20,
       "first-to-completed=%.3f (expect >=%.2f)" % (elapsed, 2 * RESP_DELAY))
 st, _, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_s3" % port)
-check("[responses C4] store=false without conversation is not persisted", st == 404, st)
+check("[responses C4] store=false is not persisted", st == 404, st)
 
-# 5.5 C4 persistence branch: a client that drops after the first read stops the
-# WRITES but not the READS (streaming.rs:574-610 sets receiver_connected=false and
-# keeps draining), so the upstream finishes and the response is still stored.
+# 5.4 a client that hangs up mid-stream tears the pump down. The persistence
+# branch used to keep draining the upstream after a disconnect so the stored row
+# would be complete; with the store gone there is nothing to complete, so the
+# upstream read stops with the client and nothing is left behind either.
 sock = socket.create_connection(("127.0.0.1", port), timeout=5)
 payload = json.dumps(stream_doc("resp_abort", store=True)).encode()
 sock.sendall(("POST /v1/responses HTTP/1.1\r\nHost: x\r\n"
@@ -474,14 +466,11 @@ sock.recv(1024)          # headers + the first event, then hang up
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 sock.close()
 time.sleep(1.5)          # past the upstream's remaining event delays
-st, got, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_abort" % port)
-check("[responses C4] store=true drains and persists after client disconnect",
-      st == 200 and json.loads(got).get("id") == "resp_abort"
-      and json.loads(got).get("status") == "completed", "%s %s" % (st, str(got)[:200]))
+st, _, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_abort" % port)
+check("[responses C4] a disconnected stream persists nothing", st == 404, st)
 
-# 5.6 C4 non-persistence branch: without store or conversation there is nothing
-# to accumulate, so the pump must tear down the moment the client goes away and
-# must leave no row behind (streaming.rs:661-722 cancels the upstream request).
+# 5.5 the plain non-persisted branch: the pump tears down the moment the client
+# goes away (streaming.rs:661-722 cancels the upstream request the same way).
 sock = socket.create_connection(("127.0.0.1", port), timeout=5)
 payload = json.dumps(stream_doc("resp_abort_nostore")).encode()
 sock.sendall(("POST /v1/responses HTTP/1.1\r\nHost: x\r\n"
@@ -494,17 +483,13 @@ time.sleep(1.2)
 st, _, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_abort_nostore" % port)
 check("[responses C4] no-store disconnect persists nothing", st == 404, st)
 
-# 5.7 C4 gate is Rust's Option<String>::is_some(): an empty conversation string
-# still enables persistence and still writes the (empty) id back. Rust would
-# reject it later in item linking with a conversation-not-found warning, which is
-# the same observable outcome here (the row stores, nothing links).
+# 5.6 an empty conversation string no longer has any meaning for the router: the
+# stream is forwarded unattached and stores nothing.
 st, raw, _ = resp_post(port, stream_doc("resp_empty_conv", conversation=""))
-st2, got, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_empty_conv" % port)
-edoc = json.loads(got) if st2 == 200 else {}
-check("[responses C4] empty-string conversation enables persistence",
-      st == 200 and "response.completed" in raw and st2 == 200
-      and edoc.get("conversation") == {"id": ""}
-      and edoc.get("conversation_id") == "", "%s %s %s" % (st, st2, str(got)[:250]))
+check("[responses C4] empty conversation still streams",
+      st == 200 and "response.completed" in raw, str(st))
+st, _, _ = http("GET", "http://127.0.0.1:%d/v1/responses/resp_empty_conv" % port)
+check("[responses C4] empty conversation stores nothing", st == 404, st)
 
 check("[responses] no lua errors", "lua entry thread aborted" not in logs(name),
       logs(name)[-500:])

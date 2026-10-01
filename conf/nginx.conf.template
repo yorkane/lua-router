@@ -114,17 +114,11 @@ http {
     #   lr_stats        计数器/直方图/滑窗样本
     #   lr_request_log  /_ui/logs 环形缓冲
     #   lr_locks        registry 写入互斥锁
-    #   lr_history      conversations / items / responses 存储
     lua_shared_dict lr_workers     2m;
     lua_shared_dict lr_policy     20m;
     lua_shared_dict lr_stats       5m;
     lua_shared_dict lr_request_log 20m;
     lua_shared_dict lr_locks       1m;
-    # Conversation / item / response store (resty.luarouter.history). 10m is the
-    # floor for SMG_HISTORY_MAX_CONVERSATIONS=10000 at ~200-400B per record plus
-    # ~70B of index per item; raise it together with the SMG_HISTORY_MAX_* caps,
-    # otherwise nginx's own LRU drops records the module still counts.
-    lua_shared_dict lr_history    10m;
     # 并发限流的 token / 活跃 / 排队计数（SMG_MAX_CONCURRENT_REQUESTS），
     # 跨 nginx 进程共享同一份预算
     lua_shared_dict lr_limit      64k;
@@ -172,13 +166,6 @@ ${TLS_SERVER_EXTRA}
             }
         }
 
-        # ui.conf 的 `^~ /_ui/` 静态前缀优先于 `location /`，所以 router 自己拥有的
-        # /_ui 路径（会话存储 stats）必须有精确 location，否则会被 SPA alias 吃掉回 404。
-        location = /_ui/history {
-            content_by_lua_block {
-                require("resty.luarouter.router").handle()
-            }
-        }
 
         # 追加 location（静态 UI、健康探测别名等）由入口脚本注入
         ${SERVER_EXTRA}

@@ -2,8 +2,8 @@
 --
 -- init_by_lua calls .init() (config only, before any ngx.* per-worker state is
 -- available); init_worker_by_lua calls .worker_init() (seed workers, start the
--- health sweep, the policy eviction timer, the history capacity sweep and - when
--- SMG_MESH_PEERS names a cluster - the mesh sync timer in worker 0 only).
+-- health sweep, the policy eviction timer and - when SMG_MESH_PEERS names a
+-- cluster - the mesh sync timer in worker 0 only).
 
 local config_mod = require "resty.luarouter.config"
 
@@ -31,14 +31,6 @@ local mesh_state = { enabled = false, captured = false }
 -- handed to otel.configure() explicitly instead of being added to that table.
 local trace_state = { captured = false, configured = false }
 
--- Redis history backend state, captured in the master process by wire_history_redis
--- (doc/gap-history-redis.md "接线步骤"). `wired` means the redis implementation was
--- registered, so SMG_HISTORY_BACKEND=redis serves requests instead of answering 501,
--- and it is the gate for the one-shot worker PING probe. A misconfigured target (no
--- URL, no host) never gets here: the wiring logs a WARN and leaves the memory backend
--- installed, which is the outcome the operator sees in the log and in /_ui/history.
-local history_redis_state = { wired = false, probed = false }
-
 ---@return table @ router config (nil before init)
 function _M.config()
     if not config then
@@ -49,75 +41,6 @@ function _M.config()
     return config
 end
 
----Register the redis history backend when the operator asked for it.
----
---- Semantics of a missing target (doc/gap-history-redis.md "接线状态"): the Rust
---- gateway refuses to start at all in this case, because RedisConfig::validate
---- rejects an empty url and main.rs turns that into a ConfigError before the
---- server binds. Aborting init_by_lua would take the data plane down over a
---- history misconfiguration, and routing itself does not need the conversation
---- store, so the Lua router keeps the collapse-to-memory rule it already uses
---- for an unknown backend name (main.rs `_ => Memory`) and logs the fallback at
---- WARN. A target that is configured but unreachable is a different case: that
---- installs normally and answers 503 history_unavailable per request, which is
---- the error mapping the module documents.
----@return boolean @ wired (redis registered), false for any other outcome
-local function wire_history_redis()
-    local ok_history, history = pcall(require, "resty.luarouter.history")
-    if not ok_history or type(history.backend) ~= "function"
-        or history.backend() ~= "redis" then
-        return false
-    end
-
-    local function env_set(name)
-        local value = os.getenv(name)
-        return value ~= nil and value ~= ""
-    end
-
-    local function fall_back(reason)
-        history.configure({ backend = "memory" })
-        ngx.log(ngx.WARN, "luarouter: SMG_HISTORY_BACKEND=redis but ", reason,
-            "; history falls back to the memory backend (the Rust gateway would ",
-            "refuse to start here: redis url should not be empty)")
-        return false
-    end
-
-    local ok_hr, history_redis = pcall(require, "resty.luarouter.history_redis")
-    if not ok_hr or type(history_redis.install) ~= "function" then
-        return fall_back("resty.luarouter.history_redis cannot be loaded ("
-            .. tostring(history_redis) .. ")")
-    end
-
-    if not env_set("SMG_HISTORY_REDIS_URL") and not env_set("SMG_HISTORY_REDIS_HOST") then
-        return fall_back("neither SMG_HISTORY_REDIS_URL nor SMG_HISTORY_REDIS_HOST is set")
-    end
-
-    -- config() parses every SMG_HISTORY_REDIS_* name once, including the URL form
-    -- applied per-component, so the cached table is built while the real
-    -- environment is still visible. Passwords are never logged.
-    local ok_cfg, cfg = pcall(history_redis.config)
-    if not ok_cfg or type(cfg) ~= "table" then
-        return fall_back("SMG_HISTORY_REDIS_* could not be parsed (" .. tostring(cfg) .. ")")
-    end
-
-    local ok_install, installed, err = pcall(history_redis.install)
-    if not ok_install or not installed then
-        return fall_back("the redis backend could not be registered ("
-            .. tostring(err or installed) .. ")")
-    end
-
-    history_redis_state.wired = true
-    ngx.log(ngx.NOTICE, "luarouter: history backend redis wired to ",
-        tostring(cfg.host), ":", tostring(cfg.port), " db ", tostring(cfg.db),
-        " prefix ", tostring(cfg.prefix))
-    return true
-end
-
----One-shot liveness probe for the wired redis backend. init_by_lua has no
----cosockets, so the earliest place a PING can be sent is a worker timer; the
----result is a log line only (a redis outage must not stop the router from
----serving, and the request path already reports 503 history_unavailable).
----@return boolean ok
 ---Capture the in-flight age-tracker knobs and start its sampler timer.
 ---
 ---The two LR_INFLIGHT_* names are read here, before the fork, and handed to
@@ -173,35 +96,6 @@ local function start_inflight_sampler()
     local ok, err = ngx.timer.at(interval, tick)
     if not ok then
         ngx.log(ngx.ERR, "luarouter: in-flight age sampler not started: ",
-            tostring(err))
-        return false
-    end
-    return true
-end
-
-local function start_history_redis_probe()
-    if not history_redis_state.wired or history_redis_state.probed then
-        return false
-    end
-    history_redis_state.probed = true
-    local ok_hr, history_redis = pcall(require, "resty.luarouter.history_redis")
-    if not ok_hr then
-        return false
-    end
-    local function probe(premature)
-        if premature then
-            return
-        end
-        local ok, reply, err = pcall(history_redis.ping)
-        if not ok or reply ~= true then
-            local detail = ok and type(err) == "table" and err.message or err
-            ngx.log(ngx.WARN, "luarouter: history redis ping failed: ",
-                tostring(detail ~= nil and detail or reply))
-        end
-    end
-    local ok, err = ngx.timer.at(0, probe)
-    if not ok then
-        ngx.log(ngx.ERR, "luarouter: history redis probe not started: ",
             tostring(err))
         return false
     end
@@ -312,30 +206,6 @@ function _M.init()
     config = config_mod.load()
     config = config_mod.validate(config)
 
-    -- Conversation store: parse SMG_HISTORY_* here while the real environment is
-    -- still visible (doc/gap-history.md "配置"). configure() re-resolves the
-    -- backend name, so an unknown value collapses to memory exactly as Rust does.
-    local ok_history, history = pcall(require, "resty.luarouter.history")
-    if ok_history and type(history.configure) == "function" then
-        local getenv = os.getenv
-        history.configure({
-            backend = getenv("SMG_HISTORY_BACKEND"),
-            max_conversations = tonumber(getenv("SMG_HISTORY_MAX_CONVERSATIONS")),
-            max_items_per_conversation =
-                tonumber(getenv("SMG_HISTORY_MAX_ITEMS_PER_CONVERSATION")),
-            max_responses = tonumber(getenv("SMG_HISTORY_MAX_RESPONSES")),
-            max_items_per_request =
-                tonumber(getenv("SMG_HISTORY_MAX_ITEMS_PER_REQUEST")),
-            ttl_secs = tonumber(getenv("SMG_HISTORY_TTL_SECS")),
-        })
-    end
-
-    -- Redis history backend: register the implementation before the fork, because
-    -- history_redis.config() reads SMG_HISTORY_REDIS_* from the environment and
-    -- nginx wipes the worker environment afterwards (same reason history.configure
-    -- is called above).
-    wire_history_redis()
-
     -- In-flight request ages (doc/gap-inflight-age.md): same reason as tracing -
     -- the numbers are read once here and the module keeps them.
     wire_inflight_tracker()
@@ -392,40 +262,6 @@ function _M.init()
         end
     end
     return config
-end
-
----Capacity sweep for the conversation store. The dict has no eviction callback of
----its own, so the SMG_HISTORY_MAX_* caps are only enforced by someone walking the
----indexes; this timer is that someone. Same cadence as the policy sweep, and like
----it, every process runs it (the work is idempotent and lock-guarded).
----@return boolean ok
-local function start_history_sweep()
-    local ok_require, history = pcall(require, "resty.luarouter.history")
-    if not ok_require then
-        return false
-    end
-    local interval = (config and config.eviction_interval_secs) or 120
-    local function sweep(premature)
-        if premature then
-            return
-        end
-        local ok, err = pcall(history.sweep)
-        if not ok and ngx.log then
-            ngx.log(ngx.WARN, "luarouter: history sweep failed: ", tostring(err))
-        end
-        local again, aerr = ngx.timer.at(interval, sweep)
-        if not again then
-            ngx.log(ngx.ERR, "luarouter: history sweep timer stopped: ",
-                tostring(aerr))
-        end
-    end
-    local ok, err = ngx.timer.at(interval, sweep)
-    if not ok then
-        ngx.log(ngx.ERR, "luarouter: history sweep timer not started: ",
-            tostring(err))
-        return false
-    end
-    return true
 end
 
 ---Push this process's policy and cache_aware tree into the cluster view
@@ -516,14 +352,9 @@ function _M.worker_init()
         ngx.log(ngx.ERR, "luarouter: policy eviction timer not started: ",
             tostring(err_timer))
     end
-    start_history_sweep()
     -- Tracing exporter: one batch timer per worker, because the buffer it drains
     -- is that worker's own Lua state.
     start_trace_exporter()
-    -- Redis liveness is reported through the log; /_ui/history already shows the
-    -- backend's own stats(), so no extra endpoint is needed.
-    start_history_redis_probe()
-
     -- The age sampler reads the shared slot table, so exactly one process runs it.
     if ngx.worker.id() == 0 then
         start_inflight_sampler()
@@ -635,20 +466,6 @@ function _M.on_log()
         ngx.log(ngx.WARN, "luarouter: released leaked load guard on worker ", held[i])
     end
     ngx.ctx.lr_held = {}
-end
-
----Ping the configured redis, for a future read-only /_ui health endpoint. Needs a
----cosocket, so it only answers inside a request; the startup probe above is what
----covers the case where nobody hits that route.
-function _M.history_redis_ping()
-    if not history_redis_state.wired then
-        return nil, "history backend is not redis"
-    end
-    local ok_hr, history_redis = pcall(require, "resty.luarouter.history_redis")
-    if not ok_hr then
-        return nil, tostring(history_redis)
-    end
-    return history_redis.ping()
 end
 
 return _M
