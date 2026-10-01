@@ -212,6 +212,36 @@ function _M.load()
         health_check_endpoint = str("SMG_HEALTH_CHECK_ENDPOINT", "/health"),
         disable_health_check = bool("SMG_DISABLE_HEALTH_CHECK", false),
 
+        -- ==================== GPU load source ====================
+        -- doc/gap-gpu-load.md. Off by default: none means no timer, no fetch and no
+        -- registry write, so a box that never opted in runs exactly the pre-feature
+        -- code path. metrics scrapes each worker's own /metrics; prom pulls one
+        -- PromQL from an existing monitoring Prometheus and maps the vector back to
+        -- workers by host.
+        load_source = one_of("SMG_LOAD_SOURCE", "none",
+                             { "none", "metrics", "prom" }),
+        load_interval_secs = num("SMG_LOAD_INTERVAL_SECS", 15),
+        load_timeout_secs = num("SMG_LOAD_TIMEOUT_SECS", 4),
+        -- Remote source: the Prometheus base (http://prom:9090) and the PromQL
+        -- template. {host} / {instance} in the template expand per worker, which is
+        -- what makes one query string serve a whole pool.
+        load_prom_url = str("SMG_LOAD_PROM_URL", ""),
+        load_prom_query = str("SMG_LOAD_PROM_QUERY", ""),
+        -- Local source: the gauge names to keep from a worker's /metrics, comma or
+        -- space separated. Empty selects the built-in candidates (gpu_load
+        -- .DEFAULT_METRIC_KEYS: the nvidia/dcgm utilization gauges plus the two KV
+        -- cache usage spellings), and the answer is their maximum.
+        load_metrics_keys = list("SMG_LOAD_METRICS_KEYS"),
+        load_metrics_path = str("SMG_LOAD_METRICS_PATH", "/metrics"),
+        -- How long a sample stays a load: the default is three intervals so one
+        -- Prometheus blip does not drop a worker to in-flight-only, and the TTL is
+        -- what makes an expired sample stop counting at all.
+        load_stale_secs = num("SMG_LOAD_STALE_SECS", 0),
+        -- Weight of a fully busy worker in in-flight-request units, i.e. the load
+        -- a 100 %-busy GPU contributes to registry.load(). 100 keeps the combined
+        -- number in the same order of magnitude as SMG_BALANCE_ABS_THRESHOLD.
+        load_scale = num("SMG_LOAD_SCALE", 100),
+
         -- ==================== retries ====================
         max_retries = num("SMG_RETRY_MAX_RETRIES", 5),
         initial_backoff_ms = num("SMG_RETRY_INITIAL_BACKOFF_MS", 50),
@@ -295,6 +325,34 @@ function _M.validate(cfg)
     end
     if cfg.health_check_interval_secs < 1 then
         cfg.health_check_interval_secs = 1
+    end
+    -- Load-source guard rails: a sub-second interval or a sub-second deadline
+    -- would turn the tick into a busy loop against every worker's /metrics, and an
+    -- unparsable timeout would hand cosocket a nil deadline. Both clamp rather than
+    -- fail the boot, as every other knob here does.
+    if cfg.load_interval_secs < 1 then
+        cfg.load_interval_secs = 1
+    end
+    if cfg.load_interval_secs > 3600 then
+        cfg.load_interval_secs = 3600
+    end
+    if cfg.load_timeout_secs < 1 then
+        cfg.load_timeout_secs = 1
+    end
+    if cfg.load_timeout_secs > 60 then
+        cfg.load_timeout_secs = 60
+    end
+    -- A tick whose probes cannot finish inside the interval would stack passes; the
+    -- single-flight lock skips them, but clamping the timeout keeps the interval
+    -- honest about how long a pass may take.
+    if cfg.load_timeout_secs * 2 > cfg.load_interval_secs then
+        cfg.load_timeout_secs = math.max(1, math.floor(cfg.load_interval_secs / 2))
+    end
+    if cfg.load_scale <= 0 then
+        cfg.load_scale = 100
+    end
+    if cfg.load_metrics_path:sub(1, 1) ~= "/" then
+        cfg.load_metrics_path = "/" .. cfg.load_metrics_path
     end
     if cfg.max_retries < 0 then
         cfg.max_retries = 0

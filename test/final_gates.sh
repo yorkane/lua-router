@@ -30,6 +30,10 @@
 #   head_routes    integration/test_head_routes.py (HEAD mirror of the GET surface)
 #   mesh_http      integration/test_mesh_http.py (mesh enabled over real HTTP)
 #   e2e_policy_parity prefix_hash/bucket/power_of_two/random quantitative parity
+#   e2e_token_accounting integration/e2e_token_accounting.py (usage injection+strip,
+#                  token counters, 400-fallback sticky)
+#   e2e_gpu_load   integration/e2e_gpu_load.py (metrics/prom load sources -> registry)
+#   e2e_routing_dyn integration/e2e_routing_dyn.py (runtime policy switch, no restart)
 #   e2e_watcher    integration/e2e_watcher.py (in-process watcher: targets/proc/docker
 #                  discovery, 9 guards, model-map, restart rediscovery)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
@@ -89,7 +93,8 @@ mkdir -p "$LOG_DIR"
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort head_routes mesh_http
-            e2e_policy_parity e2e_watcher mesh_two e2e_tls_chain)
+            e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
+            e2e_routing_dyn mesh_two e2e_tls_chain)
 
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
@@ -238,7 +243,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_mesh test_watcher; do
+    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
@@ -268,6 +273,9 @@ gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
 gate_e2e_policy_parity() { run_integration e2e_policy_parity.py 1800; }
 gate_e2e_watcher()    { run_integration e2e_watcher.py 900; }
+gate_e2e_token_accounting() { run_integration e2e_token_accounting.py 900; }
+gate_e2e_gpu_load()    { run_integration e2e_gpu_load.py 900; }
+gate_e2e_routing_dyn() { run_integration e2e_routing_dyn.py 900; }
 gate_mesh_two()        { run_integration test_mesh_two.py 900; }
 gate_e2e_tls_chain()   { run_integration e2e_tls_chain.py 1500; }
 
@@ -292,6 +300,9 @@ gate head_routes
 gate mesh_http
 gate e2e_policy_parity
 gate e2e_watcher
+gate e2e_token_accounting
+gate e2e_gpu_load
+gate e2e_routing_dyn
 gate mesh_two
 gate e2e_tls_chain
 

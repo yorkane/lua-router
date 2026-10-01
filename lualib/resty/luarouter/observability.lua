@@ -646,14 +646,55 @@ function _M.record_router_ttft(model, endpoint, seconds)
     note_window("ttft_n", 1)
 end
 
+---Charge one token count to the family. `token_type` is prompt | completion |
+---cached | reasoning.
+---
+---Two deliberate departures from Rust, both documented in
+---doc/gap-token-accounting.md: the label values are prompt/completion (Rust uses
+---input/output, and the Lua router already exported prompt/completion before this
+---change, so the series names stay stable), and the two detail counts
+---(cached/reasoning) exist at all because the Lua router reads
+---prompt_tokens_details.cached_tokens and completion_tokens_details.reasoning_tokens
+---where Rust only ever increments the input/output pair.
+---
+---prompt/completion are charged on every accounted row, including the byte/4
+---fallback rows, exactly as before this file grew the extra types -- those rows
+---carry tokens_estimated in the request log and a share in
+---/_ui/stats.tokens_estimated_share, which is how a dashboard tells them apart.
+---cached and reasoning only ever arrive from a backend usage object
+---(usage_from_object reads prompt_tokens_details.cached_tokens and
+---completion_tokens_details.reasoning_tokens), so a non-zero series on either is
+---something the engine itself reported and never a gateway guess.
 function _M.record_router_tokens(model, endpoint, token_type, count)
-    if count <= 0 then
+    if not count or count <= 0 then
         return
     end
     _M.counter("smg_router_tokens_total", {
         { "router_type", "http" }, { "backend_type", "regular" },
         { "model", model }, { "endpoint", endpoint }, { "token_type", token_type },
     }, count)
+end
+
+---Did the gateway have to ask the backend for a usage frame on the client's
+---behalf, and what happened to it? The answer to "can I trust the token counters
+---on this deployment" question, per model and endpoint:
+---  stripped          usage injected, frame read, frame removed from the client
+---                    stream (the intended steady state for a client that asked
+---                    for nothing)
+---  passed_through    usage injected but nothing was removed -- either the engine
+---                    sent no usage frame at all, or the only frame carrying one
+---                    also carried content the client needs (a finish_reason), and
+---                    sse_event_droppable refused to touch it
+---  rejected          the worker answered 400 quoting stream_options, so the
+---                    injection is disabled for it (doc/gap-token-accounting.md 6)
+---Lua-side superset: the Rust gateway never injects, so it has no such series.
+---@param model string
+---@param endpoint string
+---@param result string @ stripped | passed_through | rejected
+function _M.record_stream_usage_injection(model, endpoint, result)
+    _M.counter("smg_router_usage_injection_total", {
+        { "model", model }, { "endpoint", endpoint }, { "result", result },
+    })
 end
 
 ---Layer 3: worker-level events. `worker_url` is the label value, as in Rust.
@@ -1024,6 +1065,9 @@ local HELP = {
     smg_router_tpot_seconds = "Time per output token by router_type, backend_type, model, endpoint",
     smg_router_generation_duration_seconds = "Total generation time by router_type, backend_type, model, endpoint",
     smg_router_tokens_total = "Total tokens processed by router_type, backend_type, model, endpoint, token_type",
+    -- Lua-side superset (doc/gap-token-accounting.md): Rust never injects
+    -- stream_options.include_usage, so it has nothing to report about it.
+    smg_router_usage_injection_total = "Streaming usage-frame injections by model, endpoint, result (stripped/passed_through/rejected)",
     smg_worker_selection_total = "Worker selection events by worker_type, connection_mode, model, policy",
     smg_worker_errors_total = "Worker-level errors by worker_type, connection_mode, error_type",
     smg_worker_retries_total = "Total retry attempts by worker_type and endpoint",

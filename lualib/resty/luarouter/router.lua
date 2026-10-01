@@ -43,6 +43,11 @@ local registry = require "resty.luarouter.registry"
 -- the tokenize/parse proxies went with it (doc/scope-trim.md): /v1/responses
 -- stays as a pure inference route and that proxy family is not routed.
 local mesh_mod = require "resty.luarouter.mesh"
+-- Worker marks written by the streaming usage injection (see forward()): the
+-- registry keeps its own copy of this dict name because it owns the keys that
+-- belong to it, and sharing one module constant across the boundary would make
+-- the router depend on a registry internal for a key the registry never reads.
+local WORKER_DICT_NAME = "lr_workers"
 -- ---------------------------------------------------------------- DP rank
 
 ---Find the byte range of a top-level member in a JSON object.
@@ -782,6 +787,64 @@ end
 
 _M.set_top_field = set_top_field
 
+---Set `member` inside the top-level object member `field`, creating the object
+---when the document has no such member. Byte-preserving like set_top_field: the
+---rest of the document is never re-encoded.
+---
+---This is the edit the token-accounting injection needs and set_top_field alone
+---cannot do: the OpenAI body carries a *nested* object whose inside has to change
+---("stream_options": {"include_usage": true}), and a client that already sent a
+---stream_options object must keep its other members. Handled shapes:
+---  * `member` already truthy   -> no change (nothing to inject)
+---  * `field` absent            -> insert "<field>":{"<member>":value} first member
+---  * `field` is an object      -> splice the member into that object; the nested
+---                                 edit reuses set_top_field on the object
+---                                 substring, whose depth walk restarts at that
+---                                 substring's own first brace
+---  * `member` explicitly false or null -> rewritten to `value`
+---  * `field` present but not an object -> no change: replacing a value the client
+---                                 chose for that name is not ours to make
+---@param raw string
+---@param field string @ top-level member name
+---@param member string @ member to set inside that object
+---@param value any @ JSON scalar
+---@return string raw, boolean changed
+local function merge_top_object(raw, field, member, value)
+    if type(raw) ~= "string" or raw == "" then
+        return raw, false
+    end
+    local object_from, object_to = top_member_span(raw, field)
+    if not object_from then
+        local inserted = set_top_field(raw, field, { [member] = value })
+        return inserted, inserted ~= raw
+    end
+    local object_text = raw:sub(object_from, object_to)
+    if object_text == "null" then
+        -- An explicit null says "no options" rather than "options I chose", so it
+        -- is safe to fill in: the same replace-by-value path set_top_field uses
+        -- for a member that exists.
+        local filled = set_top_field(raw, field, { [member] = value })
+        return filled, filled ~= raw
+    end
+    if object_text:sub(1, 1) ~= "{" then
+        return raw, false
+    end
+    local member_from, member_to = top_member_span(object_text, member)
+    if member_from then
+        local current = json_decode(object_text:sub(member_from, member_to))
+        if current ~= nil and current ~= cjson.null and current ~= false then
+            return raw, false
+        end
+    end
+    local merged_object = set_top_field(object_text, member, value)
+    if merged_object == object_text then
+        return raw, false
+    end
+    return raw:sub(1, object_from - 1) .. merged_object .. raw:sub(object_to + 1), true
+end
+
+_M.merge_top_object = merge_top_object
+
 ---Decode the first top-level member named `field` without re-encoding the
 ---surrounding document. Returns (value, present); a JSON null comes back as
 ---cjson.null rather than Lua nil so "absent" and "explicit null" stay distinct.
@@ -1024,15 +1087,26 @@ local function usage_from_object(usage)
     if not prompt and not completion then
         return nil
     end
+    -- The two spellings of the details objects are the two wire families:
+    -- chat/completions uses prompt_tokens_details/completion_tokens_details, and
+    -- /v1/responses (usage nested under response) uses input_tokens_details/
+    -- output_tokens_details. The counts inside keep the same names in both, and
+    -- the pair mirrors the prompt_tokens/input_tokens alias above, so a reader
+    -- that already understands why the totals have two spellings needs nothing
+    -- new here.
     local details = (type(usage.prompt_tokens_details) == "table"
-        and usage.prompt_tokens_details) or nil
+        and usage.prompt_tokens_details)
+        or (type(usage.input_tokens_details) == "table"
+            and usage.input_tokens_details) or nil
     local cached = tonumber(details and details.cached_tokens or usage.cached_tokens) or 0
     -- Reasoning tokens come from completion_tokens_details, with a bare
     -- usage.reasoning_tokens as the fallback: exactly the two shapes Rust reads
     -- (observability/request_log.rs:304-309 and :918-922). SGLang and the
     -- thinking-capable engines use either, and the UI shows the field either way.
     local out_details = (type(usage.completion_tokens_details) == "table"
-        and usage.completion_tokens_details) or nil
+        and usage.completion_tokens_details)
+        or (type(usage.output_tokens_details) == "table"
+            and usage.output_tokens_details) or nil
     local reasoning = tonumber(out_details and out_details.reasoning_tokens
         or usage.reasoning_tokens) or 0
     return prompt or 0, completion or 0, cached, reasoning
@@ -1058,6 +1132,26 @@ local function usage_from_body(body)
     return usage_from_object(decoded.usage_metadata)
 end
 
+---Read the usage of one decoded SSE data payload, covering the two shapes a
+---backend puts on the wire:
+---  * chat/completions and completions: `usage` is a top-level member of the chunk
+---  * responses: the completed event carries it under `response`, and the chunk
+---    itself has no usage member
+---Returns nil when the payload carries neither, so callers can keep scanning.
+---@param decoded table @ one decoded data: payload
+---@return number|nil prompt, number|nil completion, number|nil cached, number|nil reasoning
+local function usage_from_chunk(decoded)
+    local prompt, completion, cached, reasoning = usage_from_object(decoded.usage)
+    if prompt or completion then
+        return prompt, completion, cached, reasoning
+    end
+    local response = decoded.response
+    if type(response) == "table" then
+        return usage_from_object(response.usage)
+    end
+    return nil
+end
+
 ---Byte-based fallback, used only when the worker sent no usage object.
 local function estimate_tokens(text)
     if not text or text == "" then
@@ -1068,6 +1162,152 @@ end
 
 _M.usage_from_body = usage_from_body
 _M.estimate_tokens = estimate_tokens
+
+---Decide whether one complete SSE event is ours to remove from the client
+---stream: a usage frame we asked the backend for on the client's behalf and that
+---carries nothing the client would otherwise have seen.
+---
+---The rule is deliberately narrow; every visible byte of the event must be the
+---accounting payload:
+---  * exactly one `data:` line. A multi-line event can also carry the [DONE]
+---    terminator, and dropping that would leave the client waiting for a stream
+---    end that never arrives.
+---  * no `event:` / `id:` / `retry:` fields. A /v1/responses frame is never just
+---    usage (its completed event is protocol the client parses), and an
+---    id-carrying frame would change the resumability the client observed.
+---  * the payload decodes to an object whose usage (top-level `usage`, or the
+---    `response.usage` of a responses-frame) is readable. Note that a
+---    /v1/responses completed event also carries an `event:` line, which the
+---    second rule already exempts from dropping.
+---  * `choices` is absent or empty, and every element carries no content: an
+---    empty or absent `delta`, no `text`, and a null or absent `finish_reason`.
+---    The last condition protects a llama.cpp style backend, which puts usage on
+---    the same chunk that closes the turn: dropping that would eat the
+---    finish_reason the client needs to end the message, so the frame stays (the
+---    client sees one usage object it did not ask for; the alternative, editing
+---    the frame's bytes, is the payload-mutating behaviour this gateway avoids).
+---Anything else -- heartbeats (": ping"), content deltas, the [DONE] sentinel --
+---passes through untouched.
+---@param text string @ one complete event, the separator line included
+---@return boolean
+local function sse_event_droppable(text)
+    if type(text) ~= "string" or text == "" then
+        return false
+    end
+    if string.find(text, "usage", 1, true) == nil then
+        return false
+    end
+    local data_lines = 0
+    local payload
+    for line in string.gmatch(text, "[^\r\n]+") do
+        if line:sub(1, 1) == ":" then
+            -- comment / heartbeat line: carries no data, does not disqualify
+        elseif line:sub(1, 5) == "data:" then
+            data_lines = data_lines + 1
+            local value = line:sub(6)
+            if value:sub(1, 1) == " " then
+                value = value:sub(2)
+            end
+            payload = value
+        else
+            -- event:, id:, retry: or any field we do not own: keep the event.
+            return false
+        end
+    end
+    if data_lines ~= 1 or payload == nil or payload == "" or payload == "[DONE]" then
+        return false
+    end
+    local decoded = json_decode(payload)
+    if type(decoded) ~= "table" then
+        return false
+    end
+    local prompt, completion = usage_from_chunk(decoded)
+    if not prompt and not completion then
+        return false
+    end
+    local choices = decoded.choices
+    if type(choices) == "table" then
+        for i = 1, #choices do
+            local choice = choices[i]
+            if type(choice) ~= "table" then
+                return false
+            end
+            if choice.finish_reason ~= nil and choice.finish_reason ~= cjson.null then
+                return false
+            end
+            local delta = choice.delta
+            if delta ~= nil and type(delta) ~= "table" then
+                return false
+            end
+            if type(delta) == "table" and next(delta) ~= nil then
+                return false
+            end
+            if choice.text ~= nil and choice.text ~= cjson.null and choice.text ~= "" then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+_M.sse_event_droppable = sse_event_droppable
+
+---Split buffered SSE bytes into the complete events they carry plus the bytes
+---still waiting for their terminating blank line.
+---
+---The boundary follows WHATWG eventsource: every line terminator (CR LF, LF, CR)
+---closes a line and an empty line closes the event. Three literal searches cover
+---the shapes a real backend produces -- "\n\n" (2), "\r\n\r\n" (4) and
+---"\n\r\n" (3, the mixed spelling from a server that writes LF after its headers
+---and CRLF inside the body). The earliest index wins; two candidates can never
+---tie at one index because their second bytes differ, and "\r\n\r\n" always beats
+---the "\n\r\n" that starts one byte later.
+---
+---Event text keeps its terminating separator: the pump forwards event.text
+---verbatim, so the client reassembles the upstream's exact bytes, separator
+---spelling included.
+---
+---Deliberately no ngx.re here: the unit-test sandbox drives this function
+---directly with nothing but the Lua string library in scope.
+---
+---A stream the upstream stopped mid-frame never loses bytes: whatever lacks a
+---terminating blank line comes back as `rest`, and the pump forwards that
+---verbatim when the upstream ends. Swallowing a partial tail would truncate the
+---client's body, a worse contract than leaking one un-dropped frame.
+---@param buf string
+---@return table events @ array of { text = string, droppable = boolean }
+---@return string rest
+local function sse_split(buf)
+    local events = {}
+    local pos = 1
+    while true do
+        local at, width
+        local hit = string.find(buf, "\n\n", pos, true)
+        if hit then
+            at, width = hit, 2
+        end
+        hit = string.find(buf, "\r\n\r\n", pos, true)
+        if hit and (not at or hit < at) then
+            at, width = hit, 4
+        end
+        hit = string.find(buf, "\n\r\n", pos, true)
+        if hit and (not at or hit < at) then
+            at, width = hit, 3
+        end
+        if not at then
+            break
+        end
+        local text = buf:sub(pos, at + width - 1)
+        events[#events + 1] = {
+            text = text,
+            droppable = sse_event_droppable(text),
+        }
+        pos = at + width
+    end
+    return events, buf:sub(pos)
+end
+
+_M.sse_split = sse_split
 
 -- ------------------------------------------------------------------ session
 
@@ -1363,6 +1603,11 @@ end
 
 -- ------------------------------------------------------------------ streaming
 
+--- Upper bound on one buffered SSE event while the usage-frame stripper is
+--- engaged. A usage frame is a few hundred bytes; this only ever binds a stream
+--- that never emits an event separator.
+local MAX_SSE_FRAME = 262144
+
 ---Pump an upstream body to the client without buffering it. The client-facing
 ---framing is decided here: keep an exact Content-Length, otherwise let nginx
 ---chunk the response. Returns ok, tail where tail carries the last bytes read
@@ -1377,7 +1622,7 @@ end
 ---@param kind string|nil @ pool class of the connection being pumped
 ---@param url string|nil @ worker url, so release() can size the pool
 ---@param conf table @ router config for the pool knobs
-local function stream_response(sock, headers, kind, url, conf)
+local function stream_response(sock, headers, kind, url, conf, strip_usage)
     local chunked = is_chunked(headers)
     local length = tonumber(headers["content-length"])
     if not (length and not chunked) then
@@ -1438,9 +1683,9 @@ local function stream_response(sock, headers, kind, url, conf)
                 and string.find(data, "usage", 1, true) then
                 local decoded = json_decode(data)
                 if type(decoded) == "table" then
-                    local p, c, a, r = usage_from_object(decoded.usage)
-                    if p then
-                        found = { p, c, a, r }
+                    local p, c, a, r = usage_from_chunk(decoded)
+                    if p or c then
+                        found = { p or 0, c or 0, a or 0, r or 0 }
                     end
                 end
             end
@@ -1452,14 +1697,81 @@ local function stream_response(sock, headers, kind, url, conf)
         end
     end
 
-    local function emit(text)
+    -- A usage frame is only ever worth one decode pass, so stripping and the
+    -- usage scan share this: the upstream bytes are always handed to note(),
+    -- whether or not the client receives them. Stripping therefore cannot cost
+    -- the accounting -- that is the whole point of injecting include_usage.
+    --
+    -- The frame splitter stays engaged for the whole stream rather than
+    -- switching off when usage arrives. Flipping mid-stream would leak the frame:
+    -- an engine that writes the data: line and its terminating blank line in two
+    -- writes puts the captured-usage signal (line based) ahead of the frame
+    -- boundary (blank-line based), so the still-partial frame would be flushed
+    -- verbatim. Buffering one frame is what any correct SSE parser does anyway,
+    -- and sse_event_droppable costs a plain "usage" substring test for every
+    -- frame that is not a usage frame, so the ordinary path stays allocation-light
+    -- apart from the split itself.
+    local stripping = strip_usage and true or false
+    local sse_carry = ""
+    local usage_stripped = false
+
+    local function deliver(text)
         if not ngx.print(text) then
             ok = false
             return false
         end
         ngx.flush(true)
-        note(text)
         return true
+    end
+
+    local kept = {}
+
+    local function emit(text)
+        if not stripping then
+            if not deliver(text) then
+                return false
+            end
+            note(text)
+            return true
+        end
+        -- The usage scanner always sees the upstream bytes, dropped or not: that
+        -- is the whole point of injecting include_usage, and it means stripping
+        -- can never cost the accounting.
+        note(text)
+        local events
+        events, sse_carry = sse_split(sse_carry .. text)
+        -- One write and one flush per upstream block, exactly as the unstripped
+        -- pump does it. Delivering event by event would turn a block that happens
+        -- to carry several frames into several round trips to the client and
+        -- change the latency profile of the injection path.
+        for i = 1, #kept do
+            kept[i] = nil
+        end
+        for i = 1, #events do
+            local event = events[i]
+            if event.droppable then
+                usage_stripped = true
+            else
+                kept[#kept + 1] = event.text
+            end
+        end
+        -- Safety valve for an upstream that never terminates an event: without a
+        -- blank line the carry would grow with the body and hold the client's
+        -- bytes hostage. Release it verbatim and keep looking for boundaries; the
+        -- cost of the valve is that one oversized frame cannot be dropped, which
+        -- is the lesser harm next to truncating or stalling a response.
+        if #sse_carry > MAX_SSE_FRAME then
+            kept[#kept + 1] = sse_carry
+            sse_carry = ""
+        end
+        if #kept == 0 then
+            return true
+        end
+        local batch = table.concat(kept)
+        for i = 1, #kept do
+            kept[i] = nil
+        end
+        return deliver(batch)
     end
 
     -- reusable: did the upstream message end cleanly at a framing boundary? Only
@@ -1533,9 +1845,20 @@ local function stream_response(sock, headers, kind, url, conf)
         end
     end
 
+    -- A stream that ended while a frame was still buffered (no usage ever
+    -- arrived, or the upstream stopped mid-event): hand the client the bytes
+    -- verbatim. Dropping them would truncate the body it was given.
+    if ok and stripping and sse_carry ~= "" then
+        local pending = sse_carry
+        sse_carry = ""
+        if not deliver(pending) then
+            ok = false
+        end
+    end
+
     registry.release(sock, conf,
         registry.response_reusable(headers, reusable), kind, url)
-    return ok, tail, prompt, completion, cached, reasoning
+    return ok, tail, prompt, completion, cached, reasoning, usage_stripped
 end
 
 ---Track the in-flight reservation per worker so log_by_lua can sweep any guard
@@ -1597,6 +1920,150 @@ local function apply_response_headers(headers)
     cors_apply()
 end
 
+---Inference routes whose backends answer the OpenAI wire format, and therefore
+---understand stream_options.include_usage. /generate and the embedding-family
+---routes are excluded on purpose: /generate is SGLang-native (its SSE carries
+---usage_metadata, which usage_from_object already reads), and a non-generating
+---endpoint has no usage frame to ask for.
+local USAGE_ROUTES = {
+    ["/v1/chat/completions"] = true,
+    ["/v1/completions"] = true,
+    ["/v1/responses"] = true,
+}
+
+--- Marker key for "this worker rejected a body that carried stream_options",
+--- kept in lr_workers next to the record it describes. A worker whose URL is
+--- re-registered keeps the same id (sha224 of the URL), so the mark is given a
+--- TTL instead of living forever, and any later stream that takes the injection
+--- successfully clears it.
+local K_STREAM_OPTIONS = "sop:"
+
+--- How long a worker sits out the injection, and the two answers trade the same
+--- risk against each other. The mark is what protects traffic -- an engine that
+--- cannot parse the field answers 400, and because the contract forbids retrying
+--- that 400, the request that discovered it is lost. So the field is never
+--- injected at a worker that was seen refusing it, and the only question is how
+--- long to believe the refusal.
+---
+---  * the backend named stream_options -> a day. That is a real refusal of our
+---    field, and re-testing it hourly would spend one doomed request an hour.
+---  * the 400 came with no such evidence -> five minutes, then try again, because
+---    the more likely reading is that the client's own body was invalid and this
+---    worker is fine. A wrong guess here costs one failed request per window and
+---    a day of estimated (rather than exact) token counts on that worker;
+---    permanently trusting the absence of evidence would cost every request to a
+---    backend whose 400 text simply does not quote the field.
+local STREAM_OPTIONS_TTL = 86400
+local STREAM_OPTIONS_TTL_WEAK = 300
+
+local function worker_flags()
+    if not ngx or not ngx.shared then
+        return nil
+    end
+    return ngx.shared[WORKER_DICT_NAME]
+end
+
+---Does a response body blame the field we injected? A backend that never learned
+---stream_options says so by name ("Unexpected value stream_options ...",
+---"'include_usage' is not supported"), which is strong enough evidence to sit the
+---injection out for a day; a 400 that does not mention it is probably the
+---client's own malformed body, so the worker only rests briefly.
+---@param text string|nil @ buffered upstream body (a 400 on a stream arrives as SSE bytes)
+---@return boolean
+local function names_stream_options(text)
+    if type(text) ~= "string" or text == "" then
+        return false
+    end
+    return string.find(text, "stream_options", 1, true) ~= nil
+        or string.find(text, "include_usage", 1, true) ~= nil
+end
+
+_M.names_stream_options = names_stream_options
+
+---True when the last attempt that asked this worker for a usage frame was
+---refused with 400: stop injecting for it until the mark expires or a success
+---clears it.
+---@param id string|nil
+---@return boolean
+local function stream_options_rejected(id)
+    if not id then
+        return false
+    end
+    local d = worker_flags()
+    if not d then
+        return false
+    end
+    return d:get(K_STREAM_OPTIONS .. id) ~= nil
+end
+
+---Charge a 400 that arrived while we had injected stream_options to the worker,
+---and warn once per worker for the life of the mark.
+---@param id string|nil
+---@param url string|nil
+---@param detail string @ upstream body, used to tell the operator what the backend said
+---@return boolean first @ false when this worker was already marked (no second WARN)
+local function note_stream_options_rejected(id, url, detail)
+    if not id then
+        return false
+    end
+    local d = worker_flags()
+    if not d then
+        return false
+    end
+    local names = names_stream_options(detail)
+    local ttl = names and STREAM_OPTIONS_TTL or STREAM_OPTIONS_TTL_WEAK
+    -- add (not set): only the request that actually stored the key warns, so a
+    -- backend that refuses the field forever costs one line, not one per request.
+    local stored, err = d:add(K_STREAM_OPTIONS .. id, 1, ttl)
+    if not stored then
+        if err ~= "exists" then
+            observability.log_debug("stream_options marker for " .. tostring(url)
+                .. " not stored: " .. tostring(err))
+        end
+        return false
+    end
+    local evidence = names
+        and "the backend named the field"
+        or "the body did not name the field, so this may be the client's own error"
+    local excerpt = string.gsub(string.sub(tostring(detail), 1, 300), "%s+", " ")
+    ngx.log(ngx.WARN, "luarouter: worker ", tostring(url), " answered 400 to the ",
+        "injected stream_options.include_usage -- injection held off for ", ttl,
+        "s, traffic forwarded unchanged, no retry (", evidence, "): ", excerpt)
+    return true
+end
+
+---An injected usage frame that came back fine proves the worker supports the
+---field, which clears any earlier mark (the operator may have swapped the engine
+---behind the same URL).
+---@param id string|nil
+local function clear_stream_options_rejected(id)
+    if not id then
+        return
+    end
+    local d = worker_flags()
+    if d then
+        d:delete(K_STREAM_OPTIONS .. id)
+    end
+end
+
+---True when the client itself asked for the usage frame. Such a stream is
+---injected nothing and stripped nothing: the frame is the client's to keep.
+---@param body table @ decoded request
+---@return boolean
+local function client_wants_usage(body)
+    local options = body.stream_options
+    if type(options) ~= "table" then
+        return false
+    end
+    local value = options.include_usage
+    return value ~= nil and value ~= false and value ~= cjson.null
+end
+
+_M.client_wants_usage = client_wants_usage
+_M.stream_options_rejected = stream_options_rejected
+_M.note_stream_options_rejected = note_stream_options_rejected
+_M.clear_stream_options_rejected = clear_stream_options_rejected
+
 ---Forward one inference request with retries. Returns status, buffered_body_or_nil.
 ---For streaming requests the body is nil because it was already written out.
 ---@param route string
@@ -1609,6 +2076,15 @@ local function forward(route, body, raw_body, model, text, incoming)
     local conf = cfg()
     local is_stream = body.stream == true
     local endpoint = endpoint_label(route)
+
+    -- Token accounting for streams (doc/gap-token-accounting.md). Without
+    -- stream_options.include_usage the OpenAI-compatible engines send no usage
+    -- frame at all, so every streamed request would fall back to the byte/4
+    -- estimate. The gateway asks for the frame on the client's behalf and then
+    -- removes it again, which keeps the client's view byte-for-byte what it
+    -- asked for while making the counters report what the backend itself said.
+    local ask_usage = is_stream and USAGE_ROUTES[route] == true
+        and not client_wants_usage(body)
 
     incoming = incoming or ngx.req.get_headers()
     local routing_key = incoming["x-smg-routing-key"]
@@ -1663,6 +2139,20 @@ local function forward(route, body, raw_body, model, text, incoming)
         hold_load(worker)
 
         local payload = rewrite_model(raw_body, worker.model_id)
+        -- Per attempt and not per request: the mark that turns the injection off
+        -- belongs to the selected worker, and a retry lands on a different one.
+        local inject_usage = ask_usage and not stream_options_rejected(worker.id)
+        if inject_usage then
+            local merged, changed = merge_top_object(payload, "stream_options",
+                "include_usage", true)
+            if changed then
+                payload = merged
+            else
+                -- The client's own body already pins stream_options to something
+                -- we must not rewrite; nothing to strip either.
+                inject_usage = false
+            end
+        end
         -- A DP-aware engine needs to know which shard a call belongs to, so the
         -- forwarded body names it as a top-level member -- the same
         -- data_parallel_rank Rust writes in http/router.rs:575-617. Gated on
@@ -1733,13 +2223,29 @@ local function forward(route, body, raw_body, model, text, incoming)
                 -- history plane used to allocate an accumulator for
                 -- store=true / conversation requests so the response could be
                 -- stored; scope-trim.md removed that plane).
-                local stream_ok, tail, prompt, completion, cached, reasoning =
+                local stream_ok, tail, prompt, completion, cached, reasoning,
+                    usage_stripped =
                     stream_response(response.sock, response.headers,
-                        response.kind, worker.url, conf)
+                        response.kind, worker.url, conf, inject_usage)
                 release_load(worker)
                 hb.record_outcome(worker.id, stream_ok and status < 400)
                 if not stream_ok then
                     observability.record_worker_error(worker.url, "backend_error")
+                end
+                if inject_usage then
+                    if status == 400 and names_stream_options(tail) then
+                        -- The backend named the field we added, so the refusal is
+                        -- about the injection: stop asking this worker for it.
+                        -- Attribution is deliberately evidence-gated -- a client
+                        -- body that is invalid for other reasons must not cost a
+                        -- healthy worker its accounting for a day.
+                        note_stream_options_rejected(worker.id, worker.url, tail)
+                        ngx.ctx.lr_usage_injection = "rejected"
+                    else
+                        clear_stream_options_rejected(worker.id)
+                        ngx.ctx.lr_usage_injection = usage_stripped
+                            and "stripped" or "passed_through"
+                    end
                 end
                 local estimated = (not prompt) and (not completion)
                 if estimated then
@@ -3065,8 +3571,22 @@ local function log_inference_request(duration_s, ttft_s)
     if record.duration_ms > 0 then
         observability.note_duration(duration_s)
     end
+    -- prompt/completion keep their pre-existing behaviour (an estimated row is
+    -- still charged, and stays identifiable by tokens_estimated plus the
+    -- /_ui/stats estimated share) so the dashboards already built on this family
+    -- see no discontinuity. cached/reasoning are different: they exist only as
+    -- detail fields of a backend usage object, so an estimate can never produce a
+    -- non-zero one and there is nothing to flag.
     observability.record_router_tokens(model, endpoint, "prompt", prompt)
     observability.record_router_tokens(model, endpoint, "completion", completion)
+    observability.record_router_tokens(model, endpoint, "cached", cached)
+    observability.record_router_tokens(model, endpoint, "reasoning", reasoning)
+    -- Lua-side superset: did the accounting come from an injected usage frame?
+    -- (doc/gap-token-accounting.md)
+    if ngx.ctx.lr_usage_injection then
+        observability.record_stream_usage_injection(model, endpoint,
+            ngx.ctx.lr_usage_injection)
+    end
 end
 
 ---Layer-1 accounting plus the request-log row, run once per request whichever

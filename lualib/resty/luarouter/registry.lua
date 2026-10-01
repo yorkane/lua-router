@@ -50,6 +50,37 @@ local K_DPROBE = "dpr:"  -- id -> /server_info probes spent on DP expansion
 -- written, so the selection path never has to decode the record to ask.
 local K_HSEL = "isel:"
 
+-- GPU 负载源（doc/gap-gpu-load.md）的两个外部采样通道，都是 **带 TTL 的数值键**：
+-- 值为归一化负载的千分位整数（0..1000 = 0..1），所以过期（读取返回 nil）就等于
+-- 「这个 tick 没有样本」，不需要额外的清理定时器，也不会把一台监控挂掉的机器永久
+-- 钉在高负载上。两键分列是因为优先级明确（见 _M.load）：
+--   xl: 外部负载源（gpu_load.lua 从 /metrics 或远程 Prometheus 抓来的 GPU 压力）
+--   sl: 引擎自报负载（/v1/loads 那条通道）。本仓库的 /v1/loads 仍是按需拉取、
+--       从不回写 registry（router.lua 的 loads_handler 只读上游），键位留给它，
+--       是为了让「谁说了算」这件事在数据模型里就写清楚，而不是靠调用顺序。
+local K_XLOAD = "xl:"  -- external GPU sample, milli of a 0..1 load, TTL'd
+local K_SLOAD = "sl:"  -- engine self-report, same shape, lower priority
+-- Weight of a fully busy worker: how many in-flight requests a 1.0 sample is
+-- worth. Published by gpu_load.run_pass on every tick so the selection path never
+-- reads the environment; the default keeps cache_aware's balance_abs_threshold (a
+-- request-count-shaped knob, Rust default 64) inside its usable range.
+local LOAD_SCALE_DEFAULT = 100
+local load_scale = LOAD_SCALE_DEFAULT   -- set_load_scale override (tests, an operator knob)
+local load_scale_from_cfg = false       -- memo of "the config value was applied"
+-- One shared "any sample exists anywhere" flag plus its per-process memo.
+--
+-- The writer is the load timer, which runs in worker 0 only; the readers are the
+-- selection paths of every process, so a per-process boolean could never be set by
+-- the process that needs it. The shared key (TTL'd like the samples it covers) is the
+-- authority, and the memo is what keeps the shipped shape (SMG_LOAD_SOURCE=none, no
+-- samples ever) at one shdict get per process per second instead of one per load()
+-- call -- that call runs once per candidate on every request, and per-request shdict
+-- traffic is already the dominant CPU cost (doc/parity-cpu-ablation.md).
+local K_XANY = "xany"   -- shared "some worker has a fresh sample" flag, TTL'd
+local MEMO_SECS = 1
+local memo_any = false
+local memo_checked_at = -MEMO_SECS
+
 -- Numeric codes follow the Rust metric encoding (gateway/src/core/
 -- circuit_breaker.rs STATE_CLOSED=0, STATE_OPEN=1, STATE_HALF_OPEN=2) so
 -- smg_worker_cb_state means the same thing on both gateways. Lua-side ordering
@@ -702,6 +733,11 @@ function _M.add(req, cfg)
         d:set(K_CBF .. id, 0)
         d:set(K_CBS .. id, 0)
         d:set(K_LOAD .. id, 0)
+        -- A re-registration is a new engine behind the url: whatever the previous
+        -- owner's GPU was doing has no right to describe this one, so both
+        -- external channels start empty (the load source refills them on its tick).
+        d:delete(K_XLOAD .. id)
+        d:delete(K_SLOAD .. id)
         local ids = read_ids(d)
         local seen = false
         for i = 1, #ids do
@@ -753,8 +789,8 @@ function _M.remove(worker_id)
         end
         dd:delete(K_IDURL .. id)
         for _, prefix in ipairs({ K_HEALTH, K_HFAIL, K_HSUCC, K_CBSTATE,
-                                 K_CBF, K_CBS, K_CBO, K_LOAD, K_DISC, K_DPROBE,
-                                 K_HSEL }) do
+                                 K_CBF, K_CBS, K_CBO, K_LOAD, K_XLOAD, K_SLOAD,
+                                 K_DISC, K_DPROBE, K_HSEL }) do
             dd:delete(prefix .. id)
         end
         local kept = {}
@@ -817,7 +853,11 @@ function _M.info(record, d)
         cost = record.cost or 1.0,
         worker_type = record.worker_type or "regular",
         is_healthy = (d:get(K_HEALTH .. id) or 0) == 1,
-        load = d:get(K_LOAD .. id) or 0,
+        -- The same number the policies rank on (see _M.load), so /workers and the
+        -- admin console show what selection actually saw rather than a different
+        -- half of it. With no load source configured this is exactly the in-flight
+        -- counter, i.e. the Rust-parity value the contract pins.
+        load = _M.load_with(d, id),
         connection_mode = record.connection_mode or "http",
         metadata = metadata,
         disable_health_check = record.disable_health_check or false,
@@ -1039,10 +1079,235 @@ function _M.is_available(id)
     return _M.breaker_available(id)
 end
 
+---Scheduling load for one worker, in in-flight-request units.
+--
+--This is *the* consumer-facing load field: power_of_two and manual's min_load mode
+--read it through registry.load(), and the standalone policies get it through
+--router.lua's `record.load` snapshot and _M.info's `load` key. One ranking rule
+--here therefore reaches every policy without any policy module knowing that a load
+--source exists (doc/gap-gpu-load.md §4).
+--
+--Priority, highest first:
+--  1. the router's own in-flight counter. Nothing else knows what this process
+--     handed a worker and has not finished serving, and it is the only signal that
+--     reacts within a millisecond of a burst.
+--  2. `xl:` the external GPU sample. It outranks the self-report because it is the
+--     only reading of the shared hardware: a worker with nothing in flight but a
+--     95 %-busy GPU (a queue another router process filled, a sibling rank of the
+--     same DP engine, a co-located second engine) must not look idle to
+--     power_of_two, and only the metrics/prometheus source can see that.
+--  3. `sl:` the engine's own self-report, consulted only when no fresh external
+--     sample exists. The metrics source answers every worker it can reach, so in
+--     practice one channel wins and the two never fight over a field.
+--
+--Both external terms are 0..1 fractions, so they are weighted by load_scale (a 1.0
+--sample = load_scale in-flight requests) before being added; that weight is what
+--keeps SMG_BALANCE_ABS_THRESHOLD meaningful whatever the knob measures. Samples
+--expire with their TTL, which degrades to in-flight alone: a monitoring system
+--that dies costs accuracy, never capacity, and never a worker.
 ---@param id string
----@return number @ in-flight requests
+---@return number @ load in in-flight units
 function _M.load(id)
-    return shdict():get(K_LOAD .. id) or 0
+    return _M.load_with(shdict(), id)
+end
+
+---The same ranking against an already-resolved dict.
+---
+---_M.info/_M.list pass their dict in so a /workers sweep reads one dict once
+---instead of resolving it per worker, and so a caller holding a dict (a test double,
+---a future batch path) can rank without going through the module-level cache.
+---@param d table @ an ngx.shared.DICT (or a test double with get)
+---@param id string
+---@return number
+function _M.load_with(d, id)
+    local inflight = d:get(K_LOAD .. id) or 0
+    if not _M.any_external_samples() then
+        return inflight
+    end
+    local milli = d:get(K_XLOAD .. id)
+    if milli == nil then
+        milli = d:get(K_SLOAD .. id)
+    end
+    if milli == nil then
+        return inflight
+    end
+    return inflight + (milli * _M.current_load_scale()) / 1000
+end
+
+---The external sample alone, normalized back to 0..1 (nil when there is none).
+---Read by gpu_load's own reporting and the unit tests; the inference plane never
+---needs it because _M.load already folded it in.
+---@param id string
+---@return number|nil load @ 0..1
+function _M.external_load(id)
+    if not _M.any_external_samples() then
+        return nil
+    end
+    local milli = shdict():get(K_XLOAD .. id)
+    if milli == nil then
+        return nil
+    end
+    return milli / 1000
+end
+
+---Store one external GPU sample for a worker.
+--
+--Only gpu_load.lua (the metrics and prom sources) and the unit tests call this:
+--the load source owns the key and there is no second writer, which is what makes
+--the ranking in _M.load decidable rather than first-come-first-served.
+---@param id string
+---@param load number|nil @ normalized 0..1
+---@param ttl_secs number|nil @ staleness window
+---@return boolean written
+function _M.set_external_load(id, load, ttl_secs)
+    local milli = _M.to_milli(load)
+    if milli == nil then
+        return false
+    end
+    local seconds = _M.stale_ttl(ttl_secs)
+    if not shdict():set(K_XLOAD .. id, milli, seconds) then
+        return false
+    end
+    _M.flag_external_samples(seconds)
+    return true
+end
+
+---Store one engine self-reported load (`/v1/loads`): the lower-priority channel.
+---@param id string
+---@param load number|nil @ normalized 0..1
+---@param ttl_secs number|nil
+---@return boolean written
+function _M.set_self_reported_load(id, load, ttl_secs)
+    local milli = _M.to_milli(load)
+    if milli == nil then
+        return false
+    end
+    local seconds = _M.stale_ttl(ttl_secs)
+    if not shdict():set(K_SLOAD .. id, milli, seconds) then
+        return false
+    end
+    _M.flag_external_samples(seconds)
+    return true
+end
+
+---Drop both external channels for a worker (an operator override, or a test).
+---@param id string
+function _M.clear_external_load(id)
+    local d = shdict()
+    d:delete(K_XLOAD .. id)
+    d:delete(K_SLOAD .. id)
+end
+
+---Normalized 0..1 -> milli integer, nil for anything unusable. NaN and the
+---infinities answer nil: they compare false against everything, so storing one
+---would strand a worker at whatever the previous sample said.
+---@param load number|nil
+---@return number|nil milli
+function _M.to_milli(load)
+    local number = tonumber(load)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge then
+        return nil
+    end
+    if number < 0 then
+        number = 0
+    elseif number > 1 then
+        number = 1
+    end
+    return math.floor(number * 1000 + 0.5)
+end
+
+---Staleness window of one sample. The TTL is what makes an expired reading stop
+---being a load, so a caller that knows its interval always passes it; the default
+---only covers a bare call from a test.
+---@param ttl_secs number|nil
+---@return number
+function _M.stale_ttl(ttl_secs)
+    local seconds = tonumber(ttl_secs)
+    if seconds == nil or seconds <= 0 or seconds ~= seconds then
+        seconds = 45
+    end
+    return math.min(math.max(seconds, 5), 3600)
+end
+
+---Whether any worker currently has an external sample (memoized per process).
+---@return boolean
+function _M.any_external_samples()
+    local now = ngx.now()
+    if now - memo_checked_at >= MEMO_SECS then
+        memo_checked_at = now
+        memo_any = shdict():get(K_XANY) ~= nil
+    end
+    return memo_any
+end
+
+---Publish the shared flag with the TTL of the sample that justified it. The TTL is
+---what retires the flag when the source stops: an expired key sends the readers back
+---to the in-flight counter without anything having to clean up, and a load source
+---that never stores a sample never writes this key at all.
+---@param ttl_secs number
+---@return boolean written
+function _M.flag_external_samples(ttl_secs)
+    if not shdict():set(K_XANY, 1, _M.stale_ttl(ttl_secs)) then
+        return false
+    end
+    -- The writer sees its own flag immediately: a policy in this process should not
+    -- wait out the memo for the sample it just stored.
+    memo_any = true
+    memo_checked_at = ngx.now()
+    return true
+end
+
+---Forget the flag as well as the samples (an operator override / a test).
+function _M.clear_external_samples_flag()
+    shdict():delete(K_XANY)
+    memo_any = false
+    memo_checked_at = -MEMO_SECS
+end
+
+---Publish the weight of a fully busy worker. gpu_load.run_pass calls this on every
+---tick, so an edited SMG_LOAD_SCALE lands on the next pass without a reload.
+---@param scale number|nil
+---@return number applied
+function _M.set_load_scale(scale)
+    local number = tonumber(scale)
+    if number == nil or number ~= number or number <= 0 then
+        return load_scale
+    end
+    load_scale = number
+    load_scale_from_cfg = true   -- an explicit override outranks the config value
+    return load_scale
+end
+
+---Current weight of a fully busy worker.
+---@return number
+function _M.load_scale()
+    return load_scale
+end
+
+---The weight actually in force: an explicit set_load_scale wins, otherwise the
+---env-published SMG_LOAD_SCALE from the config snapshot (identical in every process).
+---
+---The load timer that would otherwise publish this runs in worker 0 only, so a
+---Lua-local written from the pass would leave the other processes on the default and
+---make power_of_two rank the same pair of workers differently depending on which
+---process answered. config.load_scale is read lazily -- one table field on the first
+---sampled request -- and only superseded by an explicit set_load_scale.
+---@return number
+function _M.current_load_scale()
+    if not load_scale_from_cfg then
+        load_scale_from_cfg = true
+        local ok_cfg, outer = pcall(require, "resty.luarouter")
+        if ok_cfg and type(outer) == "table" and type(outer.config) == "function" then
+            local ok, conf = pcall(outer.config)
+            local configured = ok and type(conf) == "table"
+                and tonumber(conf.load_scale) or nil
+            if configured and configured > 0 then
+                load_scale = configured
+            end
+        end
+    end
+    return load_scale
 end
 
 ---@param id string
@@ -1077,6 +1342,10 @@ function _M.cb_state(id)
         healthy = (d:get(K_HEALTH .. id) or 0) == 1,
         health_failures = d:get(K_HFAIL .. id) or 0,
         health_successes = d:get(K_HSUCC .. id) or 0,
+        -- Deliberately the raw in-flight counter, not _M.load(): this table feeds
+        -- smg_worker_requests_active, whose Rust counterpart counts running requests
+        -- per worker. Folding a GPU sample in here would make the gauge disagree
+        -- with the router's own concurrency counters for no scheduling benefit.
         load = d:get(K_LOAD .. id) or 0,
     }
 end

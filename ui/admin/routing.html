@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Routing policy · llm-router</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="./app.css?v=5">
+</head>
+<body>
+  <div id="q-app">
+    <q-layout container class="workspace-layout">
+      <q-page-container>
+        <q-page class="workspace-page">
+          <header class="page-heading">
+            <div>
+              <h1>{{ t.title }}</h1>
+              <p>{{ t.description }}</p>
+            </div>
+            <div class="heading-actions">
+              <span v-if="doc" class="muted mono" style="font-size:11.5px">{{ revisionNote }}</span>
+              <q-btn outline no-caps icon="mdi-refresh" :label="c.retry" class="secondary-button" :loading="loading" @click="load"></q-btn>
+            </div>
+          </header>
+
+          <q-banner v-if="loadError" rounded dense class="error-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>
+            {{ loadError }}
+            <template v-slot:action><q-btn flat dense no-caps :label="c.retry" @click="load"></q-btn></template>
+          </q-banner>
+          <div class="muted q-mb-md mono">{{ persistNote }}</div>
+
+          <q-spinner v-if="loading && !doc" color="purple-3" size="30px"></q-spinner>
+
+          <!-- 生效链说明 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.chainTitle }}</div>
+                <div class="surface-subtitle">{{ t.chainCopy }}</div>
+              </div>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="preview-box">
+              <div class="preview-out">
+                <div><span class="k">{{ t.envLayer }}</span><span class="code-pill">{{ envPolicyText }}</span></div>
+                <div><span class="k">{{ t.effectiveDefault }}</span><span class="code-pill">{{ effectiveDefaultText }}</span></div>
+                <div class="preview-note">{{ t.workersHint }}</div>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 全局策略 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.globalCard }}</div>
+                <div class="surface-subtitle">{{ t.globalCopy }}</div>
+              </div>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="dialog-fields">
+                <q-select v-model="globalForm.policy" dense outlined dark :label="t.globalField"
+                          :options="policyOptions" map-options emit-value clearable
+                          :hint="globalHint" :display-value="globalDisplayValue">
+                  <template v-slot:option="scope">
+                    <q-item v-bind="scope.itemProps">
+                      <q-item-section>
+                        <q-item-label class="mono">{{ scope.opt.value }}</q-item-label>
+                        <q-item-label caption>{{ policyDescription(scope.opt.value) }}</q-item-label>
+                      </q-item-section>
+                    </q-item>
+                  </template>
+                </q-select>
+              </div>
+              <div class="row-actions" style="justify-content:flex-end">
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving"
+                       :label="t.globalSave" @click="saveGlobal"></q-btn>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 按模型策略表 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.tableTitle }}</div>
+                <div class="surface-subtitle">{{ t.tableCopy }}</div>
+              </div>
+              <q-input v-model="tableFilter" dense outlined dark debounce="200" :placeholder="c.search" class="search-input">
+                <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
+              </q-input>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-table flat dense dark :rows="policyRows" :columns="policyColumns" row-key="model"
+                     :filter="tableFilter" :loading="loading" :pagination="pagination" class="linear-table"
+                     :rows-per-page-options="[10, 20, 0]">
+              <template v-slot:body-cell-model="props">
+                <q-td :props="props">
+                  <div class="identity-cell">
+                    <div><strong class="mono">{{ props.row.model }}</strong></div>
+                    <q-badge v-if="props.row.isNew" outline color="blue-4" class="chip-soft">{{ c.add }}</q-badge>
+                    <span v-else-if="!props.row.registered" class="muted" style="font-size:11px">{{ t.registeredNo }}</span>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-registered="props">
+                <q-td :props="props">
+                  <q-badge v-if="props.row.registered" outline color="teal-4" class="chip-soft">{{ t.registeredYes }}</q-badge>
+                  <span v-else class="muted">—</span>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-override="props">
+                <q-td :props="props">
+                  <q-select v-model="props.row.override" dense outlined dark :options="policyOptions"
+                            map-options emit-value clearable :label="t.inherit" :display-value="inheritLabel"
+                            style="min-width:210px">
+                    <template v-slot:option="scope">
+                      <q-item v-bind="scope.itemProps">
+                        <q-item-section>
+                          <q-item-label class="mono">{{ scope.opt.value }}</q-item-label>
+                          <q-item-label caption>{{ policyDescription(scope.opt.value) }}</q-item-label>
+                        </q-item-section>
+                      </q-item>
+                    </template>
+                  </q-select>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-hint="props">
+                <q-td :props="props">
+                  <span v-if="props.row.hint" class="code-pill mono">{{ props.row.hint }}</span>
+                  <span v-else class="muted">—</span>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-effective="props">
+                <q-td :props="props">
+                  <span class="code-pill mono">{{ props.row.effective }}</span>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-source="props">
+                <q-td :props="props">
+                  <q-badge outline :color="sourceColor(props.row.source)" class="chip-soft">{{ sourceLabel(props.row.source) }}</q-badge>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-actions="props">
+                <q-td :props="props">
+                  <div class="row-actions">
+                    <q-btn v-if="props.row.override" flat round dense icon="mdi-backup-restore" color="orange-4"
+                           @click="clearRow(props.row)"><q-tooltip>{{ t.deleteRow }}</q-tooltip></q-btn>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:no-results><div class="empty-state"><span>{{ c.empty }}</span></div></template>
+            </q-table>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="rows-head q-mb-xs">{{ t.tableTitle }} · {{ t.addRow }}</div>
+              <div class="rows-list">
+                <div v-for="(row, index) in newRows" :key="'nr' + index" class="row-edit">
+                  <q-input v-model="row.model" dense outlined dark class="mono" :label="t.modelField"
+                           :placeholder="t.modelPlaceholder" :rules="[modelRule]"></q-input>
+                  <q-select v-model="row.policy" dense outlined dark :options="policyOptions" map-options emit-value
+                            :label="t.policyField">
+                    <template v-slot:option="scope">
+                      <q-item v-bind="scope.itemProps">
+                        <q-item-section>
+                          <q-item-label class="mono">{{ scope.opt.value }}</q-item-label>
+                          <q-item-label caption>{{ policyDescription(scope.opt.value) }}</q-item-label>
+                        </q-item-section>
+                      </q-item>
+                    </template>
+                  </q-select>
+                  <span></span>
+                  <q-btn flat round dense icon="mdi-close" color="red-4" @click="newRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                </div>
+                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.addRow"
+                           @click="newRows.push({ model: '', policy: 'cache_aware' })"></q-btn></div>
+              </div>
+              <div class="row-actions q-mt-sm" style="justify-content:flex-end">
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving"
+                       :label="t.saveTable" @click="saveTable"></q-btn>
+              </div>
+              <div v-if="!overrideCount" class="muted q-mt-sm">{{ t.tableEmpty }}</div>
+            </q-card-section>
+          </q-card>
+        </q-page>
+      </q-page-container>
+    </q-layout>
+  </div>
+
+  <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="./i18n.js?v=4"></script>
+  <script src="./api.js?v=3"></script>
+  <script>
+    const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+
+    const app = Vue.createApp({
+      setup () {
+        const doc = ref(null)
+        const locale = ref(window.lmrI18n.getLocale())
+        const loading = ref(false)
+        const saving = ref(false)
+        const loadError = ref('')
+        const tableFilter = ref('')
+        // rows[model] = { model, registered, hint, effective, source, override }
+        const rows = ref([])
+        const newRows = ref([])
+        const globalForm = reactive({ policy: null })
+        let unsubscribeLocale
+
+        const c = computed(() => window.lmrI18n.messages[locale.value].common)
+        const t = computed(() => window.lmrI18n.messages[locale.value].routing)
+        const pagination = reactive({ rowsPerPage: 15 })
+
+        // 策略候选来自后端文档（8 策略全集），前端只做展示字典的兜底
+        const policyOptions = computed(() => {
+          const names = (doc.value && Array.isArray(doc.value.policies) && doc.value.policies.length)
+            ? doc.value.policies
+            : ['random', 'round_robin', 'cache_aware', 'power_of_two',
+               'prefix_hash', 'manual', 'bucket', 'consistent_hashing']
+          return names.map(value => ({ label: value, value }))
+        })
+        function policyDescription (name) {
+          const dict = t.value.policyDesc || {}
+          return dict[name] || name
+        }
+
+        const envPolicyText = computed(() => (doc.value && doc.value.env_policy) || '—')
+        const effectiveDefaultText = computed(() => (doc.value && doc.value.effective_default) || '—')
+        const globalDisplayValue = computed(() => globalForm.policy || t.value.globalUnset)
+        const globalHint = computed(() => {
+          if (!globalForm.policy) return `${t.value.globalUnset}: ${envPolicyText.value}`
+          return policyDescription(globalForm.policy)
+        })
+        const inheritLabel = computed(() => t.value.inherit)
+        const revisionNote = computed(() => {
+          const rev = doc.value && doc.value.revision
+          return window.lmrI18n.translate(locale.value, 'routing', 'loadedNote', { rev: rev === null || rev === undefined ? '—' : rev })
+        })
+        const persistNote = computed(() => {
+          const file = doc.value && doc.value.persist && doc.value.persist.file
+          return window.lmrI18n.translate(locale.value, 'models', 'persistHint', { file: file || '—' })
+        })
+        const overrideCount = computed(() => rows.value.filter(row => row.override).length)
+
+        const policyColumns = computed(() => [
+          { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
+          { name: 'registered', label: t.value.colRegistered, field: 'registered', align: 'left', style: 'width:90px' },
+          { name: 'override', label: t.value.colOverride, field: 'override', align: 'left', style: 'width:230px' },
+          { name: 'hint', label: t.value.colHint, field: 'hint', align: 'left', style: 'width:140px' },
+          { name: 'effective', label: t.value.colEffective, field: 'effective', align: 'left', style: 'width:150px' },
+          { name: 'source', label: t.value.colSource, field: 'source', align: 'left', style: 'width:120px' },
+          { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:60px' }
+        ])
+        const policyRows = computed(() => rows.value)
+
+        function sourceLabel (source) {
+          const map = { model: t.value.sourceModel, global: t.value.sourceGlobal, hint: t.value.sourceHint, env: t.value.sourceEnv }
+          return map[source] || source || '—'
+        }
+        function sourceColor (source) {
+          if (source === 'model') return 'blue-4'
+          if (source === 'global') return 'purple-4'
+          if (source === 'hint') return 'teal-4'
+          return 'grey-6'
+        }
+        function modelRule (value) {
+          return String(value || '').trim() !== '' || t.value.modelRule
+        }
+
+        // ── 载入：GET /_ui/config/policy，行集 = 后端 models ∪ 本地未保存新增 ──
+        function hydrate (document_) {
+          doc.value = document_
+          globalForm.policy = document_.policy || null
+          const overrides = {}
+          ;(document_.model_policies || []).forEach(row => { overrides[row.model] = row.policy })
+          const seen = new Set()
+          const next = []
+          ;(document_.models || []).forEach(row => {
+            if (row.model === null || row.model === undefined) return
+            seen.add(row.model)
+            next.push({
+              model: row.model,
+              registered: row.registered === true,
+              hint: row.hint || null,
+              effective: row.effective,
+              source: row.source,
+              override: overrides[row.model] || null,
+              isNew: false
+            })
+          })
+          Object.keys(overrides).forEach(model => {
+            if (seen.has(model)) return
+            next.push({ model, registered: false, hint: null, effective: overrides[model], source: 'model', override: overrides[model], isNew: false })
+          })
+          next.sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0))
+          rows.value = next
+        }
+
+        async function load () {
+          loading.value = true
+          loadError.value = ''
+          try {
+            hydrate(await window.lmrApi.configPolicy())
+          } catch (error) {
+            loadError.value = error.message
+          } finally {
+            loading.value = false
+          }
+        }
+
+        function refreshRowsFromDoc () {
+          // 保存后由后端文档回显：override 列与生效列都以后端为准
+          return load()
+        }
+
+        async function applyPatch (patch, messageKey, values) {
+          saving.value = true
+          try {
+            const document_ = await window.lmrApi.configPolicyApply(patch)
+            hydrate(document_)
+            Quasar.Notify.create({
+              message: window.lmrI18n.translate(locale.value, 'routing', messageKey, values),
+              type: 'positive', position: 'top-right', timeout: 2600
+            })
+            return true
+          } catch (error) {
+            // 非法策略名等校验失败：后端 400 且不生效，界面保持原值并重读一次
+            Quasar.Notify.create({
+              message: window.lmrI18n.translate(locale.value, 'routing', 'applyFailed', { msg: error.message }),
+              type: 'negative', position: 'top-right', timeout: 5200
+            })
+            await load()
+            return false
+          } finally {
+            saving.value = false
+          }
+        }
+
+        function confirmChange (message, danger, onOk) {
+          Quasar.Dialog.create({
+            title: t.value.confirmTitle,
+            message: danger ? `${message}\n${t.value.confirmDanger}` : message,
+            cancel: true, persistent: true,
+            ok: { label: t.value.confirmed, color: 'primary', flat: true }
+          }).onOk(onOk)
+        }
+
+        function switchingAwayFromCache (from, to) {
+          return from === 'cache_aware' && to && to !== 'cache_aware'
+        }
+
+        // ── 全局策略 ──
+        function saveGlobal () {
+          const next = globalForm.policy || null
+          const prev = doc.value ? (doc.value.policy || null) : null
+          if (next === prev) { refreshRowsFromDoc(); return }
+          const message = window.lmrI18n.translate(locale.value, 'routing', 'confirmGlobal',
+            { name: next || envPolicyText.value })
+          confirmChange(message, switchingAwayFromCache(doc.value && doc.value.effective_default, next), () => {
+            applyPatch({ policy: next }, next ? 'globalSaved' : 'globalCleared',
+              { name: next || envPolicyText.value })
+          })
+        }
+
+        // ── 按模型表：整表提交（后端语义 = 全量替换） ──
+        function pendingTable () {
+          const entries = []
+          rows.value.forEach(row => {
+            if (row.override) entries.push({ model: row.model, policy: row.override })
+          })
+          newRows.value.forEach(row => {
+            const model = String(row.model || '').trim()
+            if (model && row.policy) {
+              const existing = entries.find(entry => entry.model === model)
+              if (existing) existing.policy = row.policy
+              else entries.push({ model, policy: row.policy })
+            }
+          })
+          return entries
+        }
+
+        function saveTable () {
+          const entries = pendingTable()
+          const prev = {}
+          ;((doc.value && doc.value.model_policies) || []).forEach(row => { prev[row.model] = row.policy })
+          let changed = 0
+          let removed = 0
+          entries.forEach(entry => { if (prev[entry.model] !== entry.policy) changed += 1 })
+          Object.keys(prev).forEach(model => {
+            if (!entries.find(entry => entry.model === model)) removed += 1
+          })
+          const same = changed === 0 && removed === 0
+          if (same) { newRows.value = []; refreshRowsFromDoc(); return }
+          let danger = false
+          entries.forEach(entry => { if (switchingAwayFromCache(prev[entry.model], entry.policy)) danger = true })
+          Object.keys(prev).forEach(model => {
+            if (!entries.find(entry => entry.model === model) && switchingAwayFromCache(prev[model], null)) danger = true
+          })
+          const message = window.lmrI18n.translate(locale.value, 'routing', 'confirmTable',
+            { n: entries.length, changed, removed })
+          confirmChange(message, danger, async () => {
+            const ok = await applyPatch({ model_policies: entries }, 'tableSaved', { n: entries.length })
+            if (ok) newRows.value = []
+          })
+        }
+
+        function clearRow (row) {
+          row.override = null
+        }
+
+        function applyLocale (nextLocale) {
+          locale.value = nextLocale
+          document.documentElement.lang = nextLocale
+          document.title = window.lmrI18n.messages[nextLocale].routing.title + ' · llm-router'
+          window.lmrI18n.applyQuasarLang(nextLocale)
+        }
+
+        onMounted(() => {
+          applyLocale(locale.value)
+          unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
+          load()
+        })
+        onBeforeUnmount(() => { if (unsubscribeLocale) unsubscribeLocale() })
+
+        return {
+          applyLocale, c, clearRow, doc, envPolicyText, effectiveDefaultText, globalDisplayValue, globalForm, globalHint,
+          inheritLabel, load, loading, loadError, newRows, overrideCount, persistNote, policyColumns, policyDescription,
+          policyOptions, policyRows, revisionNote, saveGlobal, saveTable, sourceColor, sourceLabel, tableFilter, t
+        }
+      }
+    })
+
+    app.use(Quasar, { config: { dark: true } })
+    Quasar.Dark.set(true)
+    window.lmrI18n.applyQuasarLang(window.lmrI18n.getLocale())
+    Quasar.IconSet.set(Quasar.IconSet.mdiV7)
+    app.mount('#q-app')
+  </script>
+</body>
+</html>

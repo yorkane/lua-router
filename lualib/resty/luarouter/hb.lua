@@ -1,5 +1,13 @@
 -- Health checks and circuit breaker.
 --
+-- Also the launch point for the GPU load source (doc/gap-gpu-load.md): start()
+-- hands the interval timer to gpu_load.lua, whose shape is this module's own
+-- timer pattern (worker-0 single-flight, self-rescheduling ngx.timer.at). It is
+-- launched from here rather than from init.lua because the sweep already owns
+-- "one process dials every worker on a clock", and init_worker's worker-0 gate is
+-- what makes that true; gpu_load keeps its own interval and its own failure
+-- semantics, so nothing about the health sweep changes.
+--
 -- Two independent mechanisms, both copied from the Rust gateway:
 --
 -- 1. Periodic health probe (this module's `check_all`, driven by a timer in
@@ -278,8 +286,22 @@ local function heartbeat(premature)
     end
 end
 
----Start the periodic sweep (worker 0 only, once per worker process).
+---Start the periodic sweep (worker 0 only, once per worker process), and with it
+---the GPU load source.
+---
+---The load source starts *before* the disable_health_check early-return: SMG_DISABLE
+---_HEALTH_CHECK says "do not judge workers by probing them", and a load sample that
+---never touches health has no reason to disappear with the sweep. gpu_load.start()
+---answers false and logs nothing when SMG_LOAD_SOURCE=none, so the shipped shape is
+---unchanged.
 function _M.start()
+    local ok_load, gpu_load = pcall(require, "resty.luarouter.gpu_load")
+    if ok_load and type(gpu_load) == "table" and type(gpu_load.start) == "function" then
+        local started, why = gpu_load.start(cfg())
+        if started == false and why ~= "disabled (SMG_LOAD_SOURCE=none)" then
+            ngx.log(ngx.WARN, "luarouter: gpu-load not started: ", tostring(why))
+        end
+    end
     if timer_running then
         return
     end

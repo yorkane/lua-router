@@ -295,6 +295,11 @@ local function config_handler(name)
 end
 
 function _M.config_get() return config_handler("handle_config_get") end
+--- Routing policy document (GET) and runtime change (PUT/POST); both live in
+--- config_store so the write goes through the same snapshot channel as the rest
+--- of the hot config. See doc/gap-routing-dyn.md.
+function _M.config_policy_get() return config_handler("handle_config_policy_get") end
+function _M.config_policy() return config_handler("handle_config_policy") end
 function _M.config_effort() return config_handler("handle_config_effort") end
 function _M.config_ctx() return config_handler("handle_config_ctx") end
 function _M.config_model() return config_handler("handle_config_model") end

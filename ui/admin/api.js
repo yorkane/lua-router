@@ -77,6 +77,11 @@
     // 改名映射转发给 watcher 的 /model-map；body 支持 {"orig":"new"} 形状，空值即删除
     configModelMap: mapping => post('/config/model-map', mapping, UI_BASE),
 
+    // ── 路由策略（/_ui/config/policy，doc/gap-routing-dyn.md） ──
+    // GET 返回策略链文档（候选策略 + 全局 + per-model 行），PUT 提交变更并回显新文档。
+    configPolicy: () => get('/config/policy', UI_BASE),
+    configPolicyApply: patch => put('/config/policy', patch, UI_BASE),
+
     // ── 日志与统计 ──
     logs: (cursor, limit) => get(`/logs?cursor=${cursor || 0}&limit=${limit || 500}`, UI_BASE),
     stats: () => get('/stats', UI_BASE),

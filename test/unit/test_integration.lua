@@ -295,6 +295,262 @@ else
     check(false, "set_top_field loaded")
 end
 
+local function new_case(name)
+    io.write("  case: " .. name .. "\n")
+end
+
+--------------------------------------------------------------------------
+-- 6. token 核算：stream_options 注入 / SSE 帧切分 / usage 帧剥除判定
+--    （doc/gap-token-accounting.md）
+--
+--    与第 5 节同一手法：router.lua 依赖 klib 与 cosocket，无法在 resty CLI 里
+--    require，所以把这段纯字符串逻辑单独 load 进沙箱。被 load 的片段与线上代码
+--    逐字相同（从文件里按函数名切出来），所以这里断言的是真实现，不是复刻。
+--------------------------------------------------------------------------
+local function load_accounting_sandbox()
+    local src = io.open((os.getenv("LUA_TEST_LIB") or "./lualib")
+        .. "/resty/luarouter/router.lua"):read("*a")
+    local blocks = {
+        src:match("(local function field_pattern.-)\n_M%.set_top_field"),
+        src:match("(local function merge_top_object.-)\n_M%.merge_top_object"),
+        src:match("(local function usage_from_object.-\nend\n)"),
+        src:match("(local function usage_from_chunk.-\nend\n)"),
+        src:match("(local function sse_event_droppable.-)\n_M%.sse_event_droppable"),
+        src:match("(local function sse_split.-)\n_M%.sse_split"),
+        src:match("(local function client_wants_usage.-)\n_M%.client_wants_usage"),
+        src:match("(local function names_stream_options.-)\n_M%.names_stream_options"),
+    }
+    for i = 1, #blocks do
+        if type(blocks[i]) ~= "string" then
+            return nil, "block " .. i .. " not extracted"
+        end
+    end
+    local cjson_safe = require("cjson.safe")
+    local sandbox = {
+        ngx = ngx,
+        json_encode = cjson_safe.encode,
+        json_decode = cjson_safe.decode,
+        cjson = cjson_safe,
+    }
+    setmetatable(sandbox, { __index = _G })
+    local chunk = load("local _M = {}\n"
+        .. blocks[1] .. "\n" .. blocks[2] .. "\n" .. blocks[3] .. "\n"
+        .. blocks[4] .. "\n" .. blocks[5] .. "\n" .. blocks[6] .. "\n"
+        .. blocks[7] .. "\n" .. blocks[8] .. "\n"
+        .. "return { set_top_field = set_top_field,"
+        .. " merge_top_object = merge_top_object,"
+        .. " usage_from_chunk = usage_from_chunk,"
+        .. " sse_event_droppable = sse_event_droppable,"
+        .. " sse_split = sse_split,"
+        .. " client_wants_usage = client_wants_usage,"
+        .. " names_stream_options = names_stream_options }",
+        "token accounting", "t", sandbox)
+    if not chunk then
+        return nil, "chunk did not compile"
+    end
+    return chunk()
+end
+
+local acc = load_accounting_sandbox()
+if not acc then
+    check(false, "token-accounting sandbox loaded", tostring(acc))
+else
+    new_case("stream_options injection")
+
+    -- 6.1 注入：客户端没写 stream_options 时补一个对象，其余字节逐字保留
+    local plain = '{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+    local injected, changed = acc.merge_top_object(plain, "stream_options", "include_usage", true)
+    eq(changed, true, "absent stream_options is created")
+    eq(injected, '{"stream_options":{"include_usage":true},' .. plain:sub(2),
+        "injection prepends the member and keeps every other byte")
+    check(cjson.decode(injected).stream == true
+        and cjson.decode(injected).messages[1].content == "hi",
+        "injected body still decodes to the same request")
+
+    -- 6.2 已有 stream_options 对象：合并而不是覆盖（客户端的 verbose 必须活着）
+    local partial = '{"model":"m","stream":true,"stream_options":{"verbose":true}}'
+    local merged = acc.merge_top_object(partial, "stream_options", "include_usage", true)
+    eq(merged, '{"model":"m","stream":true,"stream_options":{"include_usage":true,"verbose":true}}',
+        "existing stream_options is merged, not replaced")
+
+    -- 6.3 客户端自己就要了 usage：一个字都不改（该帧是客户端的，不能剥）
+    local _, already_changed = acc.merge_top_object(
+        '{"stream_options":{"include_usage":true}}', "stream_options", "include_usage", true)
+    eq(already_changed, false, "include_usage already true -> no change")
+
+    -- 6.4 显式 false / null：客户端的 false 会被网关改写（并剥掉后果），必须报 changed
+    local _, flipped = acc.merge_top_object(
+        '{"stream_options":{"include_usage":false}}', "stream_options", "include_usage", true)
+    eq(flipped, true, "explicit false is flipped to true")
+    local null_filled = acc.merge_top_object(
+        '{"stream_options":null,"model":"m"}', "stream_options", "include_usage", true)
+    check(null_filled:find('"stream_options":{"include_usage":true}', 1, true) ~= nil,
+        "explicit null is filled in", null_filled)
+
+    -- 6.5 客户端把这个名字用成了别的类型：不动它（覆盖客户端选定的值不是我们的权利）
+    local _, hostile_changed = acc.merge_top_object(
+        '{"stream_options":"yes"}', "stream_options", "include_usage", true)
+    eq(hostile_changed, false, "non-object stream_options is left alone")
+    local _, array_changed = acc.merge_top_object(
+        '{"stream_options":[]}', "stream_options", "include_usage", true)
+    eq(array_changed, false, "array stream_options is left alone")
+
+    -- 6.6 嵌套同名字段不受影响（top_member_span 的深度意义所在）
+    local nested = '{"a":{"stream_options":{"x":1}},"model":"m"}'
+    local nested_out = acc.merge_top_object(nested, "stream_options", "include_usage", true)
+    check(nested_out:find('"a":{"stream_options":{"x":1}}', 1, true) ~= nil,
+        "nested stream_options untouched", nested_out)
+    check(nested_out:find('"stream_options":{"include_usage":true}', 1, true) ~= nil,
+        "top-level stream_options added beside the nested one", nested_out)
+
+    -- 6.7 空对象 / 带空白的写法
+    eq(acc.merge_top_object("{}", "stream_options", "include_usage", true),
+        '{"stream_options":{"include_usage":true}}', "injection into an empty object")
+    local spaced = '{ "stream_options" : { "verbose" : true } , "model":"m" }'
+    check(acc.merge_top_object(spaced, "stream_options", "include_usage", true)
+              :find('"include_usage":true', 1, true) ~= nil,
+        "whitespace around the member is handled")
+
+    -- 6.8 客户端原意判定：只有真值 include_usage 算「客户端要这帧」
+    eq(acc.client_wants_usage({ stream_options = { include_usage = true } }), true,
+        "client asked for usage")
+    eq(acc.client_wants_usage({ stream_options = { include_usage = false } }), false,
+        "client asked against usage")
+    eq(acc.client_wants_usage({ stream_options = {} }), false, "empty stream_options is not a request")
+    eq(acc.client_wants_usage({}), false, "no stream_options at all")
+    eq(acc.client_wants_usage({ stream_options = cjson.null }), false,
+        "null stream_options is not a request")
+
+    new_case("SSE frame splitting")
+
+    -- 6.9 LF 分隔：两个完整事件，无残留
+    local events, rest = acc.sse_split('data: {"a":1}\n\ndata: [DONE]\n\n')
+    eq(#events, 2, "two LF-separated events")
+    eq(rest, "", "nothing left over")
+    eq(events[1].text, 'data: {"a":1}\n\n', "event text keeps its separator bytes")
+    eq(events[2].text, "data: [DONE]\n\n", "second event verbatim")
+
+    -- 6.10 CRLF 分隔（/v1/responses 的上游就这么写）
+    local crlf_events, crlf_rest = acc.sse_split(
+        'data: {"a":1}\r\ndata: [DONE]\r\n\r\ndata: partial')
+    eq(#crlf_events, 1, "one CRLF-terminated event")
+    eq(crlf_rest, "data: partial", "an unterminated tail stays in the carry")
+
+    -- 6.11 混排 \n\r\n（先 \n 后 \r\n 的上游）
+    local mixed, mixed_rest = acc.sse_split('data: {"a":1}\n\r\ndata: [DONE]\n\r\n')
+    eq(#mixed, 2, "mixed line endings still split into two events")
+    eq(mixed_rest, "", "mixed form leaves nothing behind")
+
+    -- 6.12 分块喂入：帧跨读必须最终切出同一帧，且不丢字节（泵按块调用）
+    local p1 = 'data: {"id":"c","choices":[{"finish_reason":"stop"}],"usa'
+    local p2 = 'ge":{"prompt_'
+    local p3 = 'tokens":11,"completion_tokens":22,"total_tokens":33}}\n\n'
+    local e1, c1 = acc.sse_split(p1)
+    local e2, c2 = acc.sse_split(c1 .. p2)
+    local e3, c3 = acc.sse_split(c2 .. p3)
+    eq(#e1, 0, "a frame with no separator is not an event yet")
+    eq(#e2, 0, "still incomplete after the second read")
+    eq(#e3, 1, "the frame closes once its blank line arrives")
+    eq(c3, "", "no residue after the completed frame")
+    eq(e3[1].text, p1 .. p2 .. p3, "reassembled frame is byte-exact")
+
+    -- 6.13 逐块拼接后必须等于原始流（剥帧只删整帧，绝不吞字节）
+    local whole = 'data: {"a":1}\n\ndata: {"b":2}\n\n'
+    local rebuilt = {}
+    local carry = ""
+    for i = 1, #whole do
+        local evs, next_carry = acc.sse_split(carry .. whole:sub(i, i))
+        for j = 1, #evs do rebuilt[#rebuilt + 1] = evs[j].text end
+        carry = next_carry
+    end
+    eq(table.concat(rebuilt) .. carry, whole, "byte-at-a-time feeding loses nothing")
+
+    new_case("usage frame drop decision")
+
+    -- 6.14 纯 usage 帧（choices 为空）：可剥
+    local usage_frame = 'data: {"id":"c","object":"chat.completion.chunk","choices":[],'
+        .. '"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}\n\n'
+    eq(acc.sse_event_droppable(usage_frame), true, "usage-only frame is droppable")
+
+    -- 6.15 choices 缺省也可剥（字段缺省不等于携带内容）
+    eq(acc.sse_event_droppable('data: {"usage":{"prompt_tokens":1}}\n\n'), true,
+        "frame with no choices member is droppable")
+
+    -- 6.16 delta 带 role 的 usage 帧（vLLM 形态）也可剥：role 之外没有内容
+    eq(acc.sse_event_droppable(
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":null}],'
+        .. '"usage":{"prompt_tokens":1,"completion_tokens":5}}\n\n'), true,
+        "empty delta plus null finish_reason stays droppable")
+
+    -- 6.17 llama.cpp 形态：usage 与 finish_reason 同帧 —— 不许剥
+    eq(acc.sse_event_droppable(
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+        .. '"usage":{"prompt_tokens":1}}\n\n'), false,
+        "a frame that closes the turn is never dropped")
+
+    -- 6.18 usage 与内容同帧 —— 不许剥
+    eq(acc.sse_event_droppable(
+        'data: {"choices":[{"index":0,"delta":{"content":"x"}},'
+        .. '{"index":1,"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":1}}\n\n'),
+        false, "a frame carrying content is never dropped")
+
+    -- 6.19 三种必须原样透传的帧
+    eq(acc.sse_event_droppable("data: [DONE]\n\n"), false, "[DONE] survives")
+    eq(acc.sse_event_droppable(": ping\n\n"), false, "heartbeat comment survives")
+    eq(acc.sse_event_droppable('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'), false,
+        "content delta survives")
+    eq(acc.sse_event_droppable("data: not-json\n\n"), false, "undecodable payload survives")
+    eq(acc.sse_event_droppable('data: {"choices":[]}\n\n'), false,
+        "usage-less empty frame survives (nothing to account for)")
+
+    -- 6.20 带 event: / id: 的帧一律不剥（/v1/responses 的协议帧、可续传游标）
+    eq(acc.sse_event_droppable('event: response.completed\n'
+        .. 'data: {"response":{"usage":{"input_tokens":3,"output_tokens":4}}}\n\n'), false,
+        "responses completed event is protocol, not ours to drop")
+    eq(acc.sse_event_droppable('id: 7\ndata: {"usage":{"prompt_tokens":1}}\n\n'), false,
+        "an id-carrying frame keeps its id by staying whole")
+
+    -- 6.21 多行 data 事件不剥（可能同时装着 [DONE]，剥掉客户端就等不到结束）
+    eq(acc.sse_event_droppable(
+        'data: {"usage":{"prompt_tokens":1}}\ndata: [DONE]\n\n'), false,
+        "a multi-line event is kept whole")
+
+    -- 6.22 /v1/responses 的 usage 藏在 response 下面：读得到（且因 event: 行不会被剥）
+    local p_, c_, a_, r_ = acc.usage_from_chunk(
+        cjson.decode('{"response":{"usage":{"input_tokens":3,"output_tokens":4,'
+            .. '"input_tokens_details":{"cached_tokens":2},'
+            .. '"output_tokens_details":{"reasoning_tokens":1}}}}'))
+    eq(p_, 3, "responses usage reads input_tokens")
+    eq(c_, 4, "responses usage reads output_tokens")
+    eq(a_, 2, "responses usage reads cached detail")
+    eq(r_, 1, "responses usage reads reasoning detail")
+    local tp, tc = acc.usage_from_chunk(
+        cjson.decode('{"choices":[{"delta":{"content":"x"}}],"usage":'
+            .. '{"prompt_tokens":1,"completion_tokens":5}}'))
+    eq(tp, 1, "chat usage reads the top-level member")
+    eq(tc, 5, "chat completion count survives")
+    check(acc.usage_from_chunk(cjson.decode('{"choices":[{"delta":{"content":"x"}}]}')) == nil,
+        "a content chunk reports no usage")
+
+    -- 6.23 空 usage / 非表 usage 都不算数
+    check(acc.usage_from_chunk(cjson.decode('{"usage":{}}')) == nil, "empty usage object is not usage")
+    check(acc.usage_from_chunk(cjson.decode('{"usage":"x"}')) == nil, "string usage is not usage")
+
+    new_case("400 fallback attribution")
+
+    -- 6.24 只有后端点名这个字段才 sticky 关闭注入：否则一个坏请求就能让健康的
+    -- worker 失去一天的精确核算
+    eq(acc.names_stream_options('{"error":{"message":"Unexpected value '
+        .. 'stream_options with input"}}'), true, "backend names stream_options")
+    eq(acc.names_stream_options("data: {'error': 'include_usage is not supported'}\n\n"), true,
+        "backend names include_usage")
+    eq(acc.names_stream_options('{"error":"messages must be a list"}'), false,
+        "an unrelated 400 does not mark the worker")
+    eq(acc.names_stream_options(""), false, "empty body marks nobody")
+    eq(acc.names_stream_options(nil), false, "nil body marks nobody")
+end
+
+--------------------------------------------------------------------------
 --------------------------------------------------------------------------
 ngx.say("integration: " .. passed .. " passed, " .. failed .. " failed")
 if failed > 0 then

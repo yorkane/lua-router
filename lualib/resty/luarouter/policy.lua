@@ -23,6 +23,12 @@
 local observability = require "resty.luarouter.observability"
 local registry = require "resty.luarouter.registry"
 
+-- Hot-config store (optional): the runtime routing-policy overrides. Required
+-- through pcall so a build without the module, or a unit run that stubs the
+-- world, keeps the plain hint -> cfg.policy chain.
+local store_ok, store = pcall(require, "resty.luarouter.config_store")
+if store_ok and type(store) ~= "table" then store_ok = false end
+
 local json = require "cjson.safe"
 
 local _M = { _VERSION = "0.1.0" }
@@ -323,7 +329,19 @@ _M.policies = policies
 ---@return table inst
 function _M.new(cfg, opts)
     opts = opts or {}
-    local requested = opts.name or cfg.policy or "round_robin"
+    -- opts.name arrives already resolved by for_model / policy_for; only the
+    -- no-name path consults the chain so a caller cannot be second-guessed.
+    local requested = opts.name
+    if requested == nil or requested == "" then
+        local cfg_policy = cfg.policy or "round_robin"
+        if store_ok and type(store.resolve_policy) == "function"
+            and (type(store.policy_override_active) ~= "function"
+                or store.policy_override_active()) then
+            local named = store.resolve_policy(cfg_policy, opts.model, nil)
+            if named then cfg_policy = named end
+        end
+        requested = cfg_policy
+    end
     local name = requested
     if not policies[name] then
         -- Fall back to the default policy when neither a built-in nor a
@@ -389,8 +407,21 @@ function _M.for_model(cfg, model, hint, has_workers)
         hint = nil
     end
 
-    local name = (hint ~= nil and hint ~= "") and hint
-        or (cfg.policy or "round_robin")
+    -- With no operator override configured this is the pre-feature expression
+    -- verbatim (unknown hints kept as the cache key included). Once an override
+    -- exists the full chain decides the name, so a policy change yields a
+    -- different instance (fresh affinity tree, exactly like a restart) and an
+    -- unchanged policy keeps hitting the instance built on the first request.
+    local name
+    if store_ok and type(store.policy_override_active) == "function"
+        and store.policy_override_active()
+        and type(store.resolve_policy) == "function" then
+        local resolved = store.resolve_policy(cfg.policy or "round_robin", key, hint)
+        name = resolved or "round_robin"
+    else
+        name = (hint ~= nil and hint ~= "") and hint
+            or (cfg.policy or "round_robin")
+    end
     local cached = _M.instances[name .. ":" .. key]
     if cached then
         return cached
@@ -403,6 +434,121 @@ function _M.for_model(cfg, model, hint, has_workers)
     end
     return inst
 end
+
+---Chain-resolve the policy name one call should use.
+---
+---With the config store present this is config_store.resolve_policy
+---(model_policies[model] > global policy > labels hint > SMG_POLICY); without it
+---the function keeps the historical hint -> cfg.policy chain, so a stripped-down
+---build behaves exactly as before the feature.
+---@param cfg table @ router config
+---@param model string|nil @ resolved model id (nil/""/default = global path)
+---@param hint string|nil @ labels.policy advertised by the model's first worker
+---@return string name, string layer
+local function chain_name(cfg, model, hint)
+    if store_ok and type(store.resolve_policy) == "function" then
+        local name, layer = store.resolve_policy((cfg and cfg.policy) or "round_robin",
+            model, hint)
+        if name then return name, layer end
+    end
+    if type(hint) == "string" and hint ~= "" then
+        return hint, "hint"
+    end
+    return (cfg and cfg.policy) or "round_robin", "env"
+end
+
+_M.chain_name = chain_name
+
+---Point an existing instance at another policy in place.
+---
+---The instance table identity matters: router.policy_for caches the global
+---instance in a file-local, and _M.instances caches per-model instances, so a
+---runtime policy change has to mutate the table every holder already references
+---rather than build a new one. Rebuilds the factory decisions for the new name
+---(built-in handler vs standalone module, unknown collapses to round_robin),
+---re-keys the instance registry, and re-seeds on the next select; the tree
+---snapshot for the new policy (same name+model key as an earlier run used) is
+---read back so flipping cache_aware -> random -> cache_aware restores affinity.
+---@param inst table
+---@param name string
+---@return string name @ the policy the instance now runs
+local function reconfigure(inst, name)
+    if inst:policy_name() == name then
+        return name
+    end
+    local cfg = inst.cfg or {}
+    local old_key = inst:name_instance()
+    local resolved = policies[name] and name or nil
+    local impl
+    if not resolved then
+        impl = build_module(name, cfg)
+        if impl then
+            resolved = name
+        else
+            resolved = "round_robin"
+        end
+    end
+    _M.instances[old_key] = nil
+    inst.name = resolved
+    inst.impl = impl
+    inst.seeded = false
+    inst.restored = false
+    inst.generation = -1
+    inst._next_adjust = nil
+    _M.instances[inst:name_instance()] = inst
+    if ngx and ngx.shared then
+        inst:restore_snapshot()
+    end
+    ngx.log(ngx.INFO, "luarouter: policy ", old_key, " switched in place to ", resolved)
+    return resolved
+end
+
+---Stamp the global instance with the policy the current request should use.
+---
+---router.policy_for returns its file-local default instance for every model
+---without a worker hint, so a per-model override for such a model has to land on
+---that shared table. Both consumers of the instance (policy_name/
+---needs_request_text at route time, select at forward time) call into policy.lua
+---first, and the whole request-pre → select window runs in one coroutine with no
+---yield between the stamp and the decision, so stamping per request keeps each
+---request's identity coherent even while the worker interleaves other requests.
+---When no override is configured at all this collapses to a single memoised
+---table lookup and the instance is never touched — the zero-behaviour-change
+---requirement for deployments that do not use the routing page.
+---@param inst table @ the instance router.policy_for is about to hand out
+---@return table inst
+local stamping_active = false
+
+---@param inst table
+---@param model string|nil @ explicit model (select passes ctx.model); falls back to ngx.ctx
+local function stamp_global(inst, model)
+    if not store_ok or type(store.policy_override_active) ~= "function" then
+        return inst
+    end
+    -- Once an operator has configured an override in this process's lifetime,
+    -- keep resolving on every request: after the last override is cleared the
+    -- instance has to walk back to the hint / SMG_POLICY chain, and an early
+    -- return here would leave it on the policy it was last stamped with.
+    if not stamping_active and not store.policy_override_active() then
+        return inst
+    end
+    stamping_active = true
+    if type(model) ~= "string" or model == "" or model == "unknown" then
+        model = ngx and ngx.ctx and ngx.ctx.lr_model
+        if model == "unknown" then model = nil end
+    end
+    -- Routing must survive a broken override read: on any error keep the
+    -- instance on the policy it already runs rather than 500 every request.
+    local ok, name = pcall(chain_name, inst.cfg or {}, model, nil)
+    if ok and name then
+        pcall(reconfigure, inst, name)
+    elseif not ok then
+        ngx.log(ngx.WARN, "luarouter: policy chain resolve failed: ", tostring(name))
+    end
+    return inst
+end
+
+_M.stamp_global = stamp_global
 
 ---Name reported to metrics and the request log (Rust Policy::name()).
 function _M:policy_name()
@@ -495,6 +641,12 @@ end
 ---@param ctx table @ {candidates, routing_key, request_text, model}
 ---@return table|nil worker
 function _M:select(ctx)
+    -- Decision point: router calls policy_for(model):select(...) in one
+    -- expression, so the instance that decides is stamped from the same model
+    -- the request will be logged against.
+    if self == _M.default and store_ok then
+        stamp_global(self, ctx.model)
+    end
     local candidates = ctx.candidates
     if not candidates or #candidates == 0 then
         observability.counter("smg_manual_policy_branch_total",
@@ -720,6 +872,12 @@ end
 ---init_worker (every worker) and, defensively, from router.policy_for.
 ---@return boolean|nil started, string|nil err
 function _M.start_eviction()
+    -- router.policy_for calls this on every request *before* it returns the
+    -- cached global instance, so it is the one hook every path goes through:
+    -- this is where a runtime policy change reaches the shared instance.
+    if _M.default then
+        stamp_global(_M.default)
+    end
     if eviction_started then
         return true
     end

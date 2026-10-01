@@ -2,13 +2,13 @@
   lua-router 管理控制台 · 主壳
 
   与 authz/admin 同构：左侧 q-drawer 菜单 + 右侧 iframe 承载独立应用页
-  （workers.html / models.html / logs.html），页面自带内联逻辑，壳只负责
+  （workers.html / models.html / routing.html / logs.html），页面自带内联逻辑，壳只负责
   导航、语言广播与网关健康摘要。零 Vue Router：#锚点 记录当前页，刷新可恢复。
 */
 const { computed, onBeforeUnmount, onMounted, ref } = Vue
 
-// 三个管理页 + 原版聊天界面（跳出壳，新标签打开）
-const pages = ['workers.html?v=1', 'models.html?v=1', 'logs.html?v=1']
+// 四个管理页 + 原版聊天界面（跳出壳，新标签打开）
+const pages = ['workers.html?v=1', 'models.html?v=1', 'routing.html?v=1', 'logs.html?v=1']
 
 function hashTarget () {
   const raw = String(window.location.hash || '').replace(/^#/, '')
@@ -56,7 +56,8 @@ const app = Vue.createApp({
           items: [
             { id: 'workers', page: pages[0], icon: 'mdi-server-network', label: dict.workers, note: dict.workersTitle },
             { id: 'models', page: pages[1], icon: 'mdi-sitemap', label: dict.models, note: dict.modelsTitle },
-            { id: 'logs', page: pages[2], icon: 'mdi-text-box-search-outline', label: dict.logs, note: dict.logsTitle }
+            { id: 'routing', page: pages[2], icon: 'mdi-call-split', label: dict.routing, note: dict.routingTitle },
+            { id: 'logs', page: pages[3], icon: 'mdi-text-box-search-outline', label: dict.logs, note: dict.logsTitle }
           ]
         },
         {
@@ -109,7 +110,8 @@ const app = Vue.createApp({
       const dict = window.lmrI18n.messages[locale.value].shell
       if (activeApp.value.startsWith(pages[0])) activeTitle.value = dict.workers
       else if (activeApp.value.startsWith(pages[1])) activeTitle.value = dict.models
-      else if (activeApp.value.startsWith(pages[2])) activeTitle.value = dict.logs
+      else if (activeApp.value.startsWith(pages[2])) activeTitle.value = dict.routing
+      else if (activeApp.value.startsWith(pages[3])) activeTitle.value = dict.logs
       else activeTitle.value = dict.frameTitle
     }
 
