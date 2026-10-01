@@ -1,0 +1,31 @@
+{
+  "apiVersion": "v1",
+  "kind": "PodList",
+  "metadata": {"resourceVersion": "1003"},
+  "items": [
+    {
+      "metadata": {
+        "name": "sglang-regular-0",
+        "namespace": "team-a",
+        "labels": {"app": "other-stack", "gpu": "l40", "shard": "0"}
+      },
+      "status": {
+        "phase": "Running",
+        "podIP": "127.0.0.1",
+        "conditions": [{"type": "Ready", "status": "True"}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "sglang-regular-1",
+        "namespace": "team-a",
+        "labels": {"app": "sglang", "gpu": "l40", "shard": "1"}
+      },
+      "status": {
+        "phase": "Running",
+        "podIP": "127.0.0.2",
+        "conditions": [{"type": "Ready", "status": "True"}]
+      }
+    }
+  ]
+}

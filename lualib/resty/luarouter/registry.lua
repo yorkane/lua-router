@@ -1,0 +1,1893 @@
+-- Worker registry backed by ngx.shared.DICT (lr_workers).
+--
+-- Mirrors the Rust gateway's core::{WorkerRegistry, JobQueue} contract:
+--   * POST /workers reserves an id, queues a background job and answers 202
+--   * the id is sha224(url) hex truncated to 32 chars, rendered as a UUID, so
+--     the same URL always maps to the same id
+--   * re-registering a live URL is not an HTTP error: the job fails with
+--     "Worker <url> already exists" and GET /workers/{id} exposes job_status
+--   * DELETE releases the url -> id mapping so the URL can be re-added
+--
+-- Static per-worker fields live in one JSON value under w:<id>; the fields that
+-- change on every request (health, circuit breaker, load) are separate numeric
+-- keys so they can be touched without decoding the JSON.
+--
+-- Being numeric is not the same as being race-free: several nginx worker
+-- processes charge the same worker concurrently, so every counter that means
+-- "consecutive" must be accumulated with shdict:incr() (see charge_cb) and any
+-- state flip must be re-checked under the registry lock (see flip_cb). A
+-- get()/set() pair there loses updates across processes.
+
+local cjson = require "cjson.safe"
+local lock_mod = require "resty.lock"
+
+-- service_discovery holds the url/rank and pod -> worker decision functions,
+-- which are plain Lua and carry no dependency on this module at load time (it
+-- reaches back through require() inside its own call paths), so importing it
+-- here cannot form a cycle.
+local discovery_mod
+local function sd()
+    if discovery_mod == nil then
+        local ok, mod = pcall(require, "resty.luarouter.service_discovery")
+        discovery_mod = ok and mod or false
+    end
+    return discovery_mod or nil
+end
+
+local _M = { _VERSION = "0.1.0" }
+
+local DICT_NAME = "lr_workers"
+local LOCK_DICT = "lr_locks"
+local IDS_KEY = "ids"
+
+local json_encode = cjson.encode
+local json_decode = cjson.decode
+
+-- key prefixes
+local K_WORKER = "w:"    -- static record (JSON)
+local K_HEALTH = "hl:"   -- 1 healthy / 0 unhealthy
+local K_HFAIL = "hf:"    -- consecutive health-check failures
+local K_HSUCC = "hs:"    -- consecutive health-check successes
+local K_CBSTATE = "cbs:" -- 0 closed, 1 half_open, 2 open
+local K_CBF = "cbf:"     -- consecutive breaker failures
+local K_CBS = "cbu:"     -- consecutive breaker successes
+local K_CBO = "cbo:"     -- ms timestamp when the breaker opened
+local K_LOAD = "lo:"     -- in-flight requests
+local K_URL2ID = "url:"  -- url -> id
+local K_IDURL  = "u:"    -- id -> url (cheap label lookup for metrics)
+local K_JOB = "job:"     -- url -> JobStatus JSON
+local K_DISC = "disc:"   -- id -> metadata discovery attempts
+local K_DPROBE = "dpr:"  -- id -> /server_info probes spent on DP expansion
+-- Cached "this record may serve the HTTP inference plane" flag (see
+-- _M.http_selectable). A derived value, recomputed whenever the static record is
+-- written, so the selection path never has to decode the record to ask.
+local K_HSEL = "isel:"
+
+-- Numeric codes follow the Rust metric encoding (gateway/src/core/
+-- circuit_breaker.rs STATE_CLOSED=0, STATE_OPEN=1, STATE_HALF_OPEN=2) so
+-- smg_worker_cb_state means the same thing on both gateways. Lua-side ordering
+-- assumptions must use the constants, never the numbers.
+_M.CB_CLOSED = 0
+_M.CB_OPEN = 1
+_M.CB_HALF_OPEN = 2
+
+local CB_STATE_NAME = { "closed", "open", "half_open" }
+_M.CB_STATE_NAME = CB_STATE_NAME
+
+-- ngx.shared.DICT is resolved lazily so the module also loads under `resty -t`.
+local dict
+
+local function shdict()
+    if dict == nil then
+        dict = ngx.shared[DICT_NAME]
+    end
+    return dict
+end
+
+local function with_lock(fn)
+    local lock, err = lock_mod:new(LOCK_DICT, { timeout = 5, exptime = 10 })
+    if not lock then
+        return nil, "lock init failed: " .. tostring(err)
+    end
+    local ok, err = lock:lock("registry")
+    if not ok then
+        return nil, "lock failed: " .. tostring(err)
+    end
+    local res, ferr = pcall(fn)
+    lock:unlock()
+    if not res then
+        return nil, "registry operation failed: " .. tostring(ferr)
+    end
+    return true
+end
+
+-- ------------------------------------------------------------------ worker id
+
+local digest_mod
+
+--- sha224(url) hex, first 32 chars, rendered in 8-4-4-4-12 UUID form.
+---@param url string
+---@return string
+function _M.worker_id_for_url(url)
+    if not digest_mod then
+        digest_mod = require "resty.openssl.digest"
+    end
+    local d, err = digest_mod.new("sha224")
+    if not d then
+        error("sha224 unavailable: " .. tostring(err))
+    end
+    local ok, uerr = d:update(url)
+    if not ok then
+        error("sha224 update failed: " .. tostring(uerr))
+    end
+    local raw, ferr = d:final()
+    if not raw then
+        error("sha224 final failed: " .. tostring(ferr))
+    end
+    local hex = {}
+    for i = 1, #raw do
+        hex[#hex + 1] = string.format("%02x", string.byte(raw, i))
+    end
+    local h = table.concat(hex):sub(1, 32)
+    return string.format("%s-%s-%s-%s-%s",
+        h:sub(1, 8), h:sub(9, 12), h:sub(13, 16), h:sub(17, 20), h:sub(21, 32))
+end
+
+local UUID_RE = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+---@param raw string
+---@return string|nil id, string|nil err
+function _M.parse_worker_id(raw)
+    if type(raw) ~= "string" or raw == "" then
+        return nil, "empty worker_id"
+    end
+    local candidate = string.lower(raw)
+    if not ngx.re.match(candidate, UUID_RE, "jo") then
+        return nil, string.format("Invalid worker_id '%s' (expected UUID)", raw)
+    end
+    return candidate
+end
+
+-- ------------------------------------------------------------------ url parse
+
+---@param url string
+---@return string|nil normalized, string|nil err
+function _M.normalize_url(url)
+    if type(url) ~= "string" or url == "" then
+        return nil, "url is required"
+    end
+    if not ngx.re.match(url, [[^https?://]], "jo") then
+        url = "http://" .. url
+    end
+    -- strip trailing slashes so http://h:p/ and http://h:p are one worker
+    url = ngx.re.gsub(url, [[/+$/]], "", "jo")
+    if not ngx.re.match(url, [[^https?://[^/]+]], "jo") then
+        return nil, "invalid worker url: " .. url
+    end
+    return url
+end
+
+---Strip a DP rank suffix from the *authority* of a url.
+---
+---The rank is scheduler identity, not transport identity: every rank of a
+---data-parallel engine is served by the same listener, so connecting to
+---"http://10.0.0.5:30000@2" means connecting to 10.0.0.5:30000 and telling the
+---engine which rank to route to inside the request (Rust does the same through
+---BasicWorker::normalised_url, gateway/src/core/worker.rs:680, which strips the
+---suffix before every outgoing call). Stripping happens here rather than in each
+---caller because every cosocket path in the router resolves through this one
+---function - the health sweep, the fan-out probes and the forwarding connect.
+---
+---Only the authority is touched, and only when it ends in "@<digits>": call sites
+---concatenate a path onto the worker url before dialing it (record.url ..
+---"/health", .. "/metrics", .. "/v1/loads"), so the suffix is rarely at the end of
+---the string that arrives here, and a userinfo "user:pw@host" must survive because
+---its tail is not digits.
+---@param url string
+---@return string url
+local function strip_rank(url)
+    if type(url) ~= "string" then
+        return url
+    end
+    local scheme, rest = url:match("^(%a[%w+.-]*)://(.*)$")
+    local prefix = scheme and (scheme .. "://") or ""
+    local body = rest or url
+    local authority, tail = body:match("^([^/]*)(.*)$")
+    local without = authority:match("^(.-)@%d+$")
+    return prefix .. (without or authority) .. tail
+end
+
+_M.strip_rank = strip_rank
+
+---DP rank carried by a url, or nil when it is a plain (non-rank) url.
+---
+---Also the expansion guard: a url that already ends in a rank is a rank, so it
+---must never be expanded again. That matters for a rank deleted and re-added
+---through POST /workers, which arrives without the dp_* record fields and would
+---otherwise be re-expanded into "<base>@<rank>@0..N".
+---@param url string
+---@return number|nil rank
+function _M.rank_of(url)
+    local stripped = strip_rank(url)
+    if stripped == url then
+        return nil
+    end
+    return tonumber(url:match("@(%d+)$"))
+end
+
+---@param url string @normalized
+---@return string host, number port, boolean tls
+function _M.split_url(url)
+    url = strip_rank(url)
+    local m = ngx.re.match(url, [==[^https?://([^/]+)]==], "jo")
+    local tls = ngx.re.match(url, [[^https://]], "jo") and true or false
+    local text = m[1]
+    local parts = ngx.re.match(text,
+        [==[^(\[[0-9a-fA-F:]+\]|[^:\]]+)(?::(\d+))?$]==], "jo")
+    if not parts then
+        return text, tls and 443 or 80, tls
+    end
+    return parts[1], tonumber(parts[2]) or (tls and 443 or 80), tls
+end
+
+---Upgrade a connected cosocket to TLS.
+---
+---OpenResty's tcp cosocket in an http{} context ignores the `ssl` option of
+---`connect` (it is only honoured by stream and by the explicit handshake), so an
+---https worker used to be contacted in cleartext and the upstream answered
+---400 "The plain HTTP request was sent to HTTPS port". Every https call path
+---therefore has to shake hands explicitly after connecting. SNI carries the
+---worker host and the certificate is not verified, which keeps the previous
+---`ssl_verify = false` intent (internal workers ship self-signed certs).
+---@param sock table @ connected ngx.socket.tcp()
+---@param host string
+---@param tls boolean|nil
+---@return boolean ok, string|nil err
+function _M.tls_handshake(sock, host, tls)
+    if not tls then
+        return true
+    end
+    local ok, err = sock:sslhandshake(nil, host, false)
+    if not ok then
+        return nil, "TLS handshake failed: " .. tostring(err)
+    end
+    return true
+end
+
+-- ------------------------------------------------------------------ pool
+
+---Cosocket pool name for one outbound target.
+---
+---OpenResty pools sockets by the `pool` string plus the connect address, so the
+---name only has to keep the parts nginx cannot see apart: the caller class (a
+---health probe must not hand a socket to the inference path and vice versa) and
+---the TLS state, because a pooled cleartext socket reused for an https worker (or
+---the other way round) is a protocol error rather than a slow start. host:port is
+---carried for readability: nginx still keys the pool by it internally, and a
+---shared name across hosts would be correct but impossible to reason about from
+---`nginx -V` output or a stack trace.
+---@param kind string @ "forward" | "stream" | "hb" | "mesh" | "store" | "probe"
+---@param url string @ normalized worker/peer url
+---@return string
+function _M.pool_name(kind, url)
+    local host, port, tls = _M.split_url(url)
+    return "lr:" .. kind .. ":" .. (tls and "s" or "c") .. ":" .. host .. ":" .. port
+end
+
+---Connect options for one outbound call: a named pool plus TCP keepalive.
+---
+---`pool_size` is cosocket's *per nginx process* idle ceiling for this pool name,
+---which is the closest thing to reqwest's pool_max_idle_per_host (one number for
+---the whole gateway process). doc/gap-http-semantics.md §5 spells out the
+---difference. `so_keepalive` maps reqwest's single tcp_keepalive interval onto
+---the three Linux knobs: idle, interval and probe count.
+---@param cfg table @ router config
+---@param kind string
+---@param url string
+---@return table opts @ ready for sock:connect(host, port, opts)
+function _M.pool_opts(cfg, kind, url)
+    local host, port, tls = _M.split_url(url)
+    local keep = cfg.tcp_keepalive_secs or 30
+    return {
+        pool = _M.pool_name(kind, url),
+        pool_size = cfg.pool_max_idle_per_host or 500,
+        so_keepalive = {
+            idle = keep,
+            interval = keep,
+            count = 3,
+            always_send = true,
+        },
+    }
+end
+
+---Idle TTL in milliseconds for setkeepalive() on a pooled socket.
+---@param cfg table
+---@return number
+function _M.pool_idle_ms(cfg)
+    return (cfg.pool_idle_timeout_secs or 50) * 1000
+end
+
+---Read a chunked body to the end, including the terminating chunk and the
+---trailer block.
+---
+---The pool only works if the socket is left at a message boundary: setkeepalive()
+---answers "unread data in buffer" for anything else, and every helper that used to
+---stop after the "0" size line silently lost its keepalive that way (the CRLF
+---before the trailer and the trailer's own CRLF were never consumed). Reading the
+---trailer is also required for correctness, because a trailer field is legal HTTP
+---and a leftover would be parsed as the next response's status line on a reused
+---connection.
+---@param sock table @ connected cosocket
+---@param collect boolean|nil @ false drops the payload (drain path)
+---@return string body, boolean complete @ false when the stream broke off early
+function _M.pump_chunked(sock, collect)
+    local buffer = {}
+    local complete = false
+    while true do
+        local size_line = sock:receive("*l")
+        if not size_line then
+            break
+        end
+        local size = tonumber(string.match(size_line, "^%x+") or "", 16)
+        if not size then
+            break
+        end
+        if size == 0 then
+            complete = true
+            break
+        end
+        local chunk = sock:receive(size)
+        if not chunk then
+            break
+        end
+        if collect ~= false then
+            buffer[#buffer + 1] = chunk
+        end
+        local crlf = sock:receive(2)
+        if not crlf or crlf == "" then
+            break
+        end
+    end
+    if complete then
+        -- Trailer headers, if any, run until the blank line that closes them.
+        while true do
+            local line = sock:receive("*l")
+            if line == nil or line == "" then
+                break
+            end
+        end
+    end
+    return table.concat(buffer), complete
+end
+
+---Whether a response may leave its connection in the pool.
+---
+---Two conditions, both borrowed from what reqwest does with a pooled client: the
+---message body has to be consumed to its declared end, and the peer must not have
+---asked to be disconnected. A `Connection: close` response that got pooled is a
+---socket the server has already forgotten, and the next request on it fails with
+---"connection reset by peer" one layer down where it is invisible to the retry loop.
+---@param headers table @ lowercase response header table
+---@param complete boolean @ the body reached its framing boundary
+---@return boolean
+function _M.response_reusable(headers, complete)
+    if not complete then
+        return false
+    end
+    local connection = headers and headers["connection"]
+    if type(connection) == "string"
+        and ngx.re.find(connection, [[\bclose\b]], "ijo") then
+        return false
+    end
+    return true
+end
+
+---Return a fully-consumed socket to its pool, or close it.
+---
+---The Rust pool hands a connection back only after the response was consumed in
+---full; anything else (a broken stream, a body we deliberately dropped) is closed.
+---Failure to keep alive is treated the same way - cosocket then already discarded
+---the fd, so a second close is harmless.
+---@param sock table
+---@param cfg table|nil @ router config; nil closes
+---@param reusable boolean @ the caller's verdict on the stream state
+---@param kind string|nil @ pool class, for the pool_size argument
+---@param url string|nil @ target url, for the pool_size argument
+---@return boolean kept
+function _M.release(sock, cfg, reusable, kind, url)
+    if reusable and cfg then
+        local pool_size
+        if kind and url then
+            pool_size = _M.pool_opts(cfg, kind, url).pool_size
+        end
+        local ok = sock:setkeepalive(_M.pool_idle_ms(cfg), pool_size)
+        if ok then
+            return true
+        end
+    end
+    sock:close()
+    return false
+end
+
+
+-- ------------------------------------------------------------------ policy hint
+
+---Routing hint advertised by a worker of one model (labels.policy), plus how many
+---workers the model has.
+---
+---The Rust gateway reads the hint once, when the worker joins
+---(core/steps/worker/shared/update_policies.rs:102 -> policies/registry.rs:66
+---on_worker_added), and keeps it for as long as the model has a worker; the entry
+---goes away with the last one (registry.rs:111). The worker records are this
+---router's durable copy, so the lookup re-reads them: that survives a restart and
+---an nginx reload without a second store, and the first hinted worker of a model
+---still wins because the id list is registration-ordered.
+---@param model_id string|nil
+---@return string|nil hint, number worker_count
+function _M.policy_hint_for_model(model_id)
+    if type(model_id) ~= "string" or model_id == "" then
+        return nil, 0
+    end
+    local records = _M.records()
+    local hint, count = nil, 0
+    for i = 1, #records do
+        local record = records[i]
+        if record.model_id == model_id then
+            count = count + 1
+            if not hint then
+                local labels = record.labels
+                if type(labels) == "table" then
+                    local candidate = labels.policy
+                    if type(candidate) == "string" and candidate ~= "" then
+                        hint = candidate
+                    end
+                end
+            end
+        end
+    end
+    return hint, count
+end
+
+-- ------------------------------------------------------------------ id index
+
+local function read_ids(d)
+    local raw = d:get(IDS_KEY)
+    if not raw or raw == "" then
+        return {}
+    end
+    local ids = {}
+    for id in string.gmatch(raw, "[^,]+") do
+        ids[#ids + 1] = id
+    end
+    return ids
+end
+
+local function write_ids(d, ids)
+    if #ids == 0 then
+        d:delete(IDS_KEY)
+        return
+    end
+    local ok, err = d:set(IDS_KEY, table.concat(ids, ","))
+    if not ok then
+        error("failed to persist worker id index: " .. tostring(err))
+    end
+end
+
+-- ------------------------------------------------------------------ CRUD
+
+-- The Rust worker spec models both knobs as enums (core/worker.rs:423-436 and
+-- :514-525): WorkerType is Regular | Prefill{bootstrap_port} | Decode and
+-- ConnectionMode is the internally-tagged {type:"http"} / {type:"grpc",port:n}.
+--
+-- The gRPC/PD variants are only accepted when the gRPC plane is enabled
+-- (SMG_GRPC=1, which is also what makes the entrypoint render the gRPC
+-- listener). With the plane off they answer 400 exactly as before, so a
+-- deployment that cannot serve them never stores a worker it would then have to
+-- ignore - and the shipped contract suite, which pins those 400s, keeps its
+-- meaning. When the plane is on both variants are stored, the value domain stays
+-- strict (an unknown type is a 400 rather than Rust's silent collapse to
+-- Regular), and the HTTP inference plane still only ever selects
+-- http + regular (see _M.is_available / _M.pool_records).
+_M.WORKER_TYPES = { regular = true, prefill = true, decode = true }
+_M.CONNECTION_MODES = { http = true, grpc = true, grpcs = true }
+
+---Is the gRPC plane enabled? Read through the router config when available so a
+---runtime toggle is picked up, and fall back to the environment for the pure-Lua
+---unit runs (no ngx, no init phase).
+---@return boolean
+function _M.grpc_enabled()
+    local ok, lr = pcall(require, "resty.luarouter")
+    if ok and lr and lr.config then
+        local good, conf = pcall(lr.config)
+        -- Only trust the config snapshot when it actually carries the knob: the
+        -- router config belongs to another agent's file, so the environment is the
+        -- source of truth until (if ever) enable_grpc joins it.
+        if good and conf and type(conf.enable_grpc) == "boolean" then
+            return conf.enable_grpc
+        end
+    end
+    local raw = os.getenv("SMG_GRPC")
+    if raw == nil then
+        raw = os.getenv("SMG_GRPC_PORT")
+    end
+    if raw == nil or raw == "" or raw == "0" then
+        return false
+    end
+    local lowered = string.lower(raw)
+    return lowered == "1" or lowered == "true" or lowered == "yes" or lowered == "on"
+end
+
+---Lower-case a knob to its canonical spelling, or nil when unrecognised.
+local function keyword(value, allowed)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local lowered = string.lower(value)
+    if allowed[lowered] then
+        return lowered
+    end
+    return nil
+end
+
+---Normalised worker_type for a POST /workers body.
+---@param value any
+---@return string|nil kind @ nil = regular
+---@return string|nil err
+function _M.parse_worker_type(value)
+    if value == nil or value == cjson.null then
+        return nil
+    end
+    if type(value) ~= "string" then
+        return nil, 'worker_type must be a string (only "regular" is supported)'
+    end
+    local kind = keyword(value, _M.WORKER_TYPES)
+    if not kind then
+        return nil, 'unsupported worker_type "' .. value
+            .. '" (only "regular" is supported by the Lua router)'
+    end
+    if kind == "regular" then
+        return nil
+    end
+    if not _M.grpc_enabled() then
+        return nil, 'unsupported worker_type "' .. value
+            .. '" (only "regular" is supported by the Lua router)'
+    end
+    return kind
+end
+
+---Bootstrap port for a prefill worker: the enum field of the Rust
+---WorkerType::Prefill, accepted either as a top-level `bootstrap_port` or inside
+---`labels` (what llm-watcher writes). pd.bootstrap_port_of reads the label form.
+---@param req table
+---@return number|nil port
+---@return string|nil err
+function _M.parse_bootstrap_port(req)
+    local labels = type(req.labels) == "table" and req.labels or {}
+    local raw = req.bootstrap_port
+    if raw == nil or raw == cjson.null then
+        raw = labels.bootstrap_port
+    end
+    if raw == nil or raw == cjson.null or raw == "" then
+        return nil
+    end
+    local port = tonumber(raw)
+    if not port or port ~= math.floor(port) or port < 1 or port > 65535 then
+        return nil, "bootstrap_port must be an integer port in 1-65535"
+    end
+    return port
+end
+
+---Normalised connection mode plus the gRPC target it implies.
+---
+---Accepted spellings (all three come from the wild):
+---  * serde tagged object  {"type":"grpc","port":20000}
+---  * plain string         "http" | "grpc" | "grpcs"
+---  * url scheme           grpc://h:p / grpcs://h:p (Rust config accepts those)
+---The record always keeps an http(s) url - every existing plane (health probe,
+---/v1/loads, /flush_cache, the UI) concatenates onto it - and the gRPC address
+---lives in grpc_port/grpc_tls, which is also what grpc_proxy.target_for reads.
+---@param value any @ req.connection_mode
+---@param url string|nil @ raw req.url, for the scheme form
+---@return string mode @ "http" | "grpc" | "grpcs"
+---@return number|nil grpc_port
+---@return string|nil err
+function _M.parse_connection_mode(value, url)
+    local kind, port
+    if value == nil or value == cjson.null then
+        kind = nil
+    elseif type(value) == "string" then
+        kind = value
+    elseif type(value) == "table" then
+        -- serde internally-tagged shape: {"type":"http"} or {"type":"grpc",...}
+        kind = value.type or value["mode"]
+        port = value.port
+        if type(kind) ~= "string" then
+            return "http", nil, 'connection_mode object must carry a string "type"'
+        end
+    else
+        return "http", nil,
+            "connection_mode must be a string or an object with a type key"
+    end
+
+    local mode
+    if kind == nil then
+        mode = "http"
+    else
+        mode = keyword(kind, _M.CONNECTION_MODES)
+        if not mode then
+            return "http", nil, "unsupported connection_mode \"" .. kind
+                .. "\" (only \"http\" is supported by the Lua router)"
+        end
+        if mode ~= "http" and not _M.grpc_enabled() then
+            return "http", nil, "unsupported connection_mode \"" .. mode
+                .. "\" (only \"http\" is supported by the Lua router)"
+        end
+    end
+
+    -- grpc:// and grpcs:// in the url carry both the mode and the port.
+    local scheme = type(url) == "string" and url:match("^(%a[%w+.-]*)://") or nil
+    if scheme then
+        scheme = string.lower(scheme)
+        if scheme == "grpc" or scheme == "grpcs" then
+            if kind ~= nil and mode ~= "grpc" and mode ~= "grpcs" then
+                return "http", nil, "connection_mode \"" .. tostring(kind)
+                    .. "\" contradicts the " .. scheme .. ":// url scheme"
+            end
+            if not _M.grpc_enabled() then
+                return "http", nil, "unsupported connection_mode \"" .. scheme
+                    .. "\" (only \"http\" is supported by the Lua router)"
+            end
+            mode = scheme
+        end
+    end
+    if mode ~= "grpc" and mode ~= "grpcs" then
+        return "http", nil
+    end
+
+    -- The port may also arrive as labels.grpc_port (sglang exposes gRPC on its
+    -- own port beside the HTTP one); that fallback lives in _M.add, where the
+    -- labels table is validated, and a grpc(s):// url carries it implicitly.
+    local target = port
+    if target == cjson.null then
+        target = nil
+    end
+    if target ~= nil then
+        local number = tonumber(target)
+        if not number or number ~= math.floor(number) or number < 1 or number > 65535 then
+            return "http", nil, "connection_mode port must be an integer in 1-65535"
+        end
+        target = number
+    end
+    if not target and type(url) == "string"
+        and (url:lower():match("^grpc") or url:lower():match("^grpcs")) then
+        -- Only a grpc(s):// url carries the gRPC port implicitly: the port of an
+        -- http:// url is the *HTTP* face, and reading it as a gRPC target would
+        -- dial the wrong service (an http url with no grpc port anywhere is a
+        -- registration error, answered 400 below).
+        local authority = url:match("^[^:/?#]+://([^/?#]+)")
+        if authority then
+            local port_text = authority:match(":([%d]+)$")
+            if port_text then
+                target = tonumber(port_text)
+            end
+        end
+    end
+    return mode, target
+end
+
+---Store-ready url: grpc:// / grpcs:// are rewritten into the http(s) form the
+---rest of the router speaks, because the record url doubles as the health-probe
+---and control-plane target. The gRPC address survives in grpc_port/grpc_tls.
+---@param url string
+---@return string|nil normalized, string|nil err
+function _M.parse_spec_url(url)
+    if type(url) ~= "string" or url == "" then
+        return nil, "url is required"
+    end
+    local scheme = url:match("^(%a[%w+.-]*)://")
+    if scheme then
+        scheme = string.lower(scheme)
+        if scheme == "grpc" then
+            url = "http://" .. url:sub(#scheme + 4)
+        elseif scheme == "grpcs" then
+            url = "https://" .. url:sub(#scheme + 4)
+        end
+    end
+    return _M.normalize_url(url)
+end
+
+---Non-empty string or nil, so an optional WorkerSpec field is absent rather than
+---cjson.null on the record (the capability readers test type() == "string").
+local function string_field(value)
+    if type(value) == "string" and value ~= "" then
+        return value
+    end
+    return nil
+end
+
+---Queue the registration of a worker (202 semantics live in router.lua).
+---@param req table @ decoded POST /workers body
+---@param cfg table @ router config providing the health-check defaults
+---@return table|nil result @ {id, url, location, status}
+---@return string|nil err
+---@return string|nil kind @ "validation" for client-side rejections (400)
+-- ------------------------------------------------------------------ mesh mirror
+--
+-- The cluster view (doc/gap-mesh.md 4.2) is a mirror of these records and has to
+-- follow every write: the boot seed, a control-plane POST/PUT/DELETE, metadata
+-- discovery and a health flip. router.lua used to be the only caller (from inside
+-- its own /workers handlers), which left every other write path - above all
+-- SMG_WORKER_URLS - invisible to peers, and left a mirrored worker frozen at the
+-- record as it stood at registration time (health false, model unknown). Hooking
+-- the registry's own write paths means a new one cannot forget it again.
+--
+-- mesh is required lazily and every step is guarded: the pure-Lua unit tests load
+-- this module without ngx, and with the mesh off there is no instance to write to.
+---@param id string
+local function mesh_mirror(id)
+    if not ngx or not ngx.shared then
+        return false
+    end
+    local ok, mesh_mod = pcall(require, "resty.luarouter.mesh")
+    if not ok or type(mesh_mod) ~= "table"
+        or type(mesh_mod.instance) ~= "function" then
+        return false
+    end
+    local inst = mesh_mod.instance()
+    if not inst then
+        return false
+    end
+    return inst:observe_worker(id, _M.get(id), _M.cb_state(id))
+end
+
+---Delete-side half: drop the key once the record is gone.
+---@param id string
+local function mesh_forget(id)
+    if not ngx or not ngx.shared then
+        return false
+    end
+    local ok, mesh_mod = pcall(require, "resty.luarouter.mesh")
+    if not ok or type(mesh_mod) ~= "table"
+        or type(mesh_mod.instance) ~= "function" then
+        return false
+    end
+    local inst = mesh_mod.instance()
+    if not inst or type(inst.remove_worker) ~= "function" then
+        return false
+    end
+    return inst:remove_worker(id)
+end
+
+function _M.add(req, cfg)
+    if type(req) ~= "table" then
+        return nil, "invalid worker config", "validation"
+    end
+    local worker_type, type_err = _M.parse_worker_type(req.worker_type)
+    if type_err then
+        return nil, type_err, "validation"
+    end
+    local mode, grpc_port, mode_err = _M.parse_connection_mode(req.connection_mode, req.url)
+    if mode_err then
+        return nil, mode_err, "validation"
+    end
+    local grpc_only_scheme = false
+    do
+        local scheme = type(req.url) == "string"
+            and string.lower(req.url:match("^(%a[%w+.-]*)://") or "") or ""
+        grpc_only_scheme = (scheme == "grpc" or scheme == "grpcs")
+    end
+    local bootstrap_port, berr = _M.parse_bootstrap_port(req)
+    if berr then
+        return nil, berr, "validation"
+    end
+    if worker_type == "decode" and bootstrap_port then
+        -- Rust's WorkerType::Decode carries no bootstrap port, so a decode worker
+        -- that names one is a spec error rather than an ignored field.
+        return nil, "bootstrap_port is only valid for worker_type=\"prefill\"",
+            "validation"
+    end
+    if worker_type and grpc_only_scheme and mode ~= "http" then
+        -- A prefill/decode worker that cannot be probed would leave /readiness
+        -- unable to answer the one question PD mode asks ("is each pool alive"):
+        -- this gateway cannot speak grpc.health.v1, and a decode worker receives no
+        -- traffic of its own, so the circuit breaker never learns anything about it
+        -- either. Registered with an http(s) url (plus connection_mode.port or
+        -- labels.grpc_port for the gRPC face), the normal sweep supplies the signal.
+        return nil, "worker_type " .. worker_type .. " needs an http(s) url to be "
+            .. "health-probed: register the engine url and put the gRPC port in "
+            .. "connection_mode.port or labels.grpc_port", "validation"
+    end
+    -- A grpc worker with no usable target would be registered but unreachable, so
+    -- the port has to come from somewhere: the tagged object, the url scheme, or
+    -- labels.grpc_port (the sglang convention: one http url, gRPC on its own port).
+    local labels_in = type(req.labels) == "table" and req.labels or {}
+    if (mode == "grpc" or mode == "grpcs") and not grpc_port then
+        local labelled = tonumber(labels_in.grpc_port)
+        if labelled and labelled == math.floor(labelled)
+            and labelled >= 1 and labelled <= 65535 then
+            grpc_port = labelled
+        end
+    end
+    if (mode == "grpc" or mode == "grpcs") and not grpc_port
+        and not (type(req.url) == "string" and req.url:match("^grpc"))
+        and not (type(req.url) == "string" and req.url:match("^grpcs")) then
+        return nil, "connection_mode grpc needs a port: connection_mode.port, "
+            .. "a grpc(s):// url, or labels.grpc_port", "validation"
+    end
+    local url, err = _M.parse_spec_url(req.url)
+    if not url then
+        return nil, err, "validation"
+    end
+    -- A worker registered as grpc:// or grpcs:// has no HTTP face at all, and the
+    -- health sweep (hb.check_all) speaks HTTP/1.1 GET <url><endpoint>. Left as is,
+    -- such a worker would fail every probe and never become selectable, so the
+    -- bare-gRPC-scheme form is registered without a probe: reachability is then
+    -- judged by the circuit breaker from real calls (grpc_proxy.on_log charges it),
+    -- which is what a TCP-open-but-dead endpoint can be judged by at all. Only a
+    -- *regular* worker may take that form - see the PD rule above, which needs a
+    -- probe because a decode worker never receives a call of its own. The sglang
+    -- convention (an http url plus labels.grpc_port) keeps the HTTP probe.
+
+    local id = _M.worker_id_for_url(url)
+
+    local ok, lerr = with_lock(function()
+        local d = shdict()
+        if d:get(K_URL2ID .. url) then
+            -- Idempotent: the URL keeps its id and the duplicate surfaces as a
+            -- failed job, matching the Rust create_worker step.
+            _M.set_job(url, "add_worker", "failed",
+                string.format("Worker %s already exists", url))
+            return
+        end
+        local record = {
+            id = id,
+            url = url,
+            model_id = req.model_id or (type(req.labels) == "table"
+                and req.labels.served_model_name) or "unknown",
+            priority = tonumber(req.priority) or 50,
+            cost = tonumber(req.cost) or 1.0,
+            worker_type = worker_type or "regular",
+            connection_mode = mode,
+            -- Only set on grpc workers: the address grpc_pass dials. Kept beside
+            -- the record (rather than only in labels) so pd/grpc_proxy do not
+            -- have to re-parse the tag on every request.
+            grpc_port = grpc_port,
+            grpc_tls = (mode == "grpcs") or nil,
+            bootstrap_port = bootstrap_port,
+            api_key = req.api_key,
+            labels = type(req.labels) == "table" and req.labels or {},
+            -- Model-card capabilities (core/model_card.rs, previously
+            -- WorkerMetadata.labels): the tokenizer and parser proxies in
+            -- resty.luarouter.{tokenizer,parse} read these three names to decide
+            -- which worker may serve /v1/tokenize and /parse/*. Kept as plain
+            -- strings so a missing field stays absent rather than cjson.null.
+            tokenizer_path = string_field(req.tokenizer_path),
+            tool_parser = string_field(req.tool_parser),
+            reasoning_parser = string_field(req.reasoning_parser),
+            vocab_size = tonumber(req.vocab_size),
+            disable_health_check = (req.disable_health_check and true)
+                or (cfg.disable_health_check and true)
+                or grpc_only_scheme or false,
+            -- Set only on the grpc-only form, so /workers can explain why a
+            -- worker reports healthy without ever having been probed.
+            health_probe = grpc_only_scheme and "none" or nil,
+            registered_at = ngx.time(),
+            -- Discovery provenance and DP identity. Both are copied onto the
+            -- record (rather than inferred from labels) because they are read on
+            -- every reconcile / expansion and must not be editable through a
+            -- PUT /workers label patch. `discovery` is the source name
+            -- ("kubernetes"), dp_* describe a rank of a data-parallel engine.
+            discovery = string_field(req.discovery),
+            dp_rank = tonumber(req.dp_rank),
+            dp_size = tonumber(req.dp_size),
+            dp_base_url = string_field(req.dp_base_url),
+            -- Copied from the router defaults: the Rust gateway ignores the
+            -- per-worker health knobs on POST too, because build_health_config
+            -- reads app_context.router_config only.
+            health_check_timeout_secs = cfg.health_check_timeout_secs,
+            health_check_interval_secs = cfg.health_check_interval_secs,
+            health_success_threshold = cfg.health_success_threshold,
+            health_failure_threshold = cfg.health_failure_threshold,
+        }
+        local encoded = json_encode(record)
+        if not encoded then
+            error("failed to encode worker record")
+        end
+        local stored, serr = d:set(K_WORKER .. id, encoded)
+        if not stored then
+            error("failed to store worker record: " .. tostring(serr))
+        end
+        d:set(K_URL2ID .. url, id)
+        d:set(K_IDURL .. id, url)
+        d:set(K_HSEL .. id, _M.record_http_selectable(record) and 1 or 0)
+        -- A fresh worker starts unhealthy until its first health check passes,
+        -- unless health checks are disabled for it.
+        d:set(K_HEALTH .. id, record.disable_health_check and 1 or 0)
+        d:set(K_HFAIL .. id, 0)
+        d:set(K_HSUCC .. id, 0)
+        d:set(K_CBSTATE .. id, _M.CB_CLOSED)
+        d:set(K_CBF .. id, 0)
+        d:set(K_CBS .. id, 0)
+        d:set(K_LOAD .. id, 0)
+        local ids = read_ids(d)
+        local seen = false
+        for i = 1, #ids do
+            if ids[i] == id then
+                seen = true
+                break
+            end
+        end
+        if not seen then
+            ids[#ids + 1] = id
+            write_ids(d, ids)
+        end
+    end)
+    if not ok then
+        return nil, lerr
+    end
+
+    -- Queued rather than synchronous: the caller answers 202 either way.
+    if not shdict():get(K_WORKER .. id) then
+        _M.set_job(url, "add_worker", "pending", nil)
+    end
+    mesh_mirror(id)
+    return { id = id, url = url, location = "/workers/" .. id, status = "accepted" }
+end
+
+---Remove a worker by id and free its URL so the URL can be re-registered.
+---@param worker_id string
+---@return table|nil result @ {worker_id, url}
+---@return string|nil err
+function _M.remove(worker_id)
+    local id, perr = _M.parse_worker_id(worker_id)
+    if not id then
+        return nil, perr
+    end
+    local d = shdict()
+    local raw = d:get(K_WORKER .. id)
+    if not raw then
+        return nil, "Worker " .. id .. " not found"
+    end
+    local record = json_decode(raw) or {}
+    local url = record.url
+
+    local ok, lerr = with_lock(function()
+        local dd = shdict()
+        dd:delete(K_WORKER .. id)
+        if url then
+            dd:delete(K_URL2ID .. url)
+            dd:delete(K_JOB .. url)
+        end
+        dd:delete(K_IDURL .. id)
+        for _, prefix in ipairs({ K_HEALTH, K_HFAIL, K_HSUCC, K_CBSTATE,
+                                 K_CBF, K_CBS, K_CBO, K_LOAD, K_DISC, K_DPROBE,
+                                 K_HSEL }) do
+            dd:delete(prefix .. id)
+        end
+        local kept = {}
+        local ids = read_ids(dd)
+        for i = 1, #ids do
+            if ids[i] ~= id then
+                kept[#kept + 1] = ids[i]
+            end
+        end
+        write_ids(dd, kept)
+    end)
+    if not ok then
+        return nil, lerr
+    end
+    mesh_forget(id)
+    return { worker_id = id, url = url }
+end
+
+---Static record plus live mutable fields, in the WorkerInfo wire shape.
+---@param worker_id string
+---@return table|nil info
+function _M.get(worker_id)
+    local id, perr = _M.parse_worker_id(worker_id)
+    if not id then
+        return nil, perr
+    end
+    local d = shdict()
+    local raw = d:get(K_WORKER .. id)
+    if not raw then
+        return nil
+    end
+    local record = json_decode(raw)
+    if type(record) ~= "table" then
+        return nil
+    end
+    record.id = record.id or id
+    return _M.info(record, d)
+end
+
+---@param record table @ decoded static record
+---@param d ngx.shared.Dict|nil
+---@return table
+function _M.info(record, d)
+    d = d or shdict()
+    local id = record.id
+    local labels = record.labels or {}
+    local metadata = {}
+    for k, v in pairs(labels) do
+        metadata[k] = tostring(v)
+    end
+    local job
+    if record.url then
+        job = _M.get_job(record.url)
+    end
+    return {
+        id = id,
+        url = record.url,
+        model_id = record.model_id or "unknown",
+        priority = record.priority or 50,
+        cost = record.cost or 1.0,
+        worker_type = record.worker_type or "regular",
+        is_healthy = (d:get(K_HEALTH .. id) or 0) == 1,
+        load = d:get(K_LOAD .. id) or 0,
+        connection_mode = record.connection_mode or "http",
+        -- gRPC transport detail (nil on the overwhelmingly common http record, so
+        -- the WorkerInfo shape is unchanged there). Rust carries the port inside
+        -- the tagged connection_mode; it is broken out here because grpc_proxy and
+        -- the PD pair both read it per request.
+        grpc_port = record.grpc_port,
+        grpc_tls = record.grpc_tls,
+        bootstrap_port = record.bootstrap_port,
+        metadata = metadata,
+        disable_health_check = record.disable_health_check or false,
+        job_status = job,
+    }
+end
+
+---@return table[] @ WorkerInfo list
+function _M.list()
+    local d = shdict()
+    local out = {}
+    local records = _M.records()
+    for i = 1, #records do
+        out[#out + 1] = _M.info(records[i], d)
+    end
+    return out
+end
+
+---Raw static records (used by the health checker, router and policy timers).
+---@return table[]
+function _M.records()
+    local d = shdict()
+    local out = {}
+    local ids = read_ids(d)
+    for i = 1, #ids do
+        local raw = d:get(K_WORKER .. ids[i])
+        if raw then
+            local record = json_decode(raw)
+            if type(record) == "table" then
+                record.id = record.id or ids[i]
+                out[#out + 1] = record
+            end
+        end
+    end
+    return out
+end
+
+---@param id string
+---@return table|nil
+function _M.record(id)
+    local d = shdict()
+    local raw = d:get(K_WORKER .. id)
+    if not raw then
+        return nil
+    end
+    local record = json_decode(raw)
+    if type(record) ~= "table" then
+        return nil
+    end
+    record.id = record.id or id
+    return record
+end
+
+---Does a record belong to the HTTP inference plane?
+---
+---The router's candidate filter (router.lua `candidates_for`, shared by every
+---HTTP route) asks only `registry.is_available(id)`, so the pool rule lives here
+---rather than in the router: a gRPC or PD worker must never be handed an OpenAI
+---HTTP request, and it cannot be reached over HTTP on its gRPC port anyway. Only
+---`connection_mode = "http"` **and** `worker_type = "regular"` may.
+---@param record table|nil
+---@return boolean
+function _M.record_http_selectable(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    local mode = record.connection_mode or "http"
+    local worker_type = record.worker_type or "regular"
+    return mode == "http" and worker_type == "regular"
+end
+
+---Write the derived flag for one record (call while holding the same lock that
+---wrote the record, so the pair cannot be observed half-updated).
+---@param id string
+---@param record table
+function _M.set_http_selectable(id, record)
+    shdict():set(K_HSEL .. id, _M.record_http_selectable(record) and 1 or 0)
+end
+
+---HTTP-plane availability. Missing flag = record written by an older build, so
+---fall back to decoding it once and cache the answer.
+---@param id string
+---@return boolean
+function _M.http_selectable(id)
+    local d = shdict()
+    local flag = d:get(K_HSEL .. id)
+    if flag ~= nil then
+        return flag == 1
+    end
+    local raw = d:get(K_WORKER .. id)
+    if not raw then
+        return false
+    end
+    local selectable = _M.record_http_selectable(json_decode(raw)) and 1 or 0
+    d:set(K_HSEL .. id, selectable)
+    return selectable == 1
+end
+
+---Health + breaker, with no pool filter: what the PD pair and the gRPC plane use
+---to decide a worker may be dialed. Deliberately not named `is_available` so the
+---HTTP plane cannot pick it up by accident.
+---@param id string
+---@return boolean
+function _M.pd_available(id)
+    if (shdict():get(K_HEALTH .. id) or 0) ~= 1 then
+        return false
+    end
+    return _M.breaker_available(id)
+end
+
+---Records in one PD pool, each carrying the live `healthy`/`load` snapshot the
+---policies read (same shape candidates_for hands out).
+---@param pool string|nil @ "regular"|"prefill"|"decode"; nil = every pool
+---@param opts table|nil @ {available=fn(id)->bool, connection_mode=string|false}
+---@return table[]
+function _M.pool_records(pool, opts)
+    opts = opts or {}
+    local available = opts.available or _M.pd_available
+    local want_mode = opts.connection_mode
+    if want_mode == nil then
+        -- gRPC and PD pools are reached over gRPC by default; pass false for
+        -- "any transport".
+        want_mode = "grpc"
+    end
+    local pd = require "resty.luarouter.pd"
+    local records = _M.records()
+    local out = {}
+    for i = 1, #records do
+        local record = records[i]
+        local mode = record.connection_mode or "http"
+        local mode_ok = (want_mode == false)
+            or (want_mode == "grpc" and (mode == "grpc" or mode == "grpcs"))
+            or (want_mode == mode)
+        if mode_ok and (not pool or pd.pool_of(record) == pool)
+            and available(record.id) then
+            record.load = _M.load(record.id)
+            record.healthy = true
+            out[#out + 1] = record
+        end
+    end
+    return out
+end
+
+---Every gRPC-capable record (transport grpc/grpcs, any pool) that is available.
+---@param opts table|nil @ {available=fn(id)->bool}
+---@return table[]
+function _M.grpc_records(opts)
+    return _M.pool_records(nil, { available = opts and opts.available,
+                                 connection_mode = "grpc" })
+end
+
+---Readiness verdict over the registry, PD-aware.
+---
+---router.lua's own /readiness handler counts "at least one healthy worker"
+---(Rust's Regular-mode rule). Once a fleet registers a prefill or decode worker
+---that answer is wrong: PD routing needs one healthy worker in **each** pool,
+---which is Rust's PrefillDecode-mode rule (server.rs readiness). The decision is
+---delegated to pd.readiness so both gateways read one implementation, and the
+---available predicate stays is_healthy - the same predicate the existing handler
+---uses - so a fleet with no PD worker answers byte-identically to before.
+---@param opts table|nil @ {records=table[], enable_igw=boolean}
+---@return boolean ready, table report @ {status, healthy_workers, total_workers, ...}
+function _M.readiness(opts)
+    opts = opts or {}
+    local pd = require "resty.luarouter.pd"
+    local records = opts.records or _M.records()
+    return pd.readiness(records, {
+        -- Availability, not just the health flag. Rust can health-check a gRPC
+        -- worker natively (grpc.health.v1); this gateway cannot speak the proto, so
+        -- a bare grpc:// record is registered probeless and the circuit breaker is
+        -- the only thing that ever notices it died. Judging readiness on health
+        -- alone would keep a PD fleet "ready" with a dead decode pool.
+        is_available = function(record)
+            return _M.pd_available(record.id)
+        end,
+        enable_igw = opts.enable_igw,
+    })
+end
+
+---@return string[] @ distinct model ids with at least one worker
+function _M.models()
+    local seen, out = {}, {}
+    local records = _M.records()
+    for i = 1, #records do
+        local model = records[i].model_id or "unknown"
+        if not seen[model] then
+            seen[model] = true
+            out[#out + 1] = model
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- ------------------------------------------------------------------ live state
+
+---@param id string
+---@return boolean
+---Worker URL for breaker metric labels (Rust labels those with the URL, not the
+---id). Falls back to the id for a record written before the reverse key existed.
+---@param id string
+---@return string
+function _M.url_for(id)
+    local d = shdict()
+    local url = d:get(K_IDURL .. id)
+    if url then
+        return url
+    end
+    local record = json_decode(d:get(K_WORKER .. id) or "")
+    if type(record) == "table" and record.url then
+        d:set(K_IDURL .. id, record.url)
+        return record.url
+    end
+    return id
+end
+
+---@param id string
+---@return boolean
+function _M.is_healthy(id)
+    return (shdict():get(K_HEALTH .. id) or 0) == 1
+end
+
+---@param id string
+---@param healthy boolean
+function _M.set_healthy(id, healthy)
+    shdict():set(K_HEALTH .. id, healthy and 1 or 0)
+    -- The cluster view advertises worker health (Rust's WorkerState.health), and a
+    -- flip is exactly when a peer's view goes stale. Mirroring here rather than in
+    -- the health sweep means every writer of health gets it for free, and the
+    -- version bump inside observe_worker is what makes the update propagate.
+    mesh_mirror(id)
+end
+
+---A worker is selectable when healthy and its breaker is not open.
+---
+--- An open circuit is not permanent: once cb_timeout_duration_secs has elapsed
+--- the breaker half-opens so the next request can probe it. The flip happens
+--- here because this is the only place every selection path goes through, which
+--- is how the Rust gateway behaves too (is_available() calls
+--- circuit_breaker().can_execute(), and can_execute() runs the state check).
+--- The CAS on the state key makes exactly one concurrent selector perform the
+--- transition, mirroring the compare_exchange in core/circuit_breaker.rs.
+---Circuit-breaker availability, including the timed open -> half_open flip.
+---Shared by the HTTP plane (is_available) and the gRPC/PD plane
+---(pd_available) so a worker can only ever have one recovery clock.
+---@param id string
+---@return boolean
+function _M.breaker_available(id)
+    local d = shdict()
+    local key = K_CBSTATE .. id
+    local state = d:get(key) or _M.CB_CLOSED
+    if state ~= _M.CB_OPEN then
+        return true
+    end
+
+    local conf = require("resty.luarouter").config()
+    if conf.disable_circuit_breaker then
+        return true
+    end
+
+    local elapsed_ms = ngx.now() * 1000 - (d:get(K_CBO .. id) or 0)
+    if elapsed_ms < conf.cb_timeout_duration_secs * 1000 then
+        return false
+    end
+
+    -- This image has no shdict CAS, so the single-writer flip runs under the
+    -- same registry lock the add/remove paths use. Whoever takes it performs the
+    -- transition; everyone else just observes half_open and stays selectable.
+    with_lock(function()
+        local dd = shdict()
+        if (dd:get(key) or _M.CB_CLOSED) ~= _M.CB_OPEN then
+            return
+        end
+        dd:set(key, _M.CB_HALF_OPEN)
+        dd:set(K_CBO .. id, ngx.now() * 1000)
+        dd:set(K_CBF .. id, 0)
+        dd:set(K_CBS .. id, 0)
+        local label = _M.url_for(id)
+        local ok_obs, observability = pcall(require, "resty.luarouter.observability")
+        if ok_obs then
+            observability.record_cb_transition(label, "open", "half_open")
+        end
+    end)
+    return true
+end
+
+---Health, pool membership and breaker for the HTTP inference plane.
+---@param id string
+---@return boolean
+function _M.is_available(id)
+    if (shdict():get(K_HEALTH .. id) or 0) ~= 1 then
+        return false
+    end
+    -- Pool gate: a gRPC or PD worker is invisible to the HTTP inference plane
+    -- (it would be dialled on the wrong port with the wrong protocol), and
+    -- router.lua's candidate filter runs is_available on every route, so gating
+    -- here keeps the HTTP surface byte-identical without touching router.lua.
+    if not _M.http_selectable(id) then
+        return false
+    end
+    return _M.breaker_available(id)
+end
+
+---@param id string
+---@return number @ in-flight requests
+function _M.load(id)
+    return shdict():get(K_LOAD .. id) or 0
+end
+
+---@param id string
+---@param delta number
+---@return number @ load after the change
+function _M.change_load(id, delta)
+    local d = shdict()
+    local value, err = d:incr(K_LOAD .. id, delta, 0)
+    if not value then
+        d:set(K_LOAD .. id, 0)
+        value = 0
+    end
+    if value < 0 then
+        d:set(K_LOAD .. id, 0)
+        return 0
+    end
+    return value
+end
+
+---Resilience state, used by hb.lua and the metrics exporter.
+---@param id string
+---@return table
+function _M.cb_state(id)
+    local d = shdict()
+    local state = d:get(K_CBSTATE .. id) or _M.CB_CLOSED
+    return {
+        state = state,
+        state_name = CB_STATE_NAME[state + 1] or "closed",
+        consecutive_failures = d:get(K_CBF .. id) or 0,
+        consecutive_successes = d:get(K_CBS .. id) or 0,
+        opened_at_ms = d:get(K_CBO .. id) or 0,
+        healthy = (d:get(K_HEALTH .. id) or 0) == 1,
+        health_failures = d:get(K_HFAIL .. id) or 0,
+        health_successes = d:get(K_HSUCC .. id) or 0,
+        load = d:get(K_LOAD .. id) or 0,
+    }
+end
+
+---@param id string
+function _M.set_cb_state(id, state, opened_at_ms)
+    local d = shdict()
+    d:set(K_CBSTATE .. id, state)
+    if opened_at_ms then
+        d:set(K_CBO .. id, opened_at_ms)
+    end
+end
+
+---Accumulate one breaker outcome atomically.
+---
+---The counters mean "consecutive", so the other side is zeroed; the charged side
+---uses shdict:incr(), which is the only cross-process-safe way to add one. A
+---get()+set() pair loses updates when several nginx workers charge the same
+---worker in the same window (four processes reading failures=2 all write 3),
+---which delays the open transition far past cb_failure_threshold.
+---@param id string
+---@param success boolean
+---@return number failures @ count after the update
+---@return number successes @ count after the update
+function _M.charge_cb(id, success)
+    local d = shdict()
+    if success then
+        d:set(K_CBF .. id, 0)
+        local value, err = d:incr(K_CBS .. id, 1, 0)
+        if not value then
+            d:set(K_CBS .. id, 1)
+            value = 1
+        end
+        return 0, value
+    end
+    d:set(K_CBS .. id, 0)
+    local value, err = d:incr(K_CBF .. id, 1, 0)
+    if not value then
+        d:set(K_CBF .. id, 1)
+        value = 1
+    end
+    return value, 0
+end
+
+---Breaker state flip, re-checked under the registry lock.
+---
+---Every process that crosses a threshold calls this; the lock plus the
+---expected-state check makes exactly one of them perform the transition, so the
+---transition metric and the log line are not counted per process. Closing also
+---clears both counters (an open circuit keeps its failure count for the metrics
+---page, which is what the Rust gateway shows too).
+---@param id string
+---@param expect number @ state the caller observed
+---@param next_state number
+---@param opened_at_ms number|nil @ stamped when the circuit opens
+---@return boolean changed @ true when this caller performed the flip
+function _M.flip_cb(id, expect, next_state, opened_at_ms)
+    local changed = false
+    with_lock(function()
+        local d = shdict()
+        if (d:get(K_CBSTATE .. id) or _M.CB_CLOSED) ~= expect then
+            return
+        end
+        d:set(K_CBSTATE .. id, next_state)
+        if opened_at_ms then
+            d:set(K_CBO .. id, opened_at_ms)
+        end
+        if next_state == _M.CB_CLOSED then
+            d:set(K_CBF .. id, 0)
+            d:set(K_CBS .. id, 0)
+        end
+        changed = true
+    end)
+    return changed
+end
+
+---@param id string
+function _M.set_cb_counters(id, failures, successes)
+    local d = shdict()
+    d:set(K_CBF .. id, failures)
+    d:set(K_CBS .. id, successes)
+end
+
+---@param id string
+---@param failures number|nil @ nil keeps the stored value
+---@param successes number|nil
+function _M.set_health_counters(id, failures, successes)
+    local d = shdict()
+    if failures then
+        d:set(K_HFAIL .. id, failures)
+    end
+    if successes then
+        d:set(K_HSUCC .. id, successes)
+    end
+end
+
+-- ---------------------------------------------------------- metadata discovery
+
+---Merge discovered fields into the stored record.
+---@param id string
+---@param patch table @ fields to overwrite (model_id, labels)
+local function patch_record(id, patch)
+    local d = shdict()
+    local raw = d:get(K_WORKER .. id)
+    if not raw then
+        return nil
+    end
+    local record = json_decode(raw)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local changed = false
+    for key, value in pairs(patch) do
+        if key == "labels" then
+            record.labels = record.labels or {}
+            for name, label in pairs(value) do
+                if record.labels[name] ~= label then
+                    record.labels[name] = label
+                    changed = true
+                end
+            end
+        elseif record[key] ~= value then
+            record[key] = value
+            changed = true
+        end
+    end
+    if not changed then
+        return record
+    end
+    local encoded = json_encode(record)
+    if encoded then
+        d:set(K_WORKER .. id, encoded)
+        -- The pool flag is derived from the record, so any write that can reach
+        -- worker_type/connection_mode has to recompute it. Kept here rather than
+        -- at each call site (discovery, PUT, the gRPC control surface) so a new
+        -- writer cannot leave it stale.
+        d:set(K_HSEL .. id, _M.record_http_selectable(record) and 1 or 0)
+        mesh_mirror(id)
+    end
+    return record
+end
+
+-- ------------------------------------------------------------------ PUT update
+
+-- Fields PUT /workers/{id} may change. Mirrors the Rust update_worker_properties
+-- step, which only touches the scheduling knobs (priority/cost/labels) and the
+-- per-worker health-check tuning; url/model_id/connection identity is immutable
+-- and any other body member is ignored rather than rejected.
+local UPDATE_NUMBER_FIELDS = {
+    "priority", "cost",
+    "health_check_timeout_secs", "health_check_interval_secs",
+    "health_success_threshold", "health_failure_threshold",
+}
+local UPDATE_BOOL_FIELDS = { "disable_health_check" }
+
+---Apply a partial update to one stored worker record.
+---@param worker_id string
+---@param patch table @ decoded PUT body
+---@return table|nil result @ {worker_id, url}
+---@return string|nil err
+---@return string|nil kind @ "validation" for client-side rejections (400)
+function _M.update(worker_id, patch)
+    if type(patch) ~= "table" then
+        return nil, "worker update must be a JSON object", "validation"
+    end
+    local id, perr = _M.parse_worker_id(worker_id)
+    if not id then
+        return nil, perr, "validation"
+    end
+    local d = shdict()
+    if not d:get(K_WORKER .. id) then
+        return nil, "Worker " .. id .. " not found", "not_found"
+    end
+
+    local changes = {}
+    for i = 1, #UPDATE_NUMBER_FIELDS do
+        local field = UPDATE_NUMBER_FIELDS[i]
+        local value = patch[field]
+        if value ~= nil and value ~= cjson.null then
+            local number = tonumber(value)
+            if not number then
+                return nil, string.format("field '%s' must be a number", field),
+                    "validation"
+            end
+            changes[field] = number
+        end
+    end
+    for i = 1, #UPDATE_BOOL_FIELDS do
+        local field = UPDATE_BOOL_FIELDS[i]
+        local value = patch[field]
+        if value ~= nil and value ~= cjson.null then
+            if type(value) ~= "boolean" then
+                return nil, string.format("field '%s' must be a boolean", field),
+                    "validation"
+            end
+            changes[field] = value
+        end
+    end
+    if patch.labels ~= nil and patch.labels ~= cjson.null then
+        if type(patch.labels) ~= "table" then
+            return nil, "field 'labels' must be a JSON object", "validation"
+        end
+        -- patch_record merges labels (discovery writes the same map), so a PUT
+        -- that only names one label keeps the rest.
+        changes.labels = patch.labels
+    end
+    if type(patch.api_key) == "string" then
+        changes.api_key = patch.api_key
+    end
+
+    local url = d:get(K_IDURL .. id)
+    local ok, lerr = with_lock(function()
+        if not patch_record(id, changes) then
+            error("worker " .. id .. " disappeared while updating")
+        end
+    end)
+    if not ok then
+        return nil, lerr
+    end
+    return { worker_id = id, url = url }
+end
+
+---Query the worker for the model it serves, the way the Rust worker workflow's
+---discover_metadata step does: /model_info and /server_info give the identity
+---labels, /v1/models is the fallback, and model_id falls back through
+---served_model_name then model_path.
+---
+---Returns nil once the worker has a real model id, so the caller can stop asking.
+---@param record table
+---@param cfg table
+---@return table|nil updated @ record after the update
+function _M.discover(record, cfg)
+    local d = shdict()
+
+    -- DP expansion comes first, because it can replace the record this function
+    -- was handed: a data-parallel engine has to become dp_size entries before
+    -- per-rank metadata makes any sense. Ranks carry dp_base_url and are never
+    -- expanded again; a base that already decided (dp_size set, including the
+    -- settled dp_size == 1) is skipped, so this costs one probe per worker.
+    --
+    -- Only "expanded" short-circuits: when the engine says dp_size <= 1, or when
+    -- /server_info has not answered yet, the ordinary metadata path below still
+    -- runs against the base worker, which is reachable and useful on its own.
+    if cfg and cfg.dp_aware and not record.dp_base_url and not record.dp_size
+        and not _M.rank_of(record.url) then
+        if _M.expand_dp(record, cfg) == "expanded" then
+            return nil
+        end
+    end
+
+    if record.model_id and record.model_id ~= "unknown" then
+        return nil
+    end
+    local attempts = d:incr(K_DISC .. record.id, 1, 0) or 1
+    if attempts > 20 then
+        return nil
+    end
+
+    local hb = require "resty.luarouter.hb"
+    local timeout_ms = cfg.health_check_timeout_secs * 1000
+    local labels = {}
+    local present = function(value)
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+        if type(value) == "number" then
+            return tostring(value)
+        end
+        return nil
+    end
+
+    local info_status, info_body = hb.http_get(record.url .. "/model_info", timeout_ms)
+    if info_status == 200 then
+        local model_info = json_decode(info_body)
+        if type(model_info) == "table" then
+            labels.model_path = present(model_info.model_path)
+            labels.served_model_name = present(model_info.served_model_name)
+        end
+    end
+
+    local server_status, server_body = hb.http_get(record.url .. "/server_info", timeout_ms)
+    if server_status == 200 then
+        local server_info = json_decode(server_body)
+        if type(server_info) == "table" then
+            labels.model_path = labels.model_path or present(server_info.model_path)
+            labels.served_model_name = labels.served_model_name
+                or present(server_info.served_model_name)
+            labels.tp_size = present(server_info.tp_size)
+            labels.dp_size = present(server_info.dp_size)
+        end
+    end
+
+    if not labels.model_path and not labels.served_model_name then
+        -- llama.cpp workers expose neither: ask the OpenAI discovery endpoint.
+        local models_status, models_body = hb.http_get(record.url .. "/v1/models", timeout_ms)
+        if models_status == 200 then
+            local listing = json_decode(models_body)
+            local data = type(listing) == "table" and listing.data or nil
+            if type(data) == "table" and type(data[1]) == "table" then
+                labels.served_model_name = present(data[1].id)
+            end
+        end
+    end
+
+    local model_id = labels.served_model_name or labels.model_path
+    if not model_id then
+        -- Nothing discovered yet; leave it unknown so the next sweep retries.
+        return nil
+    end
+
+    local merged = {}
+    for key, value in pairs(labels) do
+        if value then
+            merged[key] = value
+        end
+    end
+    return patch_record(record.id, { model_id = model_id, labels = merged })
+end
+
+-- ---------------------------------------------------------- DP-aware ranks
+
+---Expand one base worker into its data-parallel ranks.
+---
+---Called from _M.discover() (i.e. from the health sweep of a reachable worker),
+---so it never blocks a request. The probe is /server_info with /get_server_info
+---as the older spelling; both are the endpoints the Rust gateway reads dp_size
+---from. A rank is registered as "<base>@<rank>": a distinct id, distinct health
+---counters, distinct load and circuit breaker, and a policy tenant of its own -
+---which is the whole point, since the engine schedules each rank independently.
+---
+---Ranks start unhealthy like any fresh worker and are brought up by the next
+---sweep; that sweep is also what learns their metadata. The base entry is then
+---removed, so /workers shows exactly the dp_size ranks the Rust gateway would.
+---@param record table @ base worker record (no dp_base_url)
+---@param cfg table
+---@return string action @ "expanded" | "settled" | "retry"
+function _M.expand_dp(record, cfg)
+    local mod = sd()
+    if not mod then
+        return "settled"
+    end
+    local d = shdict()
+    local attempts = d:incr(K_DPROBE .. record.id, 1, 0) or 1
+
+    local hb = require "resty.luarouter.hb"
+    local timeout_ms = cfg.health_check_timeout_secs * 1000
+    local headers = record.api_key and { ["Authorization"] = "Bearer " .. record.api_key }
+        or nil
+    local dp_size, info
+    for _, endpoint in ipairs({ "/server_info", "/get_server_info" }) do
+        local status, body = hb.http_get(record.url .. endpoint, timeout_ms, headers)
+        if status == 200 then
+            local decoded = json_decode(body)
+            dp_size = mod.dp_size_from_server_info(decoded)
+            if dp_size then
+                info = decoded
+                break
+            end
+        end
+    end
+
+    -- The probe that reveals the ranks usually reveals the model as well, so hand
+    -- both to the rank records: otherwise every rank has to re-run metadata
+    -- discovery, and until it does the engine is unroutable even though the base
+    -- worker already knew its model id.
+    local meta
+    if type(info) == "table" then
+        local present = function(value)
+            if type(value) == "string" and value ~= "" then
+                return value
+            end
+            if type(value) == "number" then
+                return tostring(value)
+            end
+            return nil
+        end
+        local labels = {}
+        labels.model_path = present(info.model_path)
+        labels.served_model_name = present(info.served_model_name)
+        labels.tp_size = present(info.tp_size)
+        labels.dp_size = present(info.dp_size)
+        local model_id = labels.served_model_name or labels.model_path
+        if model_id or record.model_id ~= "unknown" then
+            meta = { model_id = model_id or record.model_id, labels = labels }
+        end
+    end
+
+    local action, width = mod.expansion_plan(dp_size, attempts)
+    if action == "retry" then
+        -- Keep asking (bounded): a loading engine answers /health before it
+        -- answers /server_info, and expanding at the wrong width is worse than
+        -- waiting. Until then the base worker carries traffic as a single entry.
+        return "retry"
+    end
+    if action == "give_up" then
+        ngx.log(ngx.WARN, "luarouter: no usable dp_size from ", record.url,
+            " after ", attempts, " probes; keeping it as a single worker")
+    end
+
+    if (width or 1) <= 1 then
+        -- Settled: record the decision so neither this worker nor the sweep
+        -- retries /server_info for DP again.
+        patch_record(record.id, { dp_size = 1 })
+        return "settled"
+    end
+
+    local requests = mod.expansion_requests(record, width, meta)
+    local added = 0
+    for i = 1, #requests do
+        local _, err = _M.add(requests[i], cfg)
+        if err then
+            -- A rank that already exists means a previous attempt got part-way:
+            -- treat it as present and let the sweep finish the job next time.
+            ngx.log(ngx.WARN, "luarouter: dp rank ", requests[i].url,
+                " not registered: ", err)
+        else
+            added = added + 1
+        end
+    end
+    if added == 0 then
+        return "retry"
+    end
+
+    -- The base entry would be a phantom candidate taking selections to a listener
+    -- that is one of the ranks, so it goes away once the ranks exist.
+    local _, remove_err = _M.remove(record.id)
+    if remove_err then
+        ngx.log(ngx.ERR, "luarouter: expanded ", record.url, " into ", added,
+            " ranks but could not remove the base entry: ", remove_err)
+    end
+
+    -- Same signal a control-plane write gives: the worker set changed, so a
+    -- stateful policy has to re-seed rather than keep a tree of the old list.
+    local ok, policy = pcall(require, "resty.luarouter.policy")
+    if ok and policy and policy.bump_generation then
+        policy.bump_generation()
+    end
+
+    ngx.log(ngx.NOTICE, "luarouter: expanded ", record.url, " into ", added,
+        " data-parallel ranks (SMG_DP_AWARE)")
+    return "expanded"
+end
+
+-- ---------------------------------------------------------- discovery view
+
+---Records that a given discovery source registered.
+---@param source string @ e.g. "kubernetes"
+---@return table[] records
+function _M.discovery_records(source)
+    local out = {}
+    local records = _M.records()
+    for i = 1, #records do
+        if records[i].discovery == source then
+            out[#out + 1] = records[i]
+        end
+    end
+    return out
+end
+
+-- ------------------------------------------------------------------ job queue
+
+---@param url string
+---@param job_type string
+---@param status string @ pending | processing | completed | failed
+---@param message string|nil
+function _M.set_job(url, job_type, status, message)
+    local job = {
+        job_type = job_type,
+        worker_url = url,
+        status = status,
+        message = message or cjson.null,
+        timestamp = ngx.time(),
+    }
+    local encoded = json_encode(job)
+    if encoded then
+        shdict():set(K_JOB .. url, encoded, 600)
+    end
+end
+
+---@param url string
+---@return table|nil
+function _M.get_job(url)
+    local raw = shdict():get(K_JOB .. url)
+    if not raw then
+        return nil
+    end
+    local job = json_decode(raw)
+    if type(job) ~= "table" then
+        return nil
+    end
+    return job
+end
+
+---@param url string
+function _M.clear_job(url)
+    shdict():delete(K_JOB .. url)
+end
+
+-- ------------------------------------------------------------------ bootstrap
+
+---Register the SMG_WORKER_URLS seed list (idempotent).
+---@param cfg table
+---@return number @ registered count
+function _M.bootstrap(cfg)
+    local count = 0
+    local urls = cfg.worker_urls or {}
+    for i = 1, #urls do
+        local _, err = _M.add({ url = urls[i] }, cfg)
+        if err then
+            ngx.log(ngx.ERR, "luarouter: seed worker ", urls[i], " failed: ", err)
+        else
+            count = count + 1
+        end
+    end
+    return count
+end
+
+return _M

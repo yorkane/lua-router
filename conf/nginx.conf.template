@@ -1,0 +1,198 @@
+# Lua router (OpenResty) 配置模板
+# 由 docker-entrypoint.sh 用 envsubst 渲染成 nginx.conf
+# 变量: WORKER_PROCESSES WORKER_CONNECTIONS NOFILE_LIMIT ERROR_LOG_PATH LOG_LEVEL
+#       LISTEN_ADDR LUA_PACKAGE_PATH DNS_RESOLVER MAX_PAYLOAD_SIZE
+#       SERVER_EXTRA HTTP_EXTRA METRICS_EXTRA GRPC_EXTRA
+#       TLS_LISTEN_FLAGS TLS_SERVER_EXTRA (SMG_TLS_* 配置时由入口脚本渲染)
+# 其余运行参数（策略、熔断、健康检查、重试等）全部由
+# resty.luarouter.config 在 init 阶段直接读环境变量，不经过这里。
+
+# WORKER_PROCESSES comes from NGINX_WORKER_PROCESSES and defaults to auto, i.e.
+# one nginx process per core. cache_aware is the exception and the entrypoint
+# forces it to 1 unless the operator set the number explicitly: the radix tree is
+# per-process state (doc/impl-policies.md deviation 1), so N processes keep N
+# approximate trees and prefix affinity degrades to 1/N of what Rust achieves.
+# The shared-dict snapshot carries each tree across a reload but not across
+# processes, so widening the worker count costs stickiness, not correctness.
+# The other stateful policies (bucket, manual, the hash rings) are unaffected.
+# nginx rebuilds the environment it hands to the worker processes from this list,
+# so anything Lua reads at *request* time (as opposed to the init-phase snapshot in
+# resty.luarouter.config) has to be named here or os.getenv answers nil inside a
+# worker. SMG_GRPC is the gRPC-plane switch registry.grpc_enabled reads per POST
+# /workers, and LR_GRPC_PD_METADATA the PD metadata switch grpc_proxy reads per
+# call; SMG_GRPC_PORT is the fallback spelling for operators who set only the port.
+env SMG_GRPC;
+env SMG_GRPC_PORT;
+env LR_GRPC_PD_METADATA;
+# SMG_CONTROL_PLANE_API_KEYS is the id:name:role:key list (doc/gap-auth-tls.md):
+# the control-plane gate reads it per request, so it must survive into the worker
+# environment. SMG_DISABLE_AUDIT_LOGGING silences that gate's audit lines.
+env SMG_CONTROL_PLANE_API_KEYS;
+env SMG_DISABLE_AUDIT_LOGGING;
+# JWT 控制面（doc/gap-dp-jwt.md）：jwks.lua 与控制面闸门在请求期用 os.getenv 读取这
+# 一组开关，nginx 重建 worker 环境，所以每个名字都要在此声明，规则同上面的
+# SMG_CONTROL_PLANE_API_KEYS。全部可选：SMG_JWT_ISSUER 与 SMG_JWT_JWKS_URI 都没设置
+# 时 JWT 闸门整体关闭，控制面沿用既有多 key 逻辑。
+env SMG_JWT_ISSUER;
+env SMG_JWT_AUDIENCE;
+env SMG_JWT_JWKS_URI;
+env SMG_JWT_ROLE_CLAIM;
+env SMG_JWT_ROLE_MAPPING;
+env SMG_JWT_LEEWAY_SECS;
+env SMG_JWT_JWKS_CACHE_SECS;
+
+# OpenTelemetry 追踪（doc/gap-otel.md）：otel.lua 在 init 阶段抓取这组开关，conf 三处
+# 同样声明，这样 worker 里的 os.getenv / /probe/otel 也能读到。SMG_ENABLE_TRACE 默认
+# 关闭；SMG_OTLP_TRACES_ENDPOINT 这里走的是 OTLP/HTTP JSON（默认 4318），与 Rust 的
+# OTLP gRPC（默认 localhost:4317）只差在传输层，W3C 上下文与 span 字段是对齐的。
+env SMG_ENABLE_TRACE;
+env SMG_OTLP_TRACES_ENDPOINT;
+env SMG_TRACE_BATCH_SIZE;
+env SMG_TRACE_BATCH_INTERVAL_MS;
+env SMG_TRACE_TIMEOUT_MS;
+env SMG_TRACE_SAMPLE_RATIO;
+env SMG_TRACE_MAX_QUEUE;
+env SMG_TRACE_UPSTREAM_CHILD;
+
+# K8s watch 与 router pod 发现（doc/gap-discovery-watch.md）。config.lua 在 init
+# 阶段读这几个变量，这里同样声明一遍，worker 内的 os.getenv 与探针才看得见。
+# WATCH 默认关（0=继续 poll）；FIELD_SELECTOR 只支持等值项；ROUTER_SELECTOR 命中的
+# pod 只进 mesh 成员表，不会被注册成推理 worker。
+env SMG_SERVICE_DISCOVERY_WATCH;
+env SMG_SERVICE_DISCOVERY_WATCH_IDLE_TIMEOUT_SECS;
+env SMG_KUBE_FIELD_SELECTOR;
+env SMG_ROUTER_SELECTOR;
+env SMG_ROUTER_MESH_PORT_ANNOTATION;
+# 在途请求年龄采样器（doc/gap-inflight-age.md）：LR_INFLIGHT_SAMPLE_SECS /
+# LR_INFLIGHT_TTL_SECS 在 init_by_lua 里 fork 之前抓取（init.lua wire_inflight_tracker），
+# worker 环境随后被 nginx 重建，所以这两个名字也要在 env 白名单里声明一遍，规则同上面的
+# SMG_ENABLE_TRACE。两个都可省略：默认按 Rust 的 20 s 采样、槽位 TTL 3600 s。
+env LR_INFLIGHT_SAMPLE_SECS;
+env LR_INFLIGHT_TTL_SECS;
+
+
+worker_processes ${WORKER_PROCESSES};
+worker_rlimit_nofile ${NOFILE_LIMIT};
+# 容器内以 root 运行，共享字典与日志目录都在镜像内，无需降权
+user root;
+error_log ${ERROR_LOG_PATH} ${LOG_LEVEL};
+pid       logs/nginx.pid;
+
+events {
+    worker_connections ${WORKER_CONNECTIONS};
+}
+
+http {
+    default_type  application/octet-stream;
+    sendfile      on;
+    tcp_nopush    on;
+    keepalive_timeout 65;
+    server_tokens off;
+
+    # luarouter 模块（?/init.lua 命中 resty/luarouter/init.lua）
+    lua_package_path "${LUA_PACKAGE_PATH}";
+
+    # 上游探测与转发的 socket 错误由路由自己记录，不需要 nginx 再抄一份
+    lua_socket_log_errors off;
+    lua_socket_connect_timeout 10s;
+    lua_socket_read_timeout 60s;
+    lua_socket_send_timeout 60s;
+
+    # 推理请求正文要整体读入：抽 model + 路由文本，改写 model 后再转发
+    client_max_body_size ${MAX_PAYLOAD_SIZE};
+    client_body_buffer_size 4m;
+    client_body_timeout 600s;
+    client_header_timeout 60s;
+    # 超时由转发协程自己的 cosocket 超时控制，这里放宽避免提前断开长流
+    send_timeout 600s;
+    request_pool_size 4k;
+    lua_use_default_type off;
+
+    # 与 ARCHITECTURE.md 对齐的五个共享字典：
+    #   lr_workers      worker 记录 + 健康/熔断/负载计数 + url->id + job 状态
+    #   lr_policy       策略状态（round_robin 游标、manual 粘性映射）
+    #   lr_stats        计数器/直方图/滑窗样本
+    #   lr_request_log  /_ui/logs 环形缓冲
+    #   lr_locks        registry 写入互斥锁
+    #   lr_history      conversations / items / responses 存储
+    lua_shared_dict lr_workers     2m;
+    lua_shared_dict lr_policy     20m;
+    lua_shared_dict lr_stats       5m;
+    lua_shared_dict lr_request_log 20m;
+    lua_shared_dict lr_locks       1m;
+    # Conversation / item / response store (resty.luarouter.history). 10m is the
+    # floor for SMG_HISTORY_MAX_CONVERSATIONS=10000 at ~200-400B per record plus
+    # ~70B of index per item; raise it together with the SMG_HISTORY_MAX_* caps,
+    # otherwise nginx's own LRU drops records the module still counts.
+    lua_shared_dict lr_history    10m;
+    # 并发限流的 token / 活跃 / 排队计数（SMG_MAX_CONCURRENT_REQUESTS），
+    # 跨 nginx 进程共享同一份预算
+    lua_shared_dict lr_limit      64k;
+
+    # 跨 worker 广播 RuntimeConfig 快照（config_store.lua 用）。缺失时该模块
+    # 退化为「每次现读 LMR_CONFIG_FILE（0.5s TTL）」，功能不挂但一致性变差。
+    lua_shared_dict luarouter_config 1m;
+
+    resolver ${DNS_RESOLVER} ipv6=off valid=30s;
+    resolver_timeout 5s;
+
+    init_by_lua_block {
+        require("resty.luarouter").init()
+    }
+
+    init_worker_by_lua_block {
+        require("resty.luarouter").worker_init()
+    }
+
+    # 客户端中途断开时也要走到这里：归还未释放的 load 计数
+    log_by_lua_block {
+        require("resty.luarouter").on_log()
+    }
+
+    server {
+        # TLS_LISTEN_FLAGS 为 " ssl" 时主监听直接变成 TLS 监听（与 Rust 的
+        # rustls 一样是替换明文监听，而不是另开端口）。
+        listen ${LISTEN_ADDR}${TLS_LISTEN_FLAGS};
+        server_name _;
+${TLS_SERVER_EXTRA}
+
+        # 预检在 rewrite 阶段应答：nginx 还没选 location 就先跑 server 级 rewrite，
+        # 于是 ui.conf 那些自带方法门的 /_ui/* 也能吃到统一的 CORS 预检（与 Rust
+        # 的 CorsLayer 最外层等价）。
+        rewrite_by_lua_block {
+            if require("resty.luarouter.router").preflight_guard() then
+                return ngx.exit(200)
+            end
+        }
+
+        # 全部端点（推理面 / 控制面 / 公开面 / _ui）由 klib.router 分发
+        location / {
+            content_by_lua_block {
+                require("resty.luarouter.router").handle()
+            }
+        }
+
+        # ui.conf 的 `^~ /_ui/` 静态前缀优先于 `location /`，所以 router 自己拥有的
+        # /_ui 路径（会话存储 stats）必须有精确 location，否则会被 SPA alias 吃掉回 404。
+        location = /_ui/history {
+            content_by_lua_block {
+                require("resty.luarouter.router").handle()
+            }
+        }
+
+        # 追加 location（静态 UI、健康探测别名等）由入口脚本注入
+        ${SERVER_EXTRA}
+    }
+
+    # 独立的 Prometheus 端口（可选，SMG_METRICS_PORT 设置后启用）
+    ${METRICS_EXTRA}
+
+    # 可选的 gRPC 推理面（SMG_GRPC_PORT > 0 时由入口脚本渲染成独立 server）。
+    # 独立监听是必须的：grpc_pass 只能在 location{}，而 gRPC 请求的 :path 就是
+    # /<package>.<service>/<method>，不能和主 server 的 klib.router 路由表共用一个
+    # location /。详见 doc/gap-grpc-pd.md §7。
+    ${GRPC_EXTRA}
+
+    # http{} 层追加配置
+    ${HTTP_EXTRA}
+}

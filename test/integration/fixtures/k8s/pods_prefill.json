@@ -1,0 +1,20 @@
+{
+  "apiVersion": "v1",
+  "kind": "PodList",
+  "metadata": {"resourceVersion": "1005"},
+  "items": [
+    {
+      "metadata": {
+        "name": "sglang-prefill-0",
+        "namespace": "team-a",
+        "labels": {"app": "sglang", "component": "prefill", "gpu": "h100"},
+        "annotations": {"sglang.ai/bootstrap-port": "8998"}
+      },
+      "status": {
+        "phase": "Running",
+        "podIP": "127.0.0.1",
+        "conditions": [{"type": "Ready", "status": "True"}]
+      }
+    }
+  ]
+}
