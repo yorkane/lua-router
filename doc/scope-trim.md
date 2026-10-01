@@ -29,7 +29,8 @@
 | history_redis.lua | 881 | **DELETE** | 随 history（跨实例共享会话场景一并移出） |
 | tokenizer.lua | 1039 | **DELETE** | tokenizer 注册表/代理属模型管理面 |
 | parse.lua | 515 | **DELETE** | function-call/reasoning 解析代理属模型管理面 |
-| jwks.lua | 705 | **DELETE** | 控制面认证收敛为内建多 key RBAC（auth_rbac）+ authz 边缘；JWT/JWKS 面向企业多租户，超出范围 |
+| jwks.lua | 705 | **DELETE** | JWT/JWKS 控制面认证（用户裁定不需要） |
+| API key / RBAC / 审计层（router.lua 内嵌 + ui.api_auth） | ~400 | **DELETE** | 用户裁定 auth 全部不需要：鉴权交给 authz 边缘与内网信任域，网关层全部端点开放（数据面/控制面/_ui） |
 | service_discovery.lua | 2038 | **DELETE** | K8s list/watch 集群发现移出：本机发现由 llm-watcher 承担、远程接入由 /workers+配置承担；DP 展开不在此模块本体 |
 | mesh.lua | 2525 | **DELETE** | /ha gossip 多路由器 HA 不在单调度器范围；watcher+unless-stopped 已提供自愈。若未来要多活再从 git 历史恢复 |
 | otel.lua | 1381 | DELETE（待确认） | 分布式追踪默认关闭、耦合低；若流量监控只需要 Prometheus 可删，需要跨服务链路追踪再留 |
@@ -37,7 +38,7 @@
 
 ## 2. router.lua 与配置面的内部裁剪点
 
-删除（随模块）：jwks 认证段（:50 require + 路由）、history 持久化（/v1/responses 累加器、
+删除（随模块）：jwks 与全部 API key/RBAC/审计认证段（数据面 key、控制面 key、角色、审计、ui.conf 各 alias 的 api_auth 调用）、history 持久化（/v1/responses 累加器、
 patch_metadata 的历史部分、conversation 链接）、tokenizer/parse 分发段、/ha/* 路由段、
 gRPC policy hint；conf/ 删 grpc-server.conf.template、grpc-readiness.conf、grpc-prototype.conf
 三个文件，entrypoint 删 GRPC_EXTRA 渲染段与 SMG_GRPC_* 校验，Dockerfile 删对应 COPY。
@@ -55,7 +56,7 @@ gRPC policy hint；conf/ 删 grpc-server.conf.template、grpc-readiness.conf、g
 | Lua 模块 | 28 | 20（删 8：grpc_proxy/pd/history/history_redis/tokenizer/parse/jwks/service_discovery/mesh 中 8 个 + otel 待定） |
 | Lua 行数 | 28 215 | ≈16 200（-43%）；若删 otel ≈14 800（-48%） |
 | 单测文件 | 12 | 4（tree/hash/policies/integration；删 pd/mesh/history/history_redis/jwks/otel/tokenizer_parse/service_discovery） |
-| 契约 | 841 / 27 段 | ≈599 / 22 段（删 history_crud 100、tokenizer_plane 80、mesh 46、jwt_gate 11、discovery 5） |
+| 契约 | 841 / 27 段 | ≈532 / 20 段（删 history_crud 100、tokenizer_plane 80、mesh 46、auth_rbac 33、ui_auth 34、jwt_gate 11、discovery 5） |
 | 门禁 | 21 | ≈13（删 e2e_grpc、e2e_history_redis、e2e_jwt、mesh_http、mesh_two、e2e_discovery_dp、e2e_otel、e2e_responses_store；DP 断言并入 e2e_stateful，responses 透传断言留在 e2e_ui_bridge） |
 | conf 文件 | 6 | 3 |
 
@@ -70,7 +71,10 @@ gRPC policy hint；conf/ 删 grpc-server.conf.template、grpc-readiness.conf、g
   （当前生产只有 opencodex 走 chat/completions，无 responses 持久化使用）。
 - **mesh 删除是单向门**：多路由器 HA、router pod 互发现都没了；单实例 + watcher + 
   unless-stopped 是既定生产形态，风险可接受，但要在 README 声明。
+- **auth 全删是信任边界变更**：/workers、/_ui、/flush_cache 等控制端点在本网关层全开放，只能暴露在 authz 边缘之后或可信内网，绝不可直接公网（README 需声明信任边界；当前生产本就未配任何 key，行为零变化）。
 - **otel 若删**：跨网关请求的链路追踪没了（当前生产未启用，默认关）。
+
+- **cache_aware 不受任何删除影响**：依赖链 = policies/cache_aware + policies/tree + registry 负载字段 + /v1/loads（hb）+ lr_policy 字典，与 8 个删除模块零交集；GPU 负载源（§5.1）落地后其逃逸与亲和决策反而更准。
 
 ## 5. 新范围的能力缺口（要新增的，不是删除）
 
