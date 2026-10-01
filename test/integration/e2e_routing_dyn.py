@@ -222,7 +222,7 @@ check("[C] the untouched model keeps global stickiness (%d/%d)" % (ha, hb),
 # worker hint 让位于运营的全局覆盖
 pc = free_port()
 start_mock(pc, "hinted")
-st, body = http("POST", "http://127.0.0.1:%d/workers" % c_port,
+st, body, _ = http("POST", "http://127.0.0.1:%d/workers" % c_port,
                 {"url": "http://127.0.0.1:%d" % pc, "model_id": "hinted",
                  "labels": {"policy": "round_robin"}})
 check("[C] hinted worker registered", st in (200, 202), "%s %s" % (st, str(body)[:160]))
