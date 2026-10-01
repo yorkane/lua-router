@@ -75,6 +75,7 @@ gRPC policy hint；conf/ 删 grpc-server.conf.template、grpc-readiness.conf、g
 - **otel 若删**：跨网关请求的链路追踪没了（当前生产未启用，默认关）。
 
 - **cache_aware 不受任何删除影响**：依赖链 = policies/cache_aware + policies/tree + registry 负载字段 + /v1/loads（hb）+ lr_policy 字典，与 8 个删除模块零交集；GPU 负载源（§5.1）落地后其逃逸与亲和决策反而更准。
+- **prefix cache 不依赖 tokenizer**：亲和键是**原始文本前缀**（cache_aware 用 tree:prefix_match_with_counts(text)，prefix_hash 用字符数截断——prefix_hash.lua:26 明注“字符数，Rust 侧是 token 数”），路由文本来自 extract_text_for_routing 的消息拼接，全程无分词；tokenizer 模块在 router.lua 只有 :3858-3876 的 /v1/tokenize 代理面注册，策略层零引用（grep 事实）。分词与块级 KV 匹配是后端（sglang/vLLM）的职责，网关只需要“同会话→同 worker”的稳定键，文本身份比分词 id 更稳（还能跨不同 tokenizer 的异构后端）。实证：real-eval 经本网关（从未实现 BPE）在真实上游测得 cached_tokens/prompt ≈97–99%、52/52 选工无漂移。
 
 ## 5. 新范围的能力缺口（要新增的，不是删除）
 
