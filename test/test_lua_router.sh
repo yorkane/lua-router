@@ -1512,10 +1512,9 @@ if section observability; then
     assert_eq "/metrics active connections is a non-negative integer" \
         "$(awk '/^smg_http_connections_active /{print ($2 ~ /^[0-9]+$/) ? "ok" : "bad " $2; found=1} END{if(!found) print "absent"}' "$TMP_DIR/body")" \
         "ok"
-    # Layer-4 discovery families belong to the poller, so an instance without
-    # SMG_SERVICE_DISCOVERY must not invent them (the poll itself is gated by
-    # integration/e2e_discovery_dp.py, which also checks the sync histogram).
-    assert_eq "/metrics has no discovery series without discovery configured" \
+    # The Kubernetes poller was removed with its four smg_discovery_* families
+    # (doc/scope-trim.md): the exporter must not carry any of them at all.
+    assert_eq "/metrics has no discovery series any more" \
         "$(grep -c '^smg_discovery_' "$TMP_DIR/body")" "0"
     # smg_router_tpot_seconds is derived from the same (duration - ttft) the
     # request log uses for tok_per_s, so it appears with a streamed response.

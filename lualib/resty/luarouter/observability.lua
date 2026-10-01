@@ -1028,11 +1028,6 @@ local HELP = {
     smg_http_inflight_request_age_dropped_total = "In-flight age registrations dropped because every probed slot was taken",
     smg_http_inflight_request_age_slots_active = "In-flight requests currently held in the age tracker",
     smg_http_rate_limit_total = "Rate limiting decisions by result (allowed/rejected)",
-    -- Layer 4 discovery (resty.luarouter.service_discovery).
-    smg_discovery_registrations_total = "Worker registration attempts by source and result",
-    smg_discovery_deregistrations_total = "Worker deregistration events by source and reason",
-    smg_discovery_sync_duration_seconds = "Discovery sync duration by source",
-    smg_discovery_workers_discovered = "Workers known via discovery by source",
     -- Policy-internal bookkeeping (resty.luarouter.policy).
     smg_manual_policy_branch_total = "Manual policy execution branch by branch",
     smg_consistent_hashing_policy_branch_total = "Consistent hashing policy execution branch by branch",

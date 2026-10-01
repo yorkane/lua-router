@@ -21,19 +21,6 @@
 local cjson = require "cjson.safe"
 local lock_mod = require "resty.lock"
 
--- service_discovery holds the url/rank and pod -> worker decision functions,
--- which are plain Lua and carry no dependency on this module at load time (it
--- reaches back through require() inside its own call paths), so importing it
--- here cannot form a cycle.
-local discovery_mod
-local function sd()
-    if discovery_mod == nil then
-        local ok, mod = pcall(require, "resty.luarouter.service_discovery")
-        discovery_mod = ok and mod or false
-    end
-    return discovery_mod or nil
-end
-
 local _M = { _VERSION = "0.1.0" }
 
 local DICT_NAME = "lr_workers"
@@ -677,11 +664,11 @@ function _M.add(req, cfg)
                 or (cfg.disable_health_check and true)
                 or false,
             registered_at = ngx.time(),
-            -- Discovery provenance and DP identity. Both are copied onto the
-            -- record (rather than inferred from labels) because they are read on
-            -- every reconcile / expansion and must not be editable through a
-            -- PUT /workers label patch. `discovery` is the source name
-            -- ("kubernetes"), dp_* describe a rank of a data-parallel engine.
+            -- Provenance and DP identity. Both are copied onto the record
+            -- (rather than inferred from labels) because expansion reads them and
+            -- they must not be editable through a PUT /workers label patch.
+            -- `discovery` is whatever wrote the entry (a watcher's own name);
+            -- dp_* describe a rank of a data-parallel engine.
             discovery = string_field(req.discovery),
             dp_rank = tonumber(req.dp_rank),
             dp_size = tonumber(req.dp_size),
@@ -1410,6 +1397,112 @@ end
 
 -- ---------------------------------------------------------- DP-aware ranks
 
+-- The three pure decisions below lived in resty.luarouter.service_discovery and
+-- moved here when the Kubernetes poller was removed (doc/scope-trim.md). The DP
+-- expansion is the scheduler's own feature: a data-parallel engine is stored as
+-- one registry entry per rank regardless of how the worker was discovered.
+
+-- A worker that never answers /server_info stays a single-entry worker after
+-- this many probes. The metadata-discovery attempt ceiling in discover() is the
+-- same order (20), so the two bounded retries end together.
+local MAX_DP_ATTEMPTS = 20
+_M.MAX_DP_ATTEMPTS = MAX_DP_ATTEMPTS
+
+---Read dp_size out of a decoded /server_info body.
+---
+---Both spellings seen in the wild are accepted: the sglang engine reports
+---dp_size at the top level, and some builds nest it under "server_args".
+---@param info table|nil
+---@return number|nil dp_size
+local function dp_size_from_server_info(info)
+    if type(info) ~= "table" then
+        return nil
+    end
+    local raw = info.dp_size
+    if raw == nil and type(info.server_args) == "table" then
+        raw = info.server_args.dp_size
+    end
+    local n = tonumber(raw)
+    if not n or n ~= math.floor(n) or n < 1 then
+        return nil
+    end
+    return n
+end
+
+---Decide what one DP probe implies for the registry.
+---
+---This function only classifies so the decision is unit-testable without a
+---shared dict; the caller (expand_dp) owns the writes.
+---@param dp_size number|nil @ parsed from /server_info, nil when unavailable
+---@param attempts number @ probes already spent on this record
+---@return string action @ "expand" | "single" | "retry" | "give_up"
+---@return number|nil dp_size @ effective fan-out width for "expand"
+local function expansion_plan(dp_size, attempts)
+    if not dp_size then
+        -- No answer. Retry a bounded number of times (the engine may still be
+        -- loading), then settle on the base worker as a single entry.
+        if (attempts or 0) >= MAX_DP_ATTEMPTS then
+            return "give_up", 1
+        end
+        return "retry", nil
+    end
+    if dp_size <= 1 then
+        return "single", 1
+    end
+    return "expand", dp_size
+end
+
+---Build the registration requests for ranks 0..dp_size-1 of one base worker.
+---
+---Everything the scheduler needs to treat a rank like the engine it stands for
+---is copied from the base record (model id, priority, cost, api key, health
+---tuning, labels); the rank identity goes in dp_rank/dp_size/dp_base_url plus a
+---dp_aware marker so a later teardown can find them again.
+---@param base table @ stored record for the base url
+---@param dp_size number
+---@param meta table|nil @ {model_id, labels} learned from the probe body
+---@return table[] @ one POST /workers-shaped request per rank
+local function expansion_requests(base, dp_size, meta)
+    meta = meta or {}
+    local out = {}
+    for rank = 0, (dp_size or 1) - 1 do
+        local labels = {}
+        for k, v in pairs(base.labels or {}) do
+            labels[k] = v
+        end
+        for k, v in pairs(meta.labels or {}) do
+            labels[k] = v
+        end
+        labels.dp_rank = tostring(rank)
+        labels.dp_size = tostring(dp_size)
+        out[#out + 1] = {
+            url = base.url .. "@" .. rank,
+            -- The probe that revealed the ranks usually carries the model too, so
+            -- a rank is routable on the sweep that created it rather than having to
+            -- re-discover /model_info four times over.
+            model_id = meta.model_id or base.model_id,
+            priority = base.priority,
+            cost = base.cost,
+            api_key = base.api_key,
+            labels = labels,
+            disable_health_check = base.disable_health_check or false,
+            health_check_timeout_secs = base.health_check_timeout_secs,
+            health_check_interval_secs = base.health_check_interval_secs,
+            health_success_threshold = base.health_success_threshold,
+            health_failure_threshold = base.health_failure_threshold,
+            dp_rank = rank,
+            dp_size = dp_size,
+            dp_base_url = base.url,
+            dp_aware = true,
+            -- Inherit the source name so a rank stays attributed to whatever
+            -- registered its base (there is no pod reconcile any more; the
+            -- field is provenance only).
+            discovery = base.discovery,
+        }
+    end
+    return out
+end
+
 ---Expand one base worker into its data-parallel ranks.
 ---
 ---Called from _M.discover() (i.e. from the health sweep of a reachable worker),
@@ -1426,10 +1519,6 @@ end
 ---@param cfg table
 ---@return string action @ "expanded" | "settled" | "retry"
 function _M.expand_dp(record, cfg)
-    local mod = sd()
-    if not mod then
-        return "settled"
-    end
     local d = shdict()
     local attempts = d:incr(K_DPROBE .. record.id, 1, 0) or 1
 
@@ -1442,7 +1531,7 @@ function _M.expand_dp(record, cfg)
         local status, body = hb.http_get(record.url .. endpoint, timeout_ms, headers)
         if status == 200 then
             local decoded = json_decode(body)
-            dp_size = mod.dp_size_from_server_info(decoded)
+            dp_size = dp_size_from_server_info(decoded)
             if dp_size then
                 info = decoded
                 break
@@ -1476,7 +1565,7 @@ function _M.expand_dp(record, cfg)
         end
     end
 
-    local action, width = mod.expansion_plan(dp_size, attempts)
+    local action, width = expansion_plan(dp_size, attempts)
     if action == "retry" then
         -- Keep asking (bounded): a loading engine answers /health before it
         -- answers /server_info, and expanding at the wrong width is worse than
@@ -1495,7 +1584,7 @@ function _M.expand_dp(record, cfg)
         return "settled"
     end
 
-    local requests = mod.expansion_requests(record, width, meta)
+    local requests = expansion_requests(record, width, meta)
     local added = 0
     for i = 1, #requests do
         local _, err = _M.add(requests[i], cfg)
@@ -1530,22 +1619,6 @@ function _M.expand_dp(record, cfg)
     ngx.log(ngx.NOTICE, "luarouter: expanded ", record.url, " into ", added,
         " data-parallel ranks (SMG_DP_AWARE)")
     return "expanded"
-end
-
--- ---------------------------------------------------------- discovery view
-
----Records that a given discovery source registered.
----@param source string @ e.g. "kubernetes"
----@return table[] records
-function _M.discovery_records(source)
-    local out = {}
-    local records = _M.records()
-    for i = 1, #records do
-        if records[i].discovery == source then
-            out[#out + 1] = records[i]
-        end
-    end
-    return out
 end
 
 -- ------------------------------------------------------------------ job queue

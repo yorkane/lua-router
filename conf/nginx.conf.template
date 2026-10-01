@@ -28,15 +28,6 @@ env SMG_TRACE_SAMPLE_RATIO;
 env SMG_TRACE_MAX_QUEUE;
 env SMG_TRACE_UPSTREAM_CHILD;
 
-# K8s watch 与 router pod 发现（doc/gap-discovery-watch.md）。config.lua 在 init
-# 阶段读这几个变量，这里同样声明一遍，worker 内的 os.getenv 与探针才看得见。
-# WATCH 默认关（0=继续 poll）；FIELD_SELECTOR 只支持等值项；ROUTER_SELECTOR 命中的
-# pod 只进 mesh 成员表，不会被注册成推理 worker。
-env SMG_SERVICE_DISCOVERY_WATCH;
-env SMG_SERVICE_DISCOVERY_WATCH_IDLE_TIMEOUT_SECS;
-env SMG_KUBE_FIELD_SELECTOR;
-env SMG_ROUTER_SELECTOR;
-env SMG_ROUTER_MESH_PORT_ANNOTATION;
 # 在途请求年龄采样器（doc/gap-inflight-age.md）：LR_INFLIGHT_SAMPLE_SECS /
 # LR_INFLIGHT_TTL_SECS 在 init_by_lua 里 fork 之前抓取（init.lua wire_inflight_tracker），
 # worker 环境随后被 nginx 重建，所以这两个名字也要在 env 白名单里声明一遍，规则同上面的

@@ -213,55 +213,10 @@ function _M.load()
         max_payload_size = num("SMG_MAX_PAYLOAD_SIZE", 536870912),
         request_id_headers = list("SMG_REQUEST_ID_HEADERS"),
 
-        -- ==================== kubernetes service discovery ====================
-        -- SMG_SERVICE_DISCOVERY turns on the pod poller (Rust gateway uses the
-        -- kube watch stream; this implementation polls, see doc). The selector
-        -- knobs take the Kubernetes label syntax "k=v,k2=v2".
-        service_discovery = bool("SMG_SERVICE_DISCOVERY", false),
-        discovery_selector = str("SMG_SELECTOR"),
-        discovery_port = num("SMG_SERVICE_DISCOVERY_PORT", 80),
-        discovery_namespace = str("SMG_SERVICE_DISCOVERY_NAMESPACE"),
-        prefill_selector = str("SMG_PREFILL_SELECTOR"),
-        decode_selector = str("SMG_DECODE_SELECTOR"),
-        -- SA mount point; SMG_KUBECONFIG is kept as the older alias because the
-        -- Rust side names the flag after kubeconfig.
-        kube_sa_path = str("SMG_KUBE_SA_PATH", str("SMG_KUBECONFIG",
-            "/var/run/secrets/kubernetes.io/serviceaccount")),
-        -- Empty = build https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT
-        -- inside the cluster. An explicit value (http:// allowed) is how the e2e
-        -- suite points the poller at a fake API server.
-        kube_api_server = str("SMG_KUBE_API_SERVER"),
-        discovery_interval_secs = num("SMG_SERVICE_DISCOVERY_CHECK_INTERVAL_SECS", 60),
-        -- Watch instead of poll (Rust always watches; here it is opt-in so the
-        -- accepted poll contract stays the default - doc/gap-discovery-watch.md 4).
-        -- On: one long-lived chunked GET /api/v1/pods?watch=true from worker 0's
-        -- timer, reconciled per event, with relist on 410 and reconnect from the
-        -- last resourceVersion. Off (or a watch that cannot be held): the poll
-        -- loop below is used, which is why the interval knob is never ignored.
-        discovery_watch = bool("SMG_SERVICE_DISCOVERY_WATCH", false),
-        -- How long one read on the watch stream may sit silent before the stream
-        -- is dropped and reopened from the last resourceVersion. It is the liveness
-        -- bound: a dead peer that sends nothing is only noticed after this window
-        -- (a real 410 or a hang-up is noticed immediately). Bookmarks from the API
-        -- server normally arrive well inside it, so a quiet cluster costs one
-        -- reconnect per window rather than a missed change.
-        discovery_watch_idle_secs = num("SMG_SERVICE_DISCOVERY_WATCH_IDLE_TIMEOUT_SECS",
-            120),
-        -- fieldSelector, equality terms only ("metadata.name=x,status.phase=Running").
-        -- Sent to the API server and re-checked locally in pod_from_api.
-        field_selector = str("SMG_KUBE_FIELD_SELECTOR"),
-        -- Router-pod discovery (Rust --router-selector): pods matching this
-        -- selector become mesh peers instead of inference workers, which is what
-        -- replaces a hand-maintained SMG_MESH_PEERS list.
-        router_selector = str("SMG_ROUTER_SELECTOR"),
-        -- Pod annotation carrying the mesh/HA port. The Rust source disagrees on
-        -- the default (config/types.rs:380 says sglang.ai/mesh-port,
-        -- main.rs:947 and service_discovery.rs:65 say sglang.ai/ha-port); the
-        -- types.rs spelling wins because it is what the shipped config default
-        -- uses, and main.rs:1096 falls back to it as well. Override it here when
-        -- the pods were annotated by an older chart.
-        router_mesh_port_annotation = str("SMG_ROUTER_MESH_PORT_ANNOTATION",
-            "sglang.ai/mesh-port"),
+        -- ==================== data-parallel ranks ===========================
+        -- The Kubernetes pod poller and the router-pod selector that fed mesh
+        -- members went out with it (doc/scope-trim.md). SMG_DP_AWARE stays above:
+        -- rank expansion is registry-side and needs no cluster API.
 
         -- ==================== metrics / observability ====================
         -- Rust name is --prometheus-port (default 29000); LR_METRICS_PORT stays
@@ -332,14 +287,6 @@ function _M.validate(cfg)
     -- Zero disables the request log entirely, as in the Rust gateway: the store
     -- is never installed there, so /_ui/logs* and /_ui/stats answer 503. Only a
     -- negative value is nonsense.
-    -- Discovery knobs: a sub-second poll would hammer the API server, and an
-    -- out-of-range port silently produces unreachable worker urls.
-    if cfg.discovery_interval_secs < 1 then
-        cfg.discovery_interval_secs = 1
-    end
-    if cfg.discovery_port < 1 or cfg.discovery_port > 65535 then
-        cfg.discovery_port = 80
-    end
     if cfg.request_log_capacity < 0 then
         cfg.request_log_capacity = 0
     end

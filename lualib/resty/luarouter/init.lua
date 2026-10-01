@@ -402,24 +402,9 @@ function _M.worker_init()
     end
 
     hb.start()
-
-    -- Kubernetes pod discovery runs in the same process as the health sweep: both
-    -- are registry writers, and a second process reconciling the same pod set
-    -- would fight over add/remove. Disabled (the default) costs nothing: the
-    -- module is only required when the knob is on.
-    if conf.service_discovery then
-        local ok_sd, discovery = pcall(require, "resty.luarouter.service_discovery")
-        if ok_sd and discovery and discovery.start then
-            local started, sd_err = discovery.start(conf)
-            if started == false then
-                ngx.log(ngx.WARN, "luarouter: kubernetes discovery not started: ",
-                    tostring(sd_err))
-            end
-        else
-            ngx.log(ngx.ERR, "luarouter: service_discovery module unavailable: ",
-                tostring(discovery))
-        end
-    end
+    -- The Kubernetes pod poller was removed (doc/scope-trim.md): workers arrive
+    -- through SMG_WORKER_URLS, POST /workers, or whatever watcher pushes them,
+    -- and the health sweep above is the only registry writer left.
     return true
 end
 

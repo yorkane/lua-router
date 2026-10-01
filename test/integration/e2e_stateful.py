@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Round 2: snapshot write-back + reload restore, bucket/prefix_hash traffic,
-empty-array preservation through the raw edits, manual regression."""
+empty-array preservation through the raw edits, manual regression, the pure
+/v1/responses pass-through contract, and the SMG_DP_AWARE expansion checks that
+were migrated out of e2e_discovery_dp.py when the Kubernetes poller was removed
+(doc/scope-trim.md)."""
 import json, os, socket, struct, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (free_port, http, check, start_mock, mock_lines, start_router,
@@ -496,6 +499,348 @@ check("[responses] no lua errors", "lua entry thread aborted" not in logs(name),
 stop_router(name)
 resp_server.shutdown()
 resp_server.server_close()
+
+
+# ---------- 6. DP-aware expansion (migrated from e2e_discovery_dp.py) ----------
+# The Kubernetes poller was removed (doc/scope-trim.md) but SMG_DP_AWARE is the
+# scheduler's own feature: a data-parallel engine found through POST /workers or
+# SMG_WORKER_URLS still expands into one "<base>@<rank>" entry per rank, each
+# with its own health counters and its own injected data_parallel_rank. The mock
+# is an in-file stdlib server because it has to answer /server_info with a
+# configurable dp_size (or a 500, or without the field) and echo the forwarded
+# body so the injected rank is observable from the client side.
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DP_SERVERS = []
+
+
+class QuietHandler(BaseHTTPRequestHandler):
+    """BaseHTTPRequestHandler that swallows client resets.
+
+    The router's cosockets close without a clean shutdown, so a reset
+    mid-request is expected here; the stdlib default prints a full traceback for
+    each one, which buries the check lines this suite's verdict is read from."""
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+
+class DPHandler(QuietHandler):
+    server_version = "DPMock/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, status, payload):
+        body = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        cfg = self.server.cfg
+        if path == "/health":
+            self._send(200, {"status": "ok"})
+        elif path == "/model_info":
+            self._send(200, {"model_path": "/models/%s" % cfg["model"],
+                             "served_model_name": cfg["model"], "is_generation": True})
+        elif path in ("/server_info", "/get_server_info"):
+            if cfg["server_info_mode"] == "fail":
+                self._send(500, {"error": "engine not ready"})
+            elif cfg["only_legacy"] and path == "/server_info":
+                self._send(404, {"error": "no route"})
+            elif cfg["server_info_mode"] == "missing":
+                self._send(200, {"model_path": "/models/%s" % cfg["model"], "tp_size": 1})
+            else:
+                self._send(200, {"model_path": "/models/%s" % cfg["model"],
+                                 "served_model_name": cfg["model"],
+                                 "tp_size": 1, "dp_size": cfg["dp_size"]})
+        elif path == "/metrics":
+            self._send(200, "# HELP mock_probe counter\n# TYPE mock_probe counter\n"
+                            "mock_probe 1\n")
+        elif path == "/v1/models":
+            self._send(200, {"object": "list",
+                             "data": [{"id": cfg["model"], "object": "model"}]})
+        else:
+            self._send(404, {"error": {"message": "no route %s" % path}})
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw.decode() or "{}")
+        except ValueError:
+            body = {}
+        cfg = self.server.cfg
+        if self.path.split("?", 1)[0] == "/v1/chat/completions":
+            self._send(200, {
+                "id": "dp-%s" % self.server.id,
+                "object": "chat.completion",
+                "model": cfg["model"],
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant",
+                                         "content": "echo[%s]" % cfg["model"]}}],
+                # What the router actually sent: both the model rewrite and the
+                # injected data_parallel_rank are observable from here.
+                "echo_body": body,
+                "worker": self.server.id,
+            })
+        else:
+            self._send(404, {"error": {"message": "no route %s" % self.path}})
+
+
+def start_dp(mock_id, dp_size=4, model="dp-model", mode="ok", only_legacy=False):
+    port = free_port()
+    srv = ThreadingHTTPServer(("0.0.0.0", port), DPHandler)
+    srv.daemon_threads = True
+    srv.id = mock_id
+    srv.cfg = {"model": model, "dp_size": dp_size, "server_info_mode": mode,
+               "only_legacy": only_legacy}
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    DP_SERVERS.append(srv)
+    for _ in range(80):
+        st, _, _ = http("GET", "http://127.0.0.1:%d/health" % port, timeout=2)
+        if st == 200:
+            return srv, port
+        time.sleep(0.1)
+    raise RuntimeError("dp mock %s never came up" % mock_id)
+
+
+def dp_workers(port):
+    st, body, _ = http("GET", "http://127.0.0.1:%d/workers" % port)
+    if st != 200:
+        return None
+    return json.loads(body).get("workers", [])
+
+
+def dp_urls(port):
+    ws = dp_workers(port)
+    return sorted(w["url"] for w in ws) if ws is not None else None
+
+
+def dp_wait_urls(port, want, timeout=40):
+    want = sorted(want)
+    for _ in range(int(timeout / 0.5)):
+        if dp_urls(port) == want:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def dp_wait_workers(port, want_n, timeout=40):
+    for _ in range(int(timeout / 0.5)):
+        ws = dp_workers(port)
+        if ws is not None and len(ws) == want_n:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def dp_wait_healthy(port, n, timeout=40):
+    for _ in range(int(timeout / 0.5)):
+        ws = dp_workers(port) or []
+        if sum(1 for w in ws if w.get("is_healthy")) >= n:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def dp_wait_missing(port, gone, timeout=30):
+    for _ in range(int(timeout / 0.5)):
+        current = dp_urls(port)
+        if current is not None and gone not in current:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def dp_metrics(port):
+    st, body, _ = http("GET", "http://127.0.0.1:%d/metrics" % port)
+    return body if st == 200 else ""
+
+
+srv, wport = start_dp("dp4", dp_size=4, model="dp-model")
+base = "http://127.0.0.1:%d" % wport
+ranks = ["%s@%d" % (base, i) for i in range(4)]
+name = "lr-dp4-" + RUN
+port = start_router({"SMG_DP_AWARE": "1", "SMG_POLICY": "round_robin",
+                     "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                     "SMG_HEALTH_CHECK_TIMEOUT_SECS": "3",
+                     "SMG_WORKER_URLS": base}, name)
+
+check("[dp4] /server_info dp_size=4 expands into 4 rank candidates",
+      dp_wait_urls(port, ranks, timeout=30), dp_urls(port))
+ws = dp_workers(port) or []
+check("[dp4] the base entry is gone once the ranks exist",
+      base not in [w["url"] for w in ws], dp_urls(port))
+check("[dp4] every rank becomes healthy", dp_wait_healthy(port, 4, timeout=30),
+      json.dumps(dp_workers(port)))
+ws = dp_workers(port) or []
+check("[dp4] ranks inherit the model id learned from the probe",
+      all(w.get("model_id") == "dp-model" for w in ws), json.dumps(ws))
+check("[dp4] rank metadata carries dp_rank and dp_size",
+      sorted(w.get("metadata", {}).get("dp_rank") for w in ws) == ["0", "1", "2", "3"]
+      and all(w["metadata"].get("dp_size") == "4" for w in ws),
+      json.dumps([w.get("metadata") for w in ws]))
+check("[dp4] ranks have distinct ids (separate health, load and breaker)",
+      len({w["id"] for w in ws}) == 4, json.dumps(ws))
+doc = json.loads(http("GET", "http://127.0.0.1:%d/workers" % port)[1])
+check("[dp4] /workers reports four regular workers",
+      doc.get("total") == 4 and doc.get("stats", {}).get("regular_count") == 4,
+      json.dumps(doc)[:300])
+
+st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                   {"model": "dp-model", "messages": [{"role": "user", "content": "dp probe"}]})
+echoed = json.loads(body).get("echo_body", {}) if st == 200 else {}
+check("[dp4] inference against a rank url works (rank stripped for dialing)",
+      st == 200 and "echo[dp-model]" in body, "%s %s" % (st, body[:200]))
+check("[dp4] the model rewrite still reaches the engine",
+      echoed.get("model") == "dp-model", json.dumps(echoed)[:200])
+# Body injection: with round_robin the four ranks take the requests in turn, so
+# four calls are enough to see every rank's value come back in its own body. The
+# assertion is a set match rather than a per-call sequence because the candidate
+# order comes from the registry dict and is not rank order; what matters is that
+# each rank's calls carry exactly its own number.
+seen = []
+for _ in range(8):
+    st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                       {"model": "dp-model",
+                        "messages": [{"role": "user", "content": "rank probe"}]})
+    if st == 200:
+        seen.append(json.loads(body).get("echo_body", {}).get("data_parallel_rank"))
+check("[dp4] every rank's calls carry its own data_parallel_rank",
+      set(seen) == {0, 1, 2, 3}, json.dumps(seen))
+check("[dp4] injection is an integer member, not a string",
+      all(isinstance(r, int) for r in seen), json.dumps(seen))
+check("[dp4] the model rewrite and the injected rank coexist in one body",
+      echoed.get("model") == "dp-model"
+      and isinstance(echoed.get("data_parallel_rank"), int), json.dumps(echoed)[:200])
+# A body that already names the field gets rewritten, not duplicated: two
+# members with the same key would make the engine's pick undefined.
+st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                   {"model": "dp-model", "data_parallel_rank": 99,
+                    "messages": [{"role": "user", "content": "override"}]})
+pre = json.loads(body).get("echo_body", {}) if st == 200 else {}
+check("[dp4] a client-sent data_parallel_rank is overwritten, not duplicated",
+      st == 200 and isinstance(pre.get("data_parallel_rank"), int)
+      and pre["data_parallel_rank"] != 99, json.dumps(pre)[:200])
+
+# Per-rank health state is what expansion buys, and it is only observable if
+# the fan-out and the sweep can still dial a url that carries the suffix.
+text = dp_metrics(port)
+ranks_in_metrics = sum(1 for line in text.splitlines()
+                       if line.startswith("smg_worker_health{") and "@rank" not in line
+                       and line.count("@") >= 1)
+check("[dp4] /metrics reports one health series per rank",
+      ranks_in_metrics == 4, "%d series" % ranks_in_metrics)
+# /engine_metrics concatenates the path onto record.url (router.lua's
+# engine_metrics_handler), so it is the case where the rank suffix is not at the
+# end of the string that gets dialed: "http://h:p@2/metrics".
+st, merged, _ = http("GET", "http://127.0.0.1:%d/engine_metrics" % port)
+check("[dp4] the path-concatenating /engine_metrics fan-out dials rank urls",
+      st == 200 and "mock_probe" in merged, "%s %s" % (st, merged[:200]))
+
+# --- one rank can be torn down on its own ------------------------------------
+before = dp_urls(port)
+victim = before[0]
+victim_id = [w for w in (dp_workers(port) or []) if w["url"] == victim][0]["id"]
+st, body, _ = http("DELETE", "http://127.0.0.1:%d/workers/%s" % (port, victim_id))
+check("[dp4] DELETE a rank answers 202", st == 202, "%s %s" % (st, body[:200]))
+check("[dp4] rank teardown removes only that rank",
+      dp_wait_missing(port, victim, timeout=20)
+      and sorted((dp_urls(port) or [])) == sorted(before[1:]), dp_urls(port))
+
+# --- and the rank comes back without re-expanding ----------------------------
+st, body, _ = http("POST", "http://127.0.0.1:%d/workers" % port, {"url": victim})
+check("[dp4] a removed rank re-registers as a rank", st == 202, "%s %s" % (st, body[:200]))
+check("[dp4] no nested expansion: still exactly 4 ranks",
+      dp_wait_urls(port, ranks, timeout=25), dp_urls(port))
+stop_router(name)
+
+# --- dp_size=1 ---------------------------------------------------------------
+_, wp1 = start_dp("dp1", dp_size=1, model="solo")
+name = "lr-dp1-" + RUN
+port = start_router({"SMG_DP_AWARE": "1", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                     "SMG_WORKER_URLS": "http://127.0.0.1:%d" % wp1}, name)
+check("[dp1] dp_size=1 does not expand", dp_wait_workers(port, 1, timeout=25), dp_urls(port))
+check("[dp1] the single entry keeps the plain url",
+      dp_urls(port) == ["http://127.0.0.1:%d" % wp1], dp_urls(port))
+check("[dp1] it becomes healthy and serves", dp_wait_healthy(port, 1, timeout=20),
+      json.dumps(dp_workers(port)))
+st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                   {"model": "solo", "messages": [{"role": "user", "content": "solo"}]})
+check("[dp1] non-expanded worker answers", st == 200 and "echo[solo]" in body,
+      "%s %s" % (st, body[:150]))
+check("[dp1] a worker without dp_rank gets the body untouched (no injection)",
+      "data_parallel_rank" not in json.loads(body).get("echo_body", {}),
+      json.dumps(json.loads(body).get("echo_body", {}))[:200])
+stop_router(name)
+
+# --- /server_info 500 --------------------------------------------------------
+_, wp2 = start_dp("dpfail", dp_size=4, model="broken", mode="fail")
+name = "lr-dpfail-" + RUN
+port = start_router({"SMG_DP_AWARE": "1", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                     "SMG_WORKER_URLS": "http://127.0.0.1:%d" % wp2}, name)
+stay = ["http://127.0.0.1:%d" % wp2]
+check("[dpfail] a failing /server_info does not expand",
+      dp_wait_workers(port, 1, timeout=20), dp_urls(port))
+check("[dpfail] the base worker is kept and becomes healthy",
+      dp_wait_healthy(port, 1, timeout=20), json.dumps(dp_workers(port)))
+time.sleep(4)
+check("[dpfail] still exactly one candidate after more sweeps",
+      dp_urls(port) == stay, dp_urls(port))
+stop_router(name)
+
+# --- /server_info 200 without dp_size ----------------------------------------
+_, wp3 = start_dp("dpmissing", dp_size=4, model="nodoc", mode="missing")
+name = "lr-dpmissing-" + RUN
+port = start_router({"SMG_DP_AWARE": "1", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                     "SMG_WORKER_URLS": "http://127.0.0.1:%d" % wp3}, name)
+check("[dpmissing] /server_info without a usable dp_size does not expand",
+      dp_wait_workers(port, 1, timeout=20), dp_urls(port))
+check("[dpmissing] the worker is still routable",
+      (dp_workers(port) or [{}])[0].get("model_id") == "nodoc", json.dumps(dp_workers(port)))
+stop_router(name)
+
+# --- /get_server_info fallback -----------------------------------------------
+_, wp4 = start_dp("dplegacy", dp_size=2, model="legacy", only_legacy=True)
+name = "lr-dplegacy-" + RUN
+port = start_router({"SMG_DP_AWARE": "1", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                     "SMG_WORKER_URLS": "http://127.0.0.1:%d" % wp4}, name)
+base4 = "http://127.0.0.1:%d" % wp4
+check("[dplegacy] the /get_server_info spelling expands dp_size=2",
+      dp_wait_urls(port, ["%s@0" % base4, "%s@1" % base4], timeout=25), dp_urls(port))
+stop_router(name)
+
+# --- SMG_DP_AWARE off --------------------------------------------------------
+_, wp5 = start_dp("dpoff", dp_size=4, model="off")
+name = "lr-dpoff-" + RUN
+port = start_router({"SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                     "SMG_WORKER_URLS": "http://127.0.0.1:%d" % wp5}, name)
+check("[dpoff] SMG_DP_AWARE unset leaves a dp_size=4 engine as one worker",
+      dp_wait_workers(port, 1, timeout=20), dp_urls(port))
+stop_router(name)
+
+for srv in DP_SERVERS:
+    srv.shutdown()
+    srv.server_close()
 
 failed = [r for r in RESULTS if not r[0]]
 print("\n=== %d checks, %d failed ===" % (len(RESULTS), len(failed)))

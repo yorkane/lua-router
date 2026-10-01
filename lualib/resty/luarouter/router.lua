@@ -44,17 +44,150 @@ local registry = require "resty.luarouter.registry"
 -- the tokenize/parse proxies went with it (doc/scope-trim.md): /v1/responses
 -- stays as a pure inference route and that proxy family is not routed.
 local mesh_mod = require "resty.luarouter.mesh"
--- service_discovery carries the data-parallel rank injection helper. Loaded
--- lazily (same shape as registry's sd()) so the module stays optional for the
--- init_by_lua syntax gate and a broken discovery file can never take the
--- forwarding path down.
-local discovery_mod
-local function discovery()
-    if discovery_mod == nil then
-        local ok, mod = pcall(require, "resty.luarouter.service_discovery")
-        discovery_mod = ok and mod or false
+-- ---------------------------------------------------------------- DP rank
+
+---Find the byte range of a top-level member in a JSON object.
+---
+---Depth-aware on purpose: a naive search for the key name also hits a *nested*
+---member with the same name (a tool call's arguments blob can carry one), and
+---rewriting that would corrupt the payload. Splices therefore have to know the
+---brace depth, which costs one forward scan with an escape-aware string state
+---machine - the same cost class as the router's "model" rewrite.
+---
+---(This pair of helpers lived in resty.luarouter.service_discovery and moved
+---here with the DP rank injection when the Kubernetes poller was removed,
+---doc/scope-trim.md.)
+---@param raw string
+---@param field string
+---@param start number @ 1-based byte offset of the object's opening brace
+---@return number|nil member_from, number|nil member_to, number|nil insert_at
+---@return   @ member range spans "field": value; insert_at is the offset just
+---@return   @ after the opening brace (where a new first member goes)
+local function find_top_member(raw, field, start)
+    local needle = '"' .. field .. '"'
+    local depth = 0
+    local i = start
+    local n = #raw
+    while i <= n do
+        local c = raw:sub(i, i)
+        if c == '"' then
+            -- Skip the whole string literal, honouring backslash escapes.
+            local j = i + 1
+            while j <= n do
+                local d = raw:sub(j, j)
+                if d == "\\" then
+                    j = j + 2
+                elseif d == '"' then
+                    break
+                else
+                    j = j + 1
+                end
+            end
+            if depth == 1 and j - i + 1 == #needle and raw:sub(i, j) == needle then
+                -- Confirm it is a key: the next non-space character is ':'.
+                local k = j + 1
+                while k <= n and raw:sub(k, k):match("^[%s]$") do
+                    k = k + 1
+                end
+                if raw:sub(k, k) == ":" then
+                    local v = k + 1
+                    while v <= n and raw:sub(v, v):match("^[%s]$") do
+                        v = v + 1
+                    end
+                    -- Value span: stop at the first top-level ',' or the '}'
+                    -- that closes the object, skipping over nested containers
+                    -- and string literals.
+                    local scan = v
+                    local inner = 0
+                    while scan <= n do
+                        local e = raw:sub(scan, scan)
+                        if e == '"' then
+                            scan = scan + 1
+                            while scan <= n do
+                                local q = raw:sub(scan, scan)
+                                if q == "\\" then
+                                    scan = scan + 2
+                                elseif q == '"' then
+                                    break
+                                else
+                                    scan = scan + 1
+                                end
+                            end
+                        elseif e == "{" or e == "[" then
+                            inner = inner + 1
+                        elseif e == "}" or e == "]" then
+                            if inner == 0 then
+                                break
+                            end
+                            inner = inner - 1
+                        elseif (e == "," or e == "}") and inner == 0 then
+                            break
+                        end
+                        scan = scan + 1
+                    end
+                    local member_to = scan - 1
+                    while member_to >= v and raw:sub(member_to, member_to):match("^[%s]$") do
+                        member_to = member_to - 1
+                    end
+                    return i, member_to, start + 1
+                end
+            end
+            i = j + 1
+        elseif c == "{" or c == "[" then
+            depth = depth + 1
+            i = i + 1
+        elseif c == "}" or c == "]" then
+            depth = depth - 1
+            if depth == 0 then
+                return nil, nil, start + 1
+            end
+            i = i + 1
+        else
+            i = i + 1
+        end
     end
-    return discovery_mod or nil
+    return nil, nil, start + 1
+end
+
+---Offset of the object's first `{`, or nil when the payload is not an object.
+---@param raw string
+---@return number|nil
+local function object_start(raw)
+    return raw:find("{", 1, true)
+end
+
+---Inject "data_parallel_rank" into a raw JSON payload.
+---
+---Splices the top-level member in place (rewrite when present, prepend when
+---absent) rather than decoding and re-encoding: the forwarding path must not
+---reorder or reformat the client's body, which is the same rule router.lua's
+---rewrite_model follows for "model".
+---@param raw string @ request body
+---@param record table @ selected worker record (rank read from dp_rank)
+---@return string raw, boolean changed
+local function inject_dp_rank(raw, record)
+    if type(raw) ~= "string" or raw == "" or type(record) ~= "table" then
+        return raw, false
+    end
+    local rank = tonumber(record.dp_rank)
+    if not rank then
+        return raw, false
+    end
+    local start = object_start(raw)
+    if not start then
+        return raw, false
+    end
+    local member_from, member_to, insert_at = find_top_member(raw, "data_parallel_rank", start)
+    if member_from then
+        return raw:sub(1, member_from - 1) .. '"data_parallel_rank":' .. rank
+            .. raw:sub(member_to + 1), true
+    end
+    -- Absent: prepend as the first member. An empty object needs no comma.
+    local rest = raw:sub(insert_at)
+    if rest:match("^%s*}") then
+        return raw:sub(1, insert_at - 1) .. '"data_parallel_rank":' .. rank .. "}", true
+    end
+    return raw:sub(1, insert_at - 1) .. '"data_parallel_rank":' .. rank .. "," .. rest, true
 end
 
 -- Declared here so the handlers below can reach it; the limiter itself is at
@@ -1626,8 +1759,8 @@ local function forward(route, body, raw_body, model, text, incoming)
         -- record by a hand-written POST /workers must not start rewriting bodies on
         -- a deployment that never opted in. The splice is byte-preserving, and a
         -- worker without dp_rank keeps the client's body exactly as sent.
-        if cfg().dp_aware and discovery() then
-            payload = (discovery().inject_dp_rank(payload, worker))
+        if cfg().dp_aware then
+            payload = (inject_dp_rank(payload, worker))
         end
         local forward_headers = collect_forward_headers(worker)
         forward_headers["content-length"] = tostring(#payload)
