@@ -507,6 +507,7 @@ grep -rn 'require "resty.luarouter.<模块>"' lualib/resty/luarouter/router.lua 
 | 文档 | 内容 |
 |---|---|
 | [doc/verification-final.md](doc/verification-final.md) | **最终验证汇总**：目标、实现范围、测试矩阵、四类对比结论、已知偏差与后续建议、文件索引 |
+| [doc/scope-trim.md](doc/scope-trim.md) | 范围收敛判定书：新范围下的模块 KEEP/DELETE/TRIM、量化收益、测试面影响与执行顺序 |
 | [doc/architect.md](doc/architect.md) | 架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略、集成、部署与测试框架 |
 | [doc/feature-gap.md](doc/feature-gap.md) | 功能缺口清单，A/B/C/D 四档，含路由面探针判据与「怎么引用这份清单」 |
 | [doc/todo-deferred.md](doc/todo-deferred.md) | TODO / Deferred 档（MCP、wasm、Postgres/Oracle history）的唯一口径 |
