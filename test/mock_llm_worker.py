@@ -31,6 +31,12 @@ a usage frame only when the request asked for one — instead of always sending 
                         field)
   SSE_HEARTBEAT         1: interleave a ": ping" comment frame, which a strip-capable
                         pump must forward untouched
+  REQUIRE_AUTH          1: every /v1* request must carry an Authorization header or
+                        the mock answers 401 with an OpenAI-style error body (the
+                        shape of a remote API that requires a key). Health, props,
+                        model_info, server_info and metrics stay open, exactly like
+                        those engines. GET /last_auth reports the Authorization value
+                        the mock last saw, so a test can pin key injection.
 """
 
 import argparse
@@ -56,6 +62,12 @@ STATE = {
     "usage_details": os.environ.get("USAGE_DETAILS", "") == "1",
     "reject_stream_options": os.environ.get("REJECT_STREAM_OPTIONS", "") == "1",
     "sse_heartbeat": os.environ.get("SSE_HEARTBEAT", "") == "1",
+    # Remote-key gate; see REQUIRE_AUTH in the module docstring.
+    "require_auth": (os.environ.get("REQUIRE_AUTH", "") or "").lower()
+                    in ("1", "true", "yes"),
+    "last_authorization": None,
+    "auth_requests": 0,
+    "auth_denied": 0,
 }
 LOCK = threading.Lock()
 
@@ -149,6 +161,31 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def _auth_gate(self, path):
+        """REQUIRE_AUTH: answer 401 to /v1* without a bearer header.
+
+        Returns False after emitting the 401. Every Authorization header -- gated
+        request or not -- is remembered on STATE for the GET /last_auth probe, so
+        key-injection assertions share one introspection channel in both mock
+        modes. Non-/v1 routes (health, props, model_info, server_info, metrics)
+        answer freely, mirroring the engines that gate the inference API only.
+        """
+        auth = self.headers.get("Authorization")
+        denied = False
+        with LOCK:
+            if auth:
+                STATE["last_authorization"] = auth
+                STATE["auth_requests"] += 1
+            if STATE["require_auth"] and path.startswith("/v1") and not auth:
+                STATE["auth_denied"] += 1
+                denied = True
+        if denied:
+            self._send(401, {"error": {
+                "message": "mock: missing Authorization header (REQUIRE_AUTH)",
+                "type": "invalid_request_error", "code": "unauthorized"}},
+                extra={"WWW-Authenticate": "Bearer"})
+        return not denied
+
     # --------------------------------------------------------------------- GET
     def do_GET(self):
         self._handle_get()
@@ -161,6 +198,8 @@ class Handler(BaseHTTPRequestHandler):
             STATE["requests"] += 1
         path = self.path.split("?", 1)[0]
         self._note_request(path)
+        if not self._auth_gate(path):
+            return
         if path == "/health":
             self._send_text(200, "OK")
         elif path == "/health_generate":
@@ -252,10 +291,24 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 snapshot = dict(STATE)
             self._send(200, snapshot)
+        elif path == "/last_auth":
+            # Introspection for the REQUIRE_AUTH gate: the last Authorization value
+            # seen on any request plus the accept/deny counters for gated /v1 hits.
+            with LOCK:
+                self._send(200, {
+                    "model": STATE["model"],
+                    "require_auth": STATE["require_auth"],
+                    "last_authorization": STATE["last_authorization"],
+                    "auth_requests": STATE["auth_requests"],
+                    "auth_denied": STATE["auth_denied"],
+                })
         elif path == "/reset":
             with LOCK:
                 STATE["fail_once_used"] = False
                 STATE["requests"] = 0
+                STATE["last_authorization"] = None
+                STATE["auth_requests"] = 0
+                STATE["auth_denied"] = 0
             self._send(200, {"status": "reset"})
         else:
             self._send(404, {"error": {"message": "mock: no route %s" % path,
@@ -268,6 +321,11 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         self._note_request(path)
         raw, body = self._read_body()
+        # The gate runs after the body is consumed: answering 401 with bytes still
+        # unread would desynchronise the keep-alive connection the cosocket pool
+        # reuses, turning one denied request into a poisoned socket.
+        if not self._auth_gate(path):
+            return
         if not isinstance(body, dict):
             body = {}
         if STATE["latency_ms"] > 0:
@@ -660,6 +718,8 @@ def main():
     parser.add_argument("--latency-ms", type=float, default=None)
     parser.add_argument("--fail-mode", default=None,
                         choices=[None, "no_retry_4xx", "retryable_500", "retry_once_500"])
+    parser.add_argument("--require-auth", action="store_true",
+                        help="401 /v1* requests that carry no Authorization header")
     args = parser.parse_args()
 
     STATE["model"] = args.model
@@ -668,6 +728,8 @@ def main():
                            else env_float("LATENCY_MS"))
     if args.fail_mode:
         STATE["fail_mode"] = args.fail_mode
+    if args.require_auth:
+        STATE["require_auth"] = True
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True

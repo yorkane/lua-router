@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Upstreams · llm-router</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="./app.css?v=5">
+</head>
+<body>
+  <div id="q-app">
+    <q-layout container class="workspace-layout">
+      <q-page-container>
+        <q-page class="workspace-page">
+          <header class="page-heading">
+            <div>
+              <h1>{{ t.title }}</h1>
+              <p>{{ t.description }}</p>
+            </div>
+            <div class="heading-actions">
+              <q-toggle v-model="autoRefresh" dense color="teal-4" :label="t.autoRefreshOn"></q-toggle>
+              <q-btn outline no-caps icon="mdi-refresh" :label="c.retry" class="secondary-button" :loading="loading" @click="load"></q-btn>
+              <q-btn unelevated no-caps icon="mdi-cloud-plus-outline" :label="t.addUpstream" class="primary-button" :disable="unsupported" @click="openAdd"></q-btn>
+            </div>
+          </header>
+
+          <q-banner v-if="loadError" rounded dense class="error-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>
+            {{ loadError }}
+            <template v-slot:action><q-btn flat dense no-caps :label="c.retry" @click="load"></q-btn></template>
+          </q-banner>
+          <q-banner v-if="unsupported" rounded dense class="info-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-information-outline"></q-icon></template>
+            {{ t.unsupportedNotice }}
+          </q-banner>
+
+          <section class="stat-grid">
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-cloud-sync-outline" class="stat-icon purple"></q-icon>
+              <div class="stat-label">{{ t.statTotal }}</div>
+              <div class="stat-value">{{ upstreams.length }}</div>
+              <div class="stat-note">{{ t.poolTitle }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-key-outline" class="stat-icon teal"></q-icon>
+              <div class="stat-label">{{ t.statWithKey }}</div>
+              <div class="stat-value">{{ keyedCount }}</div>
+              <div class="stat-note">{{ t.apiKeyKeep }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-heart-pulse" class="stat-icon blue"></q-icon>
+              <div class="stat-label">{{ t.statHealthy }}</div>
+              <div class="stat-value">{{ healthyCount }}</div>
+              <div class="stat-note">{{ t.statHealthyNote }}</div>
+            </q-card-section></q-card>
+          </section>
+
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.poolTitle }}</div>
+                <div class="surface-subtitle">{{ t.addCopy }}</div>
+              </div>
+              <q-input v-model="filter" dense outlined dark debounce="200" :placeholder="t.searchPlaceholder" class="search-input">
+                <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
+              </q-input>
+            </q-card-section>
+            <q-separator dark></q-separator>
+
+            <q-inner-loading :showing="loading && upstreams.length === 0" dark>
+              <q-spinner-gears size="34px" color="purple-3"></q-spinner-gears>
+              <div class="q-mt-sm muted">{{ c.loading }}</div>
+            </q-inner-loading>
+
+            <div v-if="!loading && filtered.length === 0" class="empty-state">
+              <q-icon name="mdi-cloud-off-outline" size="18px"></q-icon>
+              <span>{{ upstreams.length === 0 ? t.emptyPool : t.emptyFilter }}</span>
+            </div>
+
+            <q-table
+              v-else
+              flat
+              dense
+              dark
+              :rows="filtered"
+              :columns="columns"
+              :pagination="pagination"
+              :rows-per-page-options="[10, 20, 0]"
+              row-key="url"
+              class="linear-table"
+            >
+              <template v-slot:body-cell-url="props">
+                <q-td :props="props">
+                  <div class="identity-cell">
+                    <q-icon v-if="poolRow(props.row)" :name="poolRow(props.row).is_healthy || props.row.disable_health_check ? 'mdi-check-decagram' : 'mdi-alert-octagon'" :color="poolRow(props.row).is_healthy || props.row.disable_health_check ? 'teal-4' : 'red-4'" size="18px"></q-icon>
+                    <q-icon v-else name="mdi-help-circle-outline" color="grey-6" size="18px"></q-icon>
+                    <div>
+                      <strong>{{ props.row.url }}</strong>
+                      <span>{{ props.row.id || props.row.url }}</span>
+                    </div>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-model="props">
+                <q-td :props="props">{{ props.row.model_id || c.unknown }}</q-td>
+              </template>
+              <template v-slot:body-cell-status="props">
+                <q-td :props="props">
+                  <div class="route-cell">
+                    <q-badge :color="poolColor(props.row)" :label="poolLabel(props.row)" text-color="white"></q-badge>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-priority="props"><q-td :props="props" class="mono">{{ displayNumber(props.row.priority, 50) }}</q-td></template>
+              <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
+              <template v-slot:body-cell-labels="props">
+                <q-td :props="props">
+                  <div v-if="labelKeys(props.row).length" class="label-cell">
+                    <q-chip v-for="key in labelKeys(props.row)" :key="key" dense size="12px" class="chip-soft">{{ key }}={{ props.row.labels[key] }}</q-chip>
+                  </div>
+                  <span v-else class="muted">—</span>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-key="props">
+                <q-td :props="props">
+                  <q-badge v-if="hasKey(props.row)" outline color="teal-4" class="chip-soft">
+                    <q-icon name="mdi-key-variant" size="12px"></q-icon>&nbsp;{{ t.keySet }}
+                  </q-badge>
+                  <span v-else class="muted">{{ t.keyNone }}</span>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-actions="props">
+                <q-td :props="props">
+                  <div class="row-actions">
+                    <q-btn flat round dense icon="mdi-open-in-new" :disable="!poolRow(props.row)" @click="openWorker(props.row)"><q-tooltip>{{ t.openWorker }}</q-tooltip></q-btn>
+                    <q-btn flat round dense icon="mdi-pencil-outline" :disable="unsupported" @click="openEdit(props.row)"><q-tooltip>{{ c.edit }}</q-tooltip></q-btn>
+                    <q-btn flat round dense icon="mdi-trash-can-outline" color="red-4" :disable="unsupported" @click="confirmRemove(props.row)"><q-tooltip>{{ t.deleteTitle }}</q-tooltip></q-btn>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:no-results><div class="empty-state"><span>{{ t.emptyFilter }}</span></div></template>
+            </q-table>
+          </q-card>
+
+          <!-- 添加接入条目 -->
+          <q-dialog v-model="addOpen" persistent>
+            <q-card class="dialog-card">
+              <q-card-section><div class="dialog-title">{{ t.addTitle }}</div><div class="dialog-copy">{{ t.addCopy }}</div></q-card-section>
+              <q-card-section>
+                <q-form class="dialog-fields" @submit.prevent="submitAdd">
+                  <q-input v-model="addForm.url" dense outlined dark autofocus :rules="[urlRule]" :label="t.urlField" :placeholder="t.urlPlaceholder" class="mono">
+                    <template v-slot:append><q-icon name="mdi-link-variant"></q-icon></template>
+                  </q-input>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.model_id" dense outlined dark :label="t.modelField" :hint="t.modelHint"></q-input>
+                    <q-input v-model="addForm.api_key" dense outlined dark type="password" :label="t.apiKeyField" :hint="t.apiKeyHint"></q-input>
+                  </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
+                  </div>
+                  <q-input v-model="addForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :placeholder="'{&quot;gpu&quot;:&quot;0&quot;,&quot;engine&quot;:&quot;sglang&quot;}'" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
+                  <q-toggle v-model="addForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
+                  <div class="muted">{{ t.disableHealthHint }}</div>
+                </q-form>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="addOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.addSubmit" type="submit" @click="submitAdd"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+
+          <!-- 编辑接入条目 -->
+          <q-dialog v-model="editOpen" persistent>
+            <q-card class="dialog-card">
+              <q-card-section><div class="dialog-title">{{ t.editTitle }}</div><div class="dialog-copy">{{ t.editCopy }}</div></q-card-section>
+              <q-card-section>
+                <q-form class="dialog-fields" @submit.prevent="submitEdit">
+                  <q-input v-model="editForm.url" dense outlined dark :rules="[editUrlRule]" :label="t.urlField" class="mono">
+                    <template v-slot:append><q-icon name="mdi-link-variant"></q-icon></template>
+                  </q-input>
+                  <div class="form-grid-2">
+                    <q-input v-model="editForm.model_id" dense outlined dark :label="t.modelField" :hint="t.modelHint"></q-input>
+                    <q-input v-model="editForm.api_key" dense outlined dark type="password" :label="t.apiKeyField" :hint="t.apiKeyHint" :disable="editForm.clearKey"></q-input>
+                  </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="editForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
+                  </div>
+                  <q-input v-model="editForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
+                  <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
+                  <div class="muted">{{ t.disableHealthHint }}</div>
+                  <q-toggle v-model="editForm.clearKey" dense color="orange-9" :label="t.clearKey"></q-toggle>
+                  <div class="muted">{{ t.clearKeyHint }} · {{ t.apiKeyKeep }}</div>
+                </q-form>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="editOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.editSubmit" type="submit" @click="submitEdit"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+        </q-page>
+      </q-page-container>
+    </q-layout>
+  </div>
+
+  <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="./i18n.js?v=5"></script>
+  <script src="./api.js?v=4"></script>
+  <script>
+    const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+    const REFRESH_MS = 5000
+
+    function normUrl (value) {
+      return String(value || '').trim().replace(/\/+$/, '')
+    }
+
+    const app = Vue.createApp({
+      setup () {
+        const upstreams = ref([])
+        const workers = ref([])
+        const locale = ref(window.lmrI18n.getLocale())
+        const loading = ref(false)
+        const loadError = ref('')
+        const unsupported = ref(false)
+        const filter = ref('')
+        const autoRefresh = ref(true)
+        const submitting = ref(false)
+        const addOpen = ref(false)
+        const editOpen = ref(false)
+        const selectedUrl = ref('')
+        let unsubscribeLocale
+        let refreshTimer
+
+        const blankForm = () => ({ url: '', model_id: '', api_key: '', clearKey: false, priority: '', cost: '', labelsText: '', disable_health_check: false })
+        const addForm = reactive(blankForm())
+        const editForm = reactive(blankForm())
+        const pagination = reactive({ rowsPerPage: 20 })
+
+        const c = computed(() => window.lmrI18n.messages[locale.value].common)
+        const t = computed(() => window.lmrI18n.messages[locale.value].upstreams)
+
+        const columns = computed(() => [
+          { name: 'url', label: t.value.colUrl, field: 'url', align: 'left', sortable: true },
+          { name: 'model', label: t.value.colModel, field: 'model_id', align: 'left', sortable: true },
+          { name: 'status', label: t.value.colStatus, field: 'url', align: 'left' },
+          { name: 'priority', label: t.value.colPriority, field: 'priority', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'cost', label: t.value.colCost, field: 'cost', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'labels', label: t.value.colLabels, field: 'labels', align: 'left' },
+          { name: 'key', label: t.value.colKey, field: 'api_key', align: 'left', style: 'width:96px' },
+          { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:130px' }
+        ])
+
+        const keyedCount = computed(() => upstreams.value.filter(row => hasKey(row)).length)
+        const healthyCount = computed(() => upstreams.value.filter(row => row.disable_health_check || (poolRow(row) && poolRow(row).is_healthy)).length)
+
+        const filtered = computed(() => {
+          const needle = filter.value.trim().toLowerCase()
+          if (!needle) return upstreams.value
+          return upstreams.value.filter(row => {
+            const labels = Object.entries(row.labels || {}).map(entry => entry[0] + '=' + entry[1]).join(' ')
+            return [row.url, row.model_id, labels].join(' ').toLowerCase().includes(needle)
+          })
+        })
+
+        function notify (message, type = 'positive') {
+          Quasar.Notify.create({ message, type, position: 'top-right', timeout: type === 'negative' ? 5200 : 2400 })
+        }
+
+        // 与 GET /workers 的池成员按规范化 url 对上号；对不上 = 未入池（多半是同名地址被 watcher 抢先认领）
+        function poolRow (row) {
+          const url = normUrl(row.url)
+          return workers.value.find(worker => normUrl(worker.url) === url) || null
+        }
+        function poolLabel (row) {
+          if (row.disable_health_check) return t.value.poolHealthy
+          const worker = poolRow(row)
+          if (!worker) return t.value.poolOut
+          if (worker.is_healthy) return t.value.poolHealthy
+          const status = worker.job_status && worker.job_status.status
+          if (status === 'pending' || status === 'processing') return t.value.poolPending
+          return t.value.poolUnhealthy
+        }
+        function poolColor (row) {
+          if (row.disable_health_check) return 'grey-7'
+          const worker = poolRow(row)
+          if (!worker) return 'grey-7'
+          if (worker.is_healthy) return 'teal-6'
+          const status = worker.job_status && worker.job_status.status
+          if (status === 'pending' || status === 'processing') return 'amber-8'
+          return 'red-8'
+        }
+        // 回显恒 null（服务端脱敏，契约 3.4）：有 key 与否只能靠服务端的存在性标志位判断。
+        // 兼容 config_store 可能采用的几种字段名，全部 false 时按「未设置」显示，绝不明文回显。
+        function hasKey (row) {
+          if (!row) return false
+          if (row.has_api_key !== undefined) return Boolean(row.has_api_key)
+          if (row.api_key_set !== undefined) return Boolean(row.api_key_set)
+          if (row.key_present !== undefined) return Boolean(row.key_present)
+          return Boolean(row.api_key)
+        }
+        function displayNumber (value, fallback) {
+          const number = Number(value)
+          return Number.isFinite(number) ? String(number) : String(fallback)
+        }
+        function formatCost (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number)) return '1'
+          return Number.isInteger(number) ? String(number) : number.toFixed(2)
+        }
+        function labelKeys (row) {
+          return Object.keys(row.labels || {}).sort()
+        }
+
+        function urlRuleFor (selfUrl) {
+          return value => {
+            const text = normUrl(value)
+            if (!text) return c.value.required
+            if (!/^https?:\/\/[^/]+$/i.test(text)) return t.value.urlRule
+            if (selfUrl !== null && upstreams.value.some(row => normUrl(row.url) === text && normUrl(row.url) !== normUrl(selfUrl))) {
+              return t.value.dupUrlNotice
+            }
+            return true
+          }
+        }
+        const urlRule = value => urlRuleFor(null)(value)
+        const editUrlRule = value => urlRuleFor(selectedUrl.value)(value)
+
+        function numberRule (value) {
+          const text = String(value === null || value === undefined ? '' : value).trim()
+          if (!text) return true
+          return Number.isFinite(Number(text)) || t.value.numberRule
+        }
+        function labelsObject (text) {
+          const trimmed = String(text || '').trim()
+          if (!trimmed) return {}
+          let parsed
+          try { parsed = JSON.parse(trimmed) } catch (err) { return null }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+          const out = {}
+          for (const key of Object.keys(parsed)) {
+            const value = parsed[key]
+            if (value === null || value === undefined) continue
+            out[key] = String(value)
+          }
+          return out
+        }
+        function labelsRule (value) {
+          return labelsObject(value) !== null || t.value.labelsRule
+        }
+
+        // 表单 → upstreams 条目（api_key 三态：null=不动 / ""=清除 / 非空=设置，见契约 3.4）
+        function buildEntry (form, base) {
+          const entry = Object.assign({}, base || {})
+          delete entry.id
+          entry.url = normUrl(form.url)
+          const model = String(form.model_id || '').trim()
+          if (model) entry.model_id = model
+          else delete entry.model_id
+          const key = String(form.api_key || '')
+          if (form.clearKey) entry.api_key = ''
+          else if (key) entry.api_key = key
+          else delete entry.api_key
+          const priority = String(form.priority === null || form.priority === undefined ? '' : form.priority).trim()
+          if (priority !== '') entry.priority = Number(priority)
+          else delete entry.priority
+          const cost = String(form.cost === null || form.cost === undefined ? '' : form.cost).trim()
+          if (cost !== '') entry.cost = Number(cost)
+          else delete entry.cost
+          const labels = labelsObject(form.labelsText)
+          if (labels && Object.keys(labels).length) entry.labels = labels
+          else delete entry.labels
+          if (form.disable_health_check) entry.disable_health_check = true
+          else delete entry.disable_health_check
+          return entry
+        }
+
+        function formFromRow (row) {
+          return {
+            url: row.url || '',
+            model_id: row.model_id || '',
+            api_key: '',
+            clearKey: false,
+            priority: row.priority === undefined || row.priority === null ? '' : String(row.priority),
+            cost: row.cost === undefined || row.cost === null ? '' : String(row.cost),
+            labelsText: row.labels && Object.keys(row.labels).length ? JSON.stringify(row.labels) : '',
+            disable_health_check: Boolean(row.disable_health_check)
+          }
+        }
+
+        function reconcileSummary (res) {
+          const rec = res && (res.reconcile || (res.summary && res.summary.reconcile) || res.summary)
+          if (!rec || typeof rec !== 'object') return ''
+          const count = value => {
+            if (Array.isArray(value)) return value.length
+            const number = Number(value)
+            return Number.isFinite(number) ? number : 0
+          }
+          return window.lmrI18n.translate(locale.value, 'upstreams', 'reconcileNotice', {
+            added: count(rec.added), updated: count(rec.updated), removed: count(rec.removed), skipped: count(rec.skipped)
+          })
+        }
+
+        async function loadQuiet () {
+          try {
+            const [doc, pool] = await Promise.all([window.lmrApi.config(), window.lmrApi.workers()])
+            upstreams.value = (doc && Array.isArray(doc.upstreams)) ? doc.upstreams : []
+            unsupported.value = !!(doc && doc.upstreams === undefined)
+            workers.value = (pool && pool.workers) || []
+            loadError.value = ''
+            return true
+          } catch (error) {
+            loadError.value = error.message
+            return false
+          }
+        }
+        async function load () {
+          loading.value = true
+          await loadQuiet()
+          loading.value = false
+        }
+
+        function afterWrite (res, url, messageKey) {
+          notify(window.lmrI18n.translate(locale.value, 'upstreams', messageKey, { url }))
+          const summary = reconcileSummary(res)
+          if (summary) notify(summary, 'info')
+        }
+
+        async function submitList (entries, resHandler) {
+          submitting.value = true
+          try {
+            const res = await window.lmrApi.configUpstreams(entries)
+            await resHandler(res)
+            await loadQuiet()
+            startAutoRefresh()
+          } catch (error) {
+            notify(error.message, 'negative')
+          } finally {
+            submitting.value = false
+          }
+        }
+
+        async function submitAdd () {
+          if (urlRule(addForm.url) !== true || numberRule(addForm.priority) !== true || numberRule(addForm.cost) !== true || labelsRule(addForm.labelsText) !== true) return
+          const entry = buildEntry(addForm, null)
+          const entries = upstreams.value.slice()
+          entries.push(entry)
+          await submitList(entries, res => afterWrite(res, entry.url, 'addedNotice'))
+          addOpen.value = false
+          Object.assign(addForm, blankForm())
+        }
+
+        function openAdd () {
+          Object.assign(addForm, blankForm())
+          addOpen.value = true
+        }
+        function openEdit (row) {
+          selectedUrl.value = row.url
+          Object.assign(editForm, formFromRow(row))
+          editOpen.value = true
+        }
+
+        async function submitEdit () {
+          if (editUrlRule(editForm.url) !== true || numberRule(editForm.priority) !== true || numberRule(editForm.cost) !== true || labelsRule(editForm.labelsText) !== true) return
+          const original = upstreams.value.find(row => normUrl(row.url) === normUrl(selectedUrl.value))
+          if (!original) {
+            notify(t.value.emptyPool, 'negative')
+            editOpen.value = false
+            return
+          }
+          const entry = buildEntry(editForm, original)
+          const entries = upstreams.value.map(row => (normUrl(row.url) === normUrl(selectedUrl.value) ? entry : row))
+          await submitList(entries, res => afterWrite(res, entry.url, 'updatedNotice'))
+          editOpen.value = false
+        }
+
+        function confirmRemove (row) {
+          Quasar.Dialog.create({
+            title: t.value.deleteTitle,
+            message: row.url + ' · ' + (row.model_id || c.value.unknown) + ' · ' + t.value.deleteConfirm,
+            cancel: true,
+            persistent: true,
+            ok: { label: c.value.del, color: 'negative', flat: true }
+          }).onOk(async () => {
+            const entries = upstreams.value.filter(item => normUrl(item.url) !== normUrl(row.url))
+            submitting.value = true
+            try {
+              const res = await window.lmrApi.configUpstreams(entries)
+              notify(window.lmrI18n.translate(locale.value, 'upstreams', 'deletedNotice', { url: row.url }))
+              const summary = reconcileSummary(res)
+              if (summary) notify(summary, 'info')
+              await loadQuiet()
+            } catch (error) {
+              notify(error.message, 'negative')
+            } finally {
+              submitting.value = false
+            }
+          })
+        }
+
+        function openWorker (row) {
+          window.open(normUrl(row.url) + '/', '_blank', 'noopener')
+        }
+
+        function startAutoRefresh () {
+          window.clearInterval(refreshTimer)
+          if (autoRefresh.value) refreshTimer = window.setInterval(loadQuiet, REFRESH_MS)
+        }
+        function stopAutoRefresh () {
+          window.clearInterval(refreshTimer)
+          refreshTimer = null
+        }
+
+        function applyLocale (nextLocale) {
+          locale.value = nextLocale
+          document.documentElement.lang = nextLocale
+          document.title = window.lmrI18n.messages[nextLocale].upstreams.title + ' · llm-router'
+          window.lmrI18n.applyQuasarLang(nextLocale)
+        }
+
+        onMounted(() => {
+          applyLocale(locale.value)
+          unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
+          load()
+          startAutoRefresh()
+        })
+        onBeforeUnmount(() => {
+          stopAutoRefresh()
+          if (unsubscribeLocale) unsubscribeLocale()
+        })
+
+        return {
+          addForm, addOpen, autoRefresh, c, columns, confirmRemove, displayNumber, editForm, editOpen,
+          editUrlRule, filtered, formatCost, hasKey, healthyCount, keyedCount, labelKeys, load, loading,
+          loadError, numberRule, labelsRule, openAdd, openEdit, openWorker, pagination, poolLabel, poolColor,
+          poolRow, submitting, submitAdd, submitEdit, t, upstreams, urlRule, unsupported
+        }
+      }
+    })
+
+    app.use(Quasar, { config: { dark: true } })
+    Quasar.Dark.set(true)
+    window.lmrI18n.applyQuasarLang(window.lmrI18n.getLocale())
+    Quasar.IconSet.set(Quasar.IconSet.mdiV7)
+    app.mount('#q-app')
+  </script>
+</body>
+</html>

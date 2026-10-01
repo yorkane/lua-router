@@ -94,6 +94,187 @@ local function start_inflight_sampler()
     return true
 end
 
+-- ------------------------------------------------------- upstreams reconcile
+--
+-- doc/gap-virtual-models.md 3.1 trigger points. config_store owns the sync
+-- half (apply-time reconcile inside the write handlers); this is the two
+-- async halves in worker 0 only: a bootstrap pass shortly after seeding, and
+-- a 30 s self-healing timer that compares the config revision against the
+-- applied token kept in lr_workers. Everything is pcall-guarded: while the
+-- store has no reconcile_upstreams (mid-rollout / stripped build), both halves
+-- are no-ops and a failure here can never reach the request plane.
+
+local RECONCILE_INTERVAL_SECS = 30
+-- Belt-and-suspenders full pass (see registry.lua invalidate_applied_rev): the
+-- reconcile guard is a per-process flag, so an external pool mutation landing
+-- inside a guarded window could go unseen; one unconditional sweep every
+-- RECONCILE_INTERVAL_SECS * this ticks (~5 min) bounds that gap.
+local RECONCILE_SWEEP_TICKS = 10
+local sweep_ticks = 0
+-- Applied-revision token inside the registry's dict: shdict state survives a
+-- reload, so only a genuine change (or a full restart, which empties the dict)
+-- re-runs the pass. Env visibility note: no new os.getenv names are read here
+-- on purpose -- the conf `env` lists are owned by another agent (root ruled
+-- the interval constant lives in code, keyed off store.policy_revision).
+local UPSTREAMS_REV_KEY = "upstreams:applied_rev"
+
+local function store_module()
+    local ok, mod = pcall(require, "resty.luarouter.config_store")
+    if ok and type(mod) == "table" then
+        return mod
+    end
+    return nil
+end
+
+---Run one idempotent reconcile when the store offers it. Returns whether the
+---pass ran (the caller only records the token after a real pass).
+---@param store_mod table|nil
+---@return boolean ran
+local function reconcile_once(store_mod)
+    if not store_mod or type(store_mod.reconcile_upstreams) ~= "function" then
+        return false
+    end
+    -- Guard the registry for the duration of this pass: reconcile's own
+    -- add/remove must not clear the applied-revision token (that would make
+    -- every pass re-trigger the next one). The guard is per Lua process, so
+    -- external mutations observed by other request workers stay visible; the
+    -- periodic sweep in the tick bounds the narrow same-process window.
+    local ok_reg, registry = pcall(require, "resty.luarouter.registry")
+    local guarded = ok_reg and type(registry) == "table"
+        and type(registry.set_reconcile_guard) == "function"
+    if guarded then
+        pcall(registry.set_reconcile_guard, true)
+    end
+    local ok, err = pcall(store_mod.reconcile_upstreams)
+    if guarded then
+        pcall(registry.set_reconcile_guard, false)
+    end
+    if not ok then
+        ngx.log(ngx.WARN, "luarouter: upstreams reconcile failed: ", tostring(err))
+        return false
+    end
+    return true
+end
+
+---The config document revision token. policy_revision is the token config_store
+---already bumps on every write (including upstreams/virtual-model applies); a
+---document-scoped accessor is preferred when one exists.
+---@param store_mod table|nil
+---@return string|nil
+local function config_revision(store_mod)
+    if not store_mod then
+        return nil
+    end
+    if type(store_mod.document_revision) == "function" then
+        local ok, value = pcall(store_mod.document_revision)
+        if ok and value ~= nil then
+            return tostring(value)
+        end
+    end
+    if type(store_mod.policy_revision) == "function" then
+        local ok, value = pcall(store_mod.policy_revision)
+        if ok and value ~= nil then
+            return tostring(value)
+        end
+    end
+    return nil
+end
+
+local function applied_revision()
+    local d = ngx.shared and ngx.shared.lr_workers
+    if not d then
+        return nil
+    end
+    local value = d:get(UPSTREAMS_REV_KEY)
+    if value == nil then
+        return nil
+    end
+    return tostring(value)
+end
+
+local function record_applied_revision(token)
+    local d = ngx.shared and ngx.shared.lr_workers
+    if d and token ~= nil then
+        d:set(UPSTREAMS_REV_KEY, token)
+    end
+end
+
+---Bootstrap pass: shortly after worker 0 seeded the registry, pull the declared
+---upstreams into the pool (covers a container restart, where both lr_workers
+---and the applied token start empty). Deferred by 0.5 s so it lands after the
+---SMG_WORKER_URLS bootstrap and cannot race its shared-dict writes.
+---@return boolean started
+local function start_upstreams_bootstrap()
+    local store_mod = store_module()
+    if not store_mod or type(store_mod.reconcile_upstreams) ~= "function" then
+        return false
+    end
+    local function tick(premature)
+        if premature then
+            return
+        end
+        if reconcile_once(store_mod) then
+            record_applied_revision(config_revision(store_module()))
+        end
+    end
+    local ok, err = ngx.timer.at(0.5, tick)
+    if not ok then
+        ngx.log(ngx.WARN, "luarouter: upstreams bootstrap timer not started: ",
+            tostring(err))
+        return false
+    end
+    return true
+end
+
+---Self-healing loop: every 30 s, reconcile when the document moved past the
+---applied token. The comparison is per-pass state in the shared dict, so a
+---worker restart, a hand DELETE against a config member, or a write that
+---landed while this process was down all converge on the next tick. env seed
+---file (LMR_UPSTREAMS_FILE) pickup is internal to reconcile_upstreams, so no
+---separate env_upstreams call is needed beyond this pass.
+---@return boolean started
+local function start_upstreams_timer()
+    local store_mod = store_module()
+    if not store_mod or type(store_mod.reconcile_upstreams) ~= "function" then
+        return false
+    end
+    local function tick(premature)
+        if premature then
+            return
+        end
+        local current = store_module()
+        local token = config_revision(current)
+        local applied = applied_revision()
+        sweep_ticks = sweep_ticks + 1
+        local force = sweep_ticks >= RECONCILE_SWEEP_TICKS
+        if force then
+            sweep_ticks = 0
+        end
+        if token ~= nil and (token ~= applied or force) then
+            if reconcile_once(current) then
+                -- Record last, from a fresh read: the document may have moved
+                -- while the pass ran, and storing the pre-read token would
+                -- reopen the same gap until the following tick.
+                local fresh = config_revision(current) or token
+                record_applied_revision(fresh)
+                ngx.log(ngx.NOTICE, "luarouter: upstreams reconciled at revision ", fresh)
+            end
+        end
+        local again, err = ngx.timer.at(RECONCILE_INTERVAL_SECS, tick)
+        if not again then
+            ngx.log(ngx.WARN, "luarouter: upstreams reconcile timer stopped: ",
+                tostring(err))
+        end
+    end
+    local ok, err = ngx.timer.at(RECONCILE_INTERVAL_SECS, tick)
+    if not ok then
+        ngx.log(ngx.WARN, "luarouter: upstreams reconcile timer not started: ",
+            tostring(err))
+        return false
+    end
+    return true
+end
+
 ---Parse and validate the environment. Safe to call from init_by_lua.
 ---
 --- Also snapshots the LMR_* names for the config store: nginx rebuilds the
@@ -319,6 +500,11 @@ function _M.worker_init()
             ngx.log(ngx.WARN, "luarouter: watcher not started: ", tostring(why))
         end
     end
+    -- Config-declared upstreams (doc/gap-virtual-models.md 3.1): async safety
+    -- net behind the synchronous apply-time reconcile in config_store. Both
+    -- halves are guarded no-ops when the store lacks the feature.
+    start_upstreams_bootstrap()
+    start_upstreams_timer()
     return true
 end
 

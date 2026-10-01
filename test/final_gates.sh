@@ -36,6 +36,13 @@
 #   e2e_routing_dyn integration/e2e_routing_dyn.py (runtime policy switch, no restart)
 #   e2e_watcher    integration/e2e_watcher.py (in-process watcher: targets/proc/docker
 #                  discovery, 9 guards, model-map, restart rediscovery)
+#   e2e_profiles   integration/e2e_profiles.py (virtual model profiles: alias worker
+#                  whitelist, per-alias policy/effort, upstreams CRUD with remote
+#                  api_key injection + masking (key tri-state, normalized-url
+#                  dedup 400), LMR_UPSTREAMS_FILE boot seed, watcher immunity,
+#                  LMR_CONFIG_FILE revival across a restart, the 30 s self-heal
+#                  timer re-adding a hand-deleted config member, apply-document
+#                  with all-or-nothing reject)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
 #   e2e_tls_chain  integration/e2e_tls_chain.py (server-side TLS: runtime-built
@@ -54,6 +61,13 @@
 #   e2e_*          that behaviour family over a real container.
 #   e2e_watcher    the merged watcher (was a separate llm-watcher container):
 #                  without it nothing proves discovery/guards/ledger work.
+#   e2e_profiles   the virtual-model layer (doc/gap-virtual-models.md): the alias
+#                  worker whitelist, per-alias policy/effort override, the upstreams
+#                  declaration layer (remote api_key injection, the null-keeps/
+#                  empty-clears write semantics, key never echoed), watcher immunity
+#                  for discovery=config, and persistence through LMR_CONFIG_FILE
+#                  (the only layer that survives a restart for config workers), the
+#                  LMR_UPSTREAMS_FILE env layer, and the 30 s self-heal timer.
 #   head_routes    the HEAD mirror (Rust axum answers HEAD on every GET route).
 #   mesh_http      mesh enablement over real HTTP: peer apply/sync, worker
 #                  mirror, /ha/policies, /_mesh/internal/{state,apply}.
@@ -94,7 +108,7 @@ mkdir -p "$LOG_DIR"
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort head_routes mesh_http
             e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
-            e2e_routing_dyn mesh_two e2e_tls_chain)
+            e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain)
 
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
@@ -243,7 +257,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn; do
+    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
@@ -273,6 +287,7 @@ gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
 gate_e2e_policy_parity() { run_integration e2e_policy_parity.py 1800; }
 gate_e2e_watcher()    { run_integration e2e_watcher.py 900; }
+gate_e2e_profiles()   { run_integration e2e_profiles.py 1500; }
 gate_e2e_token_accounting() { run_integration e2e_token_accounting.py 900; }
 gate_e2e_gpu_load()    { run_integration e2e_gpu_load.py 900; }
 gate_e2e_routing_dyn() { run_integration e2e_routing_dyn.py 900; }
@@ -300,6 +315,7 @@ gate head_routes
 gate mesh_http
 gate e2e_policy_parity
 gate e2e_watcher
+gate e2e_profiles
 gate e2e_token_accounting
 gate e2e_gpu_load
 gate e2e_routing_dyn

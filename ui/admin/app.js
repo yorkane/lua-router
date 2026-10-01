@@ -7,8 +7,8 @@
 */
 const { computed, onBeforeUnmount, onMounted, ref } = Vue
 
-// 四个管理页 + 原版聊天界面（跳出壳，新标签打开）
-const pages = ['workers.html?v=1', 'models.html?v=1', 'routing.html?v=1', 'logs.html?v=1']
+// 五个管理页 + 原版聊天界面（跳出壳，新标签打开）
+const pages = ['workers.html?v=1', 'upstreams.html?v=1', 'models.html?v=1', 'routing.html?v=1', 'logs.html?v=1']
 
 function hashTarget () {
   const raw = String(window.location.hash || '').replace(/^#/, '')
@@ -55,9 +55,10 @@ const app = Vue.createApp({
           label: dict.groupManagement,
           items: [
             { id: 'workers', page: pages[0], icon: 'mdi-server-network', label: dict.workers, note: dict.workersTitle },
-            { id: 'models', page: pages[1], icon: 'mdi-sitemap', label: dict.models, note: dict.modelsTitle },
-            { id: 'routing', page: pages[2], icon: 'mdi-call-split', label: dict.routing, note: dict.routingTitle },
-            { id: 'logs', page: pages[3], icon: 'mdi-text-box-search-outline', label: dict.logs, note: dict.logsTitle }
+            { id: 'upstreams', page: pages[1], icon: 'mdi-cloud-plus-outline', label: dict.upstreams, note: dict.upstreamsTitle },
+            { id: 'models', page: pages[2], icon: 'mdi-sitemap', label: dict.models, note: dict.modelsTitle },
+            { id: 'routing', page: pages[3], icon: 'mdi-call-split', label: dict.routing, note: dict.routingTitle },
+            { id: 'logs', page: pages[4], icon: 'mdi-text-box-search-outline', label: dict.logs, note: dict.logsTitle }
           ]
         },
         {
@@ -109,9 +110,10 @@ const app = Vue.createApp({
     function syncFrameTitle () {
       const dict = window.lmrI18n.messages[locale.value].shell
       if (activeApp.value.startsWith(pages[0])) activeTitle.value = dict.workers
-      else if (activeApp.value.startsWith(pages[1])) activeTitle.value = dict.models
-      else if (activeApp.value.startsWith(pages[2])) activeTitle.value = dict.routing
-      else if (activeApp.value.startsWith(pages[3])) activeTitle.value = dict.logs
+      else if (activeApp.value.startsWith(pages[1])) activeTitle.value = dict.upstreams
+      else if (activeApp.value.startsWith(pages[2])) activeTitle.value = dict.models
+      else if (activeApp.value.startsWith(pages[3])) activeTitle.value = dict.routing
+      else if (activeApp.value.startsWith(pages[4])) activeTitle.value = dict.logs
       else activeTitle.value = dict.frameTitle
     }
 

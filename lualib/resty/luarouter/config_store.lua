@@ -55,6 +55,10 @@ local DICT_KEY = "runtime_config"
 -- Cheap cross-worker invalidation token for the policy readers (policy.lua calls
 -- this on the hot path; it is a plain shdict get with no JSON decode).
 local REV_KEY = "policy_revision"
+-- Cross-process token for the upstreams reconcile self-heal (contract 3.1):
+-- written after every successful reconcile, read by init.lua's 30s timer. Same
+-- unprefixed style as DICT_KEY / REV_KEY.
+local UPS_REV_KEY = "upstreams_rev"
 local SNAPSHOT_TTL = 0.5  -- seconds a worker may reuse a snapshot read from disk
 
 -- ------------------------------------------------------------------ helpers
@@ -189,6 +193,14 @@ local function parse_caps(raw)
     return order
 end
 
+--- Log helper behind a guard: unit caliber carries a stubbed ngx, and the
+--- master process may reach a logger-free moment.
+local function ngx_log_warn(...)
+    if ngx and ngx.log then
+        pcall(ngx.log, ngx.WARN, ...)
+    end
+end
+
 --- LMR_* names the module reads. Declared here so capture_env() can snapshot
 --- them once in the master process (nginx strips undeclared variables from
 --- worker environments, so os.getenv returns nil inside request phases).
@@ -197,7 +209,7 @@ _M.ENV_NAMES = {
     "LMR_DEFAULT_EFFORT", "LMR_EFFORT_MAP", "LMR_MODEL_CTX", "LMR_MODEL_EFFORT",
     "LMR_MODEL_EFFORT_MAP", "LMR_MODEL_MODALITIES", "LMR_VIRTUAL_MODELS",
     "LMR_WATCHER_URL", "LMR_CONFIG_FILE", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
-    "LMR_LOGS_BUFFER",
+    "LMR_LOGS_BUFFER", "LMR_UPSTREAMS_FILE",
 }
 
 --- Call from init_by_lua_block: caches the environment in a plain global that
@@ -254,6 +266,385 @@ local function sorted_keys(map)
     return keys
 end
 
+---registry module for the pool helpers, required once (the pure-Lua unit tests
+---never reach this path, so the pcall is only about a missing module on a box).
+local cached_store_registry
+local function store_registry()
+    if cached_store_registry ~= nil then
+        return cached_store_registry or nil
+    end
+    local ok, mod = pcall(require, "resty.luarouter.registry")
+    cached_store_registry = (ok and type(mod) == "table") and mod or false
+    return cached_store_registry or nil
+end
+
+--- Unit hook: forget the lazily required registry/router modules so a test can
+--- run both the "registry absent" and "registry stubbed" reconcile passes. Only
+--- the pure-Lua tests call this; production never resets a loaded module.
+function _M._reset_pool_module_caches()
+    cached_store_registry = nil
+    cached_pool_config = nil
+    _M._file_cache = nil
+    _M._file_cache_at = 0
+    _M._env_defaults = nil
+    _M._policy_view_dirty = true
+    _M.reset_env_upstreams_cache()
+end
+
+---Router config for the pool knobs, or nil when the router is not initialised.
+---Cached: this is on the path of every /props and model-map proxy call.
+local cached_pool_config
+local function store_config()
+    if cached_pool_config ~= nil then
+        return cached_pool_config or nil
+    end
+    local ok, luarouter = pcall(require, "resty.luarouter")
+    if ok and type(luarouter) == "table"
+        and type(luarouter.config) == "function" then
+        local good, conf = pcall(luarouter.config)
+        if good and type(conf) == "table" then
+            cached_pool_config = conf
+            return conf
+        end
+    end
+    cached_pool_config = false
+    return nil
+end
+
+-- ------------------------------------------------- upstream / profile helpers
+--
+-- The upstreams section (doc/gap-virtual-models.md 3.1) stores pool membership
+-- by *normalized* url, and virtual profiles reference pool members the same way.
+-- Normalization is reimplemented here rather than delegated to registry's
+-- normalize_url so validation runs in the pure-Lua unit caliber (no ngx.re) and
+-- config_store keeps no hard dependency on the pool module; the semantics match
+-- (lowercase scheme + host, trailing slashes stripped, http(s) only) and the
+-- reconcile path additionally pcall-delegates to registry when it is loadable.
+
+local UPSTREAMS_LIMIT = 256
+
+--- Lowercase scheme, lowercase host, port kept, no path/userinfo allowed:
+--- upstreams are transport endpoints, so "http://H:P/" and "http://h:p" are one
+--- entry and anything with a path is rejected by the caller-facing validator.
+--- Returns canonical url or nil.
+local function norm_pool_url(raw)
+    if type(raw) ~= "string" then return nil end
+    local s = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" then return nil end
+    if s:find("%s") then return nil end
+    local scheme, rest = s:match("^([%a][%w+.-]*)://(.*)$")
+    if not scheme then return nil end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then return nil end
+    if rest == "" then return nil end
+    local authority, path = rest:match("^([^/]*)(.*)$")
+    if authority == nil then return nil end
+    -- trailing slashes are identity, not a path: strip them, then anything left
+    -- over is a real path and this is not a transport endpoint.
+    path = path:gsub("/+$", "")
+    if path ~= "" then return nil end
+    if authority == "" or authority:find("@") then return nil end
+    local host, port
+    if authority:sub(1, 1) == "[" then
+        host = authority:match("^(%[[^%]]-%])")
+        if not host then return nil end
+        local tail = authority:sub(#host + 1)
+        if tail == "" then
+            port = nil
+        else
+            port = tail:match("^:(%d+)$")
+            if not port then return nil end
+        end
+    else
+        if authority:find("[^%w%.%-%:]") then return nil end
+        local h, p = authority:match("^([^:]-):(%d+)$")
+        if h and h ~= "" and p then
+            host, port = h, p
+        elseif authority:find(":") then
+            return nil
+        else
+            host, port = authority, nil
+        end
+    end
+    if host == "" then return nil end
+    host = host:lower()
+    if port then
+        local n = tonumber(port)
+        if not n or n < 1 or n > 65535 then return nil end
+        return scheme .. "://" .. host .. ":" .. tostring(n)
+    end
+    return scheme .. "://" .. host
+end
+
+local WORKER_ID_PAT = "^" .. ("%x"):rep(8) .. "%-" .. ("%x"):rep(4) .. "%-"
+    .. ("%x"):rep(4) .. "%-" .. ("%x"):rep(4) .. "%-" .. ("%x"):rep(12) .. "$"
+
+--- A candidate-instance entry may be a normalized url or a worker id (uuid); B's
+--- router filter matches on either, so both shapes are accepted and stored.
+local function looks_like_worker_id(value)
+    if type(value) ~= "string" then return false end
+    local s = value:gsub("^%s+", ""):gsub("%s+$", ""):lower()
+    return s:match(WORKER_ID_PAT) ~= nil
+end
+
+local function norm_candidate(value)
+    if type(value) ~= "string" then return nil end
+    local url = norm_pool_url(value)
+    if url then return url end
+    if looks_like_worker_id(value) then
+        return (value:gsub("^%s+", ""):gsub("%s+$", "")):lower()
+    end
+    return nil
+end
+
+--- Ordered, deduplicated candidate list; nil entries rejected by the caller.
+local function build_candidates(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if not is_array(raw) then
+        return nil, string.format("virtual model %s workers must be an array of strings", alias)
+    end
+    local out, seen = {}, {}
+    for _, item in ipairs(raw) do
+        local cand = norm_candidate(item)
+        if not cand then
+            return nil, string.format(
+                "virtual model %s workers entries must be normalized urls or worker ids", alias)
+        end
+        if not seen[cand] then
+            seen[cand] = true
+            out[#out + 1] = cand
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+--- One validated profile from one entry (shared by the env and document layers).
+--- Returns (profile, nil) or (nil, err); profile carries target plus optional
+--- workers/policy/effort, with unset fields absent (never JSON_NULL).
+local function profile_from_entry(alias, entry)
+    if type(entry) ~= "table" then
+        return nil, "virtual model entries must be objects"
+    end
+    local target = trim(entry.target or "")
+    if target == "" then
+        return nil, string.format("virtual model %s needs a target model", alias)
+    end
+    if alias == target then
+        return nil, string.format("virtual model %s must differ from its target", alias)
+    end
+    local profile = { target = target }
+    local workers, werr = build_candidates(alias, rawget(entry, "workers"))
+    if werr then return nil, werr end
+    if workers then profile.workers = workers end
+    -- "" / "auto" / "null" / null are the UI's "follow the global/default"
+    -- answers and omit the field; only a genuinely unknown name is a 400, and a
+    -- non-string is a type error (same wording family as the policy handlers).
+    if rawget(entry, "policy") ~= nil and entry.policy ~= JSON_NULL then
+        if type(entry.policy) ~= "string" then
+            return nil, string.format("virtual model %s policy must be a string or null", alias)
+        end
+        local trimmed = trim(entry.policy)
+        local name = _M.normalize_policy(trimmed)
+        if name == false then
+            return nil, string.format("unknown policy for virtual model %s: %s (want one of %s)",
+                alias, trimmed, POLICY_NAMES_JOIN)
+        end
+        if name then profile.policy = name end
+    end
+    if rawget(entry, "effort") ~= nil and entry.effort ~= JSON_NULL then
+        if type(entry.effort) ~= "string" then
+            return nil, string.format("virtual model %s effort must be a string or null", alias)
+        end
+        local trimmed = trim(entry.effort)
+        local level = _M.normalize_effort(trimmed)
+        if level == false then
+            return nil, string.format("unknown effort for virtual model %s: %s (want one of %s)",
+                alias, trimmed, EFFORT_LEVELS_JOIN)
+        end
+        if level then profile.effort = level end
+    end
+    return profile, nil
+end
+
+--- Full-graph cycle guard: no alias may point at another alias, whether that
+--- alias already exists or appears in the same batch (root ruling 4).
+local function assert_no_alias_chain(built, alias, target)
+    if built == nil then return nil end
+    if built[target] ~= nil then
+        return string.format("virtual model %s target must not be another virtual model: %s",
+            alias, target)
+    end
+    return nil
+end
+
+--- Mask one upstreams row for a response body (contract 3.4): api_key is
+--- present but always null, has_api_key says whether a secret is held, and the
+--- persistence fields (api_key_state / api_key_stored) never leave the store.
+local function sanitize_upstream_row(row)
+    local out = {}
+    for key, value in pairs(row) do
+        if key ~= "api_key" and key ~= "api_key_state" and key ~= "api_key_stored" then
+            out[key] = value
+        end
+    end
+    out.api_key = JSON_NULL
+    out.has_api_key = (row.api_key_state == "set") == true
+    return out
+end
+
+local function sanitize_upstream_rows(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do out[#out + 1] = sanitize_upstream_row(row) end
+    if #out == 0 then return setmetatable({}, EMPTY_ARRAY_MT) end
+    return out
+end
+
+--- Validate + normalize one upstreams entry. Returns (entry, nil) or (nil, err).
+--- The entry keeps the three-state api_key (absent / JSON_NULL = keep, "" =
+--- clear, non-empty = set) plus api_key_stored for persistence.
+local function upstream_from_entry(entry, index)
+    local who = "upstreams[" .. tostring(index) .. "]"
+    if type(entry) ~= "table" then
+        return nil, who .. " must be an object"
+    end
+    local url = type(entry.url) == "string" and trim(entry.url) or ""
+    if url == "" then
+        return nil, "every upstreams entry needs a url"
+    end
+    local canonical = norm_pool_url(url)
+    if not canonical then
+        return nil, string.format("invalid upstream url %s (want http(s)://host[:port])", url)
+    end
+    local out = { url = canonical }
+
+    if rawget(entry, "model_id") ~= nil and entry.model_id ~= JSON_NULL then
+        if type(entry.model_id) ~= "string" then
+            return nil, string.format("upstream %s model_id must be a string", canonical)
+        end
+        local model_id = trim(entry.model_id)
+        if model_id ~= "" then out.model_id = model_id end
+    end
+
+    -- Key tri-state (contract 3.4): absent / null = keep, "" = clear, non-empty
+    -- = set. The persisted form additionally carries api_key_state plus
+    -- api_key_stored, so a document rewrite that only knows the masked display
+    -- shape (api_key: null) cannot lose the secret.
+    local state, stored = "keep", nil
+    local declared = rawget(entry, "api_key_state")
+    if declared ~= nil and declared ~= JSON_NULL then
+        if declared ~= "keep" and declared ~= "set" and declared ~= "clear" then
+            return nil, string.format("upstream %s api_key_state must be keep, set or clear", canonical)
+        end
+        state = declared
+    end
+    -- The operative secret: api_key carries what the UI typed, api_key_stored
+    -- what the persisted snapshot carries. A display null on either field is
+    -- "not said" rather than "said empty", so the masked document shape
+    -- round-trips through the JSON editor without touching the key.
+    local explicit, explicit_field
+    for _, field in ipairs({ "api_key", "api_key_stored" }) do
+        local value = rawget(entry, field)
+        if value ~= nil and value ~= JSON_NULL then
+            explicit, explicit_field = value, field
+            break
+        end
+    end
+    if explicit ~= nil then
+        if type(explicit) ~= "string" then
+            return nil, string.format("upstream %s %s must be a string or null", canonical, explicit_field)
+        end
+        if explicit == "" then
+            state, stored = "clear", nil
+        else
+            state, stored = "set", explicit
+        end
+    elseif state == "set" then
+        ngx_log_warn("luarouter upstream ", canonical,
+            " api_key_state set without api_key_stored; treating as keep")
+        state = "keep"
+    end
+    out.api_key_state = state
+    out.api_key_stored = stored
+
+    for _, field in ipairs({ "priority", "cost" }) do
+        local value = rawget(entry, field)
+        if value ~= nil and value ~= JSON_NULL then
+            local number = tonumber(value)
+            if not number then
+                return nil, string.format("upstream %s %s must be a number", canonical, field)
+            end
+            out[field] = number
+        end
+    end
+
+    if rawget(entry, "labels") ~= nil and entry.labels ~= JSON_NULL then
+        if type(entry.labels) ~= "table" then
+            return nil, string.format("upstream %s labels must be an object of string values", canonical)
+        end
+        local labels = {}
+        for k, v in pairs(entry.labels) do
+            if type(k) ~= "string" or type(v) ~= "string" then
+                return nil, string.format("upstream %s labels must be an object of string values", canonical)
+            end
+            labels[k] = v
+        end
+        if next(labels) then out.labels = labels end
+    end
+
+    local dhc = rawget(entry, "disable_health_check")
+    if dhc ~= nil and dhc ~= JSON_NULL then
+        if type(dhc) ~= "boolean" then
+            return nil, string.format("upstream %s disable_health_check must be a boolean", canonical)
+        end
+        out.disable_health_check = dhc
+    end
+    return out, nil
+end
+
+--- Whole-section validation for upstreams: array, cap, url dedup. `previous`
+--- (optional, url -> {api_key_state, api_key_stored}) is the declaration layer
+--- being replaced: a row that says nothing about the key inherits the stored
+--- secret rather than dropping it, which is what makes a masked document
+--- round-trip (GET /_ui/config -> JSON editor -> apply) key-preserving. An
+--- explicit "" still clears, and a url that changed identity inherits nothing.
+local function build_upstreams(rows, previous)
+    if rows == nil or rows == JSON_NULL then rows = {} end
+    if not is_array(rows) then return nil, "upstreams must be an array" end
+    if #rows > UPSTREAMS_LIMIT then
+        return nil, string.format("upstreams exceeds the %d entry limit", UPSTREAMS_LIMIT)
+    end
+    local out, seen = {}, {}
+    for i, entry in ipairs(rows) do
+        local item, err = upstream_from_entry(entry, i)
+        if not item then return nil, err end
+        if seen[item.url] then
+            return nil, string.format("duplicate upstream url after normalization: %s", item.url)
+        end
+        seen[item.url] = true
+        if item.api_key_state == "keep" and not item.api_key_stored and previous then
+            local before = previous[item.url]
+            if before and before.api_key_state == "set" and before.api_key_stored then
+                item.api_key_state = "set"
+                item.api_key_stored = before.api_key_stored
+            end
+        end
+        out[#out + 1] = item
+    end
+    return out, nil
+end
+
+--- The live declaration layer in the shape build_upstreams wants for inheritance.
+local function previous_upstream_map(cfg)
+    local by_url = {}
+    for _, item in ipairs((cfg and cfg.upstreams) or {}) do
+        if type(item) == "table" and type(item.url) == "string" then
+            by_url[item.url] = item
+        end
+    end
+    return by_url
+end
+
 -- ------------------------------------------------------------- config shape
 -- Internal (map) form; the disk / dict form is the array snapshot below.
 
@@ -270,6 +661,12 @@ local function new_cfg()
         -- policy chain byte-identical to the pre-feature behaviour.
         policy = nil,
         model_policies = {},
+        -- Virtual-model profiles (doc/gap-virtual-models.md 3.1): alias -> {target,
+        -- workers, policy, effort}. virtual_models stays the alias->target map the
+        -- pre-feature readers use, so removing an entry clears both views.
+        virtual_profiles = {},
+        -- Ordered upstream declaration layer (normalized url + key tri-state).
+        upstreams = {},
     }
 end
 
@@ -316,11 +713,66 @@ local function cfg_from_env()
     for _, pair in ipairs(parse_pairs(env("LMR_VIRTUAL_MODELS"))) do
         local alias, target = pair[1], pair[2]
         if alias ~= "" and target ~= "" and alias ~= target then
+            -- Old alias=target pairs are exactly the new shape with no candidates
+            -- and no overrides, so both views get the same content.
             cfg.virtual_models[alias] = target
+            cfg.virtual_profiles[alias] = { target = target }
+        end
+    end
+    for _, entry in ipairs(_M.env_upstreams()) do
+        local item, err = upstream_from_entry(entry, #cfg.upstreams + 1)
+        if item then
+            local dup = false
+            for _, existing in ipairs(cfg.upstreams) do
+                if existing.url == item.url then dup = true break end
+            end
+            if not dup then cfg.upstreams[#cfg.upstreams + 1] = item end
+        elseif err then
+            ngx_log_warn("luarouter config env upstream skipped: ", err)
         end
     end
     return cfg
 end
+
+--- env-layer upstream seed: LMR_UPSTREAMS_FILE points at a JSON file holding
+--- either the array form or {upstreams:[...]} (the same shapes the document
+--- accepts). Missing/unreadable/invalid means "no seed" — the env layer must
+--- never take the gateway down over a bootstrap file.
+local env_upstreams_cache = { path = nil, at = 0, rows = nil }
+
+--- Forget the cached seed file (unit hook + operator reload path).
+function _M.reset_env_upstreams_cache()
+    env_upstreams_cache.path = nil
+    env_upstreams_cache.at = 0
+    env_upstreams_cache.rows = nil
+end
+
+function _M.env_upstreams()
+    local path = env("LMR_UPSTREAMS_FILE")
+    if not path then return {} end
+    local now = (ngx and ngx.now) and ngx.now() or os.time()
+    if env_upstreams_cache.path == path and env_upstreams_cache.rows
+        and (now - env_upstreams_cache.at) < SNAPSHOT_TTL then
+        return env_upstreams_cache.rows
+    end
+    env_upstreams_cache.path = path
+    env_upstreams_cache.at = now
+    env_upstreams_cache.rows = {}
+    local f = io.open(path, "r")
+    if not f then return env_upstreams_cache.rows end
+    local text = f:read("*a")
+    f:close()
+    local decoded = cjson.decode(text or "")
+    if decoded == nil then return env_upstreams_cache.rows end
+    local rows = decoded
+    if type(decoded) == "table" and not is_array(decoded) and decoded.upstreams ~= nil then
+        rows = decoded.upstreams
+    end
+    if is_array(rows) then env_upstreams_cache.rows = rows end
+    return env_upstreams_cache.rows
+end
+
+
 
 --- Array snapshot, same key set and shapes as Rust RuntimeConfig::snapshot().
 local function snapshot_of(cfg)
@@ -353,7 +805,35 @@ local function snapshot_of(cfg)
     end
     local virtual_models = {}
     for _, alias in ipairs(sorted_keys(cfg.virtual_models)) do
-        virtual_models[#virtual_models + 1] = { model = alias, target = cfg.virtual_models[alias] }
+        local profile = cfg.virtual_profiles[alias] or { target = cfg.virtual_models[alias] }
+        local entry = { model = alias, target = profile.target or cfg.virtual_models[alias] }
+        -- Optional fields are absent rather than null so a snapshot written by an
+        -- older build round-trips unchanged and the JSON editor stays readable.
+        if profile.workers then entry.workers = profile.workers end
+        if profile.policy then entry.policy = profile.policy end
+        if profile.effort then entry.effort = profile.effort end
+        virtual_models[#virtual_models + 1] = entry
+    end
+    local upstreams = {}
+    for _, item in ipairs(cfg.upstreams or {}) do
+        local entry = {
+            url = item.url,
+            model_id = nul(item.model_id),
+            -- Never echo the secret: the field is present and always null so the
+            -- JSON editor round-trips it as "leave the stored key alone" (3.4).
+            api_key = JSON_NULL,
+            priority = tonumber(item.priority) or 50,
+            cost = tonumber(item.cost) or 1.0,
+            labels = item.labels or {},
+            disable_health_check = (item.disable_health_check and true) or false,
+        }
+        -- Persistence half of the key: state + value ride the snapshot so a
+        -- restart (or another worker) can re-apply the same key without ever
+        -- seeing it on the wire.
+        if item.api_key_state then entry.api_key_state = item.api_key_state end
+        if item.api_key_stored then entry.api_key_stored = item.api_key_stored end
+        entry.has_api_key = (item.api_key_state == "set") == true
+        upstreams[#upstreams + 1] = entry
     end
     local model_policies = {}
     for _, model in ipairs(sorted_keys(cfg.model_policies)) do
@@ -368,6 +848,7 @@ local function snapshot_of(cfg)
         virtual_models = arr(virtual_models),
         policy = nul(cfg.policy),
         model_policies = arr(model_policies),
+        upstreams = arr(upstreams),
     }
 end
 
@@ -482,7 +963,9 @@ end
 
 --- Whole-document build (used by apply_document and from_snapshot): every
 --- section is rebuilt from the payload, absent sections stay empty.
-local function cfg_from_document(doc)
+---@param doc table @ decoded document / stored snapshot
+---@param previous table|nil @ url -> prior upstreams row, for key inheritance
+local function cfg_from_document(doc, previous)
     local cfg = new_cfg()
     if type(doc) ~= "table" then return cfg end
 
@@ -557,18 +1040,33 @@ local function cfg_from_document(doc)
 
     if doc.virtual_models ~= nil then
         if not is_array(doc.virtual_models) then return nil, "virtual_models must be an array" end
+        local built_profiles = {}
         for _, entry in ipairs(doc.virtual_models) do
-            local alias = trim(entry.model)
-            local target = trim(entry.target)
+            local alias = type(entry.model) == "string" and trim(entry.model) or ""
             if alias == "" then return nil, "virtual_models entries need a model (the alias)" end
-            if target == "" then
+            if type(entry.target) ~= "string" or trim(entry.target) == "" then
                 return nil, string.format("virtual model %s needs a target model", alias)
             end
-            if alias == target then
-                return nil, string.format("virtual model %s must differ from its target", alias)
-            end
-            cfg.virtual_models[alias] = target
+            local profile, perr = profile_from_entry(alias, entry)
+            if not profile then return nil, perr end
+            built_profiles[alias] = profile
         end
+        -- Chain rejection over the merged batch (root ruling 4): no target may
+        -- name an alias that exists in this table, whoever declared it.
+        for alias, profile in pairs(built_profiles) do
+            local cerr = assert_no_alias_chain(built_profiles, alias, profile.target)
+            if cerr then return nil, cerr end
+        end
+        for alias, profile in pairs(built_profiles) do
+            cfg.virtual_profiles[alias] = profile
+            cfg.virtual_models[alias] = profile.target
+        end
+    end
+
+    if doc.upstreams ~= nil then
+        local rows, uerr = build_upstreams(rawget(doc, "upstreams"), previous)
+        if not rows then return nil, uerr end
+        cfg.upstreams = rows
     end
 
     if doc.policy ~= nil then
@@ -763,7 +1261,9 @@ end
 
 function _M.env_defaults()
     if not _M._env_defaults then
-        _M._env_defaults = snapshot_of(cfg_from_env())
+        local snap = snapshot_of(cfg_from_env())
+        snap.upstreams = sanitize_upstream_rows(snap.upstreams)
+        _M._env_defaults = snap
     end
     return _M._env_defaults
 end
@@ -1113,27 +1613,344 @@ function _M.apply_model_config(patch)
     return snapshot_of(_M.current()), nil
 end
 
---- Whole-list replace for the virtual model table.
+--- Whole-list replace for the virtual model table (profiles shape). Kept as the
+--- public entry point for the existing callers; it validates through the same
+--- profile builder as apply_profiles.
 function _M.apply_virtual_models(entries)
+    return _M.apply_profiles(entries)
+end
+
+--- Whole-list replace for the profiles table: entries are the document shape
+--- [{model, target, workers?, policy?, effort?}] (legacy {model, target} pairs
+--- still validate). Returns (snapshot, nil) or (nil, error).
+function _M.apply_profiles(entries)
     if not is_array(entries) then return nil, "virtual_models must be an array" end
     local built = {}
     for _, entry in ipairs(entries) do
-        local alias = trim(entry.model)
-        local target = trim(entry.target)
-        if alias == "" or target == "" then
+        if type(entry) ~= "table" then
+            return nil, "virtual model entries must be objects"
+        end
+        local alias = trim(type(entry.model) == "string" and entry.model or "")
+        if alias == "" or trim(type(entry.target) == "string" and entry.target or "") == "" then
             return nil, "virtual model entries need both model and target"
         end
-        if alias == target then
-            return nil, string.format("virtual model %s must differ from its target", alias)
+        local profile, perr = profile_from_entry(alias, entry)
+        if not profile then return nil, perr end
+        built[alias] = profile
+    end
+    -- Batch + existing-graph chain check (root ruling 4): an alias may never
+    -- point at another alias, whether declared in this batch or earlier.
+    for alias, profile in pairs(built) do
+        local cerr = assert_no_alias_chain(built, alias, profile.target)
+        if not cerr then
+            local existing = _M.current().virtual_models[profile.target]
+            if existing ~= nil then
+                cerr = string.format(
+                    "virtual model %s target must not be another virtual model: %s", alias, profile.target)
+            end
         end
-        built[alias] = target
+        if cerr then return nil, cerr end
     end
     local cfg = _M.current()
-    cfg.virtual_models = built
+    local profiles, map = {}, {}
+    for alias, profile in pairs(built) do
+        profiles[alias] = profile
+        map[alias] = profile.target
+    end
+    cfg.virtual_profiles = profiles
+    cfg.virtual_models = map
     write_snapshot(snapshot_of(cfg))
     return snapshot_of(_M.current()), nil
 end
 
+-- ------------------------------------------------------- profile readers
+--
+-- Hot-path shape of the profile accessors: they read the already-memoised
+-- current() snapshot (SNAPSHOT_TTL window, no extra shdict round trip) and are
+-- pure functions of it, so router.lua may call them per request.
+
+--- Profile for one alias, or nil when the name is not an alias. Returns a fresh
+--- table each call so a caller cannot mutate the live snapshot.
+function _M.profile_for(model)
+    if type(model) ~= "string" or model == "" then return nil end
+    local cfg = _M.current()
+    local profile = cfg.virtual_profiles[model]
+    if type(profile) ~= "table" then
+        local target = cfg.virtual_models[model]
+        if type(target) ~= "string" then return nil end
+        return { target = target }
+    end
+    local out = { target = profile.target }
+    if profile.workers then out.workers = { table.unpack(profile.workers) } end
+    out.policy = profile.policy
+    out.effort = profile.effort
+    return out
+end
+
+--- Profiles as an array ordered by alias, the round-trip form the UI and the
+--- apply endpoint accept.
+function _M.profiles_list()
+    local cfg = _M.current()
+    local out = {}
+    for _, alias in ipairs(sorted_keys(cfg.virtual_profiles)) do
+        local profile = cfg.virtual_profiles[alias]
+        local entry = { model = alias, target = profile.target }
+        if profile.workers then entry.workers = { table.unpack(profile.workers) } end
+        entry.policy = profile.policy
+        entry.effort = profile.effort
+        out[#out + 1] = entry
+    end
+    return out
+end
+
+--- Per-alias policy override (contract 3.3: profile.policy beats
+--- model_policies, hint, global and env). Accepts either an alias or a profile
+--- table, so router.lua can pass what it already resolved.
+function _M.profile_policy(alias_or_profile)
+    local name
+    if type(alias_or_profile) == "table" then
+        name = alias_or_profile.policy
+    elseif type(alias_or_profile) == "string" and alias_or_profile ~= "" then
+        local profile = _M.current().virtual_profiles[alias_or_profile]
+        name = profile and profile.policy
+    end
+    if type(name) ~= "string" then return nil end
+    local normalized = _M.normalize_policy(name)
+    return normalized or nil
+end
+
+--- Per-alias effort override with the precedence of contract 3.3: a forced
+--- model_effort row wins, then the profile of the alias, then the profile keyed
+--- by the resolved target. nil = "no override", the caller keeps its ladder.
+function _M.profile_effort(alias, resolved)
+    local cfg = _M.current()
+    for _, key in ipairs({ alias, resolved }) do
+        if type(key) == "string" and key ~= "" then
+            local forced = cfg.model_effort[key]
+            if type(forced) == "string" and forced ~= "" then return forced end
+        end
+    end
+    for _, key in ipairs({ alias, resolved }) do
+        if type(key) == "string" and key ~= "" then
+            local profile = cfg.virtual_profiles[key]
+            local wanted = profile and profile.effort
+            if type(wanted) == "string" and wanted ~= "" then return wanted end
+        end
+    end
+    return nil
+end
+
+-- --------------------------------------------------------- upstreams layer
+--
+-- The declaration half of the pool: document rows keyed by normalized url, with
+-- reconcile_upstreams() projecting them into lr_workers. Field defaults mirror
+-- registry.add (priority 50, cost 1.0, model_id unknown), and the key follows
+-- the tri-state of contract 3.4 (keep / clear / set).
+
+local function upstream_defaults(item)
+    return {
+        model_id = (type(item.model_id) == "string" and item.model_id ~= "") and item.model_id or "unknown",
+        priority = tonumber(item.priority) or 50,
+        cost = tonumber(item.cost) or 1.0,
+        labels = item.labels or {},
+        disable_health_check = (item.disable_health_check and true) or false,
+    }
+end
+
+local function same_labels(a, b)
+    a = a or {}
+    b = b or {}
+    for k, v in pairs(a) do
+        if b[k] ~= v then return false end
+    end
+    for k, v in pairs(b) do
+        if a[k] == nil or a[k] ~= v then return false end
+    end
+    return true
+end
+
+--- True when applying `item` to `record` would change the stored worker. Root
+--- ruling 1: an unchanged declaration must not count as an update, and a keep
+--- (null/absent) api_key is never a change.
+local function upstream_drifts(item, record)
+    local want = upstream_defaults(item)
+    if (record.model_id or "unknown") ~= want.model_id then return true end
+    if (tonumber(record.priority) or 50) ~= want.priority then return true end
+    if (tonumber(record.cost) or 1.0) ~= want.cost then return true end
+    if ((record.disable_health_check and true) or false) ~= want.disable_health_check then
+        return true
+    end
+    if not same_labels(want.labels, record.labels) then return true end
+    local stored = record.api_key
+    if stored == false or stored == cjson.null then stored = nil end
+    if item.api_key_state == "set" then
+        return stored ~= item.api_key_stored
+    elseif item.api_key_state == "clear" then
+        return stored ~= nil and stored ~= ""
+    end
+    return false
+end
+
+--- What registry.update should receive for one drifted config worker. Only the
+--- tri-state key is sent when it says so; keep never touches the stored secret.
+local function upstream_patch(item)
+    local want = upstream_defaults(item)
+    local patch = {
+        model_id = want.model_id,
+        priority = want.priority,
+        cost = want.cost,
+        labels = want.labels,
+        disable_health_check = want.disable_health_check,
+    }
+    if item.api_key_state == "set" then
+        patch.api_key = item.api_key_stored
+    elseif item.api_key_state == "clear" then
+        patch.api_key = ""
+    end
+    return patch
+end
+
+--- Idempotent projection of the declared upstreams into the worker pool
+--- (contract 3.1 / 3.2). Discovery-tagged rows only: watcher, bootstrap and
+--- manual workers are never overwritten, and only config rows are reclaimed.
+--- Returns a summary {added=,updated=,removed=,skipped=} (arrays also carry the
+--- affected urls). Without a usable registry module (unit caliber, stripped
+--- build) every counter is 0 and nothing counts as an error.
+function _M.reconcile_upstreams()
+    local summary = { added = 0, updated = 0, removed = 0, skipped = 0 }
+    local reg = store_registry()
+    if not reg or type(reg.records) ~= "function"
+        or type(reg.add) ~= "function" or type(reg.update) ~= "function"
+        or type(reg.remove) ~= "function" then
+        return summary
+    end
+    local declared = _M.current().upstreams or {}
+
+    local all_records = {}
+    local by_endpoint = {}
+    local ok_records, records_or_err = pcall(reg.records)
+    if ok_records and type(records_or_err) == "table" then
+        for _, record in ipairs(records_or_err) do
+            if type(record) == "table" and type(record.url) == "string" then
+                all_records[#all_records + 1] = record
+                local key = norm_pool_url(record.url) or record.url
+                local slot = by_endpoint[key]
+                if not slot then
+                    slot = {}
+                    by_endpoint[key] = slot
+                end
+                if record.discovery == "config" or not slot.chosen then
+                    slot.chosen = record
+                end
+            end
+        end
+    end
+
+    local owned = {}
+    for _, item in ipairs(declared) do
+        local key = norm_pool_url(item.url) or item.url
+        owned[key] = true
+        local slot = by_endpoint[key]
+        local record = slot and slot.chosen
+        if not record then
+            local res, aerr, kind = reg.add({
+                url = item.url,
+                model_id = (type(item.model_id) == "string" and item.model_id ~= "") and item.model_id or "unknown",
+                api_key = (item.api_key_state == "set") and item.api_key_stored or nil,
+                priority = tonumber(item.priority) or 50,
+                cost = tonumber(item.cost) or 1.0,
+                labels = item.labels or {},
+                disable_health_check = (item.disable_health_check and true) or false,
+                discovery = "config",
+            }, store_config() or {})
+            if res then
+                summary.added = summary.added + 1
+            else
+                -- Duplicate url (a race with discovery) still means the pool has
+                -- the endpoint; anything else is a real validation failure.
+                if kind == "validation" and type(aerr) == "string"
+                    and aerr:find("already exists", 1, true) == nil then
+                    ngx_log_warn("luarouter upstream add failed for ", item.url, ": ", aerr)
+                end
+                summary.skipped = summary.skipped + 1
+            end
+        elseif record.discovery == "config" then
+            if upstream_drifts(item, record) then
+                local upd_id = record.id
+                if type(upd_id) ~= "string" then
+                    local ok_id, derived = pcall(reg.worker_id_for_url, item.url)
+                    upd_id = ok_id and derived or nil
+                end
+                local res, uerr = reg.update(upd_id, upstream_patch(item))
+                if res then
+                    summary.updated = summary.updated + 1
+                else
+                    ngx_log_warn("luarouter upstream update failed for ", item.url, ": ", uerr or "?")
+                    summary.skipped = summary.skipped + 1
+                end
+            end
+        else
+            -- Held by the watcher / bootstrap / an operator: the declaration
+            -- stands, the pool row is left exactly as it is.
+            summary.skipped = summary.skipped + 1
+        end
+    end
+
+    for _, record in ipairs(all_records) do
+        local key = norm_pool_url(record.url) or record.url
+        if record.discovery == "config" and not owned[key] then
+            local res, rerr = reg.remove(record.id)
+            if res then
+                summary.removed = summary.removed + 1
+            else
+                ngx_log_warn("luarouter upstream remove failed for ",
+                    tostring(record.url), ": ", rerr or "?")
+            end
+        end
+    end
+
+    local shared = dict()
+    if shared then
+        local token = _M.policy_revision() or tostring((ngx and ngx.now and ngx.now()) or os.time())
+        local ok_set, serr = shared:set(UPS_REV_KEY, token)
+        if not ok_set then
+            ngx_log_warn("luarouter upstreams revision write failed: ", serr or "?")
+        end
+    end
+    return summary
+end
+
+--- Token the 30s self-heal timer compares against the config revision
+--- (init.lua). nil when no shared dict can carry it.
+function _M.upstreams_revision()
+    local shared = dict()
+    if not shared then return nil end
+    local value = shared:get(UPS_REV_KEY)
+    if value == nil then return nil end
+    return tostring(value)
+end
+
+--- Validate + persist + reconcile the declared upstream pool (whole-list
+--- replace). Returns (summary, nil) or (nil, error).
+function _M.apply_upstreams(entries)
+    local rows, err = build_upstreams(entries, previous_upstream_map(_M.current()))
+    if not rows then return nil, err end
+    local cfg = _M.current()
+    cfg.upstreams = rows
+    write_snapshot(snapshot_of(cfg))
+    local summary = _M.reconcile_upstreams()
+    return summary, nil
+end
+
+--- True when the two-layer revision says a reconcile is overdue (a restart,
+--- another worker's write, or a pool edit that dropped config rows).
+function _M.upstreams_reconcile_due()
+    local shared = dict()
+    if not shared then return false end
+    local applied = shared:get(UPS_REV_KEY)
+    if applied == nil then return true end
+    return tostring(applied) ~= tostring(_M.policy_revision())
+end
 --- Routing-policy patch. Body accepts three independent sections, all optional
 --- and applied in one atomic write (validate-then-write, like apply_effort):
 ---   policy          string|null  global override; null / "" / "auto" clears it
@@ -1236,11 +2053,20 @@ function _M.apply_policy(patch)
 end
 
 --- Whole-document replace (JSON editor). Validate first: nothing half-applies.
+--- Returns (snapshot, nil, reconcile_summary_or_nil); the summary is present
+--- only when this call actually reconciled the pool (root ruling 2), so a
+--- config-only save keeps the response shape it always had.
 function _M.apply_document(doc)
-    local cfg, err = cfg_from_document(doc)
+    local previous = previous_upstream_map(_M.current())
+    local cfg, err = cfg_from_document(doc, previous)
     if not cfg then return nil, err end
     write_snapshot(snapshot_of(cfg))
-    return snapshot_of(_M.current()), nil
+    local summary
+    if type(doc) == "table"
+        and (rawget(doc, "upstreams") ~= nil or rawget(doc, "virtual_models") ~= nil) then
+        summary = _M.reconcile_upstreams()
+    end
+    return snapshot_of(_M.current()), nil, summary
 end
 
 -- ------------------------------------------------------------- watcher
@@ -1249,37 +2075,6 @@ function _M.watcher_url()
     return env("LMR_WATCHER_URL")
 end
 
----registry module for the pool helpers, required once (the pure-Lua unit tests
----never reach this path, so the pcall is only about a missing module on a box).
-local cached_store_registry
-local function store_registry()
-    if cached_store_registry ~= nil then
-        return cached_store_registry or nil
-    end
-    local ok, mod = pcall(require, "resty.luarouter.registry")
-    cached_store_registry = (ok and type(mod) == "table") and mod or false
-    return cached_store_registry or nil
-end
-
----Router config for the pool knobs, or nil when the router is not initialised.
----Cached: this is on the path of every /props and model-map proxy call.
-local cached_pool_config
-local function store_config()
-    if cached_pool_config ~= nil then
-        return cached_pool_config or nil
-    end
-    local ok, luarouter = pcall(require, "resty.luarouter")
-    if ok and type(luarouter) == "table"
-        and type(luarouter.config) == "function" then
-        local good, conf = pcall(luarouter.config)
-        if good and type(conf) == "table" then
-            cached_pool_config = conf
-            return conf
-        end
-    end
-    cached_pool_config = false
-    return nil
-end
 
 --- Minimal HTTP/1.1 client on ngx.socket.tcp. Returns status, headers(table,
 --- lowercase), body — or nil, err. Supports Content-Length and chunked.
@@ -1455,6 +2250,9 @@ end
 --- Full Config-page document: snapshot + env_defaults + watcher state.
 function _M.document()
     local snap = snapshot_of(_M.current())
+    -- The stored snapshot carries the secret for the persistence layer; the
+    -- response half of contract 3.4 masks it here.
+    snap.upstreams = sanitize_upstream_rows(snap.upstreams)
     snap.env_defaults = _M.env_defaults()
     local url = _M.watcher_url()
     local reachable, model_map = false, JSON_NULL
@@ -1599,11 +2397,36 @@ end
 function _M.handle_config_virtual()
     local body, err = read_json_body()
     if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
-    local entries = body.entries
+    if type(body) ~= "table" then
+        return respond_json(ngx.HTTP_BAD_REQUEST, { error = "body must be a JSON object" })
+    end
+    local entries = rawget(body, "entries")
     if entries == nil then entries = setmetatable({}, EMPTY_ARRAY_MT) end
     local _, apply_err = _M.apply_virtual_models(entries)
     if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
     return respond_json(ngx.HTTP_OK, _M.document())
+end
+
+--- POST /_ui/config/upstreams  {entries:[{url,model_id?,api_key?,priority?,
+---   cost?,labels?,disable_health_check?}]}
+--- Whole-list replace of the declared pool plus an immediate reconcile into
+--- lr_workers (contract 3.5). entries missing = empty list = reclaim every
+--- config row (root ruling 3: the UI always sends the full list and covers the
+--- destructive edit with its own confirmation). The response is the document
+--- with a top-level reconcile counter bag.
+function _M.handle_config_upstreams()
+    local body, err = read_json_body()
+    if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
+    if type(body) ~= "table" then
+        return respond_json(ngx.HTTP_BAD_REQUEST, { error = "body must be a JSON object" })
+    end
+    local entries = rawget(body, "entries")
+    if entries == nil then entries = setmetatable({}, EMPTY_ARRAY_MT) end
+    local summary, apply_err = _M.apply_upstreams(entries)
+    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    local doc = _M.document()
+    doc.reconcile = summary
+    return respond_json(ngx.HTTP_OK, doc)
 end
 
 --- GET /_ui/config/policy — routing-page document (chain + per-model rows).
@@ -1642,14 +2465,19 @@ end
 function _M.handle_config_apply()
     local patch, err = read_json_body()
     if patch == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
+    if type(patch) ~= "table" then
+        -- never a whole-document wipe by accident: only an object is a document
+        return respond_json(ngx.HTTP_BAD_REQUEST, { error = "body must be a JSON object" })
+    end
     local model_map
     if type(patch) == "table" then
         model_map = rawget(patch, "model_map")
         patch.model_map = nil
     end
-    local _, apply_err = _M.apply_document(patch)
+    local _, apply_err, reconcile = _M.apply_document(patch)
     if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
     local doc = _M.document()
+    if reconcile then doc.reconcile = reconcile end
     local warning
     if model_map ~= nil and model_map ~= JSON_NULL then
         local map = model_map

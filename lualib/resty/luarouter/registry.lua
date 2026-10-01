@@ -102,6 +102,46 @@ local function shdict()
     return dict
 end
 
+-- ------------------------------------------------- upstream reconcile coupling
+--
+-- The worker-0 self-healing timer (init.lua) keys off the applied-revision
+-- token in lr_workers (UPSTREAMS_REV_KEY there). e2e S3 showed the failure
+-- mode: a manual DELETE /workers/<id> of a discovery=config member never
+-- reached that token, so the pool drift stayed invisible and the member was
+-- never re-added. Any *external* mutation of the pool therefore drops the
+-- token here, and the next tick re-runs reconcile.
+--
+-- Anti-spin: config_store.reconcile_upstreams legitimately calls add/remove
+-- while it applies the document; letting those clear the token would make
+-- every pass schedule another one forever. The timer wraps its pass in
+-- _M.set_reconcile_guard(true), so reconcile-originated add/remove skip the
+-- clear (a per-Lua-process flag; the timer is worker 0 only, while
+-- control-plane writes that reconcile run in request workers with the guard
+-- off, so genuine drift stays visible). init.lua also runs one unconditional
+-- sweep every few ticks to bound the narrow window where an external
+-- mutation lands inside a guarded reconcile.
+local APPLIED_REV_KEY = "upstreams:applied_rev"
+local reconcile_guard = false
+
+---Open/close the reconcile-origin filter for the applied-revision invalidation.
+---@param on any @ truthy = suppress invalidation in this Lua process
+function _M.set_reconcile_guard(on)
+    reconcile_guard = on and true or false
+end
+
+---Drop the applied-revision token so worker 0's timer sees pool drift.
+---Tolerates every non-nginx shape (no ngx, no shdict, fake test dicts): pure
+---unit environments must not raise from a pool write.
+local function invalidate_applied_rev()
+    if reconcile_guard then
+        return
+    end
+    local ok, d = pcall(shdict)
+    if ok and d then
+        pcall(function() d:delete(APPLIED_REV_KEY) end)
+    end
+end
+
 local function with_lock(fn)
     local lock, err = lock_mod:new(LOCK_DICT, { timeout = 5, exptime = 10 })
     if not lock then
@@ -755,6 +795,11 @@ function _M.add(req, cfg)
         return nil, lerr
     end
 
+    -- Pool drift must reach the self-healing timer (see the reconcile-coupling
+    -- block near shdict): drop the applied-revision token unless this add is
+    -- part of an ongoing guarded reconcile pass.
+    invalidate_applied_rev()
+
     -- Queued rather than synchronous: the caller answers 202 either way.
     if not shdict():get(K_WORKER .. id) then
         _M.set_job(url, "add_worker", "pending", nil)
@@ -805,6 +850,10 @@ function _M.remove(worker_id)
     if not ok then
         return nil, lerr
     end
+    -- A hand DELETE of a discovery=config member is exactly the drift the
+    -- timer must catch: clear the applied-revision token (guarded reconcile's
+    -- own removals skip it, so the pass still converges).
+    invalidate_applied_rev()
     mesh_forget(id)
     return { worker_id = id, url = url }
 end
@@ -862,6 +911,13 @@ function _M.info(record, d)
         metadata = metadata,
         disable_health_check = record.disable_health_check or false,
         job_status = job,
+        -- Provenance for GET /workers (doc/gap-virtual-models.md 3.1): config
+        -- members are the config_store-declared upstreams; everything else
+        -- (watcher, SMG_WORKER_URLS bootstrap, POST /workers, mesh mirror)
+        -- reports the neutral "dynamic". The raw provenance string is only
+        -- surfaced when it is not already the dynamic spelling.
+        discovery = (record.discovery ~= nil and record.discovery ~= "")
+            and record.discovery or "dynamic",
     }
 end
 
@@ -1447,7 +1503,10 @@ end
 ---Merge discovered fields into the stored record.
 ---@param id string
 ---@param patch table @ fields to overwrite (model_id, labels)
-local function patch_record(id, patch)
+---@param opts table|nil @{labels_replace=true: the labels map replaces the
+---            stored one wholesale instead of merging; config_store's upstream
+---            reconcile wants the document to be the single source of truth}
+local function patch_record(id, patch, opts)
     local d = shdict()
     local raw = d:get(K_WORKER .. id)
     if not raw then
@@ -1460,11 +1519,20 @@ local function patch_record(id, patch)
     local changed = false
     for key, value in pairs(patch) do
         if key == "labels" then
-            record.labels = record.labels or {}
-            for name, label in pairs(value) do
-                if record.labels[name] ~= label then
-                    record.labels[name] = label
-                    changed = true
+            if opts and opts.labels_replace then
+                local next_labels = {}
+                for name, label in pairs(value) do
+                    next_labels[name] = label
+                end
+                record.labels = next_labels
+                changed = true
+            else
+                record.labels = record.labels or {}
+                for name, label in pairs(value) do
+                    if record.labels[name] ~= label then
+                        record.labels[name] = label
+                        changed = true
+                    end
                 end
             end
         elseif record[key] ~= value then
@@ -1552,13 +1620,35 @@ function _M.update(worker_id, patch)
         -- that only names one label keeps the rest.
         changes.labels = patch.labels
     end
-    if type(patch.api_key) == "string" then
-        changes.api_key = patch.api_key
+    if patch.api_key ~= nil and patch.api_key ~= cjson.null then
+        -- Non-string api_key stays ignored (Rust-style: unknown shapes of a
+        -- known field are dropped, not rejected; the contract only pins the
+        -- null / "" / non-empty tri-state). Empty string clears the key
+        -- (doc/gap-virtual-models.md 3.4), stored as false so every
+        -- `worker.api_key and ...` reader skips the Authorization header and
+        -- patch_record's pairs() can still see the write.
+        if type(patch.api_key) == "string" then
+            changes.api_key = (patch.api_key ~= "") and patch.api_key or false
+        end
+    end
+
+    -- Config-declared upstreams are owned by config_store: the reconcile in
+    -- gap-virtual-models 3.1 re-applies model_id and *replaces* the label map
+    -- from the document. Rust's identity-immutability parity rule stays intact
+    -- for every other record (a PUT naming model_id on a dynamic worker keeps
+    -- being ignored, the contract pins that).
+    local labels_replace
+    local current = json_decode(d:get(K_WORKER .. id))
+    if type(current) == "table" and current.discovery == "config" then
+        if type(patch.model_id) == "string" and patch.model_id ~= "" then
+            changes.model_id = patch.model_id
+        end
+        labels_replace = true
     end
 
     local url = d:get(K_IDURL .. id)
     local ok, lerr = with_lock(function()
-        if not patch_record(id, changes) then
+        if not patch_record(id, changes, { labels_replace = labels_replace }) then
             error("worker " .. id .. " disappeared while updating")
         end
     end)

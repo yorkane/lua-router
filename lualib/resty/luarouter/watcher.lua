@@ -1225,6 +1225,34 @@ function _M.reap_pending(state)
     return live
 end
 
+---Is this URL's pool row a config_store-declared upstream? Config members are
+---immune to every watcher mutation: no ledger reclaim, no keep-last clearing,
+---no model-map rename, no removal (doc/gap-virtual-models.md 3.2). The live
+---pool row is the authority, so a URL whose row vanished is *not* immune (the
+---removal loops need to clean the ledger entry the old way).
+---@param state table
+---@param url string
+---@return boolean
+function _M.is_config_member(state, url)
+    local live = state.actual[url]
+    return type(live) == "table" and live.discovery == "config"
+end
+
+---One-line DEBUG summary for a skipped config member, through the testable
+---state.log sink so the pure layer stays ngx-free.
+---@param state table
+---@param url string
+---@param action string
+local function note_config_skip(state, url, action)
+    if state.log then
+        state.log("debug", string.format(
+            "watcher: skipping config-declared upstream %s (%s; config_store owns it)",
+            url, action))
+    end
+end
+
+_M.note_config_skip = note_config_skip
+
 ---One reconcile pass. Everything outside this function is plumbing, which makes
 ---the eight guards above auditable in one place and testable with fakes.
 ---
@@ -1340,9 +1368,13 @@ function _M.reconcile(state)
             local have = tostring(state.actual[url].model_id or "")
             local entry = ledger.get_owned(url)
             if entry and entry.model_id ~= want and have ~= want then
-                notice(state.log, string.format("watcher: rename %s (registered %q, want %q)",
-                    url, have, want))
-                _M.release(state, url, entry, 0, "rename")
+                if _M.is_config_member(state, url) then
+                    note_config_skip(state, url, "rename")
+                else
+                    notice(state.log, string.format("watcher: rename %s (registered %q, want %q)",
+                        url, have, want))
+                    _M.release(state, url, entry, 0, "rename")
+                end
             end
         end
     end
@@ -1351,7 +1383,9 @@ function _M.reconcile(state)
             local info = protected_seen[url]
             local want = _M.model_name(info.models[1], state.model_map, cfg.short_model_names)
             local have = tostring(state.actual[url].model_id or "")
-            if have ~= "" and have ~= want then
+            if have ~= "" and have ~= want and _M.is_config_member(state, url) then
+                note_config_skip(state, url, "model-map rename")
+            elseif have ~= "" and have ~= want then
                 notice(state.log, string.format(
                     "watcher: rename of protected %s (registered %q, want %q); adopting it",
                     url, have, want))
@@ -1391,6 +1425,16 @@ function _M.reconcile(state)
                 -- Gone from the pool and from discovery: forget it, nothing to delete.
                 ledger.drop_owned(url)
                 ledger.drop_pending(url)
+            elseif _M.is_config_member(state, url) then
+                -- The row outlived the ledger's knowledge because someone
+                -- re-declared the URL as a config upstream: neither the
+                -- missing_since clock nor the delete may run against it. The
+                -- ledger forgets its claim so the member is config-owned, end
+                -- of story (watcher stop-owning, not watcher-delete).
+                note_config_skip(state, url, "reclaim")
+                ledger.drop_owned(url)
+                ledger.drop_pending(url)
+                ledger.drop_backoff(url)
             else
                 local first_missing = tonumber(entry.missing_since)
                 if not first_missing then
@@ -1785,6 +1829,14 @@ local function make_unregister()
         if not info then
             return false
         end
+        -- Backstop for the loop-level immunity above (and for any future call
+        -- site): a config_store member is never deleted through the watcher,
+        -- whatever the ledger believes about it.
+        if info.discovery == "config" then
+            ngx.log(ngx.DEBUG, "luarouter: watcher refused to remove config-declared ",
+                "upstream ", id)
+            return false
+        end
         local result, err = registry.remove(id)
         if not result then
             ngx.log(ngx.WARN, "luarouter: watcher remove ", id, " failed: ",
@@ -1818,6 +1870,11 @@ local function actual_pool()
             url = record.url,
             model_id = record.model_id or "unknown",
             is_healthy = registry.is_healthy(record.id),
+            -- Provenance for the config-member immunity below (guard 4's twin:
+            -- upstreams declared through config_store belong to nobody but the
+            -- document). registry.records() is the only pool read here, so the
+            -- field comes from the raw record rather than a second lookup.
+            discovery = record.discovery or "",
         }
     end
     return out
@@ -1885,6 +1942,8 @@ function _M.run_pass(cfg, opts)
         log = function(level, message)
             if level == "warn" then
                 ngx.log(ngx.WARN, message)
+            elseif level == "debug" then
+                ngx.log(ngx.DEBUG, message)
             else
                 ngx.log(ngx.NOTICE, message)
             end

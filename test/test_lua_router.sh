@@ -3190,6 +3190,263 @@ if section tls_server; then
 fi
 
 # ==========================================================================
+if section profiles_upstreams; then
+    # Section 23: the virtual-model profile + upstreams surface from
+    # doc/gap-virtual-models.md 3.5. The /_ui/config document grows a
+    # new-shape virtual_models array (model/target/workers/policy/effort, old
+    # {model,target} rows stay valid) and an upstreams array whose api_key is
+    # never echoed; POST /_ui/config/upstreams replaces the pool and reconciles
+    # it into the worker registry as discovery=config. Own containers: the flow
+    # rewrites whole documents repeatedly and must not leak config state into
+    # the shared main instance (the section may also run under TEST_ONLY).
+    start_container lr-profs-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1
+    PR_BASE=$BASE
+    PR_GW=$(container_gateway lr-profs-$SUIT)
+    URL_A="http://$PR_GW:$MOCK_PORT"
+    URL_B="http://$PR_GW:$SINK_PORT"
+    SECRET="sk-contract-$SUIT"
+
+    pr_config_count() {
+        # pr_config_count N -> poll GET /workers until exactly N workers carry
+        # discovery=config. Reconcile is synchronous per 3.1, but the health
+        # sweep re-rendering the list must not turn into a flaky failure.
+        local want=$1 i n
+        for i in $(seq 1 100); do
+            request "$PR_BASE" GET /workers
+            n=$(jq -r '[.workers[] | select(.discovery == "config")] | length' \
+                "$TMP_DIR/body" 2>/dev/null || echo 0)
+            [[ "$n" == "$want" ]] && return 0
+            sleep 0.1
+        done
+        return 1
+    }
+
+    # ---- 1. GET /_ui/config document shape ---------------------------------
+    request "$PR_BASE" GET /_ui/config
+    assert_eq "profiles: /_ui/config GET" "$STATUS" "200"
+    assert_json "profiles: the new sections are a superset of the old keys" \
+        '(["default_effort","effort_map","model_ctx","model_effort","model_configs","virtual_models","policy","model_policies","env_defaults","watcher","persist","models"] - keys | length) == 0 | tostring' "true"
+    assert_json "profiles: document carries an upstreams array" '(.upstreams | type)' "array"
+    assert_json "profiles: document carries a virtual_models array" '(.virtual_models | type)' "array"
+    request "$PR_BASE" HEAD /_ui/config
+    assert_eq "profiles: HEAD mirrors the GET status" "$STATUS" "200"
+    assert_contains "profiles: HEAD keeps the JSON content type" "$CONTENT_TYPE" "application/json"
+
+    # ---- 2. POST /_ui/config/virtual (whole-table replace) -----------------
+    # New profile shape: all five fields round-trip through the echoed document.
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"model\":\"vm-full\",\"target\":\"test-model\",\"workers\":[\"$URL_A\"],\"policy\":\"round_robin\",\"effort\":\"high\"}]}"
+    assert_eq "profiles: new-shape entries accepted" "$STATUS" "200"
+    assert_json "profiles: response echoes the document with the profile" \
+        '[.virtual_models[] | select(.model == "vm-full")] | length' "1"
+    assert_json "profiles: profile target round-trips" \
+        '[.virtual_models[] | select(.model == "vm-full")][0].target' "test-model"
+    assert_json "profiles: profile workers round-trips" \
+        '[.virtual_models[] | select(.model == "vm-full")][0].workers | index("'"$URL_A"'") != null | tostring' "true"
+    assert_json "profiles: profile policy round-trips" \
+        '[.virtual_models[] | select(.model == "vm-full")][0].policy' "round_robin"
+    assert_json "profiles: profile effort round-trips" \
+        '[.virtual_models[] | select(.model == "vm-full")][0].effort' "high"
+
+    # The old two-field rows keep working: replacement is whole-table, so both
+    # shapes ride the same submission and both must come back.
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"model\":\"vm-old\",\"target\":\"test-model\"},{\"model\":\"vm-full\",\"target\":\"test-model\",\"workers\":[\"$URL_A\"],\"policy\":\"round_robin\",\"effort\":\"high\"}]}"
+    assert_eq "profiles: old-shape entries still accepted" "$STATUS" "200"
+    assert_json "profiles: old row keeps model and target" \
+        '[.virtual_models[] | select(.model == "vm-old")][0].target' "test-model"
+
+    # Rejections: chained alias, self-alias, malformed workers, unknown
+    # policy/effort. Error text shape matches the existing handlers (nonempty
+    # .error); the chain message has to name one of the two models involved.
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-p1","target":"vm-p2"},{"model":"vm-p2","target":"test-model"}]}'
+    assert_eq "profiles: an alias targeting another alias is 400" "$STATUS" "400"
+    assert_matches "profiles: the chain error names the model involved" "$BODY" 'vm-p[12]'
+
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-same","target":"vm-same"}]}'
+    assert_eq "profiles: alias == target is 400" "$STATUS" "400"
+    assert_contains "profiles: the self-alias error names it" "$BODY" "vm-same"
+
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-w","target":"test-model","workers":"http://pool.invalid"}]}'
+    assert_eq "profiles: workers as a bare string is 400" "$STATUS" "400"
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-w2","target":"test-model","workers":["ok",123]}]}'
+    assert_eq "profiles: a non-string workers member is 400" "$STATUS" "400"
+
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-pol","target":"test-model","policy":"roundabout"}]}'
+    assert_eq "profiles: an unknown profile policy is 400" "$STATUS" "400"
+    assert_json "profiles: the policy rejection carries error text" \
+        '.error | length > 0 | tostring' "true"
+    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-eff","target":"test-model","effort":"mega"}]}'
+    assert_eq "profiles: an unknown profile effort is 400" "$STATUS" "400"
+
+    # A rejected replace must leave the previous table alone (no half-apply):
+    # none of the rejected aliases landed, the accepted pair survived.
+    request "$PR_BASE" GET /_ui/config
+    assert_eq "profiles: the document answers after the rejection run" "$STATUS" "200"
+    assert_json "profiles: rejected aliases never landed" \
+        '[.virtual_models[] | select(.model == "vm-p1" or .model == "vm-same" or .model == "vm-w" or .model == "vm-w2" or .model == "vm-pol" or .model == "vm-eff")] | length' "0"
+    assert_json "profiles: accepted rows survived the rejected batches" \
+        '[.virtual_models[] | select(.model == "vm-old" or .model == "vm-full")] | length' "2"
+
+    # ---- 3. POST /_ui/config/upstreams + reconcile -------------------------
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"url\":\"$URL_A\",\"model_id\":\"test-model\",\"api_key\":\"$SECRET\"},{\"url\":\"$URL_B\",\"model_id\":\"sink-model\",\"priority\":70,\"cost\":2.5,\"disable_health_check\":false}]}"
+    assert_eq "upstreams: valid entries accepted" "$STATUS" "200"
+    assert_json "upstreams: response carries the reconcile summary" \
+        '.reconcile | has("added") and has("updated") and has("removed") and has("skipped") | tostring' "true"
+    assert_json "upstreams: both pool members count as added" '.reconcile.added' "2"
+    assert_json "upstreams: a cold pool updates/removes/skips nothing" \
+        '[.reconcile.updated, .reconcile.removed, .reconcile.skipped] | tostring' "[0,0,0]"
+    pr_config_count 2 || fail "upstreams: config pool never reached 2 members"
+    assert_json "upstreams: the config worker shows up in /workers" \
+        '[.workers[] | select(.url == "'"$URL_A"'")] | length' "1"
+    assert_json "upstreams: the pool member carries discovery=config" \
+        '[.workers[] | select(.url == "'"$URL_A"'")][0].discovery' "config"
+    assert_json "upstreams: entry fields land on the worker record" \
+        '[.workers[] | select(.url == "'"$URL_B"'")][0].priority' "70"
+    assert_json "upstreams: GET /workers exposes no api_key value" \
+        '[.workers[] | .api_key] | unique | tostring' "[null]"
+    assert_not_contains "upstreams: no secret in /workers" "$BODY" "$SECRET"
+    request "$PR_BASE" GET /_ui/config
+    assert_not_contains "upstreams: no secret in the document" "$BODY" "$SECRET"
+    assert_json "upstreams: document api_key stays null" \
+        '[.upstreams[] | select(.url == "'"$URL_A"'")][0].api_key | tostring' "null"
+
+    # Validation rejections (contract 3.5): url dedup after normalization, the
+    # 256-entry cap, and a non-http(s) scheme. None of them may mutate the
+    # accepted pool.
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"url\":\"$URL_A\"},{\"url\":\"$URL_A/\"}]}"
+    assert_eq "upstreams: two entries normalizing to one url are refused" "$STATUS" "400"
+    python3 - "$TMP_DIR" <<'PY'
+import json, sys
+tmp = sys.argv[1]
+json.dump({"entries": [{"url": "http://127.0.0.1:%d" % (20000 + i)} for i in range(257)]},
+          open(tmp + "/up-many.json", "w"))
+json.dump({"virtual_models": [],
+           "upstreams": [{"url": "http://127.0.0.1:%d" % (21000 + i)} for i in range(300)]},
+          open(tmp + "/apply-over-cap.json", "w"))
+PY
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data @"$TMP_DIR/up-many.json"
+    assert_eq "upstreams: more than 256 entries are refused" "$STATUS" "400"
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data '{"entries":[{"url":"ftp://pool-member.invalid:2121"}]}'
+    assert_eq "upstreams: a non-http(s) scheme is refused" "$STATUS" "400"
+    request "$PR_BASE" GET /workers
+    assert_json "upstreams: rejected batches left the pool at two" '.total' "2"
+
+    # ---- 4. api_key write semantics (null keeps, "" clears) ----------------
+    # The key lives only inside the gateway: resubmitting null must answer 200
+    # (never 500, never echo), and the reconcile summary must report this as a
+    # keep, not a re-add. updated=0 (change-counting) or 1 (unconditional
+    # re-apply) are both contract-legal here; the exact keep-the-key behaviour
+    # is pinned by e2e_profiles against a REQUIRE_AUTH mock.
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"url\":\"$URL_A\",\"model_id\":\"test-model\",\"api_key\":null},{\"url\":\"$URL_B\",\"model_id\":\"sink-model\",\"priority\":70,\"cost\":2.5,\"disable_health_check\":false}]}"
+    assert_eq "upstreams: a null api_key resubmit answers 200, never 500" "$STATUS" "200"
+    assert_json "upstreams: the null resubmit adds nobody" '.reconcile.added' "0"
+    UPD=$(jq -r '.reconcile.updated' "$TMP_DIR/body" 2>/dev/null || echo '?')
+    case "$UPD" in
+        0|1) pass "upstreams: null-key resubmit counts as updated=$UPD";;
+        *) fail "upstreams: reconcile.updated after a null-key resubmit must be 0 or 1 (got '$UPD')";;
+    esac
+    assert_json "upstreams: the response document still hides the key" \
+        '[.upstreams[] | select(.url == "'"$URL_A"'")][0].api_key | tostring' "null"
+
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"url\":\"$URL_A\",\"model_id\":\"test-model\",\"api_key\":\"\"},{\"url\":\"$URL_B\",\"model_id\":\"sink-model\",\"priority\":70,\"cost\":2.5,\"disable_health_check\":false}]}"
+    assert_eq "upstreams: an empty-string api_key is accepted (clear semantics)" "$STATUS" "200"
+
+    # Teardown path: an empty replace removes exactly the discovery=config
+    # members and counts them (3.1: other origins are never touched).
+    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data '{"entries":[]}'
+    assert_eq "upstreams: an empty replace is accepted" "$STATUS" "200"
+    assert_json "upstreams: the removed members are counted" '.reconcile.removed' "2"
+    pr_config_count 0 || fail "upstreams: config members never left the pool"
+    request "$PR_BASE" GET /workers
+    assert_json "upstreams: the pool is empty after teardown" '.total' "0"
+
+    # ---- 5. POST /_ui/config/apply is atomic across both new sections ------
+    # Own instance: the rejection checks below compare the whole document
+    # before/after, which needs a state nobody else writes to.
+    start_container lr-apl-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1
+    AP_BASE=$BASE
+    AP_GW=$(container_gateway lr-apl-$SUIT)
+    URL_C="http://$AP_GW:$MOCK_PORT"
+
+    request "$AP_BASE" POST /_ui/config/apply -H 'Content-Type: application/json' \
+        --data "{\"virtual_models\":[{\"model\":\"ap-a\",\"target\":\"test-model\",\"workers\":[],\"policy\":\"bucket\",\"effort\":\"medium\"}],\"upstreams\":[{\"url\":\"$URL_C\",\"model_id\":\"test-model\"}]}"
+    assert_eq "apply: whole document with virtual_models + upstreams" "$STATUS" "200"
+    assert_json "apply: the answer echoes the profile" \
+        '[.virtual_models[] | select(.model == "ap-a")][0].policy' "bucket"
+    # 3.5 documents the reconcile summary for /config/upstreams; for apply it
+    # only requires that the section triggers a reconcile. The observable half
+    # of that is the pool, asserted below, so a missing summary here is a
+    # documented divergence rather than a broken contract.
+    if [[ "$(jq -r '.reconcile.added // "absent"' "$TMP_DIR/body" 2>/dev/null)" == "1" ]]; then
+        pass "apply: the upstreams section reports reconcile.added=1"
+    else
+        note "apply: response carries no reconcile.added summary for the new upstream"
+    fi
+    for _ in $(seq 1 100); do
+        request "$AP_BASE" GET /workers
+        jq -e '[.workers[] | select(.url == "'"$URL_C"'")] | length == 1' \
+            "$TMP_DIR/body" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert_json "apply: the reconciled worker carries discovery=config" \
+        '[.workers[] | select(.url == "'"$URL_C"'")][0].discovery' "config"
+    request "$AP_BASE" GET /_ui/config
+    assert_eq "apply: GET after the successful apply" "$STATUS" "200"
+    OK_DOC=$(jq -c '[.virtual_models, .upstreams]' "$TMP_DIR/body")
+
+    # An invalid policy fragment anywhere in the document rejects the whole
+    # write: virtual_models keeps ap-a (no ap-x) and upstreams keeps URL_C, so
+    # neither the good nor the bad section was half-applied.
+    request "$AP_BASE" POST /_ui/config/apply -H 'Content-Type: application/json' \
+        --data '{"virtual_models":[{"model":"ap-x","target":"test-model","policy":"notapolicy"}],"upstreams":[]}'
+    assert_eq "apply: an invalid policy fragment rejects the document" "$STATUS" "400"
+    request "$AP_BASE" GET /_ui/config
+    assert_eq "apply: the rejected document kept virtual_models and upstreams" \
+        "$(jq -c '[.virtual_models, .upstreams]' "$TMP_DIR/body")" "$OK_DOC"
+
+    # Same through the upstreams side: an over-cap batch must not half-apply
+    # (the empty virtual_models fragment must not clear the surviving profile).
+    request "$AP_BASE" POST /_ui/config/apply -H 'Content-Type: application/json' \
+        --data @"$TMP_DIR/apply-over-cap.json"
+    assert_eq "apply: an over-limit upstreams batch rejects the document" "$STATUS" "400"
+    request "$AP_BASE" GET /_ui/config
+    assert_eq "apply: the second rejection also changed nothing" \
+        "$(jq -c '[.virtual_models, .upstreams]' "$TMP_DIR/body")" "$OK_DOC"
+
+    # ---- 6. Method and HEAD mirror on the new endpoints --------------------
+    # The two POST-only sections gate like their siblings (ui.conf
+    # method_only("POST") -> axum-style 405 + Allow), and the GET-family
+    # endpoints answer HEAD through the GET route.
+    request "$PR_BASE" GET /_ui/config/upstreams
+    assert_eq "upstreams: GET is refused" "$STATUS" "405"
+    AL_UP=$(header_of Allow)
+    assert_eq "upstreams: Allow names POST only" "$AL_UP" "POST"
+    request "$PR_BASE" GET /_ui/config/virtual
+    assert_eq "virtual: GET is refused like the sibling gate" "$STATUS" "405"
+    assert_eq "virtual: the Allow shape matches /config/upstreams" \
+        "$(header_of Allow)" "$AL_UP"
+    request "$PR_BASE" PUT /_ui/config/upstreams -H 'Content-Type: application/json' \
+        --data '{"entries":[]}'
+    assert_eq "upstreams: PUT is refused too" "$STATUS" "405"
+    request "$PR_BASE" HEAD /_ui/config/policy
+    assert_eq "policy: HEAD keeps answering the GET route" "$STATUS" "200"
+fi
+
+# ==========================================================================
 printf '\n----------------------------------------\n'
 if [[ "$KEEP_GOING" == "1" ]]; then
     printf 'Triage run: %d passed, %d failed, %d notes\n' "$PASSED" "$FAILS" "$NOTE_COUNT"

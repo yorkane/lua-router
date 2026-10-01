@@ -73,6 +73,8 @@
     configCtx: (model, ctx) => post('/config/ctx', { model, ctx }, UI_BASE),
     configModel: card => post('/config/model', card, UI_BASE),
     configVirtual: entries => post('/config/virtual', { entries }, UI_BASE),
+    // 服务接入池（doc/gap-virtual-models.md 3.5）：整表替换 + 立即 reconcile
+    configUpstreams: entries => post('/config/upstreams', { entries }, UI_BASE),
     configApply: document => post('/config/apply', document, UI_BASE),
     // 改名映射转发给 watcher 的 /model-map；body 支持 {"orig":"new"} 形状，空值即删除
     configModelMap: mapping => post('/config/model-map', mapping, UI_BASE),

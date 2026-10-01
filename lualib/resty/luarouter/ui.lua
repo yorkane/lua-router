@@ -304,6 +304,8 @@ function _M.config_effort() return config_handler("handle_config_effort") end
 function _M.config_ctx() return config_handler("handle_config_ctx") end
 function _M.config_model() return config_handler("handle_config_model") end
 function _M.config_virtual() return config_handler("handle_config_virtual") end
+--- 服务接入池 upstreams（doc/gap-virtual-models.md 3.5）：整表替换 + reconcile。
+function _M.config_upstreams() return config_handler("handle_config_upstreams") end
 function _M.config_apply() return config_handler("handle_config_apply") end
 function _M.config_model_map() return config_handler("handle_config_model_map") end
 

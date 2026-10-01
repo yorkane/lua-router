@@ -232,7 +232,12 @@ end
 -- same model do not change it, and a model without a hint uses the configured
 -- default. policy_mod.for_model holds the instances; policy.default stays the
 -- global one so init_worker's eviction sweep and mesh mirror have an anchor.
-local function policy_for(model)
+-- Virtual-model profile hooks (doc/gap-virtual-models.md 3.3). The helpers
+-- call store(), so they are defined next to it further below; the names are
+-- forward declared here because policy_for already consults them.
+local profile_for_alias, profile_worker_list, profile_policy_name, profile_effort_value
+
+local function policy_for(model, profile)
     local conf = cfg()
     if not default_policy then
         default_policy = policy_mod.new(conf)
@@ -244,6 +249,23 @@ local function policy_for(model)
     policy_mod.start_eviction()
     if type(model) ~= "string" or model == "" then
         return default_policy
+    end
+    -- Profile layer (gap-virtual-models 3.3): an explicit profile.policy sits
+    -- above the whole for_model chain (model_policies > global > hint > env).
+    -- Reuse the shared instance cache so affinity state survives (same key
+    -- shape policy_mod.for_model uses); an unknown name collapses inside
+    -- policy.new exactly like every other operator-set policy name.
+    local forced = profile_policy_name(profile)
+    if forced then
+        local inst = policy_mod.instances[forced .. ":" .. model]
+        if not inst then
+            inst = policy_mod.new(conf, { model = model, name = forced })
+            inst.generation = policy_mod.generation()
+            if ngx and ngx.shared then
+                inst:restore_snapshot()
+            end
+        end
+        return inst
     end
     local hint, count = registry.policy_hint_for_model(model)
     if not hint then
@@ -565,6 +587,187 @@ local function store()
         return mod
     end
     return nil
+end
+
+-- ------------------------------------------------------------- profile reads
+--
+-- doc/gap-virtual-models.md 3.3. Every config_store entry point here goes
+-- through pcall + type checks: while the store has no profiles feature (a
+-- mid-rollout build, a stripped unit probe, or worker A's file still landing),
+-- each helper answers nil/"" and the call sites keep their pre-feature
+-- behaviour byte-for-byte. Profile reads ride the store's own snapshot cache
+-- (SNAPSHOT_TTL), so a request adds no shared-dict round trip.
+
+---Profile for one *client-facing* alias (profile_for keys off the requested
+---name, not the resolved target). Shape: {target, workers, policy, effort}.
+---@param model string|nil
+---@return table|nil
+profile_for_alias = function(model)
+    if type(model) ~= "string" or model == "" then
+        return nil
+    end
+    local store_mod = store()
+    if not store_mod or type(store_mod.profile_for) ~= "function" then
+        return nil
+    end
+    local ok, profile = pcall(store_mod.profile_for, model)
+    if ok and type(profile) == "table" then
+        return profile
+    end
+    return nil
+end
+
+_M.profile_for_alias = profile_for_alias
+
+local function is_array_table(v)
+    if type(v) ~= "table" then
+        return false
+    end
+    local n = 0
+    for k in pairs(v) do
+        -- LuaJIT-safe integer test (math.tointeger is 5.3+): the key must be a
+        -- positive whole number.
+        if type(k) ~= "number" or k < 1 or k ~= math.floor(k) then
+            return false
+        end
+        n = n + 1
+    end
+    return n == #v
+end
+
+---Non-empty candidate whitelist of a profile, or nil (= full pool). The store
+---validates the shape on write; the guards here only protect the hot path from
+---a hand-edited document.
+---@param profile table|nil
+---@return string[]|nil
+profile_worker_list = function(profile)
+    if type(profile) ~= "table" then
+        return nil
+    end
+    local workers = profile.workers
+    if not is_array_table(workers) or #workers == 0 then
+        return nil
+    end
+    for i = 1, #workers do
+        if type(workers[i]) ~= "string" or workers[i] == "" then
+            return nil
+        end
+    end
+    return workers
+end
+
+_M.profile_worker_list = profile_worker_list
+
+-- The eight accepted spellings, mirrored locally so a store without the
+-- validator (unit probes) still recognises them; when the store is present
+-- its normalize_policy is the single source of truth (same POLICY_SET the
+-- config page writes through).
+local FALLBACK_POLICY_SET = {
+    random = true, round_robin = true, cache_aware = true, power_of_two = true,
+    prefix_hash = true, manual = true, bucket = true, consistent_hashing = true,
+}
+local FALLBACK_EFFORT_SET = {
+    none = true, minimal = true, low = true, medium = true, high = true,
+    xhigh = true, max = true, ultra = true,
+}
+
+local function plain_trim(value)
+    return string.gsub(value, "^%s*(.-)%s*$", "%1")
+end
+
+local function normalize_policy_name(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local lowered = string.lower(plain_trim(value))
+    if lowered == "" then
+        return nil
+    end
+    local store_mod = store()
+    if store_mod and type(store_mod.normalize_policy) == "function" then
+        local ok, named = pcall(store_mod.normalize_policy, lowered)
+        if ok and type(named) == "string" and named ~= "" then
+            return named
+        end
+        if ok and named == false then
+            return nil
+        end
+    end
+    if FALLBACK_POLICY_SET[lowered] then
+        return lowered
+    end
+    return nil
+end
+
+---Effective per-profile policy name, or nil (policy_for keeps its chain).
+---@param profile table|nil
+---@return string|nil
+profile_policy_name = function(profile)
+    if type(profile) ~= "table" then
+        return nil
+    end
+    local named = normalize_policy_name(profile.policy)
+    if named then
+        return named
+    end
+    local store_mod = store()
+    if store_mod and type(store_mod.profile_policy) == "function" then
+        local ok, name = pcall(store_mod.profile_policy, profile)
+        if ok then
+            return normalize_policy_name(name)
+        end
+    end
+    return nil
+end
+
+_M.profile_policy_name = profile_policy_name
+
+local function normalize_effort_name(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local lowered = string.lower(plain_trim(value))
+    if lowered == "" then
+        return nil
+    end
+    local store_mod = store()
+    if store_mod and type(store_mod.normalize_effort) == "function" then
+        local ok, named = pcall(store_mod.normalize_effort, lowered)
+        if ok and type(named) == "string" and named ~= "" then
+            return named
+        end
+        if ok and named == false then
+            return nil
+        end
+    end
+    if FALLBACK_EFFORT_SET[lowered] then
+        return lowered
+    end
+    return nil
+end
+
+---Effective per-profile effort. The store helper (when A ships one) gets both
+---keys so it can prefer the alias spelling; the profile's own effort field is
+---the fallback every path can take.
+---@param profile table|nil
+---@param alias string|nil @ client-facing name
+---@param resolved string|nil @ upstream id the alias maps to
+---@return string|nil
+profile_effort_value = function(profile, alias, resolved)
+    if type(profile) ~= "table" then
+        return nil
+    end
+    local store_mod = store()
+    if store_mod and type(store_mod.profile_effort) == "function" then
+        local ok, value = pcall(store_mod.profile_effort, alias, resolved)
+        if ok then
+            local named = normalize_effort_name(value)
+            if named then
+                return named
+            end
+        end
+    end
+    return normalize_effort_name(profile.effort)
 end
 
 -- ------------------------------------------------------------------ raw JSON edits
@@ -1047,7 +1250,10 @@ _M.error_type_from_status = error_type_from_status
 ---Healthy, breaker-not-open workers. With IGW off every worker is a candidate
 ---whatever model it serves, as in the Rust router (effective_model_id is nil
 ---unless enable_igw).
-local function candidates_for(model)
+---@param profile table|nil @ optional virtual-model profile: a non-empty
+---            profile.workers narrows the candidate set to whitelisted members
+---            (normalized url or worker id match, gap-virtual-models 3.3)
+local function candidates_for(model, profile)
     local records = registry.records()
     local out = {}
     local igw = cfg().enable_igw
@@ -1066,7 +1272,36 @@ local function candidates_for(model)
             end
         end
     end
-    return out
+    local allow = profile_worker_list(profile)
+    if not allow then
+        return out
+    end
+    local kept = {}
+    for i = 1, #out do
+        local record = out[i]
+        local rec_url
+        if registry.normalize_url then
+            local ok, normalized = pcall(registry.normalize_url, record.url)
+            if ok and type(normalized) == "string" then
+                rec_url = normalized
+            end
+        end
+        for j = 1, #allow do
+            local want = allow[j]
+            local hit = want == record.id
+            if not hit and rec_url ~= nil then
+                local ok, normalized = pcall(registry.normalize_url, want)
+                if ok and type(normalized) == "string" then
+                    hit = normalized == rec_url
+                end
+            end
+            if hit then
+                kept[#kept + 1] = record
+                break
+            end
+        end
+    end
+    return kept
 end
 
 local function compact_url(url)
@@ -2072,7 +2307,7 @@ _M.clear_stream_options_rejected = clear_stream_options_rejected
 ---@param model string|nil
 ---@param text string|nil @ routing text
 ---@param incoming table|nil @ request headers (defaults to the live request)
-local function forward(route, body, raw_body, model, text, incoming)
+local function forward(route, body, raw_body, model, text, incoming, profile)
     local conf = cfg()
     local is_stream = body.stream == true
     local endpoint = endpoint_label(route)
@@ -2104,7 +2339,7 @@ local function forward(route, body, raw_body, model, text, incoming)
 
     while true do
         attempt = attempt + 1
-        local candidates = candidates_for(model)
+        local candidates = candidates_for(model, profile)
         local worker
         if pinned then
             for i = 1, #candidates do
@@ -2115,7 +2350,7 @@ local function forward(route, body, raw_body, model, text, incoming)
             end
         end
         if not worker then
-            worker = policy_for(model):select({
+            worker = policy_for(model, profile):select({
                 candidates = candidates,
                 routing_key = routing_key,
                 request_text = text,
@@ -2336,8 +2571,10 @@ end
 ---@param raw string
 ---@param body table @ decoded request
 ---@param model string|nil @ resolved model id
+---@param profile table|nil @ virtual-model profile of the client-facing alias
+---@param alias string|nil @ client-facing model name (profile effort lookup prefers it)
 ---@return string raw, string|nil requested, string|nil effective
-local function apply_effort_policy(raw, body, model)
+local function apply_effort_policy(raw, body, model, profile, alias)
     local requested
     if type(body.reasoning_effort) == "string" then
         requested = body.reasoning_effort
@@ -2345,6 +2582,30 @@ local function apply_effort_policy(raw, body, model)
     local store_mod = store()
     if not store_mod or type(store_mod.request_effort_for) ~= "function" then
         return raw, requested, requested
+    end
+    -- The model_effort forced layer (LMR_MODEL_EFFORT) sits above everything,
+    -- including a profile effort (gap-virtual-models 3.3): request_effort_for
+    -- returns it verbatim for the resolved key, so when that layer is set the
+    -- profile stays out of the way. Below it the profile sits above the model
+    -- card and the global map.
+    local forced
+    if type(model) == "string" and model ~= "" then
+        local ok_cur, cur = pcall(store_mod.current)
+        if ok_cur and type(cur) == "table" and type(cur.model_effort) == "table" then
+            local candidate = cur.model_effort[model]
+            if type(candidate) == "string" and candidate ~= "" then
+                forced = candidate
+            end
+        end
+    end
+    if forced == nil then
+        local pe = profile_effort_value(profile, alias, model)
+        if pe then
+            if requested == pe then
+                return raw, requested, pe
+            end
+            return set_top_field(raw, "reasoning_effort", pe), requested, pe
+        end
     end
     local ok, effective = pcall(store_mod.request_effort_for, model, requested)
     if not ok or type(effective) ~= "string" or effective == "" then
@@ -2415,12 +2676,17 @@ local function route_inference(route, body, raw)
         end
     end
     local resolved = resolve_alias(model) or model
+    -- Virtual-model profile (gap-virtual-models 3.3): keyed off the *client*
+    -- name, so an alias without a profile row (plain pair or no aliases at
+    -- all) is nil here and every hook below degrades to the pre-feature path.
+    local profile = profile_for_alias(model)
 
     -- /generate carries its own sampling fields, so the effort ladder and the
     -- context cap stay off that route (Rust router.rs skips them too).
     local requested_effort, effective_effort
     if route ~= "/generate" then
-        raw, requested_effort, effective_effort = apply_effort_policy(raw, body, resolved)
+        raw, requested_effort, effective_effort = apply_effort_policy(raw, body,
+            resolved, profile, model)
         raw = (apply_ctx_cap(raw, body, resolved))
     end
 
@@ -2435,13 +2701,13 @@ local function route_inference(route, body, raw)
 
     -- Only extract routing text when the policy reads it: the flattening walks
     -- every message, which random / round_robin / the hash ring never look at.
-    local inst = policy_for(resolved)
+    local inst = policy_for(resolved, profile)
     -- The request log calls this field route_type; the span reuses the same value
     -- so a trace and a log row name the same decision.
     ngx.ctx.lr_route_type = inst:policy_name()
     local text = inst:needs_request_text() and text_for(route, body) or nil
     local status, response_body = forward(route, body, raw, resolved, text,
-        ngx.req.get_headers())
+        ngx.req.get_headers(), profile)
     if route == "/v1/responses" and status >= 200 and status < 300 then
         -- Rust patches the response Value before it answers (non_streaming.rs:
         -- 141-167). The response store is gone (scope-trim.md), so this is the
@@ -3521,7 +3787,8 @@ local function log_inference_request(duration_s, ttft_s)
     local reasoning = tokens[5] or 0
 
     local candidates = {}
-    local pool = candidates_for(ngx.ctx.lr_model_query)
+    local pool = candidates_for(ngx.ctx.lr_model_query,
+        profile_for_alias(ngx.ctx.lr_requested_model))
     for i = 1, #pool do
         candidates[#candidates + 1] = compact_url(pool[i].url)
     end
@@ -3545,7 +3812,10 @@ local function log_inference_request(duration_s, ttft_s)
         effort = ngx.ctx.lr_effort or cjson.null,
         provider = labels.engine or "sglang",
         worker = compact_url(worker.url),
-        route_type = policy_for(model):policy_name(),
+        -- Reuse the name the selection actually ran under (a profile can force
+        -- another policy than a bare policy_for(model) would pick), falling
+        -- back to the plain chain when the route phase did not stamp one.
+        route_type = ngx.ctx.lr_route_type or policy_for(model):policy_name(),
         selected = compact_url(worker.url),
         candidates = candidates,
         duration_ms = math.floor(duration_s * 1000),

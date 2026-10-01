@@ -9,7 +9,10 @@
           POST ./config/model-map   名称映射，转发 llm-watcher（旧接口，保留）
           POST ./config/model       每模型配置卡保存（字段缺省=不动；null=清除；remove:true=删除整条）
           POST ./config/apply       JSON 视图整体替换（缺省字段=清空；model_map 转发 watcher 落地）
-          POST ./config/virtual     虚拟模型别名整表替换（body {entries:[{model,target}]}，空数组=清空）
+          POST ./config/virtual     虚拟模型 profile 整表替换（body {entries:[{model,target,workers,policy,effort}]}，
+                                    workers=规范化 url 白名单，policy/effort 可选覆盖；空数组=清空；兼容旧 {model,target}）
+          POST ./config/upstreams   远程服务接入池整表替换（body {entries:[{url,model_id,priority,cost,labels,
+                                    disable_health_check,api_key}]}；api_key 缺失/null=不动，""=清除；响应含 reconcile 摘要）
         模型下拉复用既有 GET ./v1/models。页面在 /_ui/config.html，因此 ./config 解析为 /_ui/config。
 
   两个视图（顶部 表单/JSON 分段按钮切换，共享同一份 state）：
@@ -20,8 +23,9 @@
       3) 模型名映射：转发 llm-watcher 落地（watcher ledger 持久化）。
       4) 环境默认值（只读）。
     JSON 视图：可编辑子集（default_effort / effort_map / model_ctx / model_effort /
-      model_configs / virtual_models / model_map）的源码编辑，「校验并应用」走 ./config/apply 整体替换。
+      model_configs / virtual_models / upstreams / model_map）的源码编辑，「校验并应用」走 ./config/apply 整体替换。
       这份 JSON 等价于容器环境变量，可导出后粘进 compose 固化。
+      upstreams 的 api_key 回显恒 null（脱敏）：提交时保持 null/缺省=不动已存密钥，填 ""=清除，填值=设置。
 
   每模型卡的后端语义（POST ./config/model）：
       字段缺省 = 不动该字段；ctx:null = 清除上限；default_effort:null = 跟随全局，
@@ -122,6 +126,16 @@ select option{background:var(--surface);color:var(--text)}
 .rows{display:flex;flex-direction:column;gap:6px;margin:8px 0}
 .rows[hidden]{display:none}
 .erow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.erow .vm-lbl{color:var(--faint);font-size:11px;flex:none}
+.wchips{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1 1 260px;min-width:200px;min-height:26px;
+  border:1px dashed var(--border);border-radius:var(--radius-sm);padding:2px 6px;background:var(--bg)}
+.wchips .none{color:var(--faint);font-size:11px}
+.wchip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:1px 6px;border-radius:var(--radius-pill);
+  border:1px solid var(--border);background:var(--raised);color:var(--text);max-width:320px}
+.wchip .u{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wchip select{background:transparent;border:none;color:var(--text);font:inherit;padding:0 2px;max-width:150px}
+.wchip button{color:var(--faint);font-size:12px;line-height:1;padding:0 2px}
+.wchip button:hover{color:var(--red)}
 
 /* 每模型配置卡 */
 .mcard{margin-bottom:14px}
@@ -255,14 +269,16 @@ details.env .body{margin-top:10px}
     <section class="card">
       <h2>虚拟模型映射</h2>
       <p class="desc">虚拟模型是对外别名，与真实模型并存、一起出现在 <code>/v1/models</code>；
-        请求用别名会被路由到 <code>target</code> 指向的上游模型。target 不存在时，请求会得到「无可用 worker」。</p>
+        请求用别名会被路由到 <code>target</code> 指向的上游模型。target 不存在时，请求会得到「无可用 worker」。
+        每行还可选：候选实例白名单（只把该别名限定到勾选的实例）、policy 与 effort 覆盖（留空=跟随全局/默认）。</p>
       <div class="rows" id="vm-rows" hidden></div>
       <div class="field" id="vm-actions" hidden>
         <button class="btn mini ghost" id="vm-add" type="button">+ 添加映射</button>
         <button class="btn" id="vm-save" type="button">保存映射</button>
       </div>
       <div class="hint" id="vm-hint" hidden>保存提交的是完整列表：删除一行后直接「保存映射」即可移除该别名。
-        两侧都留空的行提交时忽略；别名留空、目标留空、别名等于目标等非法行由后端整体拒绝并给出原因。</div>
+        别名与目标都留空的行提交时忽略；别名留空、目标留空、别名等于目标、target 指向另一个别名等非法行由后端整体拒绝并给出原因。
+        候选实例一个都不勾 = 全池可选；policy/effort 留「跟随」= 不覆盖。旧后端只认 {model,target}，多出的字段会被忽略。</div>
       <div class="legacy-note" id="vm-legacy-note" hidden>后端不支持虚拟模型映射（GET ./config 无 virtual_models 字段），请升级 llm-router。</div>
     </section>
 
@@ -296,6 +312,9 @@ details.env .body{margin-top:10px}
         LMR_MODEL_EFFORT / LMR_MODEL_EFFORT_MAP / LMR_MODEL_MODALITIES / LMR_VIRTUAL_MODELS），可以先导出再粘进 compose 固化。
         「校验并应用」走 <code>POST ./config/apply</code> <b>整体替换</b>：缺省字段视为清空；
         model_map 会转发 llm-watcher 落地改名。任一字段非法整体拒绝，不产生半提交。</p>
+      <p class="desc"><code>virtual_models</code> 可带 <code>workers</code>（规范化 url 白名单）、<code>policy</code>、
+        <code>effort</code> 覆盖。<code>upstreams</code> 的 <code>api_key</code> 回显恒 <code>null</code>（脱敏）：
+        提交时保持 <code>null</code> 或删掉该键 = 不动已存密钥，填 <code>""</code> = 清除，填值 = 设置。</p>
       <textarea id="json-ta" class="json-ta" spellcheck="false" placeholder="加载配置后此处显示可编辑 JSON 子集"></textarea>
       <div id="json-err"></div>
       <div class="field" style="margin-top:10px">
@@ -331,6 +350,25 @@ var MOD_LABELS = { image: '图片', video: '视频', audio: '音频' };
 
 var state = null;
 var modelIds = [];
+var poolWorkers = [];             // GET /workers 缓存：虚拟模型行的候选实例与 upstreams 状态对齐用
+var POLICY_NAMES = ['random', 'round_robin', 'cache_aware', 'power_of_two',
+  'prefix_hash', 'manual', 'bucket', 'consistent_hashing'];
+function normU(u){ return String(u || '').trim().replace(/\/+$/, ''); }
+function poolLabelFor(u){
+  var want = normU(u);
+  for (var i = 0; i < poolWorkers.length; i++) {
+    var w = poolWorkers[i];
+    if (w && (normU(w.url) === want || String(w.id) === want)) {
+      return normU(w.url) + ' · ' + (w.model_id || 'unknown');
+    }
+  }
+  return want;
+}
+function loadPool(){
+  return fetchJson('/workers').then(function(r){
+    poolWorkers = (r && Array.isArray(r.workers)) ? r.workers : [];
+  }, function(){ poolWorkers = []; });
+}
 var mapDraft = null;
 var mmDraft = null;
 var vmDraft = null;
@@ -911,20 +949,120 @@ function jumpToRename(name){
 }
 
 /* ---------- C. 模型名映射 ---------- */
-/* ---------- B2. 虚拟模型映射（别名 → 真实上游模型） ----------
-   后端契约：GET  document.virtual_models = [{model,target},...]；
-             POST ./config/virtual {entries:[{model,target}]} 整表替换（空数组=清空）。
-   字段缺失（旧后端）时只显示升级提示，不提供编辑区。 */
+/* ---------- B2. 虚拟模型映射（别名 → 真实上游模型 + 可选 profile） ----------
+   后端契约（doc/gap-virtual-models.md 3.5）：
+     GET  document.virtual_models = [{model,target,workers?,policy?,effort?},...]（旧后端只有 model+target）；
+     POST ./config/virtual {entries:[{model,target,workers?,policy?,effort?}]} 整表替换（空数组=清空）。
+   workers 存规范化 url（或 worker id）；空/缺省 = 全池。policy/effort 缺省 = 不覆盖。
+   字段缺失（更旧后端无 virtual_models 字段）时只显示升级提示，不提供编辑区。 */
+function vmRow(r){
+  var workers = Array.isArray(r && r.workers)
+    ? r.workers.filter(function(u){ return typeof u === 'string' && u.trim(); }).map(normU)
+    : [];
+  return {
+    model: (r && r.model) || '',
+    target: (r && r.target) || '',
+    workers: workers,
+    policy: (r && typeof r.policy === 'string') ? r.policy : '',
+    effort: (r && typeof r.effort === 'string') ? r.effort : ''
+  };
+}
 function vmRows(){
   if (vmDraft) return vmDraft;
   var src = state && Array.isArray(state.virtual_models) ? state.virtual_models : [];
-  var rows = src.map(function(r){ return { model: r.model || '', target: r.target || '' }; });
-  if (!rows.length) rows.push({ model: '', target: '' });
+  var rows = src.map(vmRow);
+  if (!rows.length) rows.push(vmRow(null));
   return rows;
 }
 function vmEdit(){
-  if (!vmDraft) vmDraft = vmRows().map(function(r){ return { model: r.model, target: r.target }; });
+  if (!vmDraft) vmDraft = vmRows().map(function(r){
+    return { model: r.model, target: r.target, workers: r.workers.slice(), policy: r.policy, effort: r.effort };
+  });
   return vmDraft;
+}
+function selectWith(options, withEmpty, emptyLabel, value){
+  var sel = document.createElement('select');
+  sel.className = 'select';
+  if (withEmpty) {
+    var o0 = document.createElement('option');
+    o0.value = ''; o0.textContent = emptyLabel;
+    sel.appendChild(o0);
+  }
+  options.forEach(function(name){
+    var o = document.createElement('option');
+    o.value = name; o.textContent = name;
+    sel.appendChild(o);
+  });
+  var want = value === null || value === undefined ? '' : String(value);
+  var known = want === '' || options.indexOf(want) !== -1;
+  if (!known) {
+    var ou = document.createElement('option');
+    ou.value = want; ou.textContent = want + '（未知）';
+    sel.appendChild(ou);
+  }
+  sel.value = want;
+  return sel;
+}
+function renderWchips(box, row, idx){
+  var d = vmEdit();
+  box.innerHTML = '';
+  if (!row.workers.length) {
+    var none = document.createElement('span');
+    none.className = 'none'; none.textContent = '全池（未限定实例）';
+    box.appendChild(none);
+  }
+  row.workers.forEach(function(u, wi){
+    var chip = document.createElement('span');
+    chip.className = 'wchip';
+    var label = document.createElement('span');
+    label.className = 'u'; label.textContent = poolLabelFor(u);
+    label.title = u;
+    chip.appendChild(label);
+    var x = document.createElement('button');
+    x.type = 'button'; x.textContent = '\u00d7';
+    x.addEventListener('click', function(){
+      var dd = vmEdit();
+      dd[idx].workers.splice(wi, 1);
+      renderVirtualModels();
+    });
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
+  var sel = document.createElement('select');
+  sel.className = 'select';
+  sel.style.maxWidth = '190px';
+  var o0 = document.createElement('option');
+  o0.value = ''; o0.textContent = '+ 限定实例…';
+  sel.appendChild(o0);
+  poolWorkers.forEach(function(w){
+    var u = normU(w.url);
+    if (!u || row.workers.indexOf(u) !== -1) return;
+    var o = document.createElement('option');
+    o.value = u; o.textContent = u + ' \u00b7 ' + (w.model_id || 'unknown');
+    sel.appendChild(o);
+  });
+  sel.addEventListener('change', function(){
+    if (!sel.value) return;
+    var dd = vmEdit();
+    if (dd[idx].workers.indexOf(sel.value) === -1) dd[idx].workers.push(sel.value);
+    renderVirtualModels();
+  });
+  box.appendChild(sel);
+  var custom = document.createElement('input');
+  custom.className = 'input';
+  custom.style.width = '150px'; custom.style.maxWidth = '150px'; custom.style.fontSize = '11px';
+  custom.placeholder = '自定义 url 回车';
+  custom.autocomplete = 'off'; custom.spellcheck = false;
+  custom.addEventListener('keydown', function(ev){
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    var u = normU(custom.value);
+    if (!u) return;
+    var dd = vmEdit();
+    if (dd[idx].workers.indexOf(u) === -1) dd[idx].workers.push(u);
+    renderVirtualModels();
+  });
+  box.appendChild(custom);
 }
 function renderVirtualModels(){
   var rows = document.getElementById('vm-rows');
@@ -951,7 +1089,7 @@ function renderVirtualModels(){
     alias.disabled = loading;
     alias.addEventListener('input', function(){ vmEdit()[idx].model = alias.value; });
     var arrow = document.createElement('span');
-    arrow.className = 'arrow'; arrow.textContent = '→';
+    arrow.className = 'arrow'; arrow.textContent = '\u2192';
     var target = document.createElement('input');
     target.className = 'input model';
     target.autocomplete = 'off'; target.spellcheck = false;
@@ -960,16 +1098,35 @@ function renderVirtualModels(){
     target.value = row.target;
     target.disabled = loading;
     target.addEventListener('input', function(){ vmEdit()[idx].target = target.value; });
+    var wLbl = document.createElement('span');
+    wLbl.className = 'vm-lbl'; wLbl.textContent = '候选';
+    var chips = document.createElement('div');
+    chips.className = 'wchips';
+    renderWchips(chips, row, idx);
+    var polLbl = document.createElement('span');
+    polLbl.className = 'vm-lbl'; polLbl.textContent = '策略';
+    var pol = selectWith(POLICY_NAMES, true, '跟随全局', row.policy);
+    pol.disabled = loading;
+    pol.addEventListener('change', function(){ vmEdit()[idx].policy = pol.value; });
+    var effLbl = document.createElement('span');
+    effLbl.className = 'vm-lbl'; effLbl.textContent = '强度';
+    var eff = selectWith(EFForts, true, '跟随默认', row.effort);
+    eff.disabled = loading;
+    eff.addEventListener('change', function(){ vmEdit()[idx].effort = eff.value; });
     var del = document.createElement('button');
     del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
     del.disabled = loading;
     del.addEventListener('click', function(){
       var d = vmEdit();
       d.splice(idx, 1);
-      if (!d.length) d.push({ model: '', target: '' });
+      if (!d.length) d.push(vmRow(null));
       renderVirtualModels();
     });
-    line.appendChild(alias); line.appendChild(arrow); line.appendChild(target); line.appendChild(del);
+    line.appendChild(alias); line.appendChild(arrow); line.appendChild(target);
+    line.appendChild(wLbl); line.appendChild(chips);
+    line.appendChild(polLbl); line.appendChild(pol);
+    line.appendChild(effLbl); line.appendChild(eff);
+    line.appendChild(del);
     rows.appendChild(line);
   });
 }
@@ -1071,8 +1228,20 @@ function renderEnv(){
     : '（空）');
   var vm = Array.isArray(e.virtual_models) ? e.virtual_models : [];
   kvLine(host, 'virtual_models(env)', vm.length
-    ? vm.map(function(r){ return (r && r.model ? String(r.model) : '?') + ' → ' + (r && r.target ? String(r.target) : '?'); }).join('，')
+    ? vm.map(function(r){
+        var s = (r && r.model ? String(r.model) : '?') + ' → ' + (r && r.target ? String(r.target) : '?');
+        if (r && Array.isArray(r.workers) && r.workers.length) s += ' [' + r.workers.length + ' 实例]';
+        if (r && r.policy) s += ' ' + r.policy;
+        if (r && r.effort) s += ' ' + r.effort;
+        return s;
+      }).join('，')
     : '（空）');
+  if (state && ('upstreams' in state)) {
+    var us = Array.isArray(state.upstreams) ? state.upstreams : [];
+    kvLine(host, 'upstreams(env)', us.length
+      ? us.map(function(r){ return (r && r.url ? String(r.url) : '?') + (r && r.api_key ? ' ·key' : ''); }).join('，')
+      : '（空）');
+  }
 }
 
 function renderDatalist(){
@@ -1111,6 +1280,19 @@ function modelConfigsArray(){
   }
   return arr;
 }
+/* 虚拟模型的可编辑形状：统一为新形状（workers/policy/effort 空则省略），
+   旧后端返回的 {model,target} 会被无损保留；用户加的 profile 字段随草稿走。 */
+function vmJsonArray(){
+  var src = vmDraft || (state && Array.isArray(state.virtual_models) ? state.virtual_models : []);
+  return src.map(function(r){
+    var row = vmRow(r);
+    var e = { model: row.model, target: row.target };
+    if (row.workers.length) e.workers = row.workers.slice();
+    if (row.policy) e.policy = row.policy;
+    if (row.effort) e.effort = row.effort;
+    return e;
+  });
+}
 function buildEditableJson(){
   var s = state || {};
   var w = s.watcher || {};
@@ -1120,9 +1302,11 @@ function buildEditableJson(){
     model_ctx: Array.isArray(s.model_ctx) ? s.model_ctx : [],
     model_effort: Array.isArray(s.model_effort) ? s.model_effort : [],
     model_configs: modelConfigsArray(),
-    virtual_models: Array.isArray(s.virtual_models) ? s.virtual_models : [],
+    virtual_models: vmJsonArray(),
     model_map: (w.model_map && typeof w.model_map === 'object') ? w.model_map : {}
   };
+  // 新后端才有 upstreams 段；旧后端不认识的字段会被整体拒绝，所以只在服务端确实返回过时才入草稿
+  if (Array.isArray(s.upstreams)) out.upstreams = JSON.parse(JSON.stringify(s.upstreams));
   return JSON.stringify(out, null, 2);
 }
 function normStr(o){
@@ -1234,6 +1418,7 @@ document.getElementById('json-apply').addEventListener('click', function(){
     virtual_models: ('virtual_models' in obj) ? obj.virtual_models : []
   };
   if ('model_map' in obj) body.model_map = obj.model_map;   // 对象或 "orig:new,..." 字符串
+  if ('upstreams' in obj) body.upstreams = obj.upstreams;   // api_key:null=不动密钥，""=清除（契约 3.4）
   submit('./config/apply', body, '配置已整体应用', function(){
     jsonDraft = null;                                    // 以响应重建
   });
@@ -1259,6 +1444,7 @@ function submit(url, body, okMsg, thenCb){
   if (loading) return Promise.resolve(null);
   var prevModels = state && Array.isArray(state.models) ? state.models : null;
   setBusy(true);
+  loadPool();   // 写操作后刷新候选实例池（异步，不阻塞提交）
   return postJson(url, body).then(function(res){
     state = res;
     mapDraft = null;
@@ -1350,15 +1536,23 @@ document.getElementById('mm-add').addEventListener('click', function(){
 
 /* ---------- B2 虚拟模型别名 ---------- */
 document.getElementById('vm-add').addEventListener('click', function(){
-  vmEdit().push({ model: '', target: '' });
+  vmEdit().push(vmRow(null));
   renderVirtualModels();
 });
-/* 整表提交：两侧都留空的行忽略，其余原样交给后端校验（别名空/目标空/别名等于目标 → 400 error 原文 toast）。
-   删到一行不剩提交空数组 = 清空全部别名。 */
+/* 整表提交：别名/目标都留空的行忽略，其余原样交给后端校验（别名空/目标空/别名等于目标/
+   target 指向别名 → 400 error 原文 toast）。可选字段空则整体省略（workers:[] 等同全池，
+   不如省掉，保持旧后端可读）。删到一行不剩提交空数组 = 清空全部别名。 */
 document.getElementById('vm-save').addEventListener('click', function(){
   var entries = vmRows()
     .filter(function(r){ return (r.model || '').trim() || (r.target || '').trim(); })
-    .map(function(r){ return { model: (r.model || '').trim(), target: (r.target || '').trim() }; });
+    .map(function(r){
+      var e = { model: (r.model || '').trim(), target: (r.target || '').trim() };
+      var ws = (r.workers || []).filter(function(u){ return typeof u === 'string' && u.trim(); }).map(normU);
+      if (ws.length) e.workers = ws;
+      if (r.policy) e.policy = r.policy;
+      if (r.effort) e.effort = r.effort;
+      return e;
+    });
   submit('./config/virtual', { entries: entries },
     entries.length ? '已保存 ' + entries.length + ' 条虚拟模型映射' : '已清空全部虚拟模型映射');
 });
@@ -1396,6 +1590,7 @@ function loadModels(){
 render();
 refresh();
 loadModels();
+loadPool();
 </script>
 <script defer src="./lmr-tabs.js" data-active="config"></script>
 </body>

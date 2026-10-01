@@ -21,13 +21,13 @@ klib.router + LuaJIT）上复刻 Rust 版 `smg` 网关（`gateway/`）的**路�
 逐条证据在 doc/parity-*.md 与 doc/gap-*.md，全量验证汇总见
 [doc/verification-final.md](doc/verification-final.md)。
 
-## 当前基线（2026-10-01 09:36–09:4x UTC 全量门禁，三特性落地后）
+## 当前基线（2026-10-01 11:2x–11:4x UTC 全量门禁，虚拟模型/upstreams 落地后）
 
-权威日志：`/data/tmp/lr-gates/gates-20261001-093642.log`（串行独占，**19 passed / 0 failed /
-0 skipped**）。三轮特性累计：内建 watcher（独立 llm-watcher 容器退役）、Quasar UMD 管理控制台
+权威日志：`/data/tmp/lr-gates/gates-20261001-113951.log`（串行独占，**20 passed / 0 failed /
+0 skipped**）。特性累计：内建 watcher（独立 llm-watcher 容器退役）、Quasar UMD 管理控制台
 `/_ui/admin/`（服务池/模型覆盖/日志监控/路由策略四页，中英双语）、流式 token 核算
 （include_usage 注入+剥帧）、GPU 负载双源（worker /metrics 与远程 Prometheus）、路由动态变更
-（policy/model_policies 热配置免重启）。
+（policy/model_policies 热配置免重启）、**虚拟 model profile + upstreams 持久化服务接入**（doc/gap-virtual-models.md：alias→target+候选白名单+per-alias policy/effort、upstreams 声明层落 LMR_CONFIG_FILE、30s 自愈 reconcile、远程 api_key 脱敏注入、服务接入页与 JSON 编辑）。
 
 按 doc/scope-trim.md 执行模块裁剪后，门禁 21 → 15；watcher 合并后 15 → 16：删掉 `e2e_grpc`、`e2e_history_redis`、
 `e2e_otel`、`e2e_responses_store`、`e2e_discovery_dp`、`e2e_jwt` 六道门（对应平面已删除），
@@ -38,8 +38,8 @@ DP 展开的断言整体迁入 `e2e_stateful`（60 → 91 项）。`preflight` �
 |---|---|---|
 | build | successful | `docker build -t lua-router:integration`，构建期跑一次 `openresty -t` |
 | conf | 2/2 syntax ok | `test/conf/nginx-lua-router.conf` + `conf/lua-router.conf` |
-| unit | luajit 4 + resty 4 口径全绿 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391；resty 侧 tree 67 / policies 118 / hash 795 / integration 66（全部 0 failed） |
-| contract | **580 passed / 0 failed / 2 notes** | 22 段（分段计数见下）。与 `test_hash` 的 795 只是数值接近，两者无关 |
+| unit | luajit 8 + resty 1 口径全绿 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 267 / gpu_load 274 / routing_dyn 122 / **profiles 421**；resty 侧 integration 125（全部 0 failed） |
+| contract | **644 passed / 0 failed / 2 notes** | 23 段（分段计数见下）。与 `test_hash` 的 795 只是数值接近，两者无关 |
 | probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
 | e2e_stateful | **91 / 0** | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses C2+C4（含断开语义）+ **DP 展开 31 项**（dp_size 展开、rank 推理、单 rank 撤收、`/server_info` 500 不展开、关时不展开） |
 | e2e_policies | 65 / 0 | 各策略真流量 + `LMR_MODEL_CTX` clamp |
@@ -54,12 +54,13 @@ DP 展开的断言整体迁入 `e2e_stateful`（60 → 91 项）。`preflight` �
 | e2e_gpu_load | **~40 / 0** | GPU 负载源：worker /metrics 抓取与远程 Prometheus 查询写入 registry 负载，power_of_two/逃逸即刻受益 |
 | e2e_routing_dyn | **~25 / 0** | 路由动态变更：全局与 per-model 策略热切换免重启（shdict revision）、非法名 400 不生效 |
 | e2e_watcher | **65 / 0** | 内建 watcher（原独立 llm-watcher 容器合并入进程）：targets/proc/docker 三源发现、九条守卫逐条有断言、model-map 改名、容器重启重发现 |
+| e2e_profiles | **97 / 0** | 虚拟 model profile 与 upstreams：alias 白名单/worker-id 白名单/per-alias policy/effort、upstreams 整表替换与 reconcile 计数、api_key 三态（null 保留/覆盖/空串清除）与脱敏、bootstrap 混写 skipped、重复/超限整批拒绝、watcher 清账免疫（discovery=config）、手工误删 30s 自愈、LMR_UPSTREAMS_FILE 种子、容器重启复活、apply 原子性 |
 | e2e_tls_chain | **112 / 0 / 2 notes** | 运行时 PKI（根→中间→叶）、四类握手负例（过期/rogue-CA/非 CA 签发/自签）、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书指纹、证书/私钥不配对 fail-closed |
 
-契约 580 的 22 段构成：gate 3、public 30、workers 75、inference 38、headers 13、**mesh 44**、
+契约 644 的 23 段构成：gate 3、public 30、workers 75、inference 38、headers 13、**mesh 44**、
 not_found 15、**observability 53**、proxy_endpoints 56、policy_hint 13、ui_fixed 51、
 tls_upstream 11、cb_race 6、igw 7、discovery 5、prometheus 14、probes 29、cors 37、
-virtual_models 15、ratelimit 14、**inflight_age 32**、tls_server 19 = 580。
+virtual_models 15、ratelimit 14、**inflight_age 32**、tls_server 19、**profiles_upstreams 64** = 644。
 其中 `discovery` 段测的是 **`/model_info` 元数据发现**（registry 健康扫描自动补 model_id），与已删除的
 Kubernetes 服务发现无关，是保留段。
 裁剪前基线为 841 项 / 27 段（`6d2103a~1`），删除的 5 段与被裁掉的断言对应：history_crud 100、
@@ -76,8 +77,8 @@ not_found 段的局部断言随各自平面收敛（逐步 841 → 840 → 740 �
 | `docker-entrypoint.sh` | env 校验 → envsubst → `openresty -t` → exec；缺省策略 `cache_aware`；cache_aware 或 mesh 开启且未显式给 `NGINX_WORKER_PROCESSES` 时把 worker 数收到 1；渲染独立 metrics 监听（缺省 `:29000`，`SMG_METRICS_PORT=0` 关闭）；`SMG_LOG_LEVEL`/`SMG_UI_DIR` 与 Lua 侧名字双认 |
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `../ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` gate |
 | `lualib/resty/luarouter/` | 实现（裁剪后 13 个模块）：`config` `registry` `hb` `policy` `router` `observability` `ui` `props` `config_store` `hash` `limit` `mesh` `init` + `policies/{tree,cache_aware,bucket,consistent_hashing,prefix_hash,utils}`。**全部已接进 `router.lua` / `init.lua` / 生产模板**；DP 展开（`expand_dp` / `url@rank`）与 rank 注入（`inject_dp_rank`）在裁剪时分别内联进 `registry.lua` 与 `router.lua`，语义逐字节不变 |
-| `test/final_gates.sh` | 19 门禁串行硬门（`SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING`），见上面的基线表 |
-| `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），22 段 |
+| `test/final_gates.sh` | 20 门禁串行硬门（`SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING`），见上面的基线表 |
+| `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），23 段 |
 | `test/conf/nginx-lua-router.conf` | 独立测试 conf：`listen 8080`、`/klib/load` 模块探针、`/probe/*` 内省端点 |
 | `test/unit/` | 纯 Lua 单测 8 个文件（tree / hash / policies / integration / mesh / watcher / gpu_load / routing_dyn），`luajit`(authz) 与 `resty`(apisix) 两个口径 |
 | `test/integration/` | 真容器 e2e：stateful（含 DP 断言）/ policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn |
