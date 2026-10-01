@@ -1,4 +1,7 @@
-# lua-router 部署记录：21.k:8801（2026-10-01）
+# lua-router fleet 部署记录（2026-10-01）
+
+两个实例的部署与验证记录：21.k:8801（验证环境，21.254.220.248）与 235.t:8800（生产，10.252.25.235）。
+「部署明细」「访问路径」「网络事实」几节只针对 21.k；235.t 见文末对应小节。
 
 ## 结论
 
@@ -162,4 +165,42 @@ PUT max_power_w=0 / max_concurrency=0 是「清回不限」，但**连续对多�
 PUT 时，后两条可能不生效**（update 走后台队列，间隔太近会挤在一起）。表现为 /workers 里
 上限仍在、请求继续 503，但单独重发一次就立刻清掉。批量清限时每条之间 sleep 1s 再复核一遍
 /workers 的 max_concurrency/max_power_w 字段，别默认「202 就是已生效」。
+
+## 生产 235.t :8800 部署 lua-router:8800-20261001-8（2026-10-01 23:5x）
+
+把 21.k 上验证过的同一版能力推到 235.t 生产实例。compose 在 /data/app/lua-router/，
+部署前镜像为 8800-20261001-7，回滚就是把它改回去再 compose up -d。
+
+compose 本轮**只换镜像**，没有新增任何 env——功率通道在 235.t 未启用（上游是远程的
+217.t 那几个，功率口径要重新评估，不在这次部署范围内）。
+
+### 部署效果：第 10 条守卫当场治好了僵尸池
+
+/workers 从 **61 → 2**。清掉的是 59 条 router-watch 僵尸记录：模型名是 alpha / beta /
+hinted 之类，端口是高位随机数，进程早已不存在（ps 查 mock_llm_worker 进程数为 0），
+但 shdict 里的记录被 keep-last 宽限一直兜着。它们正是今天跑门禁时 watcher 的 proc 扫描
+把测试 mock 短暂注册进生产池留下的。部署前基线快照：
+/data/tmp/lr-baseline/workers-8800-before.json，部署后 workers-8800-final.json。
+
+剩下的 2 条是真实上游：
+- http://127.0.0.1:10100（discovery=dynamic，聚合网关，探针拿到 16 个模型）
+- https://llm-248.ai-t.wtvdev.com（discovery=config，upstreams 声明进来）
+
+### 验收
+
+- GET /health → OK
+- smg_worker_health 两个上游都是 1；smg_worker_cb_state 都是 0（closed）
+- POST /v1/chat/completions model=q38fn → 200
+- 虚拟模型多绑定：prod-mixed 绑 10100/zai/glm-5.3 与 217/q38fn 两个不同上游的不同模型，
+  请求正确路由到 zai/glm-5.3 并按绑定名转发（验证后已把该虚拟模型清回，生产不留示例配置）
+
+### 两条要记下的事实
+
+1. **重启后 30s 内会有暂态 503**。健康巡检间隔 30s，重启后第一个周期未完成时请求会回
+   503 all circuits open or unhealthy，但上游其实是好的。等一个巡检周期即恢复——
+   排查时别把这个当成部署失败。
+2. **10100 那个聚合网关只对部分模型名真正转发**。用 gpt-6-sol / llm-248/Q38-Flash-Next
+   等名字请求它，直连与经网关都返回 "The 'gpt-6-sol' model is not supported when using
+   Codex with a ChatGPT account"——直连同样报，所以是上游自身约束（该账号不支持这些模型），
+   不是网关改写出的问题。它 /v1/models 广告的 16 个模型里只有一部分可实际调用。
 
