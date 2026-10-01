@@ -10,7 +10,7 @@
 # WORKER_PROCESSES comes from NGINX_WORKER_PROCESSES and defaults to auto, i.e.
 # one nginx process per core. cache_aware is the exception and the entrypoint
 # forces it to 1 unless the operator set the number explicitly: the radix tree is
-# per-process state (doc/impl-policies.md deviation 1), so N processes keep N
+# per-process state (the affinity tree is per-process), so N processes keep N
 # approximate trees and prefix affinity degrades to 1/N of what Rust achieves.
 # The shared-dict snapshot carries each tree across a reload but not across
 # processes, so widening the worker count costs stickiness, not correctness.

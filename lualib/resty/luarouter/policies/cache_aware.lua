@@ -1,7 +1,7 @@
 -- Cache-aware 路由策略：前缀树亲和 + 最短队列逃逸，逐分支对齐
 -- gateway/src/policies/cache_aware.rs 的 CacheAwarePolicy::select_worker。
 --
--- 与 Rust 的差异（详见 doc/impl-policies.md）：
+-- 与 Rust 的差异：
 --   * 无 mesh 同步、无跨进程共享：每 nginx worker 各持一棵树。
 --   * 无后台线程：淘汰由外部 init_worker 定时器调用 M.evict_all()，或 select 时懒触发。
 --   * 失衡判定用「min load 并列随机」与 Rust IteratorRandom::choose 对齐。

@@ -427,8 +427,7 @@ def round_bucket(have_rust):
 
     # 失衡分支：abs / rel 用 Rust CLI 默认（64 / 1.5），窗口拉长到 3600s
     # （窗口长度 = bucket_adjust_interval_secs * 1000）使「谁最小」不随衰减抖动。
-    # 必须同时把进程数钉成 1：chars_per_url 是 per-process 表（doc/impl-policies.md
-    # 偏差 1，docker-entrypoint.sh 只为 cache_aware/mesh 自动降 1），多进程下每个
+    # 必须同时把进程数钉成 1：chars_per_url 是 per-process 表（历史偏差 1；docker-entrypoint.sh 只为 cache_aware/mesh 自动降 1），多进程下每个
     # 进程各自计数，abs_diff 越不过 64，逃逸分支根本不会触发 —— 上面那条
     # 200/200 全落桶目标的对照组就是这件事的量化证据。
     name0 = "lr-pbk0-" + RUN

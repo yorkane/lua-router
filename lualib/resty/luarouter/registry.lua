@@ -336,7 +336,7 @@ end
 ---
 ---`pool_size` is cosocket's *per nginx process* idle ceiling for this pool name,
 ---which is the closest thing to reqwest's pool_max_idle_per_host (one number for
----the whole gateway process). doc/gap-http-semantics.md §5 spells out the
+---the whole gateway process). the cosocket pool notes (git history) spell out the
 ---difference. `so_keepalive` maps reqwest's single tcp_keepalive interval onto
 ---the three Linux knobs: idle, interval and probe count.
 ---@param cfg table @ router config
@@ -538,7 +538,7 @@ end
 -- connection mode. This gateway serves the regular HTTP plane only (scope-trim.md
 -- removed the transport and pool-splitting planes), so the other enum variants
 -- answer 400 rather than being silently collapsed to Regular -- the same
--- deviation from Rust that the contract suite pins (doc/impl-core.md deviation 3).
+-- deviation from Rust that the contract suite pins.
 _M.WORKER_TYPES = { regular = true }
 _M.CONNECTION_MODES = { http = true }
 

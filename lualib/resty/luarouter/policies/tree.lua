@@ -1,6 +1,6 @@
 -- 多租户基数树（近似前缀树），逐字符对齐 gateway/src/policies/tree.rs。
 --
--- 与 Rust 的结构性差异（已在 doc/impl-policies.md 记录）：
+-- 与 Rust 的结构性差异：
 --   * 无锁：每个 nginx worker 进程各持有一棵树（LuaJIT 单线程），不做跨进程同步。
 --   * 字符计数一律 UTF-8 码点数（utils.utf8_len），对齐 Rust 的 chars().count()。
 --   * epoch 仍是全局自增计数器，prefix_match 的 1/8 回写保留（epoch % 8 == 0）。

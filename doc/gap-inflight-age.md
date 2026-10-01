@@ -1,6 +1,6 @@
 # 缺口闭合：`smg_http_inflight_request_age_count` 真实采样
 
-对应 `doc/feature-gap.md` §5 第 2 条与 `doc/gap-metrics-final.md` 表 C 唯一一行。
+对应 `doc/gap-metrics-final.md` 表 C 唯一一行。
 实现落点：`observability.lua`（登记表 + 采样 + 渲染）、`init.lua`（采样定时器 + log 阶段兜底）、
 `router.lua`（`finish_request` 注销 + 顶部注释债）。契约段 `inflight_age`（32 项）。
 
@@ -197,6 +197,6 @@ conf/nginx.conf.template / conf/lua-router.conf  各自 +2 行 env 声明
 ```
 
 `router.lua` 的 md5 已经从旧稳定树的 `8000cfb6…` 变了（本次动了顶部注释与 `finish_request`），
-所以 README / feature-gap / verification-final 头部那句「三份文档同源于 `8000cfb6…`」在本轮之后
+所以 README 与历史文档头部那句「同源于 `8000cfb6…`」在本轮之后
 不再准确。本文件不动那三处头部（同一时间窗内 `service_discovery.lua`、`e2e_discovery_dp.py` 也被
 其它改动触碰过，稳定树指针归上层统一改写），只在 §6 的复现命令里给出可自证的方式。

@@ -8,7 +8,7 @@
 
 ## 0. 这一门禁补的是哪一段空白
 
-`gap-auth-tls.md` §5 里的 `tls_server`（contract gate 内，19 checks）只证明「渲染出了 ssl 指令 + 用一张
+契约 `tls_server` 段（contract gate 内，19 checks）只证明「渲染出了 ssl 指令 + 用一张
 自签证书能 200」。它无法回答这些在生产上真正咬人的问题：
 
 - 服务器**是否真的把中间证书发出去**了。只配 leaf 也能通过 `openresty -t`、也照样
@@ -154,7 +154,7 @@ ECDSA sigalgs → 发 EC leaf，客户端锁定 `ECDHE-RSA` 套件 → 发 RSA l
 
 主监听转 TLS 后，metrics 监听仍是明文（`http://…/metrics` 200），而主端口的 `/metrics`
 可以走 TLS 访问；ALPN 未协商（`ssl_alpn`/`http2` 都没渲染，尽管镜像编译了
-`--with-http_v2_module`）。gRPC 监听的 TLS 形态由 `gap-grpc-pd.md` 覆盖，不在本门禁。
+`--with-http_v2_module`）。gRPC 监听已随平面删除（scope-trim）。
 
 ## 5. 缺口一：证书与私钥不配对，入口脚本抓不住（记录，未修）
 
@@ -242,7 +242,8 @@ cd /path/to/lua-router && LR_TEST_TMP=/data/tmp/lr \
   ALPN/h2 未协商（镜像有 http_v2 模块但未渲染）；
 - OCSP stapling、`ssl_trusted_certificate`、client CA bundle、证书热更新（`nginx -s reload`
   换证）均未覆盖；
-- metrics / gRPC 监听仍是明文，本门禁不测（gRPC TLS 见 `gap-grpc-pd.md`）；
+- metrics 监听仍是明文，本门禁不测；
+- `config_store` 的 lua-resty-http 快路径必须 `ssl_verify=false`（自签上游握手需要；real-eval 记的三处显式握手不含这条快路径）。
 - 证书/私钥**配对**与**链完整性**的入口预检是 §5/§6 的记录性缺口，测试断言的是
   「当前会 fail-closed 而不是 fail-fast」，不是「被正确拦住」；
 - 一个 `server{}` 两对证书的「按签名算法选证」只在片段层实测过并写入 §3.4，

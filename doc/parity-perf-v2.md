@@ -3,7 +3,7 @@
 对拍日期 2026-09-30（UTC，窗口 11:30–12:43）。数据目录 `/data/tmp/parity/perf-v2/`。
 本报告只覆盖**吞吐/延迟/资源**与其归因；行为契约见
 [parity-contract.md](parity-contract.md)，
-v1 报告见 [parity-perf.md](parity-perf.md)。
+v1 报告已随 2026-10-01 文档精简删除（git 历史可查）。
 
 > **状态**：权威矩阵有效（主矩阵 + 慢流修正 + 同机 A/B 共 kept 63 行 / excluded 6 行、
 > 9 230 484 次请求、err=0；消融 40 行 5 966 718 请求、auto 组 24 行 3 263 416 请求，同样 err=0）。

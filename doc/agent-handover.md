@@ -1,7 +1,8 @@
 # Agent 交接说明（lua-router）
 
 > 写给接手本仓库的 agent：目标是用最少考古成本进入正确的工作状态。本文只写**当前事实**与**操作纪律**，
-> 设计推导在历史文档里（§8 地图）。最后核对：2026-10-01（HEAD `715e58b`）。
+> 设计推导在 git 历史与保留文档里（§7 地图）。最后核对：2026-10-01（契约 644/23 段，
+> 全量门禁日志锚点见 README 基线节）。
 
 ## 0. 30 秒速览
 
@@ -13,8 +14,8 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-01）：**20 门禁全绿**（含契约 580/22 段）、Lua 22 057 行 / 15 个模块 + policies/6 文件、
-单测 9 文件、文档 45 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
+基线（2026-10-01）：**20 门禁全绿**（含契约 644/23 段）、Lua 22 057 行 / 15 个模块 + policies/6 文件、
+单测 9 文件、文档 20 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
 
@@ -32,10 +33,10 @@ TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
 ```
 lualib/resty/luarouter/  15 模块 + policies/（6 个复杂策略文件；random/rr/pot/manual 内联 policy.lua）
-  router.lua(3208+)  入口总装：klib.router 分发、转发泵、重试、熔断、指标/_ui/mesh/model-map 挂载
+  router.lua(4071)   入口总装：klib.router 分发、转发泵、重试、熔断、指标/_ui/mesh/model-map 挂载
   init.lua           fork 前接线：env 快照、hb/watcher/mesh/负载定时器（worker0 + lr_locks 单飞）、on_log 兜底
   registry.lua       worker 注册表（lr_workers shdict）、健康态、DP 展开、负载字段折叠
-  watcher.lua(2024)  进程内服务发现：targets/docker/proc 三源、严格探针、九条守卫、ledger、model-map
+  watcher.lua(2120)  进程内服务发现：targets/docker/proc 三源、严格探针、九条守卫、ledger、model-map
   gpu_load.lua(1102) GPU 负载源：worker /metrics 抓取 + 远程 Prom 查询，写 registry 负载字段
   policy.lua+policies/  8 策略；cache_aware=亲和树+负载逃逸（per-process 树，多 worker 亲和率衰减）
   hb.lua             健康巡检 + 熔断计数 + /v1/loads 扇出 + gpu_load 定时器挂载点
@@ -58,6 +59,8 @@ docker-entrypoint.sh env 校验→envsubst→openresty -t→exec；cache_aware/m
 3. 精确 kill PID，禁止 pkill；测试容器名带 `lr-<套件>-<pid5>` 前缀，收尾 `docker ps -a | grep lr-` 清零。
 4. 临时产物一律 /data/tmp/；本仓代码改动每步一个 commit。
 5. 改完先语法门（luajit -bl / openresty -t）再跑对应门禁子集，最后 root 全量。
+6. 门禁验收只认 **0 skipped**：日志里出现 `SKIP_ENV` 就是假绿（历史上外部依赖门禁被 SKIP
+   掩盖过 require 失败的先例）。
 
 **命令**：
 
@@ -93,6 +96,15 @@ e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain。
 - **失败不摘 worker**：watcher/gpu_load 的探测失败只损失精度（keep-last/grace/降级纯在飞），绝不让
   监控故障拖垮转发。
 - **生产 worker 池清理**：删 worker 走 DELETE /workers/{id}；watcher 会自动重发现仍在监听的（这是设计）。
+- **镜像约束**：authz 基础镜像没有 `resty.http`（也没有 python3/perl），转发 / 健康检查 / watcher
+  全部手写 cosocket，新代码不要 `require "resty.http"`；shdict 无原子 cas，「检查再翻转」的路径
+  （熔断 state、registry 整表写）必须在 `resty.lock` 内重读后再写——charge 用 `shdict:incr`
+  原子累加、flip 在锁内重查 expect，跨进程恰好记一次 transition。
+- **随机数**：`math.randomseed` 只能在 worker_init 按 pid 混入；init_by_lua 播种会让全部 worker
+  同序列（random / power_of_two 每轮同步选同一目标）。
+- **cjson / shdict 纪律**：空数组必须显式 `cjson.empty_array`（改全局 array_mt 污染整进程）；
+  直方图桶预填 0、读取侧 `tonumber`（`cjson.null` 参与算术会崩）；shdict 写满会静默 LRU
+  驱逐旧键（计数漂移、不报错），容量按业务上限给。
 
 ## 5. 生产操作清单
 
@@ -120,21 +132,21 @@ curl -s http://127.0.0.1:8800/_ui/config/policy            # 生效链 JSON
 5. **UI 会话历史页**：history 平面已删，原版 webui 里的会话页需要下次 UI 升级时摘除。
 6. **GPU↔worker 映射靠 host**：同机独立多卡会共享读数（gap-gpu-load.md §限制）。
 
-## 7. 文档地图（doc/，45 份）
+## 7. 文档地图（doc/，20 份）
 
 **现行权威**：README（入口）、architect.md（架构总览）、scope-trim.md（裁剪判定书+执行记录）、
-agent-handover.md（本文）、todo-deferred.md（TODO 口径）、gap-watcher-merge.md、gap-gpu-load.md、
-gap-routing-dyn.md、gap-token-accounting.md、gap-inflight-age.md、gap-metrics-final.md、
-gap-mesh-final.md、gap-tls-chain.md、parity-cpu-ablation.md。
+agent-handover.md（本文）、todo-deferred.md（TODO 口径）、gap-mesh.md、gap-mesh-final.md、
+gap-watcher-merge.md、gap-gpu-load.md、gap-routing-dyn.md、gap-token-accounting.md、
+gap-inflight-age.md、gap-metrics-final.md、gap-tls-chain.md、gap-virtual-models.md、
+parity-cpu-ablation.md。
 
-**对拍与真实评测（数据留档，引用前注意树龄）**：parity-contract/routing/policy-extra/perf/perf-v2、
+**对拍与真实评测（数据留档，引用前注意树龄）**：parity-contract/routing/policy-extra/perf-v2、
 real-eval.md（prefix cache 97–99% 命中实证）。
 
-**裁剪前平面的历史留档（只读，不要当现状引用）**：feature-gap.md 与 verification-final.md 的计数仍是
-裁剪前 841/21 门口径（README 已刷新到 580/20 门，这两份待归档或重写）；gap-history*.md、
-gap-grpc-*.md、gap-dp-jwt.md、gap-discovery-*.md、gap-otel.md、gap-responses-final.md、gap-integration.md、
-gap-http-semantics.md、gap-core.md、gap-auth-tls.md、gap-test-gates.md、impl-*.md、fix-majors.md、
-verification-run3.md、wasm-feasibility.md。
+**历史留档已清理（2026-10-01）**：裁剪前平面的 26 份文档（feature-gap、verification-*、impl-*、
+fix-majors、wasm-feasibility、parity-perf v1 与已删平面的 gap-*）已随文档精简删除，需要时查
+git 历史；仍生效的结论已折进 README / architect / todo-deferred。恢复已删平面走 git revert
+对应 trim commit，不要在 main 上重写。
 
 ## 8. 环境事实（235.t）
 
@@ -145,4 +157,5 @@ verification-run3.md、wasm-feasibility.md。
 - 子智能体 provider 偶发半截返回/无声停止：交付验收以**盘上文件 + 日志证据**为准，别信口头进度。
 - 本机有多用户裸 openresty 进程是**容器内进程**（宿主 ps 可见，cwd 读不到属正常），别误杀。
 - llm-watcher 独立容器已退役（Exited，保留镜像可回滚）；它的原仓库在 /home/aigc/ChatGPT/llm-router/watcher/。
-
+- authz 镜像无 python3/perl：要在容器里跑脚本时先落盘再 `docker exec`；`mock_llm_worker.py`
+  复用连接会吞 ~44ms 级延迟，测流式延迟必须每次新建连接（对拍轮实测教训）。

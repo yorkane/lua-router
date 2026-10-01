@@ -25,9 +25,8 @@
 -- /v1/responses is a pure inference route, and the token-counting and
 -- tool-parser proxy family answers from the 404 sink.
 --
--- What is genuinely not implemented is tracked in doc/feature-gap.md: wasm
--- middleware is a deferred TODO (doc/todo-deferred.md, feasibility in
--- doc/wasm-feasibility.md) and its three /wasm routes answer 501, and the four
+-- What is genuinely not implemented is tracked in doc/todo-deferred.md: wasm
+-- middleware is a deferred TODO (doc/todo-deferred.md §2) and its three /wasm routes answer 501, and the four
 -- smg_mcp_* families stay unregistered with the MCP server absent.
 
 local cjson = require "cjson.safe"
@@ -409,7 +408,7 @@ end
 ---Answer a preflight without consulting the route table, like the CorsLayer does
 ---(cors/mod.rs:677-689: it builds the response itself). The task contract asks for
 ---a successful OPTIONS on every path, so this also catches paths the Rust gateway
----would 404 (deviation 4 in doc/gap-core.md).
+---would 404 (documented deviation).
 local function cors_preflight()
     local restricted, allowed = cors_decision()
     ngx.header["Vary"] = VARY_CORS
@@ -579,7 +578,7 @@ _M.text_extractors = text_extractors
 -- ------------------------------------------------------------------ body rewrite
 
 -- Lazily loaded: the runtime-config module owns virtual aliases, the effort
--- ladder and the per-model context cap (doc/impl-ui.md §5). Wrapped so a router
+-- ladder and the per-model context cap. Wrapped so a router
 -- without it (unit probes) still forwards.
 local function store()
     local ok, mod = pcall(require, "resty.luarouter.config_store")
@@ -2550,7 +2549,7 @@ local function text_for(route, body)
     return text
 end
 
----Virtual alias -> upstream id (doc/impl-ui.md 5). Rust resolves inside
+---Virtual alias -> upstream id. Rust resolves inside
 ---route_typed_request_once, so the candidate set, the policy state, the effort
 ---cards and the forwarded payload all key off the real id while the request log
 ---keeps the alias the client asked for.
@@ -2759,7 +2758,7 @@ local function inference_handler(params)
     return ""
 end
 
----The webui chat/completion aliases (ui.lua, doc/impl-ui.md 3). The UI layer has
+---The webui chat/completion aliases (ui.lua). The UI layer has
 ---already read the body, filled a missing model and dropped an empty effort, and
 ---passes the (spliced) original bytes alongside the decoded table; the pipeline
 ---owns everything else, including the accounting that handle() would have done
@@ -3630,7 +3629,7 @@ end
 ---IntoResponse, which emits only {"workers":[{"worker","load"}]} (a worker_type key
 ---appears for prefill/decode entries) - sampled on the Rust gateway, the body has no
 ---counter keys at all. The same three counters Rust computes internally are appended
----here because the lua-router UI reads them; doc/gap-http-semantics.md §4 records
+---here because the lua-router UI reads them; the contract suite records
 ---that as the one intentional superset.
 ---@param _params table|nil
 ---@return table|nil doc @ the response body

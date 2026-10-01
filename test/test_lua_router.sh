@@ -1426,7 +1426,7 @@ if section not_found; then
     # fallback is `sink_handler`, which answers 404 with an EMPTY body (sampled
     # on <rust-box>:8800 -- "HTTP/1.1 404 Not Found / content-length: 0"). The Lua
     # router answers its klib 404 with a JSON error body instead, which is more
-    # useful to a human and is what doc/impl-core.md describes.
+    # useful to a human and is what the public-plane design describes.
     note "404 body divergence: Rust fallback = 404 + empty body; lua-router = 404 + JSON {error:{type,code,message}} + X-SMG-Error-Code. Clients that only read the status see the same thing."
 
     # Rust answers axum's method mismatch with 405 + Allow; klib.router has no
@@ -2093,6 +2093,19 @@ if section ui_fixed; then
     request "$UI_BASE" GET /_ui
     assert_eq "/_ui redirects" "$STATUS" "301"
     assert_contains "/_ui redirect target" "$(header_of Location)" "/_ui/"
+    # Edge-safe redirects: behind a TLS-terminating edge the visible Host is the
+    # upstream address, so an absolute Location would send the client to
+    # http://127.0.0.1:PORT. Exact-equality is the guard -- assert_contains on
+    # "/_ui/" also passes when the bug is present (the absolute URL ends in it).
+    request "$UI_BASE" GET /_ui
+    assert_eq "/_ui Location stays a relative reference" "$(header_of Location)" "/_ui/"
+    request "$UI_BASE" GET /_ui/admin
+    assert_eq "/_ui/admin redirects to the directory" "$STATUS" "302"
+    assert_contains "/_ui/admin redirect is not cacheable" "$(header_of Cache-Control)" "no-store"
+    assert_eq "/_ui/admin Location stays a relative reference" "$(header_of Location)" "/_ui/admin/"
+    request "$UI_BASE" GET /_ui/admin/
+    assert_eq "/_ui/admin/ serves the console" "$STATUS" "200"
+    assert_contains "/_ui/admin/ is html" "$CONTENT_TYPE" "text/html"
     request "$UI_BASE" GET /_ui/
     assert_eq "/_ui/ serves the SPA" "$STATUS" "200"
     assert_contains "/_ui/ is html" "$CONTENT_TYPE" "text/html"
@@ -3063,7 +3076,7 @@ fi
 
 # ==========================================================================
 if section tls_server; then
-    # Server-side TLS on the *main* listener (doc/gap-auth-tls.md): the entrypoint
+    # Server-side TLS on the *main* listener: the entrypoint
     # renders `listen ... ssl` plus the certificate pair, i.e. the encrypted
     # socket replaces the plain bind on the same port exactly like Rust's rustls
     # layer, rather than opening a SMG_TLS_PORT next to it.

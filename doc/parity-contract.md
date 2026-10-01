@@ -13,9 +13,12 @@ comparison.json、analyze 输出、机制取证、回归日志、router.lua 修�
 > （M1–M6 又加 56 条断言）。
 > §4「Lua 侧未修注记」4 条（400 措辞、`/health_generate` 501、`/workers` 值型、
 > `/server_info`+`/model_info` 超集）全部仍未修，已归入
-> [feature-gap.md](feature-gap.md) §2「部分实现」。
+> 历史 feature-gap 的「部分实现」档（文档已删）。
 > 口径盲区：本报告只打「两边都存在」的 33 组接口，**没有覆盖 Lua 根本没挂路由的 15 条端点**
-> （parse / wasm / tokenizers/{id} / conversations items），那部分缺口见 feature-gap.md §3.1。
+> （parse / wasm / tokenizers/{id} / conversations items），那部分缺口大多随平面删除（scope-trim）。
+>
+> 勘误（2026-10-01 文档精简轮）：#21 `/health_generate` 的 501 口径已被后续轮次取代，
+> 现状是 200/503 纯文本双文案（以 README 端点表为准）。
 
 ## 0. 环境与口径
 
@@ -73,9 +76,9 @@ verdict 用对拍后终值。LUA=46089 RUST=8920。
 | 14 | GET /readiness | 一致 | 200 三键 JSON、application/json、长度 56（修复前 Lua 是 chunked+charset 后缀） |
 | 15 | GET /liveness | 一致 | 同 /health |
 | 16 | GET /v1/models | 偏差(Rust侧) | 8 模型集合逐条相等（排序后全等）；仅 content-type：Lua `application/json` vs Rust `text/plain; charset=utf-8`（router_manager `.to_string()` 框架行为，<dev-box>:8800 生产同样 text/plain）。Lua 更正确，不改成错 |
-| 17 | GET /server_info | 偏差(设计超集) | Rust 只有 3 键 {router_manager,routers_count,workers_count}（text/plain）；Lua 3 个共享键全在 + 自身配置摘要（policy/health_check/circuit_breaker/retry/uptime/models/enable_igw…，impl-core §公开面 记录、UI 依赖）。框架不同 + 有意超集 |
+| 17 | GET /server_info | 偏差(设计超集) | Rust 只有 3 键 {router_manager,routers_count,workers_count}（text/plain）；Lua 3 个共享键全在 + 自身配置摘要（policy/health_check/circuit_breaker/retry/uptime/models/enable_igw…、UI 依赖）。框架不同 + 有意超集 |
 | 18 | GET /get_server_info | 同上 | 别名行为与 17 相同 |
-| 19 | GET /model_info | 偏差(设计超集) | Rust 代理单个 worker（<dev-box>:8800 仲裁同为单对象）；Lua fan-out 聚合成 `{model_infos:[...]}`（impl-core 记录）。共享键集合包含关系成立 |
+| 19 | GET /model_info | 偏差(设计超集) | Rust 代理单个 worker（<dev-box>:8800 仲裁同为单对象）；Lua fan-out 聚合成 `{model_infos:[...]}`。共享键集合包含关系成立 |
 | 20 | GET /get_model_info | 同上 | 别名同 19 |
 | 21 | GET /health_generate | 偏差(已知方向) | Rust 200 text "At least one router has healthy workers"（router_manager IGW 就绪语义，prod 一致）；Lua 501 not_implemented（suite 明确断言 501，属既定设计）。未修，见 §4 |
 | 22 | 头转发: chat 带 9 个头 | 信息 | authorization/x-request-id/x-correlation-id/traceparent/tracestate/x-smg-routing-key 六个白名单头两侧均转发且值原样；cookie 与 x-custom-header、user-agent 两侧均剔除；x-request-id 客户端值两侧均原样回显在响应头（F4/F6 修后仅剩 Lua accept-encoding:identity、Rust accept:*/* 的 transport 差，见 #1） |
@@ -112,8 +115,7 @@ verdict 用对拍后终值。LUA=46089 RUST=8920。
    `invalid_request_error`（+ serde 列号文本），且 Lua 多带 X-SMG-Error-Code 头。
    复刻 serde 文本无意义；头是超集、无害。
 2. **/health_generate 501**：Rust 语义是「至少一个健康 worker」的 IGW 就绪探针，
-   Lua suite 现有断言把它钉死为 501（test_lua_router.sh:794）。要对齐需连同
-   契约套件与 impl-core 文档一起改，属行为决策，留给人裁。
+   Lua suite 现有断言把它钉死为 501（test_lua_router.sh:794）。要对齐需连同契约套件一起改，属行为决策，留给人裁。
 3. **/workers 值型**：cost int vs 1.0 float（Lua 5.1 cjson 无法把 1.0 编码成 "1.0"，
    需字符串 hack）；metadata 缺 served_model_name（Lua 存在 record 顶层非 metadata）。
    字段名集合完全一致，仪表盘按字段消费则无影响。

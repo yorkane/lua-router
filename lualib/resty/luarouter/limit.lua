@@ -21,7 +21,7 @@
 -- Rejected requests answer 429 with an empty body, like Rust
 -- (StatusCode::TOO_MANY_REQUESTS.into_response() carries no JSON). A waiter that
 -- runs out of queue time answers 429 as well; Rust answers 408 there, which is
--- deviation 2 in doc/gap-core.md.
+-- documented deviation.
 --
 -- Token return: release() is idempotent per request (the guard flag lives in
 -- ngx.ctx), is called by router.finish_request on the normal path, and by
@@ -143,7 +143,7 @@ function _M.acquire()
             d:incr(K_QUEUED, -1, 0)
             ngx.ctx.lr_limit_queued = nil
             -- Rust answers 408 here; the task contract wants 429 for every
-            -- limiter rejection (doc/gap-core.md deviation 2).
+            -- limiter rejection (documented deviation).
             observability.record_http_rate_limit("rejected")
             return false
         end

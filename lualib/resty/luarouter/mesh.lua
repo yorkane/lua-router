@@ -986,7 +986,7 @@ function _M:mark_sync_success(name, declared_status)
     end
     local entry = self.store.members[name]
     -- leaving 是该节点自己声明的终态：sync_with 在 apply_snapshot 之后还会不带
-    -- declared_status 再调一次这里（doc/gap-integration.md 记的实测 bug），若不
+    -- declared_status 再调一次这里（历史实测 bug，git 历史可查），若不
     -- 保住这个状态，一次成功同步就把刚下线过的节点重新标成 alive，对端永远看不到
     -- shutdown。只有对方在快照里自报新状态才覆盖（merge_membership 无条件采纳）。
     if entry and entry.value.status == _M.STATUS_LEAVING then
@@ -1016,7 +1016,7 @@ end
 --
 -- 与种子（SMG_MESH_PEERS）的区别：种子在 new() 里就写进成员表并计入 quorum，
 -- 动态成员只进成员表。quorum 因此保持启动时的语义（限制，见
--- doc/gap-discovery-watch.md 4.2）。
+-- 详见 git 历史里的 gap-discovery-watch.md 4.2）。
 ---------------------------------------------------------------------------
 
 ---把（或保持）一个发现到的 router pod 记为存活成员。
@@ -2080,7 +2080,7 @@ end
 
 ---内部端点的共享 token（接线层在 init_by_lua 里写入控制面 key）。
 --router.lua 用同一把 key 守 /_mesh/internal/*，所以出站同步必须带上它，否则每个
---对端都回 401、成员表永远停在 init（doc/gap-integration.md）。单测的 http 替身
+--对端都回 401、成员表永远停在 init（历史实测，git 历史可查）。单测的 http 替身
 --不走这里，因此设不设都不影响既有断言。
 _M.auth_token = nil
 

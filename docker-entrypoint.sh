@@ -14,7 +14,7 @@ LISTEN_HOST="${SMG_HOST:-0.0.0.0}"
 LISTEN_PORT="${SMG_PORT:-30000}"
 # Default one process per core. cache_aware keeps its affinity tree in per-process
 # Lua memory, so an unset count drops to 1 to avoid N partial trees
-# (doc/impl-policies.md deviation 1); an explicit NGINX_WORKER_PROCESSES always wins.
+# (the affinity tree is per-process); an explicit NGINX_WORKER_PROCESSES always wins.
 WORKER_PROCESSES="${NGINX_WORKER_PROCESSES:-auto}"
 # SMG_POLICY itself defaults to cache_aware (resty.luarouter.config), so the
 # single-process rule has to apply when the variable is unset as well: an
@@ -139,7 +139,7 @@ else
     METRICS_EXTRA=""
 fi
 
-# Server-side TLS (doc/gap-auth-tls.md). SMG_TLS_CERT_PATH + SMG_TLS_KEY_PATH
+# Server-side TLS. SMG_TLS_CERT_PATH + SMG_TLS_KEY_PATH
 # turn the *main* listener into a TLS listener, which is what the Rust gateway
 # does with rustls: the encrypted socket replaces the plain bind on the same
 # host:port instead of opening a second port, so a client that speaks plain http

@@ -7,7 +7,7 @@
 -- select the model and chat through the router.
 --
 -- Registry access is isolated in _M.http_workers() (see the contract in
--- doc/impl-ui.md). It prefers resty.luarouter.registry (owned by the core
+-- the _ui module contract). It prefers resty.luarouter.registry (owned by the core
 -- agent); while that module does not exist yet, tests can inject a worker list
 -- through the global LMR_TEST_WORKERS.
 

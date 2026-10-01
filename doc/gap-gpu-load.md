@@ -169,6 +169,9 @@ worker 的 `api_key` 会作为 `Authorization: Bearer` 带上，与 `hb` 的探�
   会让这个 gauge 与 router 自己的并发计数器打架，却没有任何调度收益。
   与之相对，`/workers` 的 `load` 用 `load_with()`，让控制台看到的正是策略实际排序用的数。
 
+上游 `/v1/loads` 的现行解析形状：{workers:[{worker,load}], total_workers,
+successful, failed}；非 2xx / 超时 / 缺字段一律记 -1（`/v1/loads/stream` 随平面删除，404）。
+
 ## 5. env 表
 
 全部在 `config.lua` 的 workers 段之后、`load_*` 命名空间下，缺省值即"关闭"。

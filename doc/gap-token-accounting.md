@@ -158,6 +158,9 @@ usage_stripped)`；`forward()` 把四类计数与 estimated 旗装进 `ngx.ctx.l
 汇流于 `finish_request`）读 ctx 记四路 `record_router_tokens` 与一路
 `record_stream_usage_injection`。与缓冲路径同一套 ctx 机制，无新调度面。
 
+`reasoning_tokens` 的来源链：`usage.completion_tokens_details.reasoning_tokens`，
+回退 `usage.reasoning_tokens`，再回退 0。
+
 ## 7. 测试
 
 - **单测**：`test/unit/test_integration.lua` 第 6 节，沙箱 `load()` 抽取 router.lua

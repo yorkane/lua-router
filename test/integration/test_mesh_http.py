@@ -22,7 +22,7 @@ the container, plus the internal endpoints' request/response framing:
 
 Two behaviours used to be pinned as DIVERGENT notes with today's (wrong) value;
 both are fixed and the suite now asserts the intended value — see
-doc/gap-http-semantics.md and doc/gap-test-gates.md §4:
+the http-semantics and test-gates rounds (git history):
   * a worker seeded from SMG_WORKER_URLS used to stay out of the cluster view
     because bootstrap bypassed the mirror hook; registry.add now mirrors every
     successful add, so boot-seeded workers appear at /ha/workers;

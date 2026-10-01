@@ -4,15 +4,14 @@
 > （layer-4 打点）、`test/test_lua_router.sh`（observability 节）、
 > `test/integration/e2e_grpc.py`、`test/integration/e2e_discovery_dp.py`。
 > 不改 `router.lua`、history、grpc 模板。本文是家族覆盖率的唯一权威口径，
-> [feature-gap.md](feature-gap.md) 旧 §3.5 的 28/48 口径以本文为准更正（feature-gap 已在最终门禁后
-> 重写为 A/B/C/D 四档，指标摘要在它的新 §4.5）。
+> 历史 feature-gap 文档旧 §3.5 的 28/48 口径以本文为准更正（该文档已随 2026-10-01 文档精简删除，git 历史可查）。
 >
 > 状态复核（2026-09-30 最终门禁）：本文 §5.1 记的 **15 门禁全绿**之后又新增一个门禁
 > `e2e_responses_store`（14/0），最终一轮 **16 passed / 0 failed / 0 skipped**
 > （`/data/tmp/lr-gates/gates-20260930-165530.log`，契约仍 795/0/2，代码树 `router.lua` md5 `c41ef30f…`）。
 > 再之后 `e2e_grpc`（59/0）与 `e2e_history_redis`（44/0）也纳入了 `GATE_ORDER`，门禁 **18/18**
 > （`gates-20260930-190905.log`，`router.lua` 仍是同一棵树），下表「需单独跑」的括注已过期。
-> 全量矩阵见 [verification-final.md](verification-final.md)。§6 那条
+> 全量矩阵见 git 历史里的 verification-final（已删）。§6 那条
 > 「表 C 剩余的 `smg_http_inflight_request_age_count`」已于本轮闭合：`lr_stats` 里 1024 槽定长表
 > 存每请求 `start_ms`，worker 0 定时器快照年龄分布，真实采样（见 doc/gap-inflight-age.md）。
 > 登记/注销两处（`router.lua` 进出）与 log 阶段兜底都已接线，契约新增 `inflight_age` 节 32 项。
@@ -158,7 +157,8 @@ smg_worker_pool_size{connection_mode="http",model="http-model",worker_type="regu
 `smg_otel_requests_total` / `smg_otel_spans_total` / `smg_otel_exports_total` /
 `smg_otel_export_failures_total` 四条已存在且已有 HELP，本轮只核对未改：Rust 侧
 `metrics.rs` 里没有任何 tracing-self 家族，因此这四条属于 **Lua 超集**，
-不计入 47 分母（`smg_otel_self_test` 是 span 名，同样不计）。
+不计入 47 分母（`smg_otel_self_test` 是 span 名，同样不计）。**勘误（2026-10-01）：这四条
+`smg_otel_*` 已随 OTel 平面删除，当前代码不再注册。**
 
 ## 4. 覆盖率前后
 

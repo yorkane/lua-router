@@ -6,7 +6,7 @@
 -- the picker endpoints answer fixed responses, and everything else forwards
 -- to the sibling modules (props.lua, config_store.lua, observability.lua).
 --
--- Pipeline contract (doc/impl-ui.md): this module NEVER proxies upstream
+-- Pipeline contract: this module NEVER proxies upstream
 -- itself. It requires resty.luarouter.api and calls
 --   api.chat(body_table, raw)     -- POST body after model/effort clean-up
 --   api.completion(body_table, raw)

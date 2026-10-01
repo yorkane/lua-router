@@ -119,7 +119,7 @@ for p in ("/_ui/v1/models", "/_ui/props", "/_ui/logs", "/_ui/stats", "/_ui/slots
 # A POST-only /_ui alias must refuse HEAD the same way it refuses GET.
 head_case(port, "/_ui/config/effort", get_status=405, chunked=True)
 
-# 5. The route that used to diverge (doc/gap-test-gates.md §3, doc/gap-http-semantics.md):
+# 5. The route that used to diverge (pinned during the head-routes round):
 # /_ui/config is read by ui.conf, whose exact location now folds HEAD into the GET
 # branch. The check is the regression gate for that fold. (/_ui/history and the
 # /v1/tokenizers trio were pinned here as well until the scope trim removed both

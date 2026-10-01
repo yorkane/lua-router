@@ -163,7 +163,7 @@ function _M.load()
         -- SMG_DP_AWARE (Rust --dp-aware). When on, a worker whose /server_info
         -- reports dp_size > 1 is expanded into one registry entry per rank, each
         -- with its own health counters, exactly like DPAwareWorkerBuilder in
-        -- core/worker_builder.rs. See doc/gap-discovery-dp.md.
+        -- core/worker_builder.rs (DP 展开设计见 git 历史).
         dp_aware = bool("SMG_DP_AWARE", false),
 
         -- ==================== policy ====================
@@ -186,7 +186,7 @@ function _M.load()
         max_tree_size = num("SMG_MAX_TREE_SIZE", 67108864),
 
         -- prefix_hash knobs (Rust --prefix-token-count / --prefix-hash-load-factor;
-        -- the Lua tree counts characters, see doc/impl-hash.md deviation 6).
+        -- the Lua tree counts characters, documented deviation).
         prefix_token_count = num("SMG_PREFIX_TOKEN_COUNT", 256),
         prefix_hash_load_factor = num("SMG_PREFIX_HASH_LOAD_FACTOR", 1.25),
 

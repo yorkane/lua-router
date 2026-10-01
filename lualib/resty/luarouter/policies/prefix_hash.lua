@@ -2,7 +2,7 @@
 -- PrefixHashPolicy::select_worker_impl，环复用 consistent_hashing 用的同一个
 -- （hash.new_ring / hash.lookup_position）。
 --
--- 两处必要偏差（详见 doc/impl-hash.md）：
+-- 两处必要偏差：
 --   1. Rust 对 token 序列哈希，HTTP 路径 tokens 恒为 None（router.rs / pd_router.rs
 --      写死 "HTTP doesn't have tokens, use gRPC for PrefixHash"），所以 Rust 在 HTTP
 --      下总是返回 NoTokens。这里用「请求文本前 N 个字符」近似 token 前缀，

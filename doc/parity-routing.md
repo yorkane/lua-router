@@ -6,11 +6,11 @@
 
 > **状态**：结论仍有效。**日期**：对拍 2026-09-29，状态复核 2026-09-30（UTC）。
 > **证据强度**：B（`/data/tmp/parity/routing/` 的 harness 与原始 JSON；t1–t4 已由
-> [verification-run3.md](verification-run3.md)
+> verification-run3（已删，git 历史）
 > 在 2026-09-29 23:00 全量重建后复现一遍）。
 >
 > 「未覆盖」一节里的 **prefix_hash / bucket / power_of_two / random 未纳入对拍**仍然成立，
-> 别把这几条当成与 Rust 行为对齐（`prefix_hash` 尤其：blake3 vs xxh3，见 impl-hash.md 偏差 7）。
+> 别把这几条当成与 Rust 行为对齐（`prefix_hash` 尤其：blake3 vs xxh3）。
 > manual 回切（#3）与 cache_aware 多进程衰减（#6，1.000→0.625）两条结论保持。
 > 口径更新：本报告为了让 Rust 进入 consistent_hashing 用的是 per-model label hint；
 > Lua 侧现在 `SMG_POLICY=consistent_hashing|prefix_hash|bucket` 已直接进分发
@@ -229,7 +229,7 @@ rust lcA 5  lcB 118 lcC 37   slow_share 0.031   95.2 req/s
 
 ## 6. 多进程对策略状态的影响（已文档化偏差的量化）
 
-`doc/impl-policies.md` 偏差 1 记录 cache_aware 的 tree 是 per-process 状态；
+cache_aware 的 tree 是 per-process 状态（历史文档已删）；
 `docker-entrypoint.sh` 因此在 `SMG_POLICY=cache_aware` 且未显式指定时把
 `worker_processes` 压到 1。这里量化不压的后果（`worker_processes=4`）：
 

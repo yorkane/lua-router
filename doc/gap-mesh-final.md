@@ -30,7 +30,7 @@ SMG_MESH_SELF  = http://127.0.0.1:18002
 原先的迁移只发生在 `apply_snapshot`，而它只能用**自报地址**回找旧键
 （`member_key_for_address(declared.address, snap.node)`）。种子写法与自报
 写法不是同一个 hostport，回找必然落空，于是那个 `init` 键留在表里 —— 与
-`doc/gap-integration.md` §5.3、`doc/feature-gap.md` §5.3 记的实测一致。
+历史接线轮（gap-integration §5.3，见 git 历史）记的实测一致。
 只有 `sync_with` 同时知道「我们拨的是哪个 url」和「对方报的是哪个名字」，
 而它当时什么都没做。
 

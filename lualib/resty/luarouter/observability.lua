@@ -910,7 +910,7 @@ end
 -- ------------------------------------------------------- /_ui HTTP entrypoints
 --
 -- ui.conf forwards /_ui/logs, /_ui/logs/stream, /_ui/logs/backends and
--- /_ui/stats here by name (see lua-router/doc/impl-ui.md section 6), so these
+-- /_ui/stats here by name (see the _ui stats contract), so these
 -- names are the bridge contract. The router registers the same handlers on its
 -- own route table, which means both entry points behave identically.
 

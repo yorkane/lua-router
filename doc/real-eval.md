@@ -12,7 +12,7 @@
 > **证据强度**：B（`/data/tmp/real-eval/` 的 jsonl 留档；全程低频串行 ≥2 s 间隔，未压测）。
 >
 > 校正与提醒：
-> - §2.5 的 `usage_from_body` 多返回值被 `or` 截断 → **已修**（fix-majors 附加项），并由契约断言
+> - §2.5 的 `usage_from_body` 多返回值被 `or` 截断 → **已修**，并由契约断言
 >   `/_ui/logs buffered usage was parsed` 钉住；非流式 `completion_tokens`/`cached_tokens` 恒 0
 >   的现象不再成立。但 §3 第 4 条建议的那次**真实上游 token 对账仍未重跑**，别当成已验收。
 > - §0 的前提「M2（https 上游 TLS）」已进主干（`registry.tls_handshake` 三处接入），
