@@ -2,7 +2,7 @@
 
 > 本文是独立仓库的架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略子系统、
 > 周边集成、部署形态与测试框架。计数对应 scope-trim 裁剪后的 main 树（2026-10-01 执行完毕：
-> 19 个 Lua 模块 / 15 837 行、5 个单测文件、契约 580 项 / 22 段、15 门禁全绿，`router.lua` md5
+> 20 个 Lua 模块 / 17 861 行、6 个单测文件、契约 580 项 / 22 段、16 门禁全绿（watcher 合并后），`router.lua` md5
 > `0d35b0b8…`）。裁剪判定与执行记录见 [scope-trim.md](scope-trim.md)；已删平面（gRPC/PD、history、
 > tokenizer/parse、auth、K8s discovery、OTel）的描述保留在 git 历史，本文只描述现状。
 
@@ -32,13 +32,13 @@ flowchart LR
     W1[HTTP worker<br/>llm-248 Q38 等]
   end
   subgraph sidecar[周边系统]
-    IW[llm-watcher 容器<br/>端口扫描 + 注册]
+    IW[内建 watcher watcher.lua<br/>进程内发现 + 注册]
     MP[mesh peer 路由器可选]
   end
   C1 --> AZ --> MAIN
   C2 --> AZ
   MAIN --> W1
-  IW -- POST /workers --> MAIN
+  IW -- registry.add 同进程 --> MAIN
   MAIN <-. gossip /ha .-> MP
 ```
 
@@ -127,6 +127,7 @@ sequenceDiagram
 | limit.lua | 209 | 全局并发闸门 + 排队（shdict 计数） | router access |
 | observability.lua | 1340 | Prometheus 家族渲染（HELP/TYPE 对齐 Rust）、请求日志环形缓冲、inflight 年龄槽表 | router/metrics handler |
 | mesh.lua | 2525 | HA gossip：成员表、快照同步、/ha/* 端点、身份统一（sync_with 并键）、suspect/down 状态机 | init 定时器 |
+| watcher.lua | 2024 | 进程内服务发现（原 llm-watcher 容器合并）：targets/docker.sock/proc 三源发现、严格 /v1/models 探针、九条守卫、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
 | ui.lua / props.lua | 381/225 | /_ui API 别名与鉴权、/props 快照 | ui.conf include |
 
 依赖方向自上而下单向：conf → init → router →（policy/registry/hb/limit/history/otel/…）→ policies。
@@ -181,7 +182,7 @@ per-model policy hint：worker 注册元数据可携带策略提示（`metadata.
 
 | 系统 | 方向 | 机制与注意 |
 |---|---|---|
-| llm-watcher | watcher→router | 容器常驻（LLM_WATCHER_ROUTER 指向主端口），端口扫描/proc 扫描/docker 事件发现本机模型服务，POST /workers 注册，账本周期对账（remove grace 300s）。**注意**：它会把任何应答 OpenAI /v1/models 的本机端口当 worker——在本机跑 e2e 测试时 mock（alpha/beta）会短暂进入生产池，测试后由对账清除；根治需要 watcher 侧黑名单 |
+| 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | watcher.lua 在 worker 0 做同样的发现/注册（targets/dockersock/proc 三源、九条守卫、宽限期），注册改同进程 registry.add；独立容器自 2026-10-01 退役。测试 mock 仍会短暂入池；根治需黑名单 |
 | mesh peer | router↔router | SMG_MESH_PEERS 种子 + gossip 同步 worker 视图；SELF/PEERS 写法不一致时由 sync_with 身份统一并键（幻影键已修，mesh_two 门钉住） |
 | authz 边缘 | client→router | 生产经隧道域名时 authz 闸门加会话登录或 x-api-key；与网关本身无关 |
 
@@ -218,6 +219,7 @@ scope-trim 删除，git 历史可恢复。
 | probes | 25 项工厂/旋钮探针 | e2e_tls_chain | 证书链/负例/SNI 112 |
 | e2e_stateful | 有状态策略+responses 透传+DP 展开 91 | e2e_errors / e2e_effort | 错误契约 10 / effort 4 |
 | e2e_policies | 策略真流量 65 | e2e_ui_bridge | /_ui 改写一致+MIME 25 |
+| e2e_watcher | 内建 watcher 三源发现/九条守卫/重启重发现 65 | | |
 
 方法论：契约=与 Rust 实例同请求逐字段对拍；策略=分布统计（χ²）+不变量+变异验证；e2e=真容器真
 上游。对拍原始报告在 doc/parity-*.md 与 doc/real-eval.md（真实上游 18/18、prefix cache 命中 97–99%）。

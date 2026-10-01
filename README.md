@@ -21,15 +21,13 @@ klib.router + LuaJIT）上复刻 Rust 版 `smg` 网关（`gateway/`）的**路�
 逐条证据在 doc/parity-*.md 与 doc/gap-*.md，全量验证汇总见
 [doc/verification-final.md](doc/verification-final.md)。
 
-## 当前基线（2026-10-01 03:41–03:48 UTC 全量门禁，裁剪后）
+## 当前基线（2026-10-01 06:59–07:0x UTC 全量门禁，watcher 合并后）
 
-权威日志：`/data/tmp/lr-gates/full-final.log`（2026-10-01 03:41:24→03:48 UTC，串行独占，
-**`== summary: 15 passed, 0 failed, 0 skipped ==`**，单轮全绿）。代码树关键 md5（与
-`lua-router:integration` 镜像内副本核对一致）：`router.lua`
-`0d35b0b8f8298c4d4188af3527d1a927`、`mesh.lua` `e424e6586121c27bdafe414829572284`、
-`registry.lua` `86729a8c81ff78e7ecfffca2393847fd`。门禁脚本已仓库化：`test/final_gates.sh`。
+权威日志：`/data/tmp/lr-gates/gates-20261001-065928.log`（串行独占，**16 passed / 0 failed /
+0 skipped**，含新增的 `e2e_watcher` 门）。本轮落地两个特性：内建 watcher（独立 llm-watcher 容器退役）
+与 Quasar UMD 管理控制台 `/_ui/admin/`（服务池 / 模型覆盖 / 日志监控，中英双语）。
 
-按 doc/scope-trim.md 执行模块裁剪后，门禁 21 → 15：删掉 `e2e_grpc`、`e2e_history_redis`、
+按 doc/scope-trim.md 执行模块裁剪后，门禁 21 → 15；watcher 合并后 15 → 16：删掉 `e2e_grpc`、`e2e_history_redis`、
 `e2e_otel`、`e2e_responses_store`、`e2e_discovery_dp`、`e2e_jwt` 六道门（对应平面已删除），
 DP 展开的断言整体迁入 `e2e_stateful`（60 → 91 项）。`preflight` 不再检查宿主机 grpcio，
 `test/local.env` 不再有必需项。剩下的耦合只有一条：门禁不可并发（host 网络 + 固定容器名前缀）。
@@ -50,6 +48,7 @@ DP 展开的断言整体迁入 `e2e_stateful`（60 → 91 项）。`preflight` �
 | mesh_http | **47 / 0** | mesh enabled 的真实 HTTP：对端 apply/sync、worker 镜像、`/ha/policies`、内部端点 |
 | e2e_policy_parity | **47 / 0** | prefix_hash / bucket / power_of_two / random 与 Rust 的量化对拍 |
 | mesh_two | **37 / 0** | 双真 router 容器互 seed：收敛到 2 alive 无幽灵键、双向 worker 镜像、18 s 长稳零抖动、`docker stop` 分区与恢复、`/ha/shutdown` retire 广播 |
+| e2e_watcher | **65 / 0** | 内建 watcher（原独立 llm-watcher 容器合并入进程）：targets/proc/docker 三源发现、九条守卫逐条有断言、model-map 改名、容器重启重发现 |
 | e2e_tls_chain | **112 / 0 / 2 notes** | 运行时 PKI（根→中间→叶）、四类握手负例（过期/rogue-CA/非 CA 签发/自签）、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书指纹、证书/私钥不配对 fail-closed |
 
 契约 580 的 22 段构成：gate 3、public 30、workers 75、inference 38、headers 13、**mesh 44**、
@@ -72,11 +71,11 @@ not_found 段的局部断言随各自平面收敛（逐步 841 → 840 → 740 �
 | `docker-entrypoint.sh` | env 校验 → envsubst → `openresty -t` → exec；缺省策略 `cache_aware`；cache_aware 或 mesh 开启且未显式给 `NGINX_WORKER_PROCESSES` 时把 worker 数收到 1；渲染独立 metrics 监听（缺省 `:29000`，`SMG_METRICS_PORT=0` 关闭）；`SMG_LOG_LEVEL`/`SMG_UI_DIR` 与 Lua 侧名字双认 |
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `../ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` gate |
 | `lualib/resty/luarouter/` | 实现（裁剪后 13 个模块）：`config` `registry` `hb` `policy` `router` `observability` `ui` `props` `config_store` `hash` `limit` `mesh` `init` + `policies/{tree,cache_aware,bucket,consistent_hashing,prefix_hash,utils}`。**全部已接进 `router.lua` / `init.lua` / 生产模板**；DP 展开（`expand_dp` / `url@rank`）与 rank 注入（`inject_dp_rank`）在裁剪时分别内联进 `registry.lua` 与 `router.lua`，语义逐字节不变 |
-| `test/final_gates.sh` | 15 门禁串行硬门（`SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING`），见上面的基线表 |
+| `test/final_gates.sh` | 16 门禁串行硬门（`SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING`），见上面的基线表 |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），22 段 |
 | `test/conf/nginx-lua-router.conf` | 独立测试 conf：`listen 8080`、`/klib/load` 模块探针、`/probe/*` 内省端点 |
-| `test/unit/` | 纯 Lua 单测 5 个文件（tree / hash / policies / integration / mesh），`luajit`(authz) 与 `resty`(apisix) 两个口径 |
-| `test/integration/` | 真容器 e2e：stateful（含 DP 断言）/ policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain |
+| `test/unit/` | 纯 Lua 单测 6 个文件（tree / hash / policies / integration / mesh / watcher），`luajit`(authz) 与 `resty`(apisix) 两个口径 |
+| `test/integration/` | 真容器 e2e：stateful（含 DP 断言）/ policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
 | `doc/` | 实现说明 + 对拍报告 + 真实上游评测 + 逐项补齐报告（`gap-*.md`）+ 缺口清单 + 最终验证汇总。**已删除平面的 gap-*.md（grpc-pd / grpc-proto / history / history-redis / tokenizer-parse / dp-jwt / auth-tls 的 JWT 部分 / discovery-dp / discovery-watch / otel）保留为历史证据，不再与当前代码一致** |
 
@@ -119,11 +118,12 @@ docker run -d --name lua-router --network host --restart unless-stopped \
 curl -s http://127.0.0.1:8801/readiness
 ```
 
-`SMG_WORKER_URLS` 可以留空，改由 `POST /workers` 或 `watcher/` 动态注册。
+`SMG_WORKER_URLS` 可以留空，改由 `POST /workers` 或内建 watcher（`SMG_WATCHER_ENABLED=1`）动态发现注册。
 入口脚本会校验渲染结果（`openresty -t`），坏配置直接起不来而不是 crash-loop。
 
 按需再开的开关（裁剪后只剩这几个，语义与限制在下面的环境变量表与对应 `doc/gap-*.md`）：
 `SMG_ENABLE_MESH=1`+`SMG_MESH_PEERS`（集群 mesh）、`SMG_DP_AWARE=1`（DP 展开 + rank 注入）、
+`SMG_WATCHER_ENABLED=1`（内建 watcher：本机/远程服务发现与自动注册，替代独立 llm-watcher 容器，见 doc/gap-watcher-merge.md）、
 `SMG_TLS_CERT_PATH`+`SMG_TLS_KEY_PATH`（服务端 TLS）。全部缺省关闭，关掉时对外行为与不接这些功能时逐字节一致。
 gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权、K8s 服务发现与 OTel 的 env 已全部移除，
 容器环境里残留这些名字不再有任何效果。
@@ -260,6 +260,19 @@ worker 记录里的 `api_key` 字段保留 —— 那是本路由向**上游**�
 限流只管推理面：公开面、控制面、`/_ui/*` 都不占令牌。拒绝回 **429 + 空体 + 无
 `X-SMG-Error-Code`**；令牌在 `finish_request`（流式响应 pump 完）与 `on_log`（客户端中途断开）
 双点归还，`smg_http_rate_limit_total{result="allowed|rejected"}` 只在限流启用时有样本。
+
+### watcher 服务发现（`SMG_WATCHER_ENABLED`，缺省关）
+
+开启后 worker 0 定时器每 `SMG_WATCHER_INTERVAL_SECS`（15）做一轮 discover→probe→reconcile：
+发现源三选可独立开关 `SMG_WATCHER_TARGETS`（逗号分隔 URL，可远程）/ `SMG_WATCHER_DOCKER`=1
+（cosocket 读 /var/run/docker.sock）/ `SMG_WATCHER_PROC_SCAN`=1（纯 Lua 读 /proc/net/tcp）；
+探针要求 `GET /v1/models` 回 OpenAI JSON 才注册（registry.add 同进程直连，metadata
+managed-by=router-watch）。九条守卫（自环排除/max-models/首接触 protected 快照/只删自己
+ledger/300s 宽限/keep-last/stuck-add/重启重发现/blind by design）与原 Python 版逐条等价，
+对照表与偏差在 [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md)。`POST /model-map` 兼容原版
+四种 body 形态做注册时改名。其余旋钮：`SMG_WATCHER_PROBE_TIMEOUT_SECS`(4)、
+`SMG_WATCHER_REMOVE_GRACE_SECS`(300)、`SMG_WATCHER_MAX_MODELS`(8)、`SMG_WATCHER_KEEP_LAST_GRACE_SECS`(1800)。
+指标：`lr_watch_*` 家族。
 
 ### mesh / HA 集群（`SMG_ENABLE_MESH`，缺省关）
 
@@ -450,6 +463,7 @@ grep -rn 'require "resty.luarouter.<模块>"' lualib/resty/luarouter/router.lua 
 | [doc/gap-dp-jwt.md](doc/gap-dp-jwt.md) | `data_parallel_rank` 注入（保留）与控制面 JWT/JWKS（**已删除**，`jwt_gate` 11 撤下） |
 | [doc/gap-discovery-dp.md](doc/gap-discovery-dp.md) | DP 展开（保留）与 K8s service discovery（**已删除**）的差异与取舍 |
 | [doc/gap-mesh.md](doc/gap-mesh.md) | mesh / HA 的 CRDT 设计、带宽代价与鉴权围栏 |
+| [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md) | watcher 合并入进程：三源发现、九条守卫对照、env 映射与 12 条偏差（单测 253/e2e 65） |
 | [doc/gap-mesh-final.md](doc/gap-mesh-final.md) | `/ha/status` 幻影键根因与真修（sync_with 身份统一）+ 双真节点 e2e（mesh_two 门 38/0） |
 | [doc/gap-discovery-watch.md](doc/gap-discovery-watch.md) | **（历史）** K8s watch 四个失败的修复（dereg 计数、router pod 进 mesh、retire 语义，117/0） |
 | [doc/gap-tls-chain.md](doc/gap-tls-chain.md) | 证书链 / SNI / 四类握手负例门（e2e_tls_chain 112/0/2）与入口预检缺口 |

@@ -10,6 +10,8 @@
 > DP 展开保留并迁入 e2e_stateful。终态：15 门全绿（/data/tmp/lr-gates/full-final.log）、契约 580/22 段、
 > 单测 5 文件、Lua 15 837 行（-44%）。用户裁定的最终差异：mesh 保留（本文原判 DELETE，用户改 KEEP）；
 > discovery 契约段 5 项保留（测的是 /model_info 元数据发现，属 KEEP 面）。
+>
+> 同日追加：watcher 合并（`f87b04f`，`watcher.lua` 2024 行 + `e2e_watcher` 门 65/0 + 单测 253/0）与管理控制台 `/_ui/admin/`（`c79264c`，Quasar UMD 静态三页：服务池/模型覆盖/日志监控）已落地；独立 llm-watcher 容器退役。
 > 
 >> 本文是裁剪判定书：逐模块给 KEEP / DELETE / TRIM 与理由，量化收益，列出测试面影响与
 > 新能力缺口。**未执行任何删除**；执行按 §6 顺序单独成 PR。基础计数对应 `9f82a2d` 树
