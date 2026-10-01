@@ -43,7 +43,7 @@
 #   unit           the pure-Lua modules (tree/hash/policies/mesh) have no
 #                  other gate — router.lua only
 #                  exercises them through HTTP, so a regression can hide.
-#   contract       the whole 659-check wire contract is unverified.
+#   contract       the whole 580-check wire contract is unverified.
 #   probes         the policy factory / config-knob / raw-JSON-editor probes.
 #   e2e_*          that behaviour family over a real container.
 #   head_routes    the HEAD mirror (Rust axum answers HEAD on every GET route).
