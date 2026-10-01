@@ -138,3 +138,28 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
 - **解除上限后原前缀不会立刻回切**。亲和树的租约仍指向 8027，同前缀匹配率超阈值所以稳定命中它；
   回切要等前缀失配（新会话）。这是 cache_aware 的既有语义，与容量上限无关，
   别误判成「上限没摘干净」。
+### 功率上限的真机形态（2026-10-01 23:1x）
+
+**这台机器上功率是整机共享读数**（8/8 worker 的 lr_gpu_load_power_watts 完全相同，95.982W），
+所以给单个 worker 配 max_power_w 会连带排除同机全部实例——这不是 bug，是「最热卡口径」的
+必然结果，也正是该口径在单卡隔离部署（CUDA_VISIBLE_DEVICES 级）下才有区分度的原因。
+真机上因此只能验「全池被功率排除」这一形态：
+
+- 给 Q38 的三个实例都配 max_power_w=50（实测 95.98W）→ 请求回 503，且错误信息把原因说清楚：
+  "No available workers (3 at their configured concurrency/power cap)"，
+  code=no_available_workers。这与熔断导致的 "all circuits open" 是**可区分**的，
+  排障时能一眼看出是容量上限而不是实例故障。
+- smg_worker_capacity_excluded_total{reason="power"} 同步增长。
+- 上限清回 0 后立刻恢复（workers with caps: 0 / 8，推理 200）。
+
+**不能在这台机器上验证的**：「功率超限只迁走这一台、流量落到同机另一台」——共享读数下不成立。
+要验那条语义需要一台多机部署或做了卡级隔离的机器；e2e_caps 用 mock 做了这一形态的覆盖
+（功率超限 → 迁到另一 worker、读数缺失 → 不排除），真机这边只能给出共享口径的证据。
+
+### 清限的一个操作坑
+
+PUT max_power_w=0 / max_concurrency=0 是「清回不限」，但**连续对多个 worker 快速发
+PUT 时，后两条可能不生效**（update 走后台队列，间隔太近会挤在一起）。表现为 /workers 里
+上限仍在、请求继续 503，但单独重发一次就立刻清掉。批量清限时每条之间 sleep 1s 再复核一遍
+/workers 的 max_concurrency/max_power_w 字段，别默认「202 就是已生效」。
+
