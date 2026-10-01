@@ -36,9 +36,12 @@ Scenarios, in order:
   5  cache_aware's escape consumes the sample: same prefix on every request (so
      affinity would pin one worker), and the hot worker must stop being the
      answer once its GPU is busy.
-  6  source=prom: host-label mapping, two co-located workers sharing one
-     reading, an unknown instance ignored, one POST per pass for a pool-wide
-     PromQL and one per distinct host for a {host} template.
+  6  source=prom: three workers on three hosts (127.0.0.2/.3 reach the same
+     0.0.0.0-bound mocks while naming different machines), so each host keeps
+     its own reading, the hottest series of a machine wins, a NaN-only machine
+     stores nothing, an unknown instance is reported not absorbed, and a
+     pool-wide PromQL costs one POST per pass; the {host}-template half then
+     collapses three workers that DO share one host onto one rendered query.
   7  the Prometheus is down: no worker leaves the pool, traffic flows, and the
      error log gets a bounded number of lines.
   8  staleness: after the worker stops reporting and SMG_LOAD_STALE_SECS passes,
@@ -315,6 +318,18 @@ def wait_no_load(port, url, timeout=25):
     return False
 
 
+def register_spec(port, spec):
+    """POST /workers with a full worker spec (url plus the fields SMG_WORKER_URLS
+    cannot carry).
+
+    The env seed path goes through registry.bootstrap(), which hands registry.add()
+    a bare {url=...}, so a key-protected worker can only get its `api_key` onto the
+    record through the control plane. This is the only way the e2e can make the
+    bearer scrape real rather than decorative.
+    """
+    return http("POST", "http://127.0.0.1:%d/workers" % port, spec)
+
+
 def chat(port, model, text="load probe"):
     return http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
                 {"model": model, "messages": [{"role": "user", "content": text}]})
@@ -369,7 +384,8 @@ def scenario_metrics_reports_gpu():
     number must NOT appear in /workers -- /v1/loads is a live pull that never
     writes the registry, which is the whole point of having separate channels.
     A worker behind an api_key is scraped with Bearer (the mock 401s otherwise),
-    which is what makes the key path load-bearing rather than decorative.
+    which is what makes the key path load-bearing rather than decorative -- and it
+    has to be registered through POST /workers for that key to exist at all.
     """
     name = "lr-gpuload-metrics-" + RUN
     pa, pb = free_port(), free_port()
@@ -377,8 +393,18 @@ def scenario_metrics_reports_gpu():
     keyed = GpuMock(pb, "beta", gpu_util=30.0, api_key="sk-load-probe")
     env = dict(GPU_ENV)
     env["SMG_LOAD_SOURCE"] = "metrics"
-    env["SMG_WORKER_URLS"] = "http://127.0.0.1:%d,http://127.0.0.1:%d" % (pa, pb)
+    env["NGINX_WORKER_PROCESSES"] = "1"       # one RR counter, or the split is per-process
+    # Only the open worker is seeded from the environment. The keyed one arrives
+    # through POST /workers, because SMG_WORKER_URLS bootstraps a bare {url=...}
+    # and a worker registered that way has no api_key on its record -- the scrape
+    # would then be refused (the mock 401s an unauthenticated /metrics) and this
+    # scenario would silently degrade into "one worker sampled".
+    env["SMG_WORKER_URLS"] = "http://127.0.0.1:%d" % pa
     port = start_router(env, name)
+    st_reg, body_reg, _ = register_spec(
+        port, {"url": "http://127.0.0.1:%d" % pb, "api_key": "sk-load-probe"})
+    check("[metrics] the keyed worker is accepted by the control plane",
+          st_reg == 202, "%s %s" % (st_reg, body_reg[:200]))
     check("[metrics] both workers healthy", wait_ready(port, 2, 40), logs(name))
     url_a, url_b = "http://127.0.0.1:%d" % pa, "http://127.0.0.1:%d" % pb
     check("[metrics] the hot worker reports its GPU through /workers",
@@ -391,7 +417,8 @@ def scenario_metrics_reports_gpu():
     check("[metrics] the pass counter is published",
           "lr_gpu_load_pass_total" in text, text[-300:])
     check("[metrics] coverage gauge counts both workers",
-          counter_value(text, "lr_gpu_load_workers") == 2.0, text[-300:])
+          counter_value(text, "lr_gpu_load_workers") == 2.0,
+          "workers=%s" % counter_value(text, "lr_gpu_load_workers"))
     st, body, _ = http("GET", "http://127.0.0.1:%d/v1/loads" % port)
     doc = json.loads(body) if st == 200 else {}
     reported = [w.get("load") for w in doc.get("workers", [])]
@@ -399,9 +426,20 @@ def scenario_metrics_reports_gpu():
           4242 in reported, str(reported))
     check("[metrics] and that self-report did not leak into /workers",
           load_of(port, url_a) != 4242, str(load_of(port, url_a)))
-    st, body, _ = chat(port, "alpha")
-    check("[metrics] inference is unaffected", st == 200 and "echo[alpha]" in body,
-          body[:200])
+    # round_robin (GPU_ENV's policy) walks the pool, so a single request proves
+    # nothing about which worker answered -- pinning one model here was the first
+    # version's mistake. Over four requests both workers must answer, each with a
+    # well-formed completion of its own: that is what "a load sample changed
+    # nothing on the forwarding path" means while both channels are live.
+    answers = []
+    for _ in range(4):
+        st, body, _ = chat(port, "alpha")
+        answers.append((st, body))
+    check("[metrics] inference is unaffected (both workers answer)",
+          all(st == 200 for st, _ in answers)
+          and sum(1 for _, b in answers if "echo[alpha]" in b) >= 2
+          and sum(1 for _, b in answers if "echo[beta]" in b) >= 1,
+          str([(st, b[:60]) for st, b in answers]))
     hot.stop()
     keyed.stop()
     stop_router(name)
@@ -553,33 +591,48 @@ def scenario_cache_aware_escapes():
 def scenario_prom_source():
     """Expected: the remote channel maps a vector back onto the pool.
 
-    Three workers on two hosts (the last two deliberately co-located, the way two
-    engines share a GPU box), and a fake Prometheus keyed on 127.0.0.1 so the
-    host-label match is the same code path production takes.
+    Three workers on three hosts and a fake Prometheus keyed on those hosts, so
+    the host-label match is the same code path production takes. The hosts are
+    127.0.0.1/.2/.3: Linux routes the whole 127/8 into this host loopback and
+    the mocks bind 0.0.0.0, so three addresses name three machines to the source
+    while the same listeners answer. (Collapsing them onto 127.0.0.1 and letting
+    only the port differ is NOT a shortcut -- the mapping key is the host with the
+    port discarded, so all three would fold into one shared reading by design. The
+    co-location half of that is the {host} sub-scenario at the end, where the urls
+    deliberately do share a host.)
 
     Assertions, in the order the pass runs:
       * a pool-wide PromQL costs exactly one POST per interval (the probers are not
         per-worker -- that is the whole reason a remote source is cheap);
-      * the two co-located workers carry the same reading, because the host is the
-        shared resource;
-      * the other host carries its own value;
+      * each host carries its own reading, and the hottest series of a machine wins
+        (88 over its 5 % sibling) rather than the last one parsed;
+      * a machine whose only series is NaN stores no sample at all -- not a zero,
+        not its neighbour 88;
       * a series naming a machine nobody in the pool serves leaves every load
         untouched and bumps lr_gpu_load_unmatched_total instead;
       * switching to a {host} template raises one POST per *distinct* host per pass,
-        and DP ranks of one host collapse into one query;
-      * NaN series contribute nothing.
+        and the ranks plus co-located sibling of one host collapse into one query.
     """
     name = "lr-gpuload-prom-" + RUN
     pa, pb, pc = free_port(), free_port(), free_port()
+    # Three genuinely distinct hosts. The mapping key is the *host*, with the port
+    # discarded, so three workers on 127.0.0.1 differing only in port would (by
+    # design) collapse into one shared reading -- which is the co-location case the
+    # {host} sub-scenario below covers, not this one. Linux routes the whole 127/8 into this
+    # host's loopback and the mocks bind 0.0.0.0, so 127.0.0.2 / .3 reach the same
+    # listeners while naming different machines to the source.
+    ha, hb, hc = "127.0.0.1", "127.0.0.2", "127.0.0.3"
     a = GpuMock(pa, "alpha", gpu_util=None)          # no /metrics: only prom can see it
     b = GpuMock(pb, "beta", gpu_util=None)
     c = GpuMock(pc, "gamma", gpu_util=None)
     pp = free_port()
     prom = FakeProm(pp, series=[
-        {"metric": {"instance": "127.0.0.1:%d" % pa, "gpu": "0"},
+        {"metric": {"instance": "%s:%d" % (ha, pa), "gpu": "0"},
          "value": [time.time(), "88"]},
-        {"metric": {"instance": "127.0.0.1:%d" % pb}, "value": [time.time(), "12"]},
-        {"metric": {"instance": "127.0.0.1:%d" % pc}, "value": [time.time(), "NaN"]},
+        {"metric": {"instance": "%s:%d" % (ha, pa), "gpu": "1"},
+         "value": [time.time(), "5"]},
+        {"metric": {"instance": "%s:%d" % (hb, pb)}, "value": [time.time(), "12"]},
+        {"metric": {"instance": "%s:%d" % (hc, pc)}, "value": [time.time(), "NaN"]},
         {"metric": {"instance": "10.255.255.1:9100"}, "value": [time.time(), "99"]},
     ])
     env = dict(GPU_ENV)
@@ -587,18 +640,21 @@ def scenario_prom_source():
         "SMG_LOAD_SOURCE": "prom",
         "SMG_LOAD_PROM_URL": "http://127.0.0.1:%d" % pp,
         "SMG_LOAD_PROM_QUERY": "avg by (instance) (DCGM_FI_DEV_GPU_UTIL)",
-        "SMG_WORKER_URLS": ",".join("http://127.0.0.1:%d" % p for p in (pa, pb, pc)),
+        "SMG_WORKER_URLS": ",".join("http://%s:%d" % (h, p)
+                                    for h, p in ((ha, pa), (hb, pb), (hc, pc))),
     })
     port = start_router(env, name)
     check("[prom] all three healthy", wait_ready(port, 3, 40), logs(name))
-    url_a, url_b, url_c = ("http://127.0.0.1:%d" % pa, "http://127.0.0.1:%d" % pb,
-                           "http://127.0.0.1:%d" % pc)
+    url_a, url_b, url_c = ("http://%s:%d" % (ha, pa), "http://%s:%d" % (hb, pb),
+                           "http://%s:%d" % (hc, pc))
     check("[prom] host labels map onto the right workers",
           wait_load(port, url_a, 88, tol=1.0), str(load_of(port, url_a)))
     check("[prom] a second host gets its own reading",
           wait_load(port, url_b, 12, tol=1.0), str(load_of(port, url_b)))
     check("[prom] a NaN series stores no load rather than a zero one",
           load_of(port, url_c) in (0, 0.0), str(load_of(port, url_c)))
+    check("[prom] the hottest series of a host wins (88 over its 5 % sibling)",
+          load_of(port, url_a) == 88, str(load_of(port, url_a)))
     # One pool-wide query per pass: sample the query log across two intervals and
     # allow the boundary to add at most one extra.
     before = len(prom.seen())
@@ -613,22 +669,20 @@ def scenario_prom_source():
     check("[prom] traffic flows while the remote source does the seeing",
           chat(port, "alpha")[0] == 200, "chat failed")
 
-    # ---- the {host} template: one query per distinct host, ranks collapsed
-    prom.set(series=[{"metric": {"host": "127.0.0.1"},
-                      "value": [time.time(), "55"]}])
+    # ---- the {host} template: one query per distinct host, ranks collapsed.
+    # All three urls now name ONE host (the mocks bind 0.0.0.0, so the second
+    # listener answers under 127.0.0.1 too) and the template names only {host},
+    # so the whole pool -- two DP ranks of one engine plus a co-located second
+    # listener -- collapses onto a single rendered query per pass. Counting the
+    # POSTs is the load-bearing part of this sub-scenario: a per-worker render
+    # would triple it at the same interval.
+    prom.set(series=[{"metric": {"host": ha}, "value": [time.time(), "55"]}])
     stop_router(name)
     env2 = dict(env)
     env2["SMG_LOAD_PROM_QUERY"] = 'DCGM_FI_DEV_GPU_UTIL{hostname="{host}"}'
-    # Two of the three urls share a host (127.0.0.1) but differ in port, so the
-    # rendered queries are distinct; the DP rank pair below is the real dedup case.
-    # All three urls sit on 127.0.0.1, and the template names only {host}, so the
-    # whole pool collapses onto ONE rendered query per pass: two ranks of the DP
-    # engine plus a second listener on the same machine, three registry workers,
-    # one POST. Counting the POSTs is the load-bearing part of this scenario --
-    # a per-worker render would triple it at this interval.
-    env2["SMG_WORKER_URLS"] = ",".join(
-        ["http://127.0.0.1:%d" % pa, "http://127.0.0.1:%d@0" % pb,
-         "http://127.0.0.1:%d@1" % pb])
+    env2["SMG_WORKER_URLS"] = ",".join(["http://%s:%d" % (ha, pa),
+                                        "http://%s:%d@0" % (ha, pb),
+                                        "http://%s:%d@1" % (ha, pb)])
     name2 = "lr-gpuload-promhost-" + RUN
     port2 = start_router(env2, name2)
     check("[prom/host] the rank pair plus its co-located sibling register",
@@ -640,13 +694,15 @@ def scenario_prom_source():
           len(distinct) == 1 and 1 <= len(host_queries) <= 5,
           "distinct=%d total=%d" % (len(distinct), len(host_queries)))
     check("[prom/host] the template reached the API expanded",
-          any("hostname%3D%22127.0.0.1%22" in q for q in host_queries),
+          any(("hostname%3D%22" + ha + "%22") in q for q in host_queries),
           str(host_queries[-2:])[:300])
+    rank0, rank1 = ("http://%s:%d@0" % (ha, pb), "http://%s:%d@1" % (ha, pb))
     check("[prom/host] both ranks of one engine share the host sample",
-          wait_load(port2, "http://127.0.0.1:%d@0" % pb, 55, tol=1.0)
-          and load_of(port2, "http://127.0.0.1:%d@1" % pb) == 55,
-          "%s / %s" % (load_of(port2, "http://127.0.0.1:%d@0" % pb),
-                       load_of(port2, "http://127.0.0.1:%d@1" % pb)))
+          wait_load(port2, rank0, 55, tol=1.0) and load_of(port2, rank1) == 55,
+          "%s / %s" % (load_of(port2, rank0), load_of(port2, rank1)))
+    check("[prom/host] the co-located sibling reads the same number",
+          load_of(port2, "http://%s:%d" % (ha, pa)) == 55,
+          str(load_of(port2, "http://%s:%d" % (ha, pa))))
     for m in (a, b, c):
         m.stop()
     prom.stop()

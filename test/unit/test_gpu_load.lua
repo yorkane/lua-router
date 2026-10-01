@@ -798,6 +798,39 @@ eq(#calls_r.post, 1, "four DP ranks of one machine cost one POST, not four")
 eq(st_r.matched, 4, "and every rank still received the host sample")
 near(registry.load("r2"), 64, "which is what selection sees for each of them")
 
+new_case("one host's reading never bleeds onto its neighbours' workers")
+-- The port is deliberately dropped by the mapping, so this is the exact shape the
+-- e2e tripped over: three workers, three hosts, one hot series and one cooler
+-- sibling on the first host, and a NaN on the third. Folding per host means the
+-- hot machine's 88 must not be able to reach the other two, and a host whose only
+-- series is NaN must keep no sample at all -- not a stale one, and not its
+-- neighbour's. If host_values() ever keyed on the array index instead of the
+-- label, both of these numbers arrive as 88.
+reset_store()
+local _, seams_iso = counting_seams({
+    workers = {
+        { id = "h1", url = "http://10.0.0.1:8800" },
+        { id = "h2", url = "http://10.0.0.2:8800" },
+        { id = "h3", url = "http://10.0.0.3:8800" },
+    },
+    post = { status = 200, body =
+        '{"status":"success","data":{"resultType":"vector","result":['
+        .. '{"metric":{"instance":"10.0.0.1:9100","gpu":"0"},"value":[1,"88"]},'
+        .. '{"metric":{"instance":"10.0.0.1:9100","gpu":"1"},"value":[1,"5"]},'
+        .. '{"metric":{"instance":"10.0.0.2:9100"},"value":[1,"12"]},'
+        .. '{"metric":{"instance":"10.0.0.3:9100"},"value":[1,"NaN"]}]}}' },
+})
+local st_iso = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "gpu_util", load_scale = 100,
+}, seams_iso)
+near(registry.load("h1"), 88, "the hot machine contributes its maximum, not its mean")
+near(registry.load("h2"), 12, "the next machine keeps its own reading")
+eq(registry.external_load("h3"), nil, "the NaN-only machine gets no sample at all")
+eq(registry.load("h3"), 0, "which is no load, and not the previous worker's 88")
+eq(st_iso.matched, 2, "two workers sampled, the third legitimately unsampled")
+eq(st_iso.unmatched, 0, "and every series belonged to someone")
+
 new_case("unknown instances are ignored, never invented onto a worker")
 reset_store()
 local _, seams_unk = counting_seams(prom_doc(

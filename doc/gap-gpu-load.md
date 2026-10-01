@@ -7,8 +7,8 @@
 + live 层）、[registry.lua](../lualib/resty/luarouter/registry.lua)（负载字段读写，
 +274/-5 行）、[hb.lua](../lualib/resty/luarouter/hb.lua)（定时器接线，+23/-1 行）、
 [config.lua](../lualib/resty/luarouter/config.lua)（env，+58 行）。
-单测：[test_gpu_load.lua](../test/unit/test_gpu_load.lua)（995 行，43 个 case，**268 checks**）。
-e2e：[e2e_gpu_load.py](../test/integration/e2e_gpu_load.py)（762 行，8 个场景、51 处 check，
+单测：[test_gpu_load.lua](../test/unit/test_gpu_load.lua)（1024 行，44 个 case，**274 checks**）。
+e2e：[e2e_gpu_load.py](../test/integration/e2e_gpu_load.py)（818 行，8 个场景、54 处 check，
 本轮**只写不跑**）。
 
 消费端零改动：`power_of_two`（policy.lua 取 `registry.load(id)`）、`cache_aware`
@@ -211,7 +211,7 @@ worker 的 `api_key` 会作为 `Authorization: Bearer` 带上，与 `hb` 的探�
 docker run --rm -v "$PWD:/repo:ro" -w /repo \
   --entrypoint /usr/local/openresty/luajit/bin/luajit -e LUA_TEST_LIB=/repo/lualib \
   authz:latest /repo/test/unit/test_gpu_load.lua
-→ === 268 checks, 0 failed ===   （43 个 case）
+→ === 274 checks, 0 failed ===   （44 个 case）
 ```
 
 覆盖面（Phase A 在 `_G.ngx = nil` 下验纯逻辑，Phase B 用假 `ngx` + 假 `shdict` 验
@@ -220,7 +220,11 @@ TTL 与 registry 写入）：metric 名归一、`parse_number` 对 NaN/Inf、样
 （93→0.93、1→1、400→1、负→nil）、`split_host`（rank 后缀、userinfo、IPv6、FQDN 尾点）、
 占位符渲染、`query_endpoint`、`query_body` 的精确 percent-encoding、
 `parse_prom_response`（vector 通过、matrix/scalar 拒绝、NaN）、`host_values`、
-`assign`（同 host 共享、未知 instance 计 unmatched）、`effective_load`、registry 的
+`assign`（同 host 共享、未知 instance 计 unmatched）、
+`one host's reading never bleeds onto its neighbours' workers`（三 worker 三台机器、热机器带
+88/5 两条序列、第三台只有 NaN：88 不许串到邻居，NaN-only 主机一个样本都不留）——该 case
+用变异测试反向验证过：把 NaN 改成沿用上一条值 → 4 条红；把所有行折叠到第一个 host 键 → 6 条红。
+`effective_load`、registry 的
 优先级与 TTL 过期、`to_milli`、`stale_ttl`、`source=none` 零副作用、metrics 源
 （404 不摘 worker、无 gauge、超大正文、抛错、bearer、keys 限制）、prom 源（单 POST、
 `{host}` 每 worker 一次、DP rank 去重、未知 instance、down/垃圾正文、缺配置跳过）、
