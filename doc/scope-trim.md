@@ -5,7 +5,13 @@
 > 不考虑 gRPC、MCP、本地推理、模型管理。服务动态添加、路由动态变更、配置映射改写、
 > 流量性能监控、UI 可观察可配置是重点。
 >
-> 本文是裁剪判定书：逐模块给 KEEP / DELETE / TRIM 与理由，量化收益，列出测试面影响与
+> **执行状态（2026-10-01 04:0x UTC）：已全部执行完毕。** 七个 commit（6d2103a→732dc0b）落地：
+> gRPC+PD、history、tokenizer/parse、auth 全层、K8s discovery、OTel 六面删除；mesh 保留（md5 未变）、
+> DP 展开保留并迁入 e2e_stateful。终态：15 门全绿（/data/tmp/lr-gates/full-final.log）、契约 580/22 段、
+> 单测 5 文件、Lua 15 837 行（-44%）。用户裁定的最终差异：mesh 保留（本文原判 DELETE，用户改 KEEP）；
+> discovery 契约段 5 项保留（测的是 /model_info 元数据发现，属 KEEP 面）。
+> 
+>> 本文是裁剪判定书：逐模块给 KEEP / DELETE / TRIM 与理由，量化收益，列出测试面影响与
 > 新能力缺口。**未执行任何删除**；执行按 §6 顺序单独成 PR。基础计数对应 `9f82a2d` 树
 >（28 个 Lua 模块 / 28 215 行、契约 841、21 门禁）。
 
