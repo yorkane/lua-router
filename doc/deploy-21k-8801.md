@@ -67,3 +67,43 @@ watcher.lua:1729 附近），会探测容器 EXPOSE 端口；21.k 所有 LLM 服
 ssh 21.k 'cd /data1/app/lua-router-8801 && docker compose down'   # 完全移除
 # 8800 的 Rust 版全程未动，无级联影响
 ```
+
+## 升级到 lua-router:8801-20261001-2（2026-10-01 22:3x）
+
+镜像换成含「虚拟模型多绑定 + 每服务并发/功率上限」的那版。回滚到旧版：
+
+`bash
+ssh 21.k 'cd /data1/app/lua-router-8801 && sed -i "s#8801-20261001-2#8801-20261001-1#" docker-compose.yml && docker compose up -d'
+`
+
+compose 追加了功率通道（DCGM exporter 在本机 9400，Prometheus 在 9092）：
+
+```
+SMG_LOAD_SOURCE: "prom"
+SMG_LOAD_PROM_URL: "http://127.0.0.1:9092"
+SMG_LOAD_PROM_QUERY: "max by (Hostname) (DCGM_FI_DEV_GPU_UTIL)"
+SMG_LOAD_POWER_QUERY: "max by (Hostname,instance) (DCGM_FI_DEV_POWER_USAGE)"
+SMG_LOAD_INTERVAL_SECS: "10"
+SMG_LOAD_STALE_SECS: "30"
+```
+
+**功率查询必须带 instance**：只写 by (Hostname) 时采样侧拿到的是机器名
+gpu-pro6000-1，而 21.k 的 worker 全部注册为 127.0.0.1:8012 这类 IP，两侧命名对不上，
+lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。加 instance
+之后两者被判定为同一台机器并折叠，读数才落得到池成员上。
+
+### 真机验证结论
+
+- 功率通道：8/8 worker 采到真实瓦数（lr_gpu_load_power_watts = 96.46，与 DCGM 原始值
+  一致），unmatched 归零。八个 worker 读数相同——功率是**整机最热卡**口径，共享是预期行为。
+- 虚拟模型多绑定：mixed-route 绑 8025/Q38-Flash-Next 与
+  8021/qwen38-flashnext-orca-nvfp4 两个**不同上游的不同模型**，请求按绑定名转发并返回
+  对应模型；only-orca 单候选同样正确。两条都是 apply 后**要等一拍**再发第一个请求，
+  热配置是异步生效的。
+- 并发上限：给 8026 配 max_concurrency=1，并发压上去之后
+  smg_worker_capacity_excluded_total{reason="concurrency"} 真实增长，流量迁到 8025/8027，
+  而 8026 本身仍留在池中——上限是选路信号而不是健康信号，不摘 worker。
+- 功率上限：给 8025 配 max_power_w=50（实测 96W）后
+  smg_worker_capacity_excluded_total{reason="power"} 增长，该 worker 被跳过、请求仍成功。
+- 验证完已把两个 worker 的上限与全部虚拟模型配置清回（workers with caps: 0 / 8，
+  health OK，推理 200）。
