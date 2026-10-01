@@ -8,6 +8,11 @@
 
 1. **更灵活的模型服务调度策略**：在现有 8 策略骨架上继续演进——策略可按模型/别名粒度组合，
    感知健康、熔断、负载与 GPU 利用率；新调度能力的落点是 `policies/` 与 `policy.lua`。
+   已落地的两块即按此形状走：`virtual_models` 的 `candidates` 多绑定（一个别名把不同实例绑到相同或
+   不同的上游模型，转发体的 model 与 effort/ctx 卡跟着选中候选的绑定名走），以及每服务并发/功率上限
+   （`max_concurrency` / `max_power_w` 在 `router.candidates_for` 装配候选时**硬排除**，即使 cache_aware
+   亲和命中也迁走；**功率读数未知 → 不排除**）。两者都刻意做到 `policies/` 零改动，口径见
+   doc/gap-worker-caps.md 与 doc/gap-virtual-models.md §8。
 2. **覆盖与弥补下游请求的配置**：网关侧对请求做顶层改写与补齐（model 别名、effort/ctx 卡片、
    `stream_options`、per-alias policy/profile 收窄），让不完美或欠配置的客户端请求也能被正确
    调度——改写一律走 `set_top_field` 式顶层精确改写，不整表重编码。
@@ -24,7 +29,7 @@
    host 网络 + 容器名前缀，**严禁并发**（跑前 `ps` 查）；luajit/resty 单测（无端口绑定）可并发。
    精确 kill PID，禁止 pkill。测试容器全部 `lr-*` 前缀，收尾必须清零。门禁两档：
    `GATE_TIER=quick`（缺省，build/conf/unit/contract/probes 约 3 分钟）供普通修改快速验证；
-   发版、文档计数更新、生产镜像替换必须 `GATE_TIER=full` 全量 20 门全绿（快速档绿不算全绿锚点）。
+   发版、文档计数更新、生产镜像替换必须 `GATE_TIER=full` 全量 21 门全绿（快速档绿不算全绿锚点）。
 2. **临时文件一律 /data/tmp/**；生产验证文档更新进 doc/。
 3. **生产容器白名单**：本仓只许动 `lua-router-8800`（compose 在 /data/app/lua-router/）；
    `authz`、`searxng-*`、`qdrant-faces`、`face-*`、`va-*`、`pg18-video`、`n8nc`、`resdown-*`、

@@ -734,6 +734,477 @@ eq(wid_err, nil, "a worker id candidate is accepted")
 local wid_row = store.profiles_list()[1]
 eq(wid_row and #wid_row.workers, 2, "both candidate kinds are stored")
 eq(wid_row and wid_row.workers[1], UUID, "worker ids are stored lowercase")
+--------------------------------------------------------------------------
+-- 5b. virtual_models 新形状：候选各带模型（candidates 绑定层）
+--
+-- 需求：一个别名可以把不同上游实例绑到不同模型（不必同构），target 因此变成可选。
+-- 这里逐条钉住 build_candidate_bindings / profile_from_entry /
+-- assert_bindings_no_alias / snapshot_of / profiles_list / profile_for /
+-- cfg_from_document 的契约，尤其是「旧 {model,target} 形状逐字段不变」与
+-- 「candidates-only 不许长出没人声明的 target」两条红线。
+--------------------------------------------------------------------------
+-- luajit 的 main chunk 只容得下 200 个局部变量，本段整体收进一个函数里跑。
+local function verify_candidate_bindings()
+    local UUID_UP = "0F8FAD5B-D9CB-469F-A165-70867728950F"
+    local UUID_LOW = "0f8fad5b-d9cb-469f-a165-70867728950f"
+    local function cnd(worker, model) return { worker = worker, model = model } end
+
+    -- (1) 候选各带模型：两条候选、两个不同 model，声明顺序与形状都保留
+    reset_env()
+    local mb_snap, mb_err = store.apply_profiles({
+        { model = "vm-multi", candidates = { cnd(A, "qwen3-30b"), cnd(B, "deepseek-v3") } },
+    })
+    eq(mb_err, nil, "1) per-candidate models are accepted")
+    local mb_row = store.profiles_list()[1]
+    ok(mb_row ~= nil, "1) the multi-binding row is listed")
+    eq(mb_row and mb_row.model, "vm-multi", "1) the alias is kept")
+    local mb_c = mb_row and mb_row.candidates
+    ok(type(mb_c) == "table", "1) the row carries candidates")
+    eq(mb_c and #mb_c, 2, "1) both bindings are stored")
+    eq(mb_c and mb_c[1].worker, A, "1) binding 1 keeps its worker")
+    eq(mb_c and mb_c[1].model, "qwen3-30b", "1) binding 1 keeps its model (declaration order)")
+    eq(mb_c and mb_c[2].worker, B, "1) binding 2 keeps its worker")
+    eq(mb_c and mb_c[2].model, "deepseek-v3", "1) binding 2 keeps its model")
+    check(mb_c ~= nil and mb_c[1].model ~= mb_c[2].model, "1) the two bindings use different models")
+    check(mb_c ~= nil and rawget(mb_c[1], "url") == nil, "1) a binding is {worker,model} with no url key")
+    local function binding_key_count(row)
+        local n = 0
+        for _ in pairs(row) do n = n + 1 end
+        return n
+    end
+    eq(mb_c and binding_key_count(mb_c[1]), 2, "1) a binding carries exactly the worker and model keys")
+    eq(mb_c and mb_c[1].worker ~= nil and mb_c[1].model ~= nil, true, "1) both binding fields are filled")
+    eq(store.profile_for("vm-multi") and store.profile_for("vm-multi").target, "qwen3-30b",
+        "1) the representative target is the first explicit model")
+    eq(store.current().virtual_profiles["vm-multi"] and store.current().virtual_profiles["vm-multi"].target,
+        "qwen3-30b", "1) the stored profile keeps the derived representative")
+    eq(store.resolve_model("vm-multi"), "qwen3-30b", "1) resolve_model maps to the representative")
+    eq(mb_row and rawget(mb_row, "target"), nil, "1) an undeclared target stays absent from the row")
+    local mb_prof = store.profile_for("vm-multi")
+    eq(mb_prof and #mb_prof.candidates, 2, "1) profile_for carries the bindings")
+    eq(mb_prof and mb_prof.candidates[2].model, "deepseek-v3", "1) profile_for keeps the binding models")
+    eq(mb_prof and rawget(mb_prof, "explicit_target"), nil, "1) profile_for hides explicit_target")
+    local mb_snap_row = mb_snap and mb_snap.virtual_models[1]
+    eq(mb_snap_row and #mb_snap_row.candidates, 2, "1) the returned snapshot carries the bindings")
+    eq(mb_snap_row and mb_snap_row.candidates[1].model, "qwen3-30b", "1) the snapshot keeps binding models")
+
+    -- (2) target 可缺省：不写 target 也能 apply
+    reset_env()
+    local co_snap, co_err = store.apply_profiles({
+        { model = "vm-conly", candidates = { cnd(A, "model-a"), cnd(B, "model-b") } },
+    })
+    eq(co_err, nil, "2) a candidates-only profile applies without a target")
+    local co_row = store.profiles_list()[1]
+    ok(co_row ~= nil, "2) the candidates-only row is listed")
+    eq(co_row and #co_row.candidates, 2, "2) both bindings survived")
+    eq(co_row and rawget(co_row, "target"), nil, "2) no target key when none was declared")
+    eq(co_snap and rawget(co_snap.virtual_models[1], "target"), nil, "2) the returned snapshot has no target key")
+    eq(store.profile_for("vm-conly") and store.profile_for("vm-conly").target, "model-a",
+        "2) the representative target is still readable by pre-feature readers")
+
+    -- (3) candidates[].model 缺省继承 target
+    reset_env()
+    local _, ih_err = store.apply_profiles({
+        { model = "vm-inherit", target = "test-model", candidates = { { worker = A }, { worker = B } } },
+    })
+    eq(ih_err, nil, "3) bindings without a model are accepted when a target exists")
+    local ih_row = store.profiles_list()[1]
+    eq(ih_row and #ih_row.candidates, 2, "3) both inherit-bindings are stored")
+    eq(ih_row and ih_row.candidates[1].model, "test-model", "3) binding 1 inherits the target")
+    eq(ih_row and ih_row.candidates[2].model, "test-model", "3) binding 2 inherits the target")
+    eq(ih_row and ih_row.target, "test-model", "3) the declared target survives")
+    local ih_prof = store.profile_for("vm-inherit")
+    eq(ih_prof and ih_prof.candidates[2].model, "test-model", "3) profile_for hands out the inherited model")
+    reset_env()
+    local _, in_err = store.apply_profiles({
+        { model = "vm-nullmodel", target = "test-model",
+          candidates = { { worker = A, model = NULL }, { worker = B, model = "" } } },
+    })
+    eq(in_err, nil, "3) a null or empty model reads as unset")
+    local in_row = store.profiles_list()[1]
+    eq(in_row and in_row.candidates[1].model, "test-model", "3) an explicit null inherits the target")
+    eq(in_row and in_row.candidates[2].model, "test-model", "3) an empty model inherits the target")
+
+    -- (4) 无 target 且候选无 model -> 报错（no target to inherit）
+    reset_env()
+    local _, nt_err = store.apply_profiles({ { model = "vm-nt", candidates = { { worker = A } } } })
+    check(type(nt_err) == "string" and nt_err:find("no target to inherit", 1, true) ~= nil,
+        "4) a target-less binding without a model is refused", nt_err)
+    check(type(nt_err) == "string" and nt_err:find("vm-nt", 1, true) ~= nil,
+        "4) the rejection names the alias", nt_err)
+    check(type(nt_err) == "string" and nt_err:find(A, 1, true) ~= nil,
+        "4) the rejection names the offending worker", nt_err)
+    eq(#store.profiles_list(), 0, "4) the refused batch wrote nothing")
+    reset_env()
+    local _, nt2_err = store.apply_profiles({
+        { model = "vm-nt2", candidates = { cnd(A, "model-a"), { worker = B } } },
+    })
+    check(type(nt2_err) == "string" and nt2_err:find("no target to inherit", 1, true) ~= nil,
+        "4) one model-less binding among explicit ones is refused", nt2_err)
+    eq(#store.profiles_list(), 0, "4) the partially bad batch wrote nothing")
+    local _, nt3_err = store.apply_profiles({
+        { model = "vm-nt2", target = "model-a", candidates = { cnd(A, "model-a"), { worker = B } } },
+    })
+    eq(nt3_err, nil, "4) the same row is accepted once a target exists to inherit")
+
+    -- (5) 同一 worker 绑两个模型报错；同一条绑定重复提交静默去重
+    reset_env()
+    local _, two_err = store.apply_profiles({
+        { model = "vm-two", candidates = { cnd(A, "model-a"), cnd(A, "model-b") } },
+    })
+    check(type(two_err) == "string" and two_err:find("two models", 1, true) ~= nil,
+        "5) one worker bound to two models is refused", two_err)
+    check(type(two_err) == "string" and two_err:find("vm-two", 1, true) ~= nil,
+        "5) the two-model rejection names the alias", two_err)
+    check(type(two_err) == "string" and two_err:find(A, 1, true) ~= nil,
+        "5) the two-model rejection names the worker", two_err)
+    eq(#store.profiles_list(), 0, "5) the refused two-model batch wrote nothing")
+    reset_env()
+    local _, dd_err = store.apply_profiles({
+        { model = "vm-dd", candidates = { cnd(A, "model-a"), cnd(A, "model-a"), cnd(A, "model-a") } },
+    })
+    eq(dd_err, nil, "5) the identical binding repeated is accepted")
+    local dd_row = store.profiles_list()[1]
+    eq(dd_row and #dd_row.candidates, 1, "5) the duplicate binding silently dedupes to one row")
+    eq(dd_row and dd_row.candidates[1].model, "model-a", "5) the deduped binding keeps its model")
+    eq(dd_row and dd_row.candidates[1].worker, A, "5) the deduped binding keeps its worker")
+    reset_env()
+    local _, dd2_err = store.apply_profiles({
+        { model = "vm-dd2", target = "test-model", candidates = { { worker = A }, { worker = A } } },
+    })
+    eq(dd2_err, nil, "5) two model-less bindings for one worker dedupe")
+    local dd2_row = store.profiles_list()[1]
+    eq(dd2_row and #dd2_row.candidates, 1, "5) the inherit-duplicates collapse to one binding")
+    eq(dd2_row and dd2_row.candidates[1].model, "test-model", "5) the collapsed binding inherits the target")
+    reset_env()
+    local _, dd3_err = store.apply_profiles({
+        { model = "vm-dd3", candidates = { cnd(A, "model-a"), { url = A, model = "model-a" } } },
+    })
+    eq(dd3_err, nil, "5) worker= and url= spellings of one binding dedupe together")
+    eq(store.profiles_list()[1] and #store.profiles_list()[1].candidates, 1,
+        "5) the mixed spelling batch stores one binding")
+
+    -- (6) 绑定指向别的别名 -> 拒绝（沿用 target 那一族文案）
+    reset_env()
+    local _, sib_err = store.apply_profiles({ { model = "vm-sib", target = "test-model" } })
+    eq(sib_err, nil, "6) the sibling alias is created first")
+    local _, b1_err = store.apply_profiles({
+        { model = "vm-b1", target = "real-model", candidates = { cnd(A, "real-2"), cnd(B, "vm-sib") } },
+    })
+    check(type(b1_err) == "string" and b1_err:find("must not be another virtual model", 1, true) ~= nil,
+        "6) a binding that names an existing alias is refused", b1_err)
+    check(type(b1_err) == "string" and b1_err:find("vm-b1", 1, true) ~= nil,
+        "6) the binding chain rejection names the writer", b1_err)
+    eq(#store.profiles_list(), 1, "6) the refused batch left the table untouched")
+    eq(store.profiles_list()[1] and store.profiles_list()[1].model, "vm-sib",
+        "6) the surviving row is the old alias")
+    reset_env()
+    local _, b2_err = store.apply_profiles({
+        { model = "vm-m1", target = "real-1", candidates = { cnd(A, "real-2"), cnd(B, "vm-m2") } },
+        { model = "vm-m2", target = "real-3", candidates = { cnd(A, "real-4") } },
+    })
+    check(type(b2_err) == "string" and b2_err:find("must not be another virtual model", 1, true) ~= nil,
+        "6) same-batch bindings to a sibling alias are refused", b2_err)
+    eq(#store.profiles_list(), 0, "6) the refused same-batch wrote nothing")
+    reset_env()
+    local _, b2b_err = store.apply_profiles({
+        { model = "vm-cx", target = "real-1", candidates = { cnd(A, "vm-cy") } },
+        { model = "vm-cy", target = "real-2", candidates = { cnd(B, "vm-cx") } },
+    })
+    check(type(b2b_err) == "string" and b2b_err:find("must not be another virtual model", 1, true) ~= nil,
+        "6) two bindings in one batch that point at each other are refused", b2b_err)
+    eq(#store.profiles_list(), 0, "6) the mutually-pointing batch wrote nothing")
+    reset_env()
+    local _, b3_err = store.apply_profiles({
+        { model = "vm-self", target = "real-1", candidates = { cnd(A, "real-2"), cnd(B, "vm-self") } },
+    })
+    check(type(b3_err) == "string" and b3_err:find("must differ from its target", 1, true) ~= nil,
+        "6) a binding that names its own alias uses the self-reference wording", b3_err)
+    reset_env()
+    local _, b4_err = store.apply_profiles({ { model = "vm-named", candidates = { cnd(A, "vm-named") } } })
+    check(type(b4_err) == "string" and b4_err:find("must differ from its target", 1, true) ~= nil,
+        "6) a candidates-only row named after itself is refused", b4_err)
+    reset_env()
+    local _, anc_err = store.apply_profiles({ { model = "vm-anchor", target = "test-model" } })
+    eq(anc_err, nil, "6) the anchor alias for the legacy wording is created")
+    local _, t6_err = store.apply_profiles({ { model = "vm-child", target = "vm-anchor" } })
+    check(type(t6_err) == "string" and t6_err:find("must not be another virtual model", 1, true) ~= nil,
+        "6) the legacy target->alias wording is unchanged", t6_err)
+    check(type(t6_err) == "string" and t6_err:find("vm-child", 1, true) ~= nil,
+        "6) the legacy rejection still names the writer", t6_err)
+    -- document 层（cfg_from_document）同样挡住互指
+    local _, d6_err = store.cfg_from_document({
+        virtual_models = {
+            { model = "vm-d1", target = "real-1", candidates = { cnd(A, "vm-d2") } },
+            { model = "vm-d2", target = "real-2", candidates = { cnd(B, "ok-model") } },
+        },
+    })
+    check(type(d6_err) == "string" and d6_err:find("must not be another virtual model", 1, true) ~= nil,
+        "6) cfg_from_document refuses cross-alias bindings in the batch", d6_err)
+
+    -- (7) 向后兼容：旧 {model,target} 形状四条链路逐字段不变
+    reset_env()
+    local lg_snap, lg_err = store.apply_profiles({
+        { model = "vm-legacy", target = "test-model", workers = { A }, policy = "round_robin", effort = "high" },
+    })
+    eq(lg_err, nil, "7) the legacy {model,target} shape still applies")
+    local lg_row = store.profiles_list()[1]
+    ok(lg_row ~= nil, "7) the legacy row is listed")
+    eq(lg_row and lg_row.model, "vm-legacy", "7) the legacy alias is kept")
+    eq(lg_row and lg_row.target, "test-model", "7) the legacy target is always written back")
+    eq(lg_row and rawget(lg_row, "candidates"), nil, "7) the legacy row grows no candidates key")
+    eq(lg_row and lg_row.policy, "round_robin", "7) the legacy policy is kept")
+    eq(lg_row and lg_row.effort, "high", "7) the legacy effort is kept")
+    eq(lg_row and #lg_row.workers, 1, "7) the legacy workers list is kept")
+    check(lg_row ~= nil and cjson.encode(lg_row):find("candidates", 1, true) == nil,
+        "7) the encoded legacy row never mentions candidates")
+    local lg_snap_row = lg_snap and lg_snap.virtual_models[1]
+    eq(lg_snap_row and rawget(lg_snap_row, "candidates"), nil, "7) apply_profiles' snapshot has no candidates key")
+    eq(lg_snap_row and lg_snap_row.target, "test-model", "7) apply_profiles' snapshot keeps the target")
+    local lg_of = store.snapshot_of(store.current()).virtual_models[1]
+    eq(lg_of and rawget(lg_of, "candidates"), nil, "7) snapshot_of hands out no candidates key")
+    eq(lg_of and lg_of.target, "test-model", "7) snapshot_of writes the target")
+    check(lg_of ~= nil and cjson.encode(lg_of):find("candidates", 1, true) == nil,
+        "7) the snapshot text has no candidates field")
+    local lg_doc = store.document().virtual_models[1]
+    eq(lg_doc and rawget(lg_doc, "candidates"), nil, "7) document() has no candidates key")
+    eq(lg_doc and lg_doc.target, "test-model", "7) document() writes the target back")
+    check(cjson.encode(store.document().virtual_models):find("candidates", 1, true) == nil,
+        "7) the document text never mentions candidates")
+    local lg_prof = store.profile_for("vm-legacy")
+    eq(lg_prof and rawget(lg_prof, "candidates"), nil, "7) profile_for hands out no candidates key")
+    eq(lg_prof and lg_prof.target, "test-model", "7) profile_for keeps the legacy target")
+    eq(lg_prof and rawget(lg_prof, "explicit_target"), nil, "7) profile_for leaks no bookkeeping")
+    local lg_cfg, lg_cfg_err = store.cfg_from_document({ virtual_models = { { model = "vm-l2", target = "t2" } } })
+    eq(lg_cfg_err, nil, "7) cfg_from_document accepts the legacy shape")
+    eq(lg_cfg and lg_cfg.virtual_models["vm-l2"], "t2", "7) the alias -> target map is unchanged")
+    eq(lg_cfg and lg_cfg.virtual_profiles["vm-l2"].target, "t2", "7) the profile view is unchanged")
+    eq(lg_cfg and rawget(lg_cfg.virtual_profiles["vm-l2"], "candidates"), nil,
+        "7) cfg_from_document invents no candidates")
+    check(lg_cfg ~= nil
+        and cjson.encode(store.snapshot_of(lg_cfg).virtual_models[1]):find("candidates", 1, true) == nil,
+        "7) the rebuilt legacy snapshot stays candidates-free")
+    -- 纯 target 行经过 document 两轮往返也必须逐字节稳定（没有 candidates 干扰）
+    local lg_t1 = cjson.encode(store.document())
+    local _, lg_a1 = store.apply_document(cjson.decode(lg_t1))
+    eq(lg_a1, nil, "7) the legacy document re-saves cleanly")
+    eq(cjson.encode(store.document()), lg_t1, "7) the legacy round trip is byte-identical")
+
+    -- (8) candidates-only 不长出幻影 target：document 往返逐字节稳定
+    reset_env()
+    store.apply_profiles({ { model = "vm-rt", candidates = { cnd(A, "r-one"), cnd(B, "r-two") } } })
+    local rt_text1 = cjson.encode(store.document())
+    local rt_row1 = cjson.decode(rt_text1).virtual_models[1]
+    eq(rt_row1 and rawget(rt_row1, "target"), nil, "8) round 1 writes no target for a candidates-only row")
+    check(rt_row1 ~= nil and cjson.encode(rt_row1):find('"target"', 1, true) == nil,
+        "8) the encoded candidates-only row has no target field")
+    local _, rt_e2 = store.apply_document(cjson.decode(rt_text1))
+    eq(rt_e2, nil, "8) the JSON editor can save the candidates-only document")
+    local rt_text2 = cjson.encode(store.document())
+    local _, rt_e3 = store.apply_document(cjson.decode(rt_text2))
+    eq(rt_e3, nil, "8) saving it a second time stays clean")
+    local rt_text3 = cjson.encode(store.document())
+    eq(rt_text2, rt_text3, "8) two round trips produce byte-identical JSON")
+    eq(rt_text1, rt_text2, "8) the first save is already a fixed point")
+    local rt_row3 = cjson.decode(rt_text3).virtual_models[1]
+    eq(rt_row3 and rawget(rt_row3, "target"), nil, "8) no phantom target after two round trips")
+    eq(rt_row3 and #rt_row3.candidates, 2, "8) both bindings survive the round trips")
+    eq(rt_row3 and rt_row3.candidates[2].model, "r-two", "8) the binding models survive the round trips")
+    eq(store.profiles_list()[1] and rawget(store.profiles_list()[1], "target"), nil,
+        "8) profiles_list stays target-free after the round trips")
+    check(rt_text3:find("explicit_target", 1, true) == nil,
+        "8) the internal bookkeeping field never reaches the document")
+    check(rt_text3:find("phantom", 1, true) == nil, "8) no invented model name appears in the text")
+    reset_env()
+    store.apply_profiles({
+        { model = "vm-mix8", target = "rep-model", candidates = { cnd(A, "m-one"), cnd(B, "m-two") } },
+    })
+    local mx_text1 = cjson.encode(store.document())
+    check(mx_text1:find('"target":"rep-model"', 1, true) ~= nil,
+        "8) a declared target is written back for a candidates row", mx_text1)
+    local _, mx_e2 = store.apply_document(cjson.decode(mx_text1))
+    eq(mx_e2, nil, "8) the declared-target row re-saves cleanly")
+    local _, mx_e3 = store.apply_document(cjson.decode(cjson.encode(store.document())))
+    eq(mx_e3, nil, "8) and a third save stays clean")
+    local mx_row3 = cjson.decode(cjson.encode(store.document())).virtual_models[1]
+    eq(mx_row3 and mx_row3.target, "rep-model", "8) the declared target survives two round trips")
+    eq(mx_row3 and #mx_row3.candidates, 2, "8) bindings survive alongside a declared target")
+    eq(mx_row3 and mx_row3.candidates[1].model, "m-one", "8) the binding models survive with a declared target")
+
+    -- (9) worker 字段规范化：三种拼写归一、uuid 收小写、url 与 worker 同义
+    reset_env()
+    local _, nz_err = store.apply_profiles({
+        { model = "vm-nz", target = "test-model", candidates = {
+            { worker = "HTTP://POOL-A.INVALID:8080", model = "m-nz" },
+            { worker = "http://pool-a.invalid:8080/", model = "m-nz" },
+            { worker = "http://pool-a.invalid:8080", model = "m-nz" },
+        } },
+    })
+    eq(nz_err, nil, "9) three spellings of one worker are not a conflict")
+    local nz_row = store.profiles_list()[1]
+    eq(nz_row and #nz_row.candidates, 1, "9) the three spellings dedupe to one binding")
+    eq(nz_row and nz_row.candidates[1].worker, A, "9) the worker is stored in normalized form")
+    reset_env()
+    local _, us_err = store.apply_profiles({
+        { model = "vm-url", candidates = {
+            { url = "HTTP://POOL-A.INVALID:8080/", model = "m-u" }, { url = B, model = "m-v" },
+        } },
+    })
+    eq(us_err, nil, "9) url= is accepted as a synonym for worker=")
+    local us_row = store.profiles_list()[1]
+    eq(us_row and #us_row.candidates, 2, "9) both url-shape bindings are stored")
+    eq(us_row and us_row.candidates[1].worker, A, "9) the synonym is stored under worker and normalized")
+    eq(us_row and us_row.candidates[2].worker, B, "9) the second synonym is normalized too")
+    eq(us_row and us_row.candidates[1].model, "m-u", "9) the synonym binding keeps its model")
+    check(us_row ~= nil and rawget(us_row.candidates[1], "url") == nil, "9) no url key survives the store")
+    reset_env()
+    local _, pw_err = store.apply_profiles({
+        { model = "vm-pw", target = "test-model", candidates = { { worker = A, url = B, model = "m-p" } } },
+    })
+    eq(pw_err, nil, "9) a row naming both worker and url is accepted")
+    eq(store.profiles_list()[1] and store.profiles_list()[1].candidates[1].worker, A,
+        "9) worker= wins over the url= synonym")
+    reset_env()
+    local _, uid_err = store.apply_profiles({
+        { model = "vm-uid", candidates = { { worker = UUID_UP, model = "m-id" } } },
+    })
+    eq(uid_err, nil, "9) a uuid-form worker id is accepted as a binding")
+    local uid_row = store.profiles_list()[1]
+    eq(uid_row and uid_row.candidates[1].worker, UUID_LOW, "9) the id binding is stored lowercase")
+    eq(uid_row and uid_row.candidates[1].model, "m-id", "9) the id binding keeps its model")
+    reset_env()
+    local _, mx9_err = store.apply_profiles({
+        { model = "vm-mix9", target = "test-model", candidates = {
+            { worker = "  " .. A .. "  ", model = "m1" }, { worker = UUID_UP, model = "m2" },
+        } },
+    })
+    eq(mx9_err, nil, "9) a padded url and an id coexist in one list")
+    local mx9_row = store.profiles_list()[1]
+    eq(mx9_row and mx9_row.candidates[1].worker, A, "9) the padded url is trimmed and normalized")
+    eq(mx9_row and mx9_row.candidates[2].worker, UUID_LOW, "9) the id is trimmed and lowercased")
+
+    -- (10) candidates 与 workers 两层独立；非法形状各自文案；空数组按未设置处理
+    reset_env()
+    local _, cw_err = store.apply_profiles({
+        { model = "vm-both", target = "test-model", workers = { A, B },
+          candidates = { cnd(A, "m-x"), cnd(B, "m-y") } },
+    })
+    eq(cw_err, nil, "10) workers and candidates are accepted together")
+    local cw_row = store.profiles_list()[1]
+    eq(cw_row and #cw_row.workers, 2, "10) the workers whitelist is kept")
+    eq(cw_row and cw_row.workers[2], B, "10) workers stay normalized urls")
+    eq(cw_row and #cw_row.candidates, 2, "10) the binding layer is kept as well")
+    eq(cw_row and cw_row.candidates[1].model, "m-x", "10) bindings keep their own models")
+    eq(cw_row and cw_row.target, "test-model", "10) the declared target is kept")
+    local cw_snap = cjson.encode(store.snapshot_of(store.current()).virtual_models[1])
+    check(cw_snap:find('"workers"', 1, true) ~= nil and cw_snap:find('"candidates"', 1, true) ~= nil,
+        "10) the snapshot encodes both layers", cw_snap)
+    local bad_cands = {
+        { "not-an-array", "candidates must be an array of objects" },
+        { { "plain-string" }, "must be objects with a worker" },
+        { { 42 }, "must be objects with a worker" },
+        { { { foo = 1 } }, "must name a normalized url or worker id" },
+        { { { model = "m" } }, "must name a normalized url or worker id" },
+        { { { worker = "not a url at all", model = "m" } }, "must name a normalized url or worker id" },
+        { { { worker = 12345, model = "m" } }, "must name a normalized url or worker id" },
+        { { { worker = A, model = 42 } }, "model must be a string or null" },
+        { { { worker = A, model = true } }, "model must be a string or null" },
+        { { foo = 1 }, "candidates must be an array of objects" },
+        { { { worker = NULL, model = "m" } }, "must name a normalized url or worker id" },
+    }
+    for _, case in ipairs(bad_cands) do
+        reset_env()
+        local _, cerr = store.apply_profiles({
+            { model = "vm-bc", target = "test-model", candidates = case[1] },
+        })
+        check(type(cerr) == "string" and cerr:find(case[2], 1, true) ~= nil,
+            "10) candidates rejection wording: " .. case[2], cerr)
+        check(type(cerr) == "string" and cerr:find("vm-bc", 1, true) ~= nil,
+            "10) the rejection names the alias: " .. case[2], cerr)
+        eq(#store.profiles_list(), 0, "10) the rejected batch wrote nothing: " .. case[2])
+    end
+    for _, empty in ipairs({ {}, cjson.decode("[]") }) do
+        reset_env()
+        local _, eerr = store.apply_profiles({
+            { model = "vm-ce", target = "test-model", candidates = empty },
+        })
+        eq(eerr, nil, "10) an empty candidates list is legal (field omitted)")
+        local ce_row = store.profiles_list()[1]
+        ok(ce_row ~= nil, "10) the empty-candidates row is stored")
+        eq(ce_row and rawget(ce_row, "candidates"), nil, "10) an empty candidates list stores nothing")
+        eq(ce_row and ce_row.target, "test-model", "10) the row keeps its other fields")
+    end
+    reset_env()
+    local _, ne_err = store.apply_profiles({ { model = "vm-ne", candidates = {} } })
+    check(type(ne_err) == "string" and (ne_err:find("need both model and target", 1, true) ~= nil
+        or ne_err:find("needs a target model", 1, true) ~= nil),
+        "10) an empty candidates list with no target is the neither-half error", ne_err)
+    reset_env()
+    local _, nd_err = store.apply_profiles({ { model = "vm-nd" } })
+    check(type(nd_err) == "string" and (nd_err:find("need both model and target", 1, true) ~= nil
+        or nd_err:find("needs a target model", 1, true) ~= nil),
+        "10) a row with neither half keeps the old wording", nd_err)
+    local _, doc_nd_err = store.cfg_from_document({ virtual_models = { { model = "vm-dn" } } })
+    check(type(doc_nd_err) == "string" and doc_nd_err:find("needs a target model", 1, true) ~= nil,
+        "10) cfg_from_document words the neither-half row as documented", doc_nd_err)
+    local _, doc_ok_err = store.cfg_from_document({
+        virtual_models = { { model = "vm-dok", candidates = { cnd(A, "doc-model") } } },
+    })
+    eq(doc_ok_err, nil, "10) cfg_from_document accepts a target-less candidates row")
+
+    -- (11) profile_for 返回拷贝：调用方改不坏存储
+    reset_env()
+    store.apply_profiles({
+        { model = "vm-copy", target = "rep-model", candidates = { cnd(A, "m-one"), cnd(B, "m-two") },
+          workers = { A }, policy = "bucket", effort = "low" },
+    })
+    local cp1 = store.profile_for("vm-copy")
+    ok(cp1 ~= nil, "11) profile_for returns a table for the alias")
+    eq(rawget(cp1, "explicit_target"), nil, "11) the returned profile has no explicit_target key")
+    eq(cp1 and cp1.candidates[1].model, "m-one", "11) the copy carries the binding model")
+    cp1.candidates[1].model = "tampered"
+    cp1.candidates[1].worker = "tampered"
+    cp1.candidates[2] = { worker = A, model = "phantom" }
+    cp1.target = "tampered"
+    local cp2 = store.profile_for("vm-copy")
+    eq(cp2 and cp2.candidates[1].model, "m-one", "11) the stored binding is immune to caller writes")
+    eq(cp2 and cp2.candidates[1].worker, A, "11) the stored worker is immune too")
+    eq(cp2 and #cp2.candidates, 2, "11) an appended binding does not leak into the store")
+    eq(cp2 and cp2.target, "rep-model", "11) the stored target is immune to caller writes")
+    eq(store.profiles_list()[1] and store.profiles_list()[1].candidates[1].model, "m-one",
+        "11) profiles_list reads untampered bindings")
+    eq(store.current().virtual_profiles["vm-copy"].candidates[1].model, "m-one",
+        "11) current() keeps the untampered binding")
+    check(cp2 ~= nil and cp1 ~= nil and cp2.candidates[1] ~= cp1.candidates[1],
+        "11) two calls hand out different binding tables")
+    local cp3 = store.profile_for("vm-copy")
+    eq(cp3 and #cp3.workers, 1, "11) the copied worker list is independent too")
+    eq(cp3 and cp3.policy, "bucket", "11) the copy carries the policy")
+    eq(cp3 and cp3.effort, "low", "11) the copy carries the effort")
+
+    -- (12) env 种子层：旧 LMR_VIRTUAL_MODELS 形状仍只是 {target} 的 profile
+    reset_env()
+    _G.LMR_ENV_CACHE.LMR_VIRTUAL_MODELS = "env-old:real-old"
+    local ev_doc = store.env_defaults()
+    local ev_rows = {}
+    for _, row in ipairs(ev_doc.virtual_models) do ev_rows[row.model] = row end
+    ok(ev_rows["env-old"] ~= nil, "12) the legacy env pair still seeds a row")
+    eq(ev_rows["env-old"] and ev_rows["env-old"].target, "real-old", "12) the env row keeps its target")
+    eq(ev_rows["env-old"] and rawget(ev_rows["env-old"], "candidates"), nil,
+        "12) the env row grows no candidates key")
+    check(ev_rows["env-old"] ~= nil
+        and cjson.encode(ev_rows["env-old"]):find("candidates", 1, true) == nil,
+        "12) the encoded env row never mentions candidates")
+    local ev_prof = store.profile_for("env-old")
+    eq(ev_prof and ev_prof.target, "real-old", "12) profile_for serves the env alias")
+    eq(ev_prof and rawget(ev_prof, "candidates"), nil, "12) the env profile carries no candidates key")
+    eq(ev_prof and rawget(ev_prof, "explicit_target"), nil, "12) no internal bookkeeping leaks for the env row")
+    eq(store.profiles_list()[1] and rawget(store.profiles_list()[1], "candidates"), nil,
+        "12) profiles_list keeps the env row target-only")
+    eq(store.resolve_model("env-old"), "real-old", "12) resolve_model still maps the env alias")
+    reset_env()
+end
+verify_candidate_bindings()
 
 --------------------------------------------------------------------------
 -- 6. policy / effort 词表：合法名收下，空/auto/null 省略，垃圾名与非字符串 400

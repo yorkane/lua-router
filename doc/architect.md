@@ -2,8 +2,8 @@
 
 > 本文是架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略子系统、周边集成、
 > 部署形态与测试框架。计数对应 2026-10-01 当前 main 树：15 个 Lua 模块 + policies/ 6 文件 /
-> 22 319 行、单测 9 文件、契约 650 项 / 23 段、20 门禁全绿（日志
-> `/data/tmp/lr-gates/gates-20261001-145420.log`）。裁剪判定与执行记录见
+> 24 417 行、单测 10 文件、契约 650 项 / 23 段、21 门禁全绿（日志
+> `/data/tmp/lr-gates/gates-20261001-214729.log`）。裁剪判定与执行记录见
 > [scope-trim.md](scope-trim.md)；已删平面的描述在 git 历史，本文只描述现状。
 
 ## 0. 定位与全景
@@ -112,18 +112,18 @@ sequenceDiagram
 
 ## 3. 模块地图
 
-全部在 `lualib/resty/luarouter/`，单测对应 `test/unit/test_*.lua`（9 个文件，luajit 与 resty
+全部在 `lualib/resty/luarouter/`，单测对应 `test/unit/test_*.lua`（10 个文件，luajit 与 resty
 双口径）。
 
 | 模块 | 行数 | 职责 | 被谁接线 |
 |---|---:|---|---|
-| router.lua | 4071 | 入口与总装：路由表、转发泵、重试、/_ui 处理、metrics handler、DP rank 注入 | init.lua / 各 conf 的 *_by_lua |
-| config_store.lua | 2509 | 热配置：别名/profile/upstreams/effort/ctx/policy（`LMR_CONFIG_FILE` 原子落盘 + shdict 快照） | router/init |
-| registry.lua | 2042 | worker 注册表（shdict 持久）、健康状态、`/model_info` 元数据发现、DP 展开 url@rank、负载字段折叠 | router/hb/mesh/watcher |
+| router.lua | 4409 | 入口与总装：路由表、转发泵、重试、/_ui 处理、metrics handler、DP rank 注入；候选装配 `candidates_for` 的门序（健康→白名单/绑定→模型许可→容量硬排除）与 per-attempt 卡片解析 | init.lua / 各 conf 的 *_by_lua |
+| config_store.lua | 2864 | 热配置：别名/profile（含 `candidates` 多绑定与其校验）/upstreams（含每服务上限声明）/effort/ctx/policy（`LMR_CONFIG_FILE` 原子落盘 + shdict 快照） | router/init |
+| registry.lua | 2795 | worker 注册表（shdict 持久）、健康状态、`/model_info` 元数据发现、DP 展开 url@rank、负载字段折叠、**每服务上限判定 `capacity_exclusion`**、`models`/`models_verified` 覆盖度 | router/hb/mesh/watcher |
 | mesh.lua | 2525 | HA gossip：成员表、快照同步、/ha/* 端点、身份统一（sync_with 并键）、suspect/down 状态机 | init 定时器 |
 | watcher.lua | ~2.2k（描述性，非计数口径） | 进程内服务发现：targets/docker.sock/proc 三源、严格 /v1/models 探针、十条守卫（1-9 移植自 Python 守护进程，第 10 条=探针确认不可用即按分档摘除，见 gap-watcher-merge.md §1.1）、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
-| observability.lua | 1407 | Prometheus 家族渲染（HELP/TYPE 对齐 Rust）、请求日志环形缓冲、inflight 年龄槽表 | router/metrics handler |
-| gpu_load.lua | 1102 | GPU 负载源：worker /metrics 抓取 + 远程 Prometheus 查询，写 registry 负载字段 | hb 定时器挂载 |
+| observability.lua | 1460 | Prometheus 家族渲染（HELP/TYPE 对齐 Rust）、请求日志环形缓冲、inflight 年龄槽表 | router/metrics handler |
+| gpu_load.lua | 1721 | GPU 负载源：worker /metrics 抓取 + 远程 Prometheus 查询，写 registry 负载字段；**第三条通道**顺带采回绝对瓦特（`pw:`，只服务 `max_power_w`，不参与 0..1 打分） | hb 定时器挂载 |
 | hash.lua | 964 | BLAKE3 环位（与 Rust 逐位兼容）、ketama 序、粘滞键 | consistent_hashing/prefix_hash |
 | policy.lua | 901 | 策略分发（random/round_robin/power_of_two/manual 内联于此）、policy hint、cache_aware 逃逸/快照 | router |
 | policies/*.lua | 2314 | tree（基数树+粘滞）/cache_aware/bucket/consistent_hashing/prefix_hash 五个实现 + utils | policy |
@@ -153,7 +153,7 @@ sequenceDiagram
 
 | 字典 | 大小 | 内容 | 写者 |
 |---|---|---|---|
-| lr_workers | 2m | worker 记录（URL/模型/健康/熔断/元数据/负载字段），registry 每次读写整表 JSON | registry/hb/watcher/mesh |
+| lr_workers | 2m | worker 记录（URL/模型/覆盖度 `models`+`models_verified`/健康/熔断/元数据/负载字段）与数值键 `lo:`（本网关在飞）/`xl:`/`sl:`（外部负载）/`pw:`（毫瓦功率样本，TTL）/`mp:`+`mpok:`（覆盖度探针预算），registry 每次读写整表 JSON | registry/hb/watcher/mesh/gpu_load |
 | lr_policy | 20m | 策略态：manual 粘滞键、routing key 计数、cache_aware 树快照 | policy |
 | lr_stats | 5m | 计数器/直方图/inflight 年龄槽表（1024 定长槽） | observability |
 | lr_request_log | 20m | 请求日志环形缓冲（/_ui/logs 与 SSE 源） | router log 阶段 |
@@ -171,6 +171,11 @@ P1+P2 ≈45–65%）。
 选择流：`router.route_inference` → `policy.select(policy_name, ctx)` → 策略实现从 registry 候选里
 挑目标；`hb` 先过滤不健康/熔断中的 worker；失败回退序在 router 层（重试换 worker）。策略可经
 `/_ui/config` 热切换（全局 + per-model，免重启，见 [gap-routing-dyn.md](gap-routing-dyn.md)）。
+
+候选集层面先于策略的两道门（`router.candidates_for`，策略零改动）：**模型许可**（IGW 只收窄未绑定候选，
+显式绑定不受探针否决）与**每服务容量硬排除**（`registry.capacity_exclusion`）。后者必须是排除而不是打分，
+因为 cache_aware 命中亲和时按 URL 直取 tenant、完全不看负载——「超限但粘人」的 worker 会把这条规则想搬走
+的流量原样留下；唯一不会与之打架的位置就是让它根本进不了候选数组。见 [gap-worker-caps.md](gap-worker-caps.md) §1。
 
 路由文本抽取契约（策略稳定键的来源）：messages 按 system/user/tool/developer 序拼 content、
 assistant 含 `reasoning_content`、数组 content 只取 `{type=text}` 片段以单空格拼接、
@@ -194,6 +199,8 @@ per-model policy hint：worker 注册元数据可携带策略提示（`metadata.
 |---|---|---|
 | 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | worker 0 三源发现（targets/dockersock/proc）、严格 `/v1/models` 探针、十条守卫、宽限期；独立容器已退役。探针确认不可用按分档摘除：确定性否定当轮摘、传输层未知攒 `SMG_WATCHER_PROBE_FAILURES`(2) 轮再摘、单轮摘除超 owned 一半降级为只 warn。测试 mock 仍会短暂入池，根治需端口黑白名单（见 [gap-watcher-merge.md](gap-watcher-merge.md)） |
 | GPU 负载源 | worker/监控 → registry | `gpu_load.lua` 两路：抓 worker `/metrics` 的 DCGM 类指标 + 远程 Prometheus 查询；keep-last/grace。这类**转发路径上的**探测失败只损失选路精度、不参与摘除判定（摘除分档只属于上一行的 watcher 严格探针，见 agent-handover.md §4），详见 [gap-gpu-load.md](gap-gpu-load.md) |
+| 每服务容量上限（新增） | 操作员配置 + 两个实时读数 → 选路 | `registry.capacity_exclusion`（`lo:` 本网关在飞计数 / `pw:` gpu_load 采到的毫瓦）在 `router.candidates_for` 装配候选时**硬排除**：超限的 worker 进不了候选数组，即使 cache_aware 亲和命中也迁走；不摘 worker、不改健康。**读数未知 → 不排除**（`pw:` 缺席=未知≠0，监控故障只许损失精度不许损失容量）。全场都在上限上时 fail-closed 503 `no_available_workers`（不放宽），message 追加「N at their configured concurrency/power cap」以区分「池子空了」与「池子满了」。指标 `smg_worker_capacity_excluded_total{reason}`（Lua 独有超集，Rust 无此能力）。见 [gap-worker-caps.md](gap-worker-caps.md) |
+| 虚拟模型多绑定（新增） | config → 选路与改写 | `virtual_models` 条目的 `target` 变可选、新增 `candidates:[{worker, model?}]`：一个别名可把不同实例绑到相同或不同的上游模型，转发体的 `model` 与 effort/ctx 卡都跟着**选中候选的绑定名**走。worker 记录多 `models`（主模型恒居首）与 `models_verified`（只有引擎 `/v1/models` 答过的才盖章；手填/声明不盖章 → 不构成排除依据）。旧形状原样兼容。见 [gap-virtual-models.md](gap-virtual-models.md) §8 |
 | mesh peer | router↔router | `SMG_MESH_PEERS` 种子 + gossip 同步 worker 视图；身份统一由 sync_with 并键（幻影键已修，mesh_two 门钉住）；`/_mesh/internal/*` 无鉴权，只能开在可信网络 |
 | authz 边缘 | client→router | 生产经隧道域名时 authz 闸门加会话登录或 x-api-key；网关自身零鉴权，全部端点开放 |
 
@@ -223,7 +230,7 @@ scope-trim 删除，git 历史可恢复。
 
 `test/final_gates.sh` 是唯一入口（GATE_TIER=quick|full 缺省 quick、SKIP_ENV/GATE_ONLY/KEEP_GOING，
 串行硬门，**不可并发**——host 网络 + 固定容器名前缀会争用；发版/计数/生产替换必须 full 档）。
-20 门：build、conf、unit、contract（23 段 650 项）、probes、
+21 门：build、conf、unit、contract（23 段 650 项）、probes、
 e2e_stateful、e2e_policies、e2e_ui_bridge、e2e_errors、e2e_effort、head_routes、mesh_http、
 e2e_policy_parity、e2e_watcher、e2e_profiles、e2e_token_accounting、e2e_gpu_load、
 e2e_routing_dyn、mesh_two、e2e_tls_chain；逐门计数与覆盖见 README 基线表。

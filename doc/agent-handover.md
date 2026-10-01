@@ -8,14 +8,15 @@
 
 lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能移植 + 裁剪 + 扩展）。当前形态：
 **多 GPU 服务的服务发现与请求调度器**——8 策略选路、健康/熔断/限流、DP 展开、mesh HA、进程内 watcher
-（原独立 llm-watcher 容器已合并退役）、GPU 负载双源、路由策略热切换、token 核算、虚拟模型 profile 与
-持久化 upstreams、Quasar UMD 管理控制台（/_ui/admin/）。
+（原独立 llm-watcher 容器已合并退役）、GPU 负载双源 + 功率通道、路由策略热切换、token 核算、
+虚拟模型 profile 与持久化 upstreams（含 candidates 多绑定：一个别名可把不同实例绑到不同上游模型）、
+每服务并发/功率上限（候选集硬排除）、Quasar UMD 管理控制台（/_ui/admin/）。
 
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-01）：**20 门禁全绿**（含契约 650/23 段）、Lua 22 319 行 / 15 个模块 + policies/6 文件、
-单测 9 文件、文档 20 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
+基线（2026-10-01）：**21 门禁全绿**（含契约 650/23 段）、Lua 24 417 行 / 15 个模块 + policies/6 文件、
+单测 10 文件、文档 20 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
 
@@ -33,16 +34,20 @@ TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
 ```
 lualib/resty/luarouter/  15 模块 + policies/（6 个复杂策略文件；random/rr/pot/manual 内联 policy.lua）
-  router.lua(4071)   入口总装：klib.router 分发、转发泵、重试、熔断、指标/_ui/mesh/model-map 挂载
+  router.lua(4409)   入口总装：klib.router 分发、转发泵、重试、熔断、指标/_ui/mesh/model-map 挂载
   init.lua           fork 前接线：env 快照、hb/watcher/mesh/负载定时器（worker0 + lr_locks 单飞）、on_log 兜底
   registry.lua       worker 注册表（lr_workers shdict）、健康态、DP 展开、负载字段折叠
+                     新增：每服务上限判定 capacity_exclusion（lo:/pw: 两个读数）+ models/models_verified 覆盖度
   watcher.lua(~2.2k 行，描述性)  进程内服务发现：targets/docker/proc 三源、严格 /v1/models 探针、
                      十条守卫（1-9 移植自 Python 守护进程；第 10 条=探针按分档摘除不可用条目，
                      见 §4 与 gap-watcher-merge.md §1.1）、ledger、model-map
-  gpu_load.lua(1102) GPU 负载源：worker /metrics 抓取 + 远程 Prom 查询，写 registry 负载字段
+  gpu_load.lua(1721) GPU 负载源：worker /metrics 抓取 + 远程 Prom 查询，写 registry 负载字段
+                     第三条通道：同一轮顺带采回绝对瓦特写 pw:（只服务 max_power_w，不参与打分）
   policy.lua+policies/  8 策略；cache_aware=亲和树+负载逃逸（per-process 树，多 worker 亲和率衰减）
   hb.lua             健康巡检 + 熔断计数 + /v1/loads 扇出 + gpu_load 定时器挂载点
   config_store.lua   热配置：别名/profile/upstreams/effort/ctx/policy（LMR_CONFIG_FILE 原子落盘+shdict）
+                     virtual_models 支持 candidates:[{worker,model?}] 多绑定（一个别名跨模型/跨实例）；
+                     upstreams 可声明 max_concurrency/max_power_w/models
   observability.lua  Prometheus 家族渲染、请求日志环形缓冲（/_ui/logs 源）、inflight 年龄槽表
   mesh.lua(2525)     HA gossip（用户裁定保留；/_mesh/internal/* 无鉴权=信任边界=网络）
   limit.lua / hash.lua / ui.lua / props.lua / config.lua
@@ -71,14 +76,14 @@ docker-entrypoint.sh env 校验→envsubst→openresty -t→exec；cache_aware/m
 ```bash
 cd /home/aigc/ChatGPT/lua-router
 bash test/final_gates.sh                     # 快速档（缺省 5 门，约 3 分钟）——普通修改够用
-GATE_TIER=full bash test/final_gates.sh      # 全量 20 门（串行 12–17 分钟）——发版/计数/生产替换
+GATE_TIER=full bash test/final_gates.sh      # 全量 21 门（串行 12–17 分钟）——发版/计数/生产替换
 GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 TEST_ONLY=inflight_age bash test/test_lua_router.sh   # 契约单段
 ```
 
-**20 门**：build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge e2e_errors
+**21 门**：build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge e2e_errors
 e2e_effort head_routes mesh_http e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
-e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain。
+e2e_routing_dyn e2e_profiles e2e_caps mesh_two e2e_tls_chain。
 
 **已知 flake/坑**：
 
@@ -105,6 +110,17 @@ e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain。
   luarouter_config）；进程内可变状态只许 cache_aware 树、bucket 计数、mesh 成员表（三者都已钉 worker=1 或有衰减文档）。
 - **缺省零行为变化**：所有新开关（SMG_WATCHER_ENABLED、SMG_LOAD_SOURCE、policy 覆盖）缺省时对外行为
   与旧版逐字节一致，这是门禁判据的一部分。
+- **每服务上限是「候选集层面的硬排除」，并且「读数未知 → 不排除」**（用户裁定 2026-10-01，新增的安全性地基）：
+  worker 记录上的 `max_concurrency` / `max_power_w` 到顶时该 worker 必须**从候选数组里剔除**，
+  **即使 cache_aware 的亲和命中也照样迁走**（判定在 `registry.capacity_exclusion`，接入在
+  `router.candidates_for`、`policy:select` 之前，`policies/` 零改动）。不许把它实现成策略里的一个负载
+  打分项：亲和命中按 URL 直取 tenant、完全不看负载，打分挪不走它想挪的流量。它同时**不摘 worker、
+  不改健康位与熔断状态**——这是「这一轮不给它派活」，不是「它坏了」。另一半地基是**功率读数未知时
+  绝不排除**：`pw:` 缺席=「未知」而非 0，`set_power_w` 拒收负值/NaN/±inf，采不到就什么都不写、靠 TTL
+  过期回到 nil，**绝不写 0、绝不沿用上一次旧值**。理由与下面的探针红线同源：监控系统挂掉的代价只能是
+  精度，不能是容量。全场都在上限上时 fail-closed 503 `no_available_workers` 不放宽（只给 message 加一个
+  「N at their configured concurrency/power cap」从句，让操作员分清「池子空了」与「池子满了」）。
+  完整口径见 [gap-worker-caps.md](gap-worker-caps.md) §1–§3。
 - **探针失败分档，后果不同**（用户裁定 2026-10-01，改这块前先读；完整口径与表格见
   gap-watcher-merge.md §1.1，本节与它必须逐字同义）：
   - **转发路径上的探测**（hb 健康巡检、gpu_load 抓 /metrics 与远程 Prom）失败只损失精度——降级、keep-last、
@@ -164,13 +180,24 @@ curl -s http://127.0.0.1:8800/_ui/config/policy            # 生效链 JSON
 4. **watcher 扫描污染根治**：proc 扫描需要端口黑白名单策略（或 GPU 负载门禁标签）以区分测试 mock。
 5. **UI 会话历史页**：history 平面已删，原版 webui 里的会话页需要下次 UI 升级时摘除。
 6. **GPU↔worker 映射靠 host**：同机独立多卡会共享读数（gap-gpu-load.md §限制）。
+7. **每服务上限的两个残余缺口**（gap-worker-caps.md §8）：① **mesh 集群视图不同步** ——
+   `mesh.observe_worker` 只镜像 `{worker_id, model_id, url, health, load}`，`models` /
+   `models_verified` 与两个上限都不过去，对端 `GET /ha/workers` 看不见，上限因此是**每网关独立**；
+   ② **`disable_health_check` 的 worker 永不获得引擎背书** —— 它不进 discover，因此永不经
+   `registry.refresh_models`，`models_verified` 不会为真，要多模型绑定只能靠 config 行显式声明
+   `models`（只是备注，不构成否决依据）。另有一处前后端断点：`registry.info()` 不输出
+   `models_verified`，`GET /workers` 因此拿不到它，管理台的「引擎已验证」徽章与
+   `ui/admin/models.html` 的已验证计数恒不生效（后端补一个字段即通）。
+8. **功率三个 env 没进 config.lua/JSON/UI**（`SMG_LOAD_POWER` / `_KEYS` / `_QUERY` 由 gpu_load
+   自己 `os.getenv`）：不可热改、进不了 `/_ui/config`，与 AGENTS.md 重点 3/4 的口径不符（收尾项）。
 
-## 7. 文档地图（doc/，20 份）
+## 7. 文档地图（doc/，22 份）
 
 **现行权威**：README（入口）、architect.md（架构总览）、scope-trim.md（裁剪判定书+执行记录）、
 agent-handover.md（本文）、todo-deferred.md（TODO 口径）、gap-mesh.md、gap-mesh-final.md、
 gap-watcher-merge.md、gap-gpu-load.md、gap-routing-dyn.md、gap-token-accounting.md、
 gap-inflight-age.md、gap-metrics-final.md、gap-tls-chain.md、gap-virtual-models.md、
+gap-worker-caps.md（每服务并发/功率上限：候选集硬排除、最热卡口径、功率通道）、
 parity-cpu-ablation.md。
 
 **对拍与真实评测（数据留档，引用前注意树龄）**：parity-contract/routing/policy-extra/perf-v2、

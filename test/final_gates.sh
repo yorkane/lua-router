@@ -10,7 +10,7 @@
 #
 # Usage:
 #   bash test/final_gates.sh                    # quick tier (default, ~3 min)
-#   GATE_TIER=full bash test/final_gates.sh     # all 20 gates (release/count/
+#   GATE_TIER=full bash test/final_gates.sh     # all 21 gates (release/count/
 #                                               # pre-production changes)
 #   SKIP_ENV=mesh_http GATE_TIER=full bash ...  # skip named gates (recorded)
 #   GATE_ONLY=unit bash test/final_gates.sh     # single gate (any tier)
@@ -45,6 +45,22 @@
 #                  LMR_CONFIG_FILE revival across a restart, the 30 s self-heal
 #                  timer re-adding a hand-deleted config member, apply-document
 #                  with all-or-nothing reject)
+#   e2e_caps       integration/e2e_caps.py (the two worker-level capabilities:
+#                  S1 a virtual alias bound to two instances of two *different*
+#                  models under IGW=1 and IGW=0 (forwarded model == the bound
+#                  name), plus candidates-intersect-legacy-workers (an added
+#                  `workers` list can only narrow the bindings, never widen them:
+#                  a whitelist that matches nothing must empty the candidate set to
+#                  503 without leaking to a bound instance);
+#                  S2 per-worker max_concurrency really excludes the saturated
+#                  instance from the candidate array; S3 max_power_w excludes on the
+#                  gpu_load watt reading (machine-hottest-card semantics) while a
+#                  *missing* reading stays unknown = never excluded; the /metrics
+#                  lr_gpu_load_power* family; S6 default-off exports zero power
+#                  series; S4 cache_aware affinity cannot carry a capped instance;
+#                  S5 pool-full 503 keeps code no_available_workers with the cap
+#                  count in the message; S7 a renamed config row stops routing the
+#                  old name under IGW; S5c default-off pool behaviour unchanged)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
 #   e2e_tls_chain  integration/e2e_tls_chain.py (server-side TLS: runtime-built
@@ -55,7 +71,7 @@
 # Tiers (GATE_TIER=quick|full, default quick):
 #   quick = build conf unit contract probes — the fast-verifiable core
 #           (~3 min). Enough for ordinary edits.
-#   full  = all 20 gates (~12-17 min serial). Required for release builds,
+#   full  = all 21 gates (~12-17 min serial). Required for release builds,
 #           README/handover count updates and production image replacement;
 #           a quick-tier green log never counts as a full-green anchor.
 #
@@ -117,7 +133,7 @@ mkdir -p "$LOG_DIR"
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort head_routes mesh_http
             e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
-            e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain)
+            e2e_routing_dyn e2e_profiles e2e_caps mesh_two e2e_tls_chain)
 
 # quick tier: only the gates that verify in seconds-to-minutes without the
 # slow e2e container suites. The default for ordinary changes.
@@ -289,7 +305,10 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles; do
+    # test_caps_routing：并发/功率上限与 candidates 交集的纯 luajit 单测（无端口，
+    # 与其余 luajit 组同档）；它钉的判定在 router.lua/registry.lua 里，HTTP 面只有
+    # e2e_caps 一份门禁，二者缺一就会漏掉"上限写成排序项"这类回归。
+    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
@@ -320,6 +339,9 @@ gate_mesh_http()     { run_integration test_mesh_http.py 900; }
 gate_e2e_policy_parity() { run_integration e2e_policy_parity.py 1800; }
 gate_e2e_watcher()    { run_integration e2e_watcher.py 900; }
 gate_e2e_profiles()   { run_integration e2e_profiles.py 1500; }
+# 与 e2e_profiles 相邻：同样依赖 virtual_models/profiles 形状（candidates 绑定/交集
+# 走的是同一套 config_store 校验与 candidates_for 过滤）。
+gate_e2e_caps()       { run_integration e2e_caps.py 900; }
 gate_e2e_token_accounting() { run_integration e2e_token_accounting.py 900; }
 gate_e2e_gpu_load()    { run_integration e2e_gpu_load.py 900; }
 gate_e2e_routing_dyn() { run_integration e2e_routing_dyn.py 900; }
@@ -348,6 +370,7 @@ gate mesh_http
 gate e2e_policy_parity
 gate e2e_watcher
 gate e2e_profiles
+gate e2e_caps
 gate e2e_token_accounting
 gate e2e_gpu_load
 gate e2e_routing_dyn

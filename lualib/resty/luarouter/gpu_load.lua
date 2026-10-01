@@ -11,6 +11,26 @@
 --   * source=none     缺省：没有定时器、没有抓取、registry 一个 key 都不写，
 --     也就是零行为变化。
 --
+-- 第三条通道：GPU **功率**（worker 记录上的 max_power_w 上限，判定在 registry 的
+-- capacity_exclusion，本模块只负责喂读数）。它与上面
+-- 两路共用同一次抓取（metrics 路复用同一个 /metrics 正文，prom 路各自多一条 PromQL），
+-- 但走 registry 的独立键（pw:，毫瓦）而不是负载归一化那一路：
+--   * 功率是**绝对瓦特**，不是 0..1 打分，所以绝不进 _M.normalize()（那会把 90 W
+--     当成 90 % 折成满载），也不写进 load()/K_XLOAD。
+--   * 一台 worker 对应整台机器的多张卡时取**所有卡的最大值**：上限判定要避免把请求
+--     打到已经最热的那张卡上，取和会让「一张满载七张空闲」看起来仍然很闲。
+--     口径（router/文档/UI 必须按这一句写，运维按它配阈值）：per-worker 功率上限
+--     max_power_w 比较的是**本机最热那张卡的绝对瓦特**，不是该 worker 独占那张卡的
+--     瓦特。一台 8 卡机上的每个实例都看得见全部卡，所以同机 worker 拿到同一个读数；
+--     多卡共机上据此排除会比「只按自己那张卡」保守，这是有意的（宁可少打一份流量，
+--     也不把请求塞给一张已经顶到 TDP 的卡）。想按单卡 TDP 配的运维要先把 worker 与卡
+--     一一对上，否则阈值会提前触发。
+--   * 采不到就什么都不写，让 TTL 自然过期回到 registry.power_w() == nil，router 侧
+--     「未知 -> 不排除」。写 0 或沿用上一次的旧值都会让一个坏掉的 exporter 把 worker
+--     永久顶在功率上限之外，那是监控系统故障吃掉容量。
+-- 缺省关闭：metrics 路要 SMG_LOAD_POWER=1 才扫功率，prom 路要 SMG_LOAD_POWER_QUERY
+-- 非空才多发一条查询，两者都不设时本模块的抓取次数与写入的 key 和改动前逐个字节一致。
+--
 -- 分两层（与 watcher.lua / mesh.lua 同一形状）：
 --   * 纯逻辑层（本文件前半）：Prometheus 文本解析、PromQL 模板渲染、vector 到 worker
 --     的映射、负载合成。不碰 ngx、不 require registry，所以
@@ -60,6 +80,39 @@ local DEFAULT_METRIC_KEYS = {
     "vllm:gpu_cache_usage_perc",
 }
 _M.DEFAULT_METRIC_KEYS = DEFAULT_METRIC_KEYS
+
+-- 功率 gauge 的候选名（SMG_LOAD_POWER_KEYS 为空时用）。列在这里的名字都是在
+-- 21.k（8x RTX PRO 6000 Blackwell SE）上真实抓到的写法：
+--   * DCGM_FI_DEV_POWER_USAGE        dcgm-exporter :9400 的每卡瓦特，
+--       '# HELP DCGM_FI_DEV_POWER_USAGE Power draw (in W).'，样本
+--       DCGM_FI_DEV_POWER_USAGE{gpu="0",Hostname="gpu-pro6000-1",...} 89.780000
+--       （抓取：ssh 21.k 'curl -s 127.0.0.1:9400/metrics'，样本
+--        /data/tmp/dcgm-metrics-9400.txt）。Prometheus :9092 里同名，标签
+--       多出 instance="127.0.0.1:9400" / job="dcgm"。
+--   * node_hwmon_power_average_watt  node_exporter 的 hwmon 功率，只有整机口径，
+--       **故意不进缺省名单**。折叠规则是「取最大」，而 node_hwmon 给的是整机/电源
+--       口径（一台 8 卡机能读到 700 W+），把它和每卡读数混在一起会让最热的卡被高估，
+--       配上 max_power_w 就是「这台机器上的所有 worker 永久高于上限」——监控系统的一
+--       个口径错误吃掉整台机器的容量，比没有读数糟得多。确实只有 node_exporter 的
+--       机器请显式写进 SMG_LOAD_POWER_KEYS（那时取最大就是 operator 自己的选择）。
+-- 推理引擎自己的 /metrics 一律**没有**功率：21.k 上的 sglang 8026 全文 87 KB 里
+-- grep -iE 'power|watt' 命中 0 行（样本 /data/tmp/sglang-metrics-8026.txt），vLLM
+-- 同样只有 gpu_cache_usage_perc 一类。所以 metrics 路只对「引擎与 dcgm-exporter
+-- 同机、且 operator 把 SMG_LOAD_METRICS_PATH 指到 exporter」的情形有意义，
+-- 跨机采集请用 prom 路。
+local DEFAULT_POWER_METRIC_KEYS = {
+    "dcgm_fi_dev_power_usage",
+}
+_M.DEFAULT_POWER_METRIC_KEYS = DEFAULT_POWER_METRIC_KEYS
+
+-- 一个还能被当成「单卡功率」的读数上限。dcgm 的 DCGM_FI_DEV_POWER_USAGE 是每卡
+-- 瞬时瓦特，本 fleet 里最大的卡（Blackwell SE / H200 级）功率墙也在 600-1000 W，
+-- 取 5000 留五倍余量。超出的几乎只会是被误配进来的**能量计数器**（焦耳，例如
+-- DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION 会爬到千万）、整机功耗或 UPS 读数——那种
+-- 数字喂给功率上限判定，会让这一路 worker 永久高于上限而被整个摘出候选集，
+-- 也就是一个配错的 gauge 名单独干掉一个实例。宁可回「未知」。
+local MAX_PLAUSIBLE_WATTS = 5000
+_M.MAX_PLAUSIBLE_WATTS = MAX_PLAUSIBLE_WATTS
 
 -- Identity labels a Prometheus series can carry the machine in. `instance` is what
 -- the exporters get scraped with (host:port), the rest cover the SD-produced label
@@ -397,6 +450,243 @@ function _M.normalize(value)
     return load
 end
 
+--------------------------------------------------------------- power (absolute W)
+
+---Usable single-GPU watt reading, or nil.
+---
+---三道筛子，每一道都对应一种「会把功率上限判定带偏」的真实读数：
+---  * 非数 / NaN / ±inf：同 parse_number() 的口径。
+---  * <= 0：本 fleet 的卡（RTX PRO 6000 SE）空载也有 80-90 W，读到 0 只可能是
+---    exporter 把「没有这个字段」渲染成了 0。registry 允许存 0，而 0 会被判成
+---    「远低于任何上限」，等于一个坏 exporter 给这台 worker 发了免检牌。
+---  * >= MAX_PLAUSIBLE_WATTS：几乎只会是被误配进 SMG_LOAD_POWER_KEYS 的能量计数器
+---    （DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION 是焦耳，会爬到 1e7 以上）或整机/UPS
+---    功率。这种数字进池子会让该 worker 永久高于上限、整个从候选集消失。
+---宁可回 nil（未知 → 不排除），也不猜。
+---@param value number|string|nil
+---@return number|nil watts
+function _M.power_watt(value)
+    local number = _M.parse_number(value)
+    if number == nil or number <= 0 or number >= MAX_PLAUSIBLE_WATTS then
+        return nil
+    end
+    return number
+end
+
+---Max **usable** watt reading over every power gauge in one exposition.
+---
+---Same shape as max_gauge() (any label set of any wanted name participates) but
+---not the same reduction rule: values go through power_watt() first, so a body
+---that carries one honest 96 W series and one mis-fed 1.2e7 energy counter still
+---answers 96 W instead of poisoning the cap. max_gauge() cannot do this because
+---it reduces over raw values before normalize() ever sees them.
+---@param text string|nil @ the exposition body
+---@param names table[]|string|nil @ gauge names to keep (default DEFAULT_POWER_METRIC_KEYS)
+---@return number|nil watts
+function _M.max_power_watts(text, names)
+    if type(text) ~= "string" or text == "" then
+        return nil
+    end
+    local wanted = {}
+    local list = _M.metric_key_list(names)
+    if #list == 0 then
+        list = _M.metric_key_list(DEFAULT_POWER_METRIC_KEYS)
+    end
+    for i = 1, #list do
+        wanted[list[i]] = true
+    end
+    local best
+    for line in string.gmatch(text, "[^\r\n]+") do
+        if string.byte(line, 1) ~= 35 then
+            local identity, value_text = split_sample(line)
+            local name = canon(identity)
+            if name and wanted[name] then
+                local watts = _M.power_watt(value_text)
+                if watts and (best == nil or watts > best) then
+                    best = watts
+                end
+            end
+        end
+    end
+    return best
+end
+
+---Fold a result vector down to one **watt** reading per host (hottest card wins).
+---
+---host_values() 的功率版：唯一的区别是不走 normalize()。那是本模块最容易写错的
+---一行——照抄 host_values() 会把 96 W 折成 1.0（96/100 夹到上限），于是功率通道
+---输出的「1」既不是瓦特也不是负载，上限判定拿它去比 max_power_w 就永远不成立。
+---多卡取最大而非取和/取平均：一台 worker 往往看得见整机所有卡，路由要避免把请求
+---打到已经最热的那张卡上，取和会让「一张满载七张空闲」看起来仍然很闲。
+---
+--- 标签匹配比 host_values() 宽一档，而且要解决一个 host_values() 从来不需要面对的
+--- 歧义：dcgm-exporter 的机器名标签是**大写** Hostname（见 /data/tmp/dcgm-metrics-9400.txt），
+--- host_of() 只认小写键，所以先把标签键小写化；但小写化之后 Hostname 仍然排在
+--- HOST_LABELS 里 instance 的**后面**，而 dcgm 的每条 series 都同时带
+--- instance="127.0.0.1:9400"——那是 exporter 被抓取的地址，不是机器身份。照抄
+--- host_of() 的优先级会让两台机器各自的 dcgm-exporter 因为 instance 相同被折成同一个
+--- 键，A 机器最热的卡把 B 机器的 worker 顶出自己的功率上限，而 unmatched 仍是 0、
+--- 日志一声不响（跨机串瓦数）。反过来，若 operator 按注释里的建议写
+--- max by (Hostname)(...)，结果只剩 Hostname，而 worker url 是 http://127.0.0.1:80xx
+--- （21.k 生产实例的八个 worker 全这样），按机器名匹配又会全部 unmatched。两个方向都
+--- 要能落地，所以这里自己定优先级并**同时**登记两把键：
+---   * 机器名标签（Hostname / hostname / nodename / host / node / pod / name）→
+---     键 = 机器名，覆盖「operator 只 by(Hostname)」与「url 用可解析主机名」两种写法；
+---   * instance → 键 = 它的主机部分，但只有它是非环回地址（真·机器地址），或共享这个
+---     环回 instance 的整批 series 只属于**一台**机器时才采纳。后者正是本 fleet 的常态：
+---     21.k 的八个 worker 全注册成 http://127.0.0.1:80xx，dcgm 的 instance 是
+---     127.0.0.1:9400，两边在 "127.0.0.1" 这个键上相遇。一旦同一个环回 instance 背后
+---     出现两个不同 Hostname，说明这台 Prometheus 抓了多台机器的本机 exporter，此时环回
+---     键没有资格代表其中任何一台，整个不采纳（→ 采不到 → 什么都不写，绝不猜）。
+--- 只作用于功率通道，负载那一路的匹配语义保持原样（改动它会影响既有 e2e 的断言）。
+---@param rows table[]|nil @ parse_prom_response() rows
+---@return table @ host -> watts (only usable readings)
+function _M.host_powers(rows)
+    local by_host = {}
+    if type(rows) ~= "table" then
+        return by_host
+    end
+    -- pass 1：折叠机器名读数，同时记录「每个 instance 键背后出现过哪些机器名」。
+    local inst_watts, inst_machines = {}, {}
+    for i = 1, #rows do
+        local row = rows[i]
+        local watts = row and _M.power_watt(row.value)
+        if watts and type(row.labels) == "table" then
+            local lowered = {}
+            for key, value in pairs(row.labels) do
+                if type(key) == "string" then
+                    lowered[string.lower(key)] = value
+                end
+            end
+            local machine = _M.host_of({
+                hostname = lowered.hostname or lowered.nodename or lowered.host,
+                node = lowered.node, pod = lowered.pod, name = lowered.name,
+            })
+            local inst = _M.host_from_label(lowered.instance)
+            if machine then
+                if by_host[machine] == nil or watts > by_host[machine] then
+                    by_host[machine] = watts
+                end
+            end
+            if inst then
+                if inst_watts[inst] == nil or watts > inst_watts[inst] then
+                    inst_watts[inst] = watts
+                end
+                local seen = inst_machines[inst]
+                if not seen then
+                    seen = {}
+                    inst_machines[inst] = seen
+                end
+                -- 没有机器名标签的 series 无法自证身份，用空串占位表示「归属存疑」。
+                seen[machine or ""] = true
+            end
+        end
+    end
+    -- pass 2：环回 instance 只有在「整批 series 同属一台机器」时才有资格当键。
+    -- adopted 记下哪些 instance 键真的被采纳，pass 3 要用它判断机器名键是否多余。
+    local adopted = {}
+    for inst, watts in pairs(inst_watts) do
+        local distinct = 0
+        for machine in pairs(inst_machines[inst] or {}) do
+            distinct = distinct + 1
+        end
+        local loopback = (inst == "localhost" or inst == "::1"
+            or string.sub(inst, 1, 4) == "127.")
+        if (not loopback) or distinct <= 1 then
+            if by_host[inst] == nil or watts > by_host[inst] then
+                by_host[inst] = watts
+            end
+            adopted[inst] = watts
+        end
+    end
+    -- pass 3：删掉被 instance 键完全代表的机器名键。
+    --
+    -- 同一台机器往往同时被两把键代表：Hostname="gpu-pro6000-1" 与
+    -- instance="10.252.25.217:9400"。裸查或 by (Hostname, instance) 时两者都会出现，
+    -- 而 worker url 只能命中其中一把——另一把必然落进 unmatched，于是「明明采到了、
+    -- 功率上限也在生效」的实例上，lr_gpu_load_power_unmatched_total 会随机器数稳定
+    -- 增长，排障的人就会被指向「标签口径对不上」这个根本不存在的原因（17c 就是这个
+    -- 形状）。因为 instance 键的 max 覆盖了该机器全部 series，只要它被采纳且
+    -- 值不小于机器名键，机器名键就没有携带任何额外信息：删掉不丢读数。
+    -- 反过来，机器名键被单独保留（17d 的 by (Hostname) 场景）正是 operator 需要看到
+    -- 的「采得到却配不上 worker」信号，绝不能一起删掉。
+    for machine, watts in pairs(by_host) do
+        if adopted[machine] == nil and machine ~= "" then
+            local redundant
+            for inst, inst_watts in pairs(adopted) do
+                local seen = inst_machines[inst]
+                if seen and seen[machine] and inst_watts >= watts then
+                    redundant = true
+                    break
+                end
+            end
+            if redundant then
+                by_host[machine] = nil
+            end
+        end
+    end
+    return by_host
+end
+
+--- Power knobs for this pass, read straight from the environment.
+---
+--- 为什么读 env 而不是 cfg：resty.luarouter.config 不在本轮改动范围内（它把每个开关都
+--- 过一遍 clamp 与缺省归一化），所以这三个名字由本模块自己 os.getenv。三点后果如实写
+--- 在这里，别让下一个读者误以为它们已经和其余 SMG_LOAD_* 同等待遇：
+---   * nginx 按 `env` 白名单重建 worker 环境，漏声明就静默失效（本仓库踩过的坑），
+---     所以三份 conf 都要声明：conf/lua-router.conf、conf/nginx.conf.template，以及集成
+---     测试用的 test/conf/nginx-lua-router.conf（_lib.py 的 CONF_TEST 用的正是它，漏了它
+---     e2e 里设 SMG_LOAD_POWER=1 会形同虚设）。
+---   * worker 环境在 fork 时就固定，全仓没有任何 setenv/putenv，所以这里每 tick 现读并不
+---     比 init 期读一次更“热”——真正的生效方式是重启容器 / 重下 compose。别把这三个开关
+---     承诺成可热改的能力。
+---   * 它们因此也进不了 config_store 的 JSON 文档与 /_ui/config，UI 上看不见也改不了。
+---     并进 config.lua 的解析（从而被 JSON 保存链路与管理台覆盖，符合 AGENTS.md「新配置面
+---     必须落到可视化」）是紧随其后的收尾项，需要 config 侧的文件所有权。
+--- cfg.load_power* 优先于 env：给测试注入用，也是将来接进 config.lua 的天然入口。
+---  * SMG_LOAD_POWER       metrics 路是否顺带扫功率（"1"/"true"/"yes"）
+---  * SMG_LOAD_POWER_KEYS  覆盖功率 gauge 名单（逗号/空格分隔）
+---  * SMG_LOAD_POWER_QUERY prom 路的第二条 PromQL；留空 = 不采功率
+---@param cfg table|nil @ router config; cfg.load_power* wins when present
+---@return table @ {on, keys, query}
+function _M.power_config(cfg)
+    cfg = cfg or {}
+    local function env(name)
+        if type(os.getenv) ~= "function" then
+            return nil
+        end
+        local value = os.getenv(name)
+        if type(value) ~= "string" or value == "" then
+            return nil
+        end
+        return value
+    end
+    local on = cfg.load_power
+    if on == nil then
+        local raw = env("SMG_LOAD_POWER")
+        if type(raw) == "string" then
+            local lowered = string.lower(raw)
+            on = lowered == "1" or lowered == "true" or lowered == "yes" or lowered == "on"
+        else
+            on = false
+        end
+    end
+    local keys = cfg.load_power_keys
+    if keys == nil or (type(keys) == "table" and #keys == 0)
+        or (type(keys) == "string" and string.match(keys, "^%s*$")) then
+        keys = env("SMG_LOAD_POWER_KEYS")
+    end
+    local query = cfg.load_power_query
+    if query == nil or (type(query) == "string" and query == "") then
+        query = env("SMG_LOAD_POWER_QUERY")
+    end
+    return {
+        on = not not on,
+        keys = keys,
+        query = (type(query) == "string" and query ~= "") and query or nil,
+    }
+end
+
 ------------------------------------------------------------------ prom (remote)
 
 ---Render one PromQL out of the template.
@@ -727,6 +1017,66 @@ local function default_write(id, value, timestamp, ttl_secs, url)
     return written
 end
 
+---Store one **watt** sample on the registry's independent `pw:` key.
+---
+---Why two return values rather than a boolean: the caller must distinguish "there
+---was no reading to store" (nothing is written, the old sample simply TTLs out and
+---the cap reads *unknown*) from "a reading registry refused" (a genuinely broken
+---exporter, worth a counter), and both from a stored sample. This layer never
+---writes 0 and never repeats the previous value — that is exactly what makes the
+---power cap safe to leave switched on. registry.set_power_w() already rejects
+---negatives/NaN/±inf; what is added here is the seam symmetry with
+---default_write() and the per-worker gauge.
+---@param id string
+---@param watts number|nil @ absolute watts
+---@param timestamp number @ ms clock (accepted for seam symmetry, unused here)
+---@param ttl_secs number
+---@param url string|nil @ only for the gauge label
+---@return boolean stored, string reason
+local function default_write_power_inner(id, watts, ttl_secs, url)
+    local registry = registry_mod()
+    if not registry or type(registry.set_power_w) ~= "function" then
+        return false, "no-registry"
+    end
+    local stored = registry.set_power_w(id, watts, ttl_secs)
+    if not stored then
+        return false, "rejected"
+    end
+    if url then
+        _M.publish_worker_power_gauge(url, watts)
+    end
+    return true, "stored"
+end
+
+---Store one watt sample, telling the two kinds of "not stored" apart.
+---
+---registry.set_power_w() answers false both when it refuses an unusable number
+---(negative / NaN / ±inf) and when the shared dict simply had no room — the first
+---means the exporter is lying, the second means this gateway is out of memory, and
+---an operator reading one counter must not be sent looking at the wrong one. So
+---the value is re-screened here with the same predicate the parsers use: if it is
+---valid, a false from registry can only be the dict, which is counted as an error
+---of *this* module rather than a rejection. (The "rejected" branch is therefore
+---rare by construction — everything reaching here already passed power_watt().)
+---@param id string
+---@param watts number|nil @ absolute watts
+---@param timestamp number @ ms clock (accepted for seam symmetry, unused here)
+---@param ttl_secs number
+---@param url string|nil @ only for the gauge label
+---@return boolean stored, string reason
+local function default_write_power(id, watts, timestamp, ttl_secs, url)
+    if _M.power_watt(watts) == nil then
+        return false, "rejected"
+    end
+    local stored, why = default_write_power_inner(id, watts, ttl_secs, url)
+    if (not stored) and why == "rejected" then
+        -- The number is usable, so registry's only remaining reason to refuse is
+        -- the shared dict. It already logged the shdict error itself.
+        return false, "store-failed"
+    end
+    return stored, why
+end
+
 -- One warn key per (class, target) so a Prometheus that is down does not spend the
 -- error log; the window is the reason the key carries the class.
 local warned_at = {}
@@ -779,9 +1129,28 @@ function _M.run_pass(cfg, opts)
     local stats = {
         source = cfg.load_source or "none", probed = 0, matched = 0,
         failed = 0, unmatched = 0, skipped = 0, errors = 0,
+        -- 功率通道的独立计数（每 worker 功率上限的采集侧）。全部从 0 起，未启用时保持
+        -- 全 0 且不导出，缺省关闭的实例上 /metrics 与改动前逐字节一致。口径：
+        -- probed = metrics 路是「被拨通过且正文可用」的 worker 数，prom 路是「成功
+        -- 执行的功率查询」数；matched = 真正写进 pw: 的读数数；failed = 拨通了却取不
+        -- 到可用瓦数；errors = 连查询都没做成/响应不可解析；rejected = registry 拒收。
+        power_enabled = false, power_probed = 0, power_matched = 0,
+        power_failed = 0, power_rejected = 0, power_errors = 0,
+        power_unmatched = 0, power_skipped = 0,
     }
     if stats.source == "none" then
         stats.skipped = 1
+        -- 唯一需要在「负载源关着」时说的话：功率是**搭载**在负载源上的（同一个
+        -- 定时器、同一次抓取），source=none 时那个定时器根本不启动，于是设了
+        -- SMG_LOAD_POWER / SMG_LOAD_POWER_QUERY 也不会有任何读数，而 max_power_w
+        -- 会安静地一直按「未知 → 不排除」放行——正是最容易以为自己在生效、其实没有的
+        -- 那种配置。留一条去重 WARN，比静默强。
+        local want_power = _M.power_config(cfg)
+        if want_power.on or want_power.query then
+            -- 这里不能用手边的 stamp()：它在下面才赋值，此刻还是个 nil 全局。
+            _M.warn_dedup("power-source-none", "none",
+                "power requested but SMG_LOAD_SOURCE=none: no timer runs, set it to metrics or prom")
+        end
         return stats
     end
 
@@ -789,6 +1158,7 @@ function _M.run_pass(cfg, opts)
     local post = opts.post or default_post
     local list_workers = opts.workers or default_workers
     local write = opts.write or default_write
+    local write_power = opts.write_power or default_write_power
     local stamp = opts.now or now_ms
     local timeout_ms = math.max(250, (tonumber(cfg.load_timeout_secs) or 4) * 1000)
     local ttl_secs = tonumber(cfg.load_stale_secs)
@@ -812,8 +1182,34 @@ function _M.run_pass(cfg, opts)
     local workers = list_workers() or {}
     stats.workers = #workers
 
+    -- 功率通道（缺省关闭）。放在两路分支之前统一算一次，metrics 路用它决定「同一个
+    -- 正文要不要顺手扫功率」，prom 路用它决定「要不要多发一条查询」；两处都不启用时
+    -- 下面两个分支的执行路径与改动前完全一致。
+    local power = _M.power_config(cfg)
+    -- 「这一路真的被启用了」而不是「操作员配过某个功率开关」：metrics 路只认 on，prom
+    -- 路只认 query。否则会出现一种误导性的导出——source=metrics 却只设了
+    -- SMG_LOAD_POWER_QUERY（那条查询在这条路上永远不执行，只有 WARN），power_enabled
+    -- 为真于是导出 power_workers=0 / samples_total=0，看板读起来像「功率在生效但一台
+    -- 都没采到」，而真相是这条根本不该有读数。
+    if stats.source == "metrics" then
+        stats.power_enabled = power.on
+    elseif stats.source == "prom" then
+        stats.power_enabled = power.query ~= nil
+    else
+        stats.power_enabled = false
+    end
+
     if stats.source == "metrics" then
         local names = _M.metric_key_list(cfg.load_metrics_keys)
+        local power_names = _M.metric_key_list(power.keys)
+        if power.query then
+            -- 配了功率 PromQL 却把负载源设成 metrics：这条查询永远不会被执行。
+            -- metrics 路没有 Prometheus 可问，只能扫 worker 自己的 /metrics。与其
+            -- 静默失效（operator 会一直以为功率上限在生效），留一条去重 WARN。
+            _M.warn_dedup("power-query-ignored", "metrics",
+                "SMG_LOAD_POWER_QUERY set but SMG_LOAD_SOURCE=metrics; use source=prom",
+                stamp())
+        end
         for i = 1, #workers do
             local record = workers[i]
             stats.probed = stats.probed + 1
@@ -850,18 +1246,69 @@ function _M.run_pass(cfg, opts)
                         write(record.id, load, stamp(), ttl_secs, record.url)
                         stats.matched = stats.matched + 1
                     end
+                    -- 功率用**同一次 GET 的正文**再扫一遍：一次抓取两个读数，不额外
+                    -- 增加拨号次数（引擎的 /metrics 常有几十 KB，多打一轮是纯浪费）。
+                    -- 位置很关键：它排在上面「负载 gauge 有没有采到」的 if/else **之后**
+                    -- 而不是它的 else 分支里——一个正文里没有负载 gauge 却带功率 gauge
+                    -- 的 exporter（dcgm-exporter 本体就是这种，只有 DCGM_* 没有
+                    -- nvidia_gpu_utilization）仍然要交出功率读数，两个读数是独立的。
+                    -- 反过来取不到功率也不影响负载那一路：stats.failed 与
+                    -- power_failed 各自记账，抓取失败（非 2xx / 超正文上限）只算进
+                    -- 负载的 failed，功率这边连 probed 都不加——没有正文就没什么可扫的，
+                    -- 再记一次 failure 会把同一个故障数成两遍。
+                    if power.on then
+                        stats.power_probed = stats.power_probed + 1
+                        local watts = _M.max_power_watts(body, power_names)
+                        if watts == nil then
+                            -- 采不到：什么都不写。旧的 pw: 键会在自己的 TTL 后消失，
+                            -- registry.power_w() 回到 nil，router 侧按「未知 → 不排除」
+                            -- 处理。写 0 或沿用上一次的旧值都会让坏 exporter 把这台
+                            -- worker 永久顶在功率上限之外。
+                            stats.power_failed = stats.power_failed + 1
+                            _M.warn_dedup("power-nogauge", record.url,
+                                "no power gauge in " .. #body .. "B", stamp())
+                        else
+                            local stored, why = write_power(record.id, watts, stamp(),
+                                ttl_secs, record.url)
+                            if stored then
+                                stats.power_matched = stats.power_matched + 1
+                            elseif why == "rejected" then
+                                stats.power_rejected = stats.power_rejected + 1
+                            else
+                                stats.power_errors = stats.power_errors + 1
+                            end
+                        end
+                    end
                 end
             end
         end
     elseif stats.source == "prom" then
         local endpoint = _M.query_endpoint(cfg.load_prom_url)
         local template = cfg.load_prom_query
-        if not endpoint or type(template) ~= "string" or template == "" then
-            stats.skipped = 1
-            _M.warn_dedup("prom-config", tostring(cfg.load_prom_url),
-                "SMG_LOAD_PROM_URL/SMG_LOAD_PROM_QUERY incomplete", stamp())
-            return stats
+        if power.on and not power.query then
+            -- 反过来：metrics 路的功率开关对 prom 路没有意义（那里没有 /metrics
+            -- 正文可扫），功率要靠第二条查询。同样只是提示，不改变行为。
+            _M.warn_dedup("power-flag-ignored", "prom",
+                "SMG_LOAD_POWER is the metrics-path switch; prom needs SMG_LOAD_POWER_QUERY",
+                stamp())
         end
+        if not endpoint or type(template) ~= "string" or template == "" then
+            -- 只配功率查询、没配负载查询：以前这里整轮 skip，于是「只想从 Prometheus
+            -- 拿功率」这种完全合理的部署永远采不到读数，max_power_w 一直按「未知 →
+            -- 不排除」放行，操作员却以为上限在生效。现在负载那一路自己 skip，功率
+            -- 那一路照常执行；两条查询共用同一个 SMG_LOAD_PROM_URL，所以 endpoint
+            -- 缺失仍然是整轮 skip。
+            if endpoint and power.query then
+                _M.warn_dedup("prom-config", tostring(cfg.load_prom_url),
+                    "SMG_LOAD_PROM_QUERY empty: running the power query only", stamp())
+            else
+                stats.skipped = 1
+                _M.warn_dedup("prom-config", tostring(cfg.load_prom_url),
+                    "SMG_LOAD_PROM_URL/SMG_LOAD_PROM_QUERY incomplete", stamp())
+                return stats
+            end
+        end
+        local has_load_query = type(template) == "string" and template ~= ""
         local headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }
         local by_host = {}
         local function one(query, target)
@@ -893,7 +1340,127 @@ function _M.run_pass(cfg, opts)
             end
             stats.probed = stats.probed + 1
         end
-        if _M.query_needs_host(template) then
+
+        -- 功率那一路复用同一个 endpoint、同一条 POST helper、同一套
+        -- parse_prom_response / host 折叠，只是换成第二条 PromQL（独立配置项
+        -- SMG_LOAD_POWER_QUERY，留空即不采），并把值交给 host_powers() 而不是
+        -- host_values()——差的正是 normalize() 那一步。
+        --
+--- 为什么不与负载查询合并成一条 PromQL：两者的 gauge 家族、聚合口径常常不同
+--- （负载 avg by (instance) (DCGM_FI_DEV_GPU_UTIL)，功率
+--- max by (Hostname, instance) (DCGM_FI_DEV_POWER_USAGE)），拼成 or/vector(0)
+--- 之类的花活会让一条写坏时两路一起失效，也没法分别归因。两次查询的代价是一个 tick
+--- 多一个 POST，本 fleet 的 Prometheus 完全吃得住。
+---
+--- 写这条 PromQL 时请**保留 instance 标签**（by (Hostname, instance) 或直接裸查
+--- DCGM_FI_DEV_POWER_USAGE）：本 fleet 的 worker 全部注册成 http://127.0.0.1:80xx，
+--- 而机器名标签（Hostname）与 IP 之间没有任何映射可用，只有 exporter 的抓取地址
+--- 127.0.0.1:9400 能把读数交回本机 worker。聚合时把 Hostname 一起 by 上，是为了让
+--- host_powers() 在「同一台 Prometheus 抓了多台机器的本机 exporter」时仍能识破归属
+--- 冲突、宁可整台不采纳，也不会把 A 机最热的卡挂到 B 机头上。
+        local by_power = {}
+        local function one_power(query, target)
+            local ok_call, status, body, err = pcall(post, endpoint, timeout_ms,
+                headers, _M.query_body(query))
+            if not ok_call then
+                stats.power_errors = stats.power_errors + 1
+                _M.warn_dedup("power-prom-raise", target, tostring(status), stamp())
+                return false
+            end
+            local code = tonumber(status) or 0
+            if code < 200 or code >= 300 or type(body) ~= "string" then
+                stats.power_errors = stats.power_errors + 1
+                _M.warn_dedup("power-prom", target,
+                    err or ("status " .. tostring(status)), stamp())
+                return false
+            end
+            local rows, perr = _M.parse_prom_response(body)
+            if not rows then
+                -- 正文不是合法 PromQL 响应（404 页面、query 语法错被代理成 200）：
+                -- 这是「解析失败」，单独计数，供 lr_gpu_load_power_parse_failures_total
+                -- 观测。
+                stats.power_errors = stats.power_errors + 1
+                _M.warn_dedup("power-prom", target, perr, stamp())
+                return false
+            end
+            local folded = _M.host_powers(rows)
+            for host, watts in pairs(folded) do
+                if by_power[host] == nil or watts > by_power[host] then
+                    by_power[host] = watts
+                end
+            end
+            stats.power_probed = stats.power_probed + 1
+            return true
+        end
+        -- 功率这一路：先把自己的 vector 拉回来（查询是否按 host 展开由**它自己的**
+        -- 模板决定，与负载查询互不牵连），再交给 assign() 按 host 落到 worker 上。
+        -- assign() 只按 split_host 取值、不碰数值语义，所以负载那一路的同一套映射
+        -- 规则原样可用：同机多个 worker（DP rank、一机两引擎）自动共享同一个读数，
+        -- series 找不到归属的记成 power_unmatched 而不是硬塞给谁。
+        if power.query then
+            if _M.query_needs_host(power.query) then
+                local queried = {}
+                for i = 1, #workers do
+                    local record = workers[i]
+                    local pq = _M.render_query(power.query, record)
+                    if pq then
+                        if not queried[pq] then
+                            queried[pq] = true
+                            one_power(pq, record.url)
+                        end
+                    else
+                        -- 这条 worker 的 url 解析不出 host，模板没法展开：与负载
+                        -- 那一路的 skipped 同义——它不是「监控系统没给出读数」，而是
+                        -- 「这个 worker 没法问」，混进 failed 会让 lr_gpu_load_power_
+                        -- parse_failures_total 随坏 url 的个数放大，指错排障方向。
+                        stats.power_skipped = stats.power_skipped + 1
+                    end
+                end
+            else
+                one_power(power.query, endpoint)
+            end
+
+            local url_for_power = {}
+            for i = 1, #workers do
+                url_for_power[workers[i].id] = workers[i].url
+            end
+            local p_assigned, p_unmatched = _M.assign(by_power, workers)
+            stats.power_unmatched = p_unmatched
+            -- 查询本身成功却一个可用读数都没有（gauge 名写错、那批机器没起 dcgm、
+            -- 整表都是 NaN）：与 metrics 路的 no-gauge 同义，记一次 failed 并留一条
+            -- 去重 WARN。放在这里而不是 one_power 内，是因为按 host 展开时会有多次
+            -- 查询，只有折叠完才知道「整个 vector 到底有没有可用读数」。
+            if next(by_power) == nil and (stats.power_errors or 0) == 0 then
+                stats.power_failed = stats.power_failed + 1
+                _M.warn_dedup("power-prom-nogauge", tostring(power.query),
+                    "power query returned no usable watt series", stamp())
+            elseif next(p_assigned) == nil and next(by_power) ~= nil then
+                -- 查得到读数、一个 worker 都没配上：几乎只会是标签口径对不上（比如
+                -- by(Hostname) 折叠出的机器名与注册成 IP:port 的 worker url 永不在同
+                -- 一把键上相遇）。这是「功率上限看着在生效、其实一台都没进」最隐蔽的
+                -- 一种，只靠 power_unmatched 计数太容易漏看，所以补一条去重 WARN。
+                _M.warn_dedup("power-prom-unassigned", tostring(power.query),
+                    "power series matched no pooled worker (" ..
+                    tostring(stats.power_unmatched) .. " hosts unmatched)", stamp())
+            end
+            for id, watts in pairs(p_assigned) do
+                local stored, why = write_power(id, watts, stamp(), ttl_secs,
+                    url_for_power[id])
+                if stored then
+                    stats.power_matched = stats.power_matched + 1
+                elseif why == "rejected" then
+                    stats.power_rejected = stats.power_rejected + 1
+                else
+                    stats.power_errors = stats.power_errors + 1
+                end
+            end
+        end
+
+        if not has_load_query then
+            -- 负载这一路本轮没有查询可发（template 是 nil/空），下面的循环必须整个
+            -- 跳过——否则会拿空串去 POST 一条 PromQL，既浪费一次拨号又记进 failed。
+            stats.skipped = stats.skipped + 1
+        elseif _M.query_needs_host(template) then
             -- A {host}-templated PromQL is one query per *machine*: the template is
             -- written against a single host, and several workers can live on one
             -- (the ranks of a DP engine, two engines on one GPU box). Rendering is
@@ -968,6 +1535,33 @@ function _M.publish_metrics(stats)
             stats.unmatched)
     end
     pcall(observability.gauge, "lr_gpu_load_workers", {}, stats.matched or 0)
+    -- 功率家族只在**启用**时导出：缺省关闭的实例上这些键保持 0，一个 series 都不
+    -- 渲染（observability 的导出器会跳过空家族），所以 /metrics 与改动前逐字节一致，
+    -- 契约门禁的 prometheus 段也不会突然多出一族没人解释的指标。
+    if stats.power_enabled then
+        pcall(observability.counter, "lr_gpu_load_power_samples_total", {},
+            stats.power_matched or 0)
+        -- 「解析失败」= 拨通了、查询发出去了，却拿不到可用瓦数：正文里没有功率 gauge、
+        -- 或响应不是合法 PromQL 向量。skipped（worker url 解析不出 host，压根没法问）
+        -- 刻意**不在**这一族里——它是配置问题，数量随坏 url 线性增长，混进来会淹没真
+        -- 故障。error log 里的 warn_dedup class 把每种情形分开写。
+        if (stats.power_failed or 0) > 0 or (stats.power_errors or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_power_parse_failures_total", {},
+                (stats.power_failed or 0) + (stats.power_errors or 0))
+        end
+        -- registry 主动拒收（负值 / NaN / ±inf）：单独的族，因为它意味着 exporter
+        -- 在撒谎而不是没数据，运维要查的是 exporter 而不是网络。
+        if (stats.power_rejected or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_power_rejected_total", {},
+                stats.power_rejected)
+        end
+        if (stats.power_unmatched or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_power_unmatched_total", {},
+                stats.power_unmatched)
+        end
+        pcall(observability.gauge, "lr_gpu_load_power_workers", {},
+            stats.power_matched or 0)
+    end
     return true
 end
 
@@ -986,6 +1580,24 @@ function _M.publish_worker_gauge(url, load)
     end
     return pcall(observability.gauge, "lr_gpu_load", { { "worker", tostring(url) } },
         load)
+end
+
+---Per-worker watt gauge, the power counterpart of publish_worker_gauge(). 单位是
+---**绝对瓦特**，所以这一族绝不能与 lr_gpu_load（0..1）混用或同族——一个看板把两者
+---画在一条 y 轴上，读数是 96 还是 0.96 就说不清了。
+---@param url string
+---@param watts number @ absolute watts
+function _M.publish_worker_power_gauge(url, watts)
+    if not live_ngx() then
+        return false
+    end
+    local ok_obs, observability = pcall(require, "resty.luarouter.observability")
+    if not ok_obs or type(observability) ~= "table"
+        or type(observability.gauge) ~= "function" then
+        return false
+    end
+    return pcall(observability.gauge, "lr_gpu_load_power_watts",
+        { { "worker", tostring(url) } }, watts)
 end
 
 ------------------------------------------------------------------ the timer
@@ -1074,9 +1686,16 @@ function _M.start(cfg)
         return false, "unknown SMG_LOAD_SOURCE: " .. tostring(source)
     end
     if source == "prom" then
-        if not _M.query_endpoint(cfg.load_prom_url)
-            or type(cfg.load_prom_query) ~= "string" or cfg.load_prom_query == "" then
+        -- 启动门槛与 run_pass 对齐：负载查询与功率查询至少要有一条，Prometheus 地址
+        -- 必须有。只填 SMG_LOAD_POWER_QUERY 也是合法部署（只要功率读数），以前这里
+        -- 会连带把它拒掉，定时器根本不启动、功率永远采不到，而且失败原因说的是
+        -- SMG_LOAD_PROM_QUERY，操作员照着改会以为必须配负载查询。
+        local power = _M.power_config(cfg)
+        local has_load = type(cfg.load_prom_query) == "string"
+            and cfg.load_prom_query ~= ""
+        if not _M.query_endpoint(cfg.load_prom_url) or (not has_load and not power.query) then
             return false, "source=prom needs SMG_LOAD_PROM_URL and SMG_LOAD_PROM_QUERY"
+                .. " (or SMG_LOAD_POWER_QUERY for the power channel alone)"
         end
     end
     if timer_running then

@@ -65,6 +65,7 @@
                   <span class="muted q-ml-sm">({{ previewResult.effortChain }})</span></div>
                 <div><span class="k">{{ t.previewResultCtx }}</span><span class="code-pill">{{ previewResult.ctxText }}</span>
                   <span v-if="previewResult.ctx" class="muted q-ml-sm">{{ t.previewCtxNote }}</span></div>
+                <div><span class="k">{{ t.previewServing }}</span><span class="code-pill">{{ previewServing.text }}</span></div>
                 <div v-if="mapNote" class="preview-note">{{ mapNote }}</div>
               </div>
             </q-card-section>
@@ -89,7 +90,10 @@
                 <q-td :props="props">
                   <div class="identity-cell">
                     <div><strong>{{ props.row.model }}</strong>
-                      <span v-if="props.row.target">{{ t.virtualTarget }} → {{ props.row.target }}</span></div>
+                      <span v-if="props.row.target">{{ t.virtualTarget }} → {{ props.row.target }}</span>
+                      <q-badge v-if="(props.row.candidates || []).length" outline color="purple-4" class="chip-soft">
+                        {{ t.virtualCandidates }} · {{ props.row.candidates.length }}</q-badge>
+                      <span v-else-if="props.row.virtual" class="muted" style="font-size:11px">{{ t.virtualBadge }}</span></div>
                   </div>
                 </q-td>
               </template>
@@ -205,15 +209,41 @@
             <q-separator dark></q-separator>
             <q-card-section class="surface-body">
               <div class="rows-list">
-                <div v-for="(row, index) in virtualRows" :key="'va' + index" class="row-edit">
-                  <q-input v-model="row.model" dense outlined dark class="mono" :label="t.virtualAlias" :rules="[virtualAliasRule]"></q-input>
-                  <q-select v-model="row.target" dense outlined dark use-input :options="modelOptions" :option-label="modelOptionLabel"
-                            map-options emit-value :label="t.virtualTarget" :rules="[virtualTargetRule]" input-debounce="120"></q-select>
-                  <span class="muted" style="font-size:11px">{{ t.virtualDeleteHint }}</span>
-                  <q-btn flat round dense icon="mdi-close" color="red-4" @click="virtualRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                <div v-for="(row, index) in virtualRows" :key="'va' + index" style="display:grid;gap:4px;padding:6px 0">
+                  <div class="row-edit">
+                    <q-input v-model="row.model" dense outlined dark class="mono" :label="t.virtualAlias" :rules="[virtualAliasRule]"></q-input>
+                    <!-- target 仍是单值入口（多数别名只绑一个模型）；有候选时它同时充当候选缺省继承的模型名 -->
+                    <q-select v-model="row.target" dense outlined dark use-input :options="modelOptions" :option-label="modelOptionLabel"
+                              map-options emit-value clearable :label="t.virtualTarget" input-debounce="120"></q-select>
+                    <div class="route-cell" style="gap:4px;justify-content:flex-end">
+                      <q-badge v-if="(row.candidates || []).length" outline color="purple-4" class="chip-soft"
+                               :label="t.virtualCandidates + ' · ' + row.candidates.length"></q-badge>
+                      <q-btn flat dense round size="sm" :icon="row.expanded ? 'mdi-chevron-up' : 'mdi-call-split'"
+                             @click="row.expanded = !row.expanded"><q-tooltip>{{ t.virtualCandidates }}</q-tooltip></q-btn>
+                      <span class="muted" style="font-size:11px">{{ t.virtualDeleteHint }}</span>
+                    </div>
+                    <q-btn flat round dense icon="mdi-close" color="red-4" @click="virtualRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                  </div>
+                  <!-- 逐实例绑定：同一别名可以把不同实例绑到不同模型，target 因此可以整体省略 -->
+                  <div v-if="row.expanded || (row.candidates || []).length" style="padding:2px 0 6px 16px">
+                    <div class="rows-list">
+                      <div v-for="(cand, ci) in row.candidates" :key="'vc' + index + '-' + ci"
+                           class="row-edit" style="grid-template-columns: minmax(0,1.4fr) minmax(0,1.2fr) minmax(0,1fr) auto">
+                        <q-select v-model="cand.worker" dense outlined dark use-input :options="workerOptionsFor(cand)"
+                                  map-options emit-value :label="t.virtualWorkerField" input-debounce="120"
+                                  :placeholder="t.virtualWorkerPlaceholder"></q-select>
+                        <q-select v-model="cand.model" dense outlined dark use-input :options="candidateModelOptions(cand.worker)"
+                                  map-options emit-value clearable :label="t.virtualCandidateModel"
+                                  :placeholder="t.virtualInherit" input-debounce="120"></q-select>
+                        <span class="muted" style="font-size:11px">{{ candidateNote(cand, row) }}</span>
+                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="row.candidates.splice(ci, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                      </div>
+                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.virtualCandidateAdd" @click="addCandidate(row)"></q-btn></div>
+                    </div>
+                  </div>
                 </div>
                 <div v-if="!virtualRows.length" class="muted">{{ t.rowsEmpty }}</div>
-                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.virtualAdd" @click="virtualRows.push({ model: '', target: '' })"></q-btn></div>
+                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.virtualAdd" @click="addVirtualRow"></q-btn></div>
               </div>
             </q-card-section>
           </q-card>
@@ -308,6 +338,9 @@
         const legacyCtx = ref([])
         const virtualRows = ref([])
         const mapRows = ref([])
+        // 池成员的实时形状（url / model_id / models / models_verified）：给候选下拉用，
+        // 拉取失败时退化为「只能手填 url」，不阻塞本页其它编辑
+        const poolWorkers = ref([])
         const cardForm = reactive({ model: '', ctx: '', default_effort: null, effort_map: [], modalities: [] })
         const preview = reactive({ model: '', effort: null, modelFilter: '' })
         const filteredModelOptions = ref([])
@@ -325,7 +358,17 @@
           const names = new Set(models.value.map(row => row.model))
           ;(doc.value && doc.value.model_ctx ? doc.value.model_ctx : []).forEach(row => names.add(row.model))
           ;(doc.value && doc.value.model_effort ? doc.value.model_effort : []).forEach(row => names.add(row.model))
-          virtualRows.value.forEach(row => { if (row.target) names.add(row.target) })
+          virtualRows.value.forEach(row => {
+            if (row.target) names.add(row.target)
+            ;(row.candidates || []).forEach(cand => { if (cand.model) names.add(cand.model) })
+          })
+          // 逐实例绑定的模型名也进可引用集合：candidates-only 的别名否则在档位/ctx 的
+          // 下拉里彻底选不到，而那些卡片本来就是按落点模型名配的
+          ;((doc.value && doc.value.virtual_models) || []).forEach(entry => {
+            ;(entry && Array.isArray(entry.candidates) ? entry.candidates : []).forEach(cand => {
+              if (cand && cand.model) names.add(cand.model)
+            })
+          })
           return [...names].filter(Boolean).sort()
         })
         function modelOptionLabel (option) { return option }
@@ -352,6 +395,7 @@
         })
         const mapNote = computed(() => (mapRows.value.length ? t.value.previewMapNote : ''))
 
+
         const cardColumns = computed(() => [
           { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
           { name: 'registered', label: t.value.colRegistered, field: 'registered', align: 'left', sortable: true },
@@ -362,13 +406,34 @@
           { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:90px' }
         ])
 
+        // 别名不服务任何实例，所以永远进不了 models.value（只由池派生）：这里按
+        // document.virtual_models 单独补行，否则配好的别名在表里完全看不见，
+        // 操作员只能靠下面的编辑区盲改。target 缺省时（纯 candidates 绑定）
+        // 用第一条绑定的模型作代表值展示，与后端 representative_target 同口径。
         const cardRows = computed(() => {
           const cards = new Map(models.value.map(row => [row.model, row]))
           const configured = (doc.value && doc.value.model_configs) || []
           configured.forEach(card => {
             if (!cards.has(card.model)) cards.set(card.model, { ...card, registered: false, sources: [] })
           })
-          return [...cards.values()]
+          const rows = [...cards.values()]
+          const aliases = (doc.value && doc.value.virtual_models) || []
+          aliases.forEach(entry => {
+            if (!entry || !entry.model) return
+            const candidates = Array.isArray(entry.candidates) ? entry.candidates : []
+            const first = candidates.find(cand => cand && cand.model)
+            const target = typeof entry.target === 'string' && entry.target
+              ? entry.target : (first ? first.model : '')
+            const existing = rows.find(row => row.model === entry.model)
+            if (existing) {
+              existing.virtual = true
+              existing.target = target
+              existing.candidates = candidates
+              return
+            }
+            rows.push({ model: entry.model, registered: false, sources: [], virtual: true, target, candidates })
+          })
+          return rows
         })
 
         function effortText (value) {
@@ -448,6 +513,23 @@
           }
         })
 
+        // 「这个别名到底有几台实例真的能服务它」不能靠猜：只有引擎自己 /v1/models 答过的
+        // 实例（models_verified）才有否决权，手填或 config 声明的列表只是备注。与后端
+        // registry 的三档同口径：已验证且不含 -> 明确不可路由；一台已验证的都没有 ->
+        // 「没人证明过」，保持可路由而不是假装健康。
+        const previewServing = computed(() => {
+          const model = previewResult.value.resolved || preview.model
+          if (!model || model === '—') return { text: c.value.empty, ok: null }
+          const verified = poolWorkers.value.filter(row => row.models_verified === true)
+          const serving = verified.filter(row => (row.models || []).indexOf(model) !== -1)
+          if (verified.length && serving.length === 0) return { text: t.value.previewServingNo, ok: false }
+          if (!verified.length) {
+            const legacy = poolWorkers.value.filter(row => row.model_id === model).length
+            return { text: legacy ? t.value.previewServingUnverified : t.value.previewServingNone, ok: null }
+          }
+          return { text: t.value.previewServingYes.replace('{n}', String(serving.length)), ok: true }
+        })
+
         // ── 载入 ──
         function hydrate (document_) {
           doc.value = document_
@@ -456,7 +538,16 @@
           globalForm.effort_map = (document_.effort_map || []).map(row => ({ from: row.from, to: row.to }))
           globalForm.model_effort = (document_.model_effort || []).map(row => ({ model: row.model, effort: row.effort }))
           legacyCtx.value = (document_.model_ctx || []).map(row => ({ model: row.model, ctx: row.ctx }))
-          virtualRows.value = (document_.virtual_models || []).map(row => ({ model: row.model, target: row.target }))
+          // raw 保存服务端原样条目：workers/policy/effort 这些表单画不出的字段靠它在保存时
+          // 原样带回，编辑 target 或 candidates 不会顺手抹掉它们（JSON 才是权威面）
+          virtualRows.value = (document_.virtual_models || []).map(row => ({
+            model: row.model || '',
+            target: typeof row.target === 'string' ? row.target : '',
+            candidates: Array.isArray(row.candidates)
+              ? row.candidates.map(cand => ({ worker: cand && cand.worker ? String(cand.worker) : '', model: cand && cand.model ? String(cand.model) : '' }))
+              : [],
+            raw: { ...row }
+          }))
           const map = (document_.watcher && document_.watcher.model_map) || {}
           mapRows.value = Object.entries(map).map(([original, value]) => ({ original, value }))
           if (!preview.model) preview.model = models.value.length ? models.value[0].model : (modelOptions.value[0] || '')
@@ -468,10 +559,19 @@
           loadError.value = ''
           try {
             hydrate(await window.lmrApi.config())
+            loadError.value = ''
           } catch (error) {
             loadError.value = error.message
           } finally {
             loading.value = false
+          }
+          // 服务池只为候选下拉与「该实例覆盖哪些模型」服务：拿不到就退化成手填 url，
+          // 不把整页标成加载失败（别名与档位编辑跟池是否可达无关）
+          try {
+            const pool = await window.lmrApi.workers()
+            poolWorkers.value = (pool && pool.workers) || []
+          } catch (error) {
+            poolWorkers.value = []
           }
         }
 
@@ -526,16 +626,115 @@
         }
 
         function virtualAliasRule (value) { return Boolean(String(value || '').trim()) || t.value.virtualRuleAlias }
-        function virtualTargetRule (value) { return Boolean(String(value || '').trim()) || t.value.virtualRuleTarget }
+
+        // ── 虚拟模型：别名 →（单值 target 或逐实例 candidates）──
+        // 后端约定：target 与 candidates 至少一个；候选的 model 缺省继承 target，所以
+        // 「所有实例绑同一模型」只写 target 就够，「各绑各的模型」才需要 candidates。
+        // worker 用规范化 url（去掉末尾斜杠），与 config_store 的 norm_candidate 同口径。
+        function normWorker (value) {
+          return String(value || '').trim().replace(/\/+$/, '')
+        }
+        function addVirtualRow () {
+          virtualRows.value.push({ model: '', target: '', candidates: [], raw: null, expanded: false })
+        }
+        function addCandidate (row) {
+          if (!Array.isArray(row.candidates)) row.candidates = []
+          row.candidates.push({ worker: '', model: '' })
+          row.expanded = true
+        }
+        // 候选实例的下拉：整个池，外加该行已写的 worker（历史配置不会被「选项里没有」吃掉）
+        function workerOptionsFor (cand) {
+          const names = new Set(poolWorkers.value.map(row => normWorker(row.url)).filter(Boolean))
+          const current = normWorker(cand && cand.worker)
+          if (current) names.add(current)
+          return [...names].sort()
+        }
+        // 候选模型的下拉：该实例真实覆盖的模型优先，无覆盖信息时退回全量模型名
+        function candidateModelOptions (worker) {
+          const url = normWorker(worker)
+          const hit = poolWorkers.value.find(row => normWorker(row.url) === url)
+          const names = new Set(hit && Array.isArray(hit.models) && hit.models.length ? hit.models : modelOptions.value)
+          modelOptions.value.forEach(name => names.add(name))
+          return [...names].filter(Boolean).sort()
+        }
+        function workerNote (url) {
+          if (!normWorker(url)) return t.value.virtualWorkerPick
+          const hit = poolWorkers.value.find(row => normWorker(row.url) === normWorker(url))
+          if (!hit) return t.value.virtualWorkerOffline
+          if (hit.models_verified === false) return t.value.virtualWorkerUnverified
+          return t.value.virtualWorkerPool
+        }
+        function candidateNote (cand, row) {
+          const model = String(cand.model || '').trim()
+          const target = String(row.target || '').trim()
+          const base = workerNote(cand.worker)
+          if (!model) return target ? base + ' · ' + t.value.virtualInheritTo + ' ' + target : base + ' · ' + t.value.virtualNeedsModel
+          return base
+        }
+
+        // 校验口径与 config_store.profile_from_entry 对齐：target/candidates 至少一个、候选要么
+        // 自带 model 要么有 target 可继承、同一 worker 不得绑两个不同模型、别名不等于自己的模型。
+        // 服务端仍是最终裁判，这里只是把 400 提前到点保存之前，并给出可操作的中文说明。
+        function validateVirtualRow (row) {
+          const alias = String(row.model || '').trim()
+          if (!alias) return t.value.virtualRuleAlias
+          const target = String(row.target || '').trim()
+          const bindings = (row.candidates || [])
+            .map(cand => ({ worker: normWorker(cand.worker), model: String(cand.model || '').trim() }))
+            .filter(cand => cand.worker || cand.model)
+          if (!target && !bindings.length) return t.value.virtualNeedEither
+          const seen = {}
+          for (const cand of bindings) {
+            if (!cand.worker) return t.value.virtualCandidateNeedsWorker
+            if (!cand.model && !target) return t.value.virtualNeedsModel
+            const model = cand.model || target
+            if (seen[cand.worker] && seen[cand.worker] !== model) {
+              return window.lmrI18n.translate(locale.value, 'models', 'virtualDupWorker',
+                { worker: cand.worker, a: seen[cand.worker], b: model })
+            }
+            seen[cand.worker] = model
+            if (model === alias) return alias + ' · ' + t.value.virtualSame
+          }
+          if (target && target === alias) return alias + ' · ' + t.value.virtualSame
+          return ''
+        }
+
+        // 表单 → 后端条目：从服务端原样带回的 raw 出发，只改写表单画得出的字段。
+        // raw 里的未知字段（workers/policy/effort 以及将来新增的任何键）一律保留：
+        // 画不出不等于不存在，表单只是 JSON 权威面之外的快捷方式。
+        function virtualEntryFromRow (row) {
+          const entry = { ...(row.raw || {}) }
+          entry.model = String(row.model || '').trim()
+          const target = String(row.target || '').trim()
+          if (target) entry.target = target
+          else delete entry.target
+          const bindings = (row.candidates || [])
+            .map(cand => ({ worker: normWorker(cand.worker), model: String(cand.model || '').trim() }))
+            .filter(cand => cand.worker)
+            .map(cand => (cand.model ? { worker: cand.worker, model: cand.model } : { worker: cand.worker }))
+          if (bindings.length) entry.candidates = bindings
+          else delete entry.candidates
+          return entry
+        }
 
         async function saveVirtual () {
-          const rows = virtualRows.value.map(row => ({ model: String(row.model || '').trim(), target: String(row.target || '').trim() }))
-            .filter(row => row.model || row.target)
-          const invalid = rows.find(row => !row.model || !row.target)
-          if (invalid) { Quasar.Notify.create({ message: t.value.virtualNeedBoth, type: 'negative', position: 'top-right' }); return }
-          const same = rows.find(row => row.model === row.target)
-          if (same) { Quasar.Notify.create({ message: `${same.model} · ${t.value.virtualSame}`, type: 'negative', position: 'top-right' }); return }
-          await mutate(() => window.lmrApi.configVirtual(rows), 'virtualSaved')
+          // 整表替换语义：空行（既没写别名也没写目标）静默丢弃，其余一律提交。
+          // 校验放在发请求之前，报错点名到具体别名，避免服务端 400 只回一行文案。
+          const kept = virtualRows.value.filter(row => {
+            const alias = String(row.model || '').trim()
+            const target = String(row.target || '').trim()
+            const bindings = (row.candidates || []).some(cand => normWorker(cand.worker) || String(cand.model || '').trim())
+            return Boolean(alias || target || bindings)
+          })
+          for (const row of kept) {
+            const error = validateVirtualRow(row)
+            if (error) {
+              Quasar.Notify.create({ message: (String(row.model || '').trim() || '(<no alias>)') + ' — ' + error, type: 'negative', position: 'top-right', timeout: 5200 })
+              return
+            }
+          }
+          const entries = kept.map(virtualEntryFromRow)
+          await mutate(() => window.lmrApi.configVirtual(entries), 'virtualSaved')
         }
 
         async function saveModelMap () {
@@ -619,7 +818,9 @@
           deleteMapRow, doc, effortOptions, effortText, filterModelOptions, globalForm, legacyCtx, load,
           loading, loadError, mapNote, mapRows, modelOptionLabel, modelOptions, modalityOptions,
           modalitiesText, mutate, openCard, pagination, persistNote, preview, previewResult, saving, saveCard, saveGlobal,
-          saveLegacyCtx, saveModelMap, saveVirtual, t, virtualAliasRule, virtualRows, virtualTargetRule,
+          saveLegacyCtx, saveModelMap, saveVirtual, t, virtualAliasRule, virtualRows,
+          addCandidate, addVirtualRow, candidateModelOptions, candidateNote, normWorker, poolWorkers, workerOptionsFor,
+          previewServing,
           watcherColor, watcherLabel, warningMessage
         }
       }

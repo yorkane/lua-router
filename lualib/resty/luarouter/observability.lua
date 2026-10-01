@@ -1098,6 +1098,15 @@ local HELP = {
     -- exporter derives the same series from lr_workers at scrape time, which is
     -- why an empty combination is simply absent rather than rendered as 0.
     smg_worker_pool_size = "Current worker pool size by worker_type, connection_mode, model",
+    -- Lua-side superset: the Rust gateway has no per-worker capacity caps, so this
+    -- family only exists here. router.lua's candidate filter emits it with
+    -- reason=concurrency|power, and those two readings are different in kind (an
+    -- in-flight count this gateway owns versus an external watt sample), so one
+    -- HELP line naming both keeps a Grafana legend from reading the family as a
+    -- single undifferentiated failure mode. Missing this entry is not cosmetic:
+    -- the exporter prints the TYPE line with no HELP above it and the scraper is
+    -- left with a blank description.
+    smg_worker_capacity_excluded_total = "Candidates removed from selection by their configured concurrency or power cap by reason",
     -- Lua-side superset: Rust has no tracing-self metrics and no in-flight gauge.
     smg_http_inflight_requests = "Requests currently being served by the router",
     -- Rust renders this family as non-cumulative gt/le gauges off a 30 s..86400 s
@@ -1139,6 +1148,29 @@ local HELP = {
     lr_watch_owned_workers = "Workers the in-process watcher currently owns",
     lr_watch_protected_workers = "Pre-existing workers the in-process watcher will never delete",
     lr_watch_model_map_entries = "Active watcher model-map renames",
+    -- Power channel of the GPU load source (the per-worker max_power_w cap). Separate
+    -- families from lr_gpu_load* on purpose: those are a 0..1 score, these are
+    -- absolute watts, and one dashboard axis cannot carry both. They only appear
+    -- when SMG_LOAD_POWER / SMG_LOAD_POWER_QUERY is on, so a box that never opted
+    -- in exports exactly what it exported before.
+    --   samples      = watt readings that reached the registry's `pw:` key
+    --   parse_failures = the reading that should have been there and was not: no
+    --                    power gauge in the body, the query failed, or the answer
+    --                    was not a legal PromQL vector
+    --   rejected     = a reading that reached registry.set_power_w and was refused
+    --                    there as unusable. Near-zero by construction: this module
+    --                    screens with power_watt() before calling, so a non-zero
+    --                    count here means an exporter that answers with numbers
+    --                    this gateway cannot trust (negative/NaN/inf) rather than
+    --                    an exporter that is merely silent -- the latter shows up
+    --                    as parse_failures, not here.
+    --   unmatched    = series naming a host no pooled worker is behind
+    lr_gpu_load_power_samples_total = "GPU watt samples stored by the load source",
+    lr_gpu_load_power_parse_failures_total = "GPU watt readings the load source could not obtain or parse",
+    lr_gpu_load_power_rejected_total = "GPU watt readings refused by the registry as unusable",
+    lr_gpu_load_power_unmatched_total = "GPU watt series naming a host with no pooled worker",
+    lr_gpu_load_power_workers = "Workers with a fresh GPU watt sample",
+    lr_gpu_load_power_watts = "Hottest GPU power draw per worker in watts (absolute, not a 0..1 score)",
 }
 
 ---Pool membership labels for one worker record, in the spelling Rust uses.

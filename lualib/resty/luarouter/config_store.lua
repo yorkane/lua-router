@@ -419,21 +419,161 @@ local function build_candidates(alias, raw)
     return out
 end
 
+--- Per-candidate model bindings: {worker=, model=} objects, in declaration order.
+---
+--- 为什么要这一层：一个虚拟模型过去只能整体指向一个 target，于是"217 上那两个实例服务
+--- 同一个模型、21.k 那个实例服务另一个模型"这种真实拓扑就配不出来（要么把整池收窄成一
+--- 个模型，要么所有候选共用一个名字）。候选各带 model 后，转发体里的 model 由选中的那个
+--- 候选决定，绑定就与"上游恰好同构"解耦了。
+---
+--- model 允许缺省：绝大多数绑定就是"这个实例用它自己注册的模型名"，强制写全只会让配置
+--- 冗长、并且和上游改名漂移。缺省即回退 profile.target；target 也没有时这条绑定没有意义
+--- （转发出去的名字双方都没约定过），由 profile_from_entry 拒绝。
+local function build_candidate_bindings(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if not is_array(raw) then
+        return nil, string.format("virtual model %s candidates must be an array of objects", alias)
+    end
+    local out, seen = {}, {}
+    for _, item in ipairs(raw) do
+        if type(item) ~= "table" then
+            return nil, string.format(
+                "virtual model %s candidates entries must be objects with a worker", alias)
+        end
+        -- worker 是唯一必填项。url 收作同义字段：候选描述的就是一个池成员，UI 表格里
+        -- 那一列历来叫 url，两种写法不该有两种语义。
+        local raw_worker = rawget(item, "worker")
+        if raw_worker == nil or raw_worker == JSON_NULL then
+            raw_worker = rawget(item, "url")
+        end
+        local worker = norm_candidate(raw_worker)
+        if not worker then
+            return nil, string.format(
+                "virtual model %s candidates entries must name a normalized url or worker id", alias)
+        end
+        local model
+        local declared = rawget(item, "model")
+        if declared ~= nil and declared ~= JSON_NULL then
+            if type(declared) ~= "string" then
+                return nil, string.format(
+                    "virtual model %s candidate %s model must be a string or null", alias, worker)
+            end
+            local trimmed = trim(declared)
+            if trimmed ~= "" then model = trimmed end
+        end
+        -- 同一实例出现两次：同一条绑定重复提交（UI 往返、运维手改）就静默去重，绑到两个
+        -- 不同模型则必须报 400——"最后一条说了算"会让一次误粘配置悄悄改变路由。
+        local previous = seen[worker]
+        if previous == nil then
+            seen[worker] = model or false
+            out[#out + 1] = { worker = worker, model = model }
+        elseif previous ~= (model or false) then
+            return nil, string.format(
+                "virtual model %s candidate %s is bound to two models: %s and %s",
+                alias, worker, tostring(previous), tostring(model))
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+local function copy_bindings(candidates)
+    -- Shallow copy of the binding list: the snapshot and profile_for must not hand out
+    -- the live tables, or a caller that edits one row would rewrite the config in place.
+    if candidates == nil then return nil end
+    local out = {}
+    for i = 1, #candidates do
+        out[i] = { worker = candidates[i].worker, model = candidates[i].model }
+    end
+    return out
+end
+
+--- Representative upstream model of one profile, i.e. what the *pre-feature* readers
+--- (resolve_model, /v1/models 注入, models 文档) key off. A profile with an explicit
+--- target keeps it verbatim; a candidates-only profile uses its first explicit model so
+--- the alias stays a name those readers understand. Stays nil only when the entry is
+--- rejected anyway (profile_from_entry guarantees a string for every accepted profile).
+local function representative_target(target, candidates)
+    if type(target) == "string" and target ~= "" then return target end
+    for i = 1, #(candidates or {}) do
+        local model = candidates[i].model
+        if type(model) == "string" and model ~= "" then return model end
+    end
+    return nil
+end
+
+--- Shape test for the two pre-validations (document reader and apply_profiles): an
+--- entry may carry either a target or a candidates array, so a missing target is only
+--- fatal when the row also names no bindings. Element-level errors stay with
+--- profile_from_entry; this guards only the wording family the contract pins for
+--- "neither half present". Declared next to the builders because cfg_from_document,
+--- which is much earlier in the file, has to see it as a local.
+local function entry_has_bindings(entry)
+    if type(entry) ~= "table" then return false end
+    local raw = rawget(entry, "candidates")
+    if raw == nil or raw == JSON_NULL then return false end
+    if not is_array(raw) then return true end   -- wrong type: let the builder word it
+    return #raw > 0
+end
+
 --- One validated profile from one entry (shared by the env and document layers).
 --- Returns (profile, nil) or (nil, err); profile carries target plus optional
---- workers/policy/effort, with unset fields absent (never JSON_NULL).
+--- candidates/workers/policy/effort, with unset fields absent (never JSON_NULL).
+---
+--- target became optional (root ruling 2026-10-01, 虚拟模型多绑定): a profile may
+--- instead bind each candidate to its own model, in which case the representative
+--- target is derived from the first explicit binding. Both shapes round-trip; the
+--- legacy {model, target} entry is untouched by this branch.
 local function profile_from_entry(alias, entry)
     if type(entry) ~= "table" then
         return nil, "virtual model entries must be objects"
     end
-    local target = trim(entry.target or "")
-    if target == "" then
-        return nil, string.format("virtual model %s needs a target model", alias)
+    local declared_target = rawget(entry, "target")
+    if declared_target ~= nil and declared_target ~= JSON_NULL and type(declared_target) ~= "string" then
+        return nil, string.format("virtual model %s target must be a string or null", alias)
     end
-    if alias == target then
+    local target = trim(declared_target or "")
+    if target == "" then target = nil end
+    if target ~= nil and alias == target then
         return nil, string.format("virtual model %s must differ from its target", alias)
     end
-    local profile = { target = target }
+    local candidates, cerr = build_candidate_bindings(alias, rawget(entry, "candidates"))
+    if cerr then return nil, cerr end
+    if target == nil and candidates == nil then
+        return nil, string.format("virtual model %s needs a target model or candidates", alias)
+    end
+    -- A binding without its own model inherits the profile target; with no target to
+    -- inherit the forwarded name would be undefined for that one instance, so it is a
+    -- config error rather than something to guess at request time.
+    if candidates then
+        for i = 1, #candidates do
+            local model = candidates[i].model
+            if (model == nil or model == "") and target ~= nil then
+                candidates[i].model = target
+                model = target
+            end
+            if model == nil or model == "" then
+                return nil, string.format(
+                    "virtual model %s candidate %s needs a model (no target to inherit)",
+                    alias, candidates[i].worker)
+            end
+        end
+    end
+    local profile = {
+        target = target or representative_target(target, candidates),
+    }
+    -- The derived representative is held to the same rule as a written target: without
+    -- it a candidates-only entry that names itself gets rejected by the batch chain
+    -- check with the "another virtual model" wording, while the identical shape written
+    -- as a target gets "must differ from its target". Same mistake, one message.
+    if profile.target == alias then
+        return nil, string.format("virtual model %s must differ from its target", alias)
+    end
+    -- 记下 target 是操作员写的还是从候选推出来的。快照必须只回写"写过的"字段：一个
+    -- candidates-only 配置如果被隐式补上 target，磁盘文档就长出一个没人声明的模型名，
+    -- 之后所有 reader（effort 卡、policy hint、/v1/models）都会跟着这个幻影名字找配置。
+    if target ~= nil then profile.explicit_target = true end
+    if candidates then profile.candidates = candidates end
     local workers, werr = build_candidates(alias, rawget(entry, "workers"))
     if werr then return nil, werr end
     if workers then profile.workers = workers end
@@ -467,13 +607,66 @@ local function profile_from_entry(alias, entry)
     return profile, nil
 end
 
---- Full-graph cycle guard: no alias may point at another alias, whether that
---- alias already exists or appears in the same batch (root ruling 4).
 local function assert_no_alias_chain(built, alias, target)
     if built == nil then return nil end
     if built[target] ~= nil then
         return string.format("virtual model %s target must not be another virtual model: %s",
             alias, target)
+    end
+    return nil
+end
+
+--- Per-worker capacity caps for the declaration layer.
+---
+--- 规范化一律走 registry.cap_limit（唯一权威实现）：声明层与 POST/PUT /workers 的 API 层
+--- 必须对同一个输入给出同一个规范值，否则「UI 里填 2.5」与「curl 里填 2.5」会落进池子两
+--- 条不同的记录，drift 判定也会永远收敛不掉。registry 用 store_registry() 的惰性 pcall
+--- 取（与 reconcile 同一入口）：本模块在纯 Lua 单测里会在 registry 缺席或被 stub 替换的
+--- 情况下解析声明，此时退化成本函数末尾那 6 行同语义兜底，并打一条 warn——两侧一致性由
+--- 单测用同一组输入对齐断言，兜底路径本身不作为生产口径。
+---
+--- 为什么 nil 是「不限」而不是 0：记录里根本没有这个键，读取侧（registry.capacity_exclusion
+--- / info）先过 cap_limit，<=0 与非数一律折成 nil。所以声明侧「没写这个字段」与写了个
+--- 无效值，和记录侧「键缺席」，三者必须读成同一件事；drift 判定两侧都先规范化再比较，
+--- 否则「声明不限」对「池里无限」会被判成漂移，30 秒自愈就永远在重写同一个 worker。
+local function declared_cap(value, integer)
+    local reg = store_registry()
+    if reg and type(reg.cap_limit) == "function" then
+        return reg.cap_limit(value, integer)
+    end
+    local number = tonumber(value)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge or number <= 0 then
+        return nil
+    end
+    ngx_log_warn("luarouter config upstream cap normalization without registry (worker stub?)")
+    return integer and math.floor(number) or number
+end
+
+--- Chain guard for the per-candidate bindings.
+
+--- 一条绑定如果指向另一个别名，选到那个候选后转发体里的 model 就成了别名本身，而它根本
+--- 不是上游认识的名字：轻则 404，重则（对端也是本网关）成环。target 只覆盖代表值，其余
+--- 候选必须在写入前一起查，否则"把 target 改成一池各绑各的"这条编辑路径会绕过 root
+--- ruling 4。文案沿用 target 那一族（契约锚定的是措辞家族，不是字段名）。
+---@param built table|nil @ alias -> profile for the batch being validated
+---@param existing table|nil @ live alias -> target map (checked when built does not know it)
+---@return string|nil err
+local function assert_bindings_no_alias(built, existing, alias, profile)
+    if type(profile) ~= "table" or profile.candidates == nil then return nil end
+    for i = 1, #profile.candidates do
+        local model = profile.candidates[i].model
+        if type(model) == "string" and model ~= "" then
+            if model == alias then
+                return string.format("virtual model %s must differ from its target", alias)
+            end
+            local cerr = assert_no_alias_chain(built, alias, model)
+            if not cerr and existing and existing[model] ~= nil then
+                cerr = string.format(
+                    "virtual model %s target must not be another virtual model: %s", alias, model)
+            end
+            if cerr then return cerr end
+        end
     end
     return nil
 end
@@ -524,6 +717,29 @@ local function upstream_from_entry(entry, index)
         end
         local model_id = trim(entry.model_id)
         if model_id ~= "" then out.model_id = model_id end
+    end
+
+    -- Advertised coverage of this endpoint. An operator can name more than the one
+    -- model the engine happens to report first (a merged endpoint serves two, or the
+    -- engine's /v1/models answer is not the name the virtual model binds to), which is
+    -- what makes a per-candidate binding verifiable before traffic arrives. Absent =
+    -- "the probe decides", so this never overwrites what a sweep learned.
+    if rawget(entry, "models") ~= nil and entry.models ~= JSON_NULL then
+        if not is_array(entry.models) then
+            return nil, string.format("upstream %s models must be an array of strings", canonical)
+        end
+        local list, seen = {}, {}
+        for _, item in ipairs(entry.models) do
+            if type(item) ~= "string" then
+                return nil, string.format("upstream %s models must be an array of strings", canonical)
+            end
+            local name = trim(item)
+            if name ~= "" and not seen[name] then
+                seen[name] = true
+                list[#list + 1] = name
+            end
+        end
+        if #list > 0 then out.models = list end
     end
 
     -- Key tri-state (contract 3.4): absent / null = keep, "" = clear, non-empty
@@ -598,6 +814,20 @@ local function upstream_from_entry(entry, index)
             return nil, string.format("upstream %s disable_health_check must be a boolean", canonical)
         end
         out.disable_health_check = dhc
+    end
+
+    -- Per-worker capacity caps (doc/gap-worker-caps.md): the pool side already
+    -- accepts them on POST/PUT /workers, so a declaration that cannot carry them is
+    -- a field the console can set and the document cannot keep. Absent / null /
+    -- invalid all normalize to nil = "unlimited", which is stored as *absent* (never
+    -- an explicit null) exactly like the other optional fields, so a row that never
+    -- mentions caps keeps its pre-feature byte-identical shape.
+    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+        local value = rawget(entry, field)
+        if value ~= nil and value ~= JSON_NULL then
+            local cap = declared_cap(value, field == "max_concurrency")
+            if cap ~= nil then out[field] = cap end
+        end
     end
     return out, nil
 end
@@ -806,7 +1036,19 @@ local function snapshot_of(cfg)
     local virtual_models = {}
     for _, alias in ipairs(sorted_keys(cfg.virtual_models)) do
         local profile = cfg.virtual_profiles[alias] or { target = cfg.virtual_models[alias] }
-        local entry = { model = alias, target = profile.target or cfg.virtual_models[alias] }
+        -- target 只在操作员真的写过它时回写。candidates-only 的配置里 profile.target 是
+        -- 从第一条绑定推出来的代表值，写进磁盘就变成一个没人声明过的模型名：它会被后续
+        -- reader 当成真实模型去找 effort/policy 卡，也会让"删掉 target"这种编辑在下次
+        -- reload 后悄悄复活。缺省字段（而不是 null）是这里既有的往返约定。
+        local entry = { model = alias }
+        if profile.candidates then
+            if profile.explicit_target then
+                entry.target = profile.target or cfg.virtual_models[alias]
+            end
+            entry.candidates = copy_bindings(profile.candidates)
+        else
+            entry.target = profile.target or cfg.virtual_models[alias]
+        end
         -- Optional fields are absent rather than null so a snapshot written by an
         -- older build round-trips unchanged and the JSON editor stays readable.
         if profile.workers then entry.workers = profile.workers end
@@ -827,6 +1069,18 @@ local function snapshot_of(cfg)
             labels = item.labels or {},
             disable_health_check = (item.disable_health_check and true) or false,
         }
+        -- Advertised coverage rides the snapshot so the JSON editor round-trips it:
+        -- absent when nothing was declared (never an explicit null), which is what
+        -- distinguishes "the probe decides" from "declared empty" on the way back in.
+        if item.models then entry.models = { table.unpack(item.models) } end
+        -- Capacity caps round-trip the same way: written only when the row declared a
+        -- usable limit, and *absent* (never an explicit null) for "unlimited". Writing
+        -- an explicit null would make the snapshot carry a field no operator declared,
+        -- and an old build reading it would have to know the key means nothing.
+        for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+            local cap = declared_cap(item[field], field == "max_concurrency")
+            if cap ~= nil then entry[field] = cap end
+        end
         -- Persistence half of the key: state + value ride the snapshot so a
         -- restart (or another worker) can re-apply the same key without ever
         -- seeing it on the wire.
@@ -1044,7 +1298,10 @@ local function cfg_from_document(doc, previous)
         for _, entry in ipairs(doc.virtual_models) do
             local alias = type(entry.model) == "string" and trim(entry.model) or ""
             if alias == "" then return nil, "virtual_models entries need a model (the alias)" end
-            if type(entry.target) ~= "string" or trim(entry.target) == "" then
+            -- target is optional whenever the row carries its own bindings (see
+            -- profile_from_entry); a blank row with neither half keeps the old wording.
+            if (type(entry.target) ~= "string" or trim(entry.target) == "")
+                and not entry_has_bindings(entry) then
                 return nil, string.format("virtual model %s needs a target model", alias)
             end
             local profile, perr = profile_from_entry(alias, entry)
@@ -1055,6 +1312,8 @@ local function cfg_from_document(doc, previous)
         -- name an alias that exists in this table, whoever declared it.
         for alias, profile in pairs(built_profiles) do
             local cerr = assert_no_alias_chain(built_profiles, alias, profile.target)
+            if cerr then return nil, cerr end
+            cerr = assert_bindings_no_alias(built_profiles, nil, alias, profile)
             if cerr then return nil, cerr end
         end
         for alias, profile in pairs(built_profiles) do
@@ -1621,8 +1880,9 @@ function _M.apply_virtual_models(entries)
 end
 
 --- Whole-list replace for the profiles table: entries are the document shape
---- [{model, target, workers?, policy?, effort?}] (legacy {model, target} pairs
---- still validate). Returns (snapshot, nil) or (nil, error).
+--- [{model, target?, candidates?, workers?, policy?, effort?}] (legacy
+--- {model, target} pairs still validate; target-less entries bind per candidate).
+--- Returns (snapshot, nil) or (nil, error).
 function _M.apply_profiles(entries)
     if not is_array(entries) then return nil, "virtual_models must be an array" end
     local built = {}
@@ -1631,7 +1891,8 @@ function _M.apply_profiles(entries)
             return nil, "virtual model entries must be objects"
         end
         local alias = trim(type(entry.model) == "string" and entry.model or "")
-        if alias == "" or trim(type(entry.target) == "string" and entry.target or "") == "" then
+        local has_target = trim(type(entry.target) == "string" and entry.target or "") ~= ""
+        if alias == "" or (not has_target and not entry_has_bindings(entry)) then
             return nil, "virtual model entries need both model and target"
         end
         local profile, perr = profile_from_entry(alias, entry)
@@ -1648,6 +1909,9 @@ function _M.apply_profiles(entries)
                 cerr = string.format(
                     "virtual model %s target must not be another virtual model: %s", alias, profile.target)
             end
+        end
+        if not cerr then
+            cerr = assert_bindings_no_alias(built, _M.current().virtual_models, alias, profile)
         end
         if cerr then return nil, cerr end
     end
@@ -1682,6 +1946,10 @@ function _M.profile_for(model)
     end
     local out = { target = profile.target }
     if profile.workers then out.workers = { table.unpack(profile.workers) } end
+    -- Bindings ride the same "fresh copy" rule as workers: the router reads them per
+    -- request and must not be able to corrupt the live snapshot through the returned
+    -- table. explicit_target is internal bookkeeping and stays inside the store.
+    if profile.candidates then out.candidates = copy_bindings(profile.candidates) end
     out.policy = profile.policy
     out.effort = profile.effort
     return out
@@ -1694,7 +1962,16 @@ function _M.profiles_list()
     local out = {}
     for _, alias in ipairs(sorted_keys(cfg.virtual_profiles)) do
         local profile = cfg.virtual_profiles[alias]
-        local entry = { model = alias, target = profile.target }
+        -- Same rule as snapshot_of: only an operator-declared target is re-emitted, so
+        -- the list handed to the UI / apply endpoint round-trips a candidates-only row
+        -- without inventing a model name nobody configured.
+        local entry = { model = alias }
+        if profile.candidates then
+            if profile.explicit_target then entry.target = profile.target end
+            entry.candidates = copy_bindings(profile.candidates)
+        else
+            entry.target = profile.target
+        end
         if profile.workers then entry.workers = { table.unpack(profile.workers) } end
         entry.policy = profile.policy
         entry.effort = profile.effort
@@ -1754,7 +2031,38 @@ local function upstream_defaults(item)
         cost = tonumber(item.cost) or 1.0,
         labels = item.labels or {},
         disable_health_check = (item.disable_health_check and true) or false,
+        -- Caps are projected through the same normalizer here (rather than read raw)
+        -- so drift and patch see *one* value for "unlimited": nil. The record side is
+        -- normalized the same way before comparison, which is what stops a row that
+        -- declares no cap from reporting drift against a worker that has none either
+        -- (a permanent drift would make the 30s self-heal rewrite the same worker
+        -- forever, the failure mode models_covered() exists to avoid).
+        max_concurrency = declared_cap(item.max_concurrency, true),
+        max_power_w = declared_cap(item.max_power_w, false),
     }
+end
+
+--- Does the stored advertised list already carry everything the row declares?
+---
+--- Subset rather than equality, because the registry *folds* a declaration into what
+--- the probe learned (registry.merge_models): a worker that advertises two models and
+--- is declared with one is converged, and comparing the raw declaration against the
+--- merged list would report drift forever -- the 30s self-heal would rewrite the same
+--- worker on every tick and never settle.
+local function models_covered(want, have)
+    if want == nil then return true end
+    have = have or {}
+    for i = 1, #want do
+        local found = false
+        for j = 1, #have do
+            if have[j] == want[i] then
+                found = true
+                break
+            end
+        end
+        if not found then return false end
+    end
+    return true
 end
 
 local function same_labels(a, b)
@@ -1780,7 +2088,22 @@ local function upstream_drifts(item, record)
     if ((record.disable_health_check and true) or false) ~= want.disable_health_check then
         return true
     end
+    -- Caps on both sides go through the same normalizer before they are compared:
+    -- a PUT of 0 or a negative is stored verbatim by registry.update, but cap_limit
+    -- reads all of those as "unlimited", and an absent field is also "unlimited".
+    -- Comparing raw would report a drift that the pool can never satisfy (the two
+    -- stored shapes both normalize to nil), i.e. the endless self-heal loop again.
+    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+        local have = declared_cap(record[field], field == "max_concurrency")
+        if have ~= want[field] then return true end
+    end
     if not same_labels(want.labels, record.labels) then return true end
+    -- Drift is judged against the *merged* list the registry would end up with, not
+    -- against the declaration: the registry folds a declared single model into what
+    -- the probe already learned (registry.merge_models), so comparing the raw
+    -- declaration against the stored list would report a permanent drift and the
+    -- 30s self-heal would rewrite the same worker forever.
+    if not models_covered(item.models, record.models) then return true end
     local stored = record.api_key
     if stored == false or stored == cjson.null then stored = nil end
     if item.api_key_state == "set" then
@@ -1793,7 +2116,15 @@ end
 
 --- What registry.update should receive for one drifted config worker. Only the
 --- tri-state key is sent when it says so; keep never touches the stored secret.
-local function upstream_patch(item)
+---
+--- `record` (the live pool row, optional) decides only the cap *clears*: registry.update
+--- ignores an absent or null number field, so "the declaration stopped naming a cap"
+--- cannot be sent as a deletion -- the one spelling the pool reads back as unlimited is
+--- an explicit 0 (cap_limit folds <=0 to nil, and an uncapped record costs no dict read).
+--- That 0 is therefore sent only when the stored row really holds a limit; sending it
+--- unconditionally would materialize two keys on every config worker the operator never
+--- capped, which is the byte-shape change this layer promises to avoid.
+local function upstream_patch(item, record)
     local want = upstream_defaults(item)
     local patch = {
         model_id = want.model_id,
@@ -1802,6 +2133,18 @@ local function upstream_patch(item)
         labels = want.labels,
         disable_health_check = want.disable_health_check,
     }
+    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+        local integer = field == "max_concurrency"
+        if want[field] ~= nil then
+            patch[field] = want[field]
+        elseif record and declared_cap(record[field], integer) ~= nil then
+            patch[field] = 0
+        end
+    end
+    -- Carried only when the row says something: registry.patch_record folds it into
+    -- the stored list rather than replacing it, so a declaration that names one model
+    -- cannot erase the rest of what the probe learned.
+    if item.models then patch.models = item.models end
     if item.api_key_state == "set" then
         patch.api_key = item.api_key_stored
     elseif item.api_key_state == "clear" then
@@ -1855,12 +2198,24 @@ function _M.reconcile_upstreams()
         if not record then
             local res, aerr, kind = reg.add({
                 url = item.url,
+                -- Same pass-through as the patch path: registry.add seeds the record's
+                -- advertised list from `models`, falling back to model_id, so a worker
+                -- created by the declaration layer starts out carrying everything the
+                -- operator said about it instead of waiting for a sweep.
+                models = item.models,
                 model_id = (type(item.model_id) == "string" and item.model_id ~= "") and item.model_id or "unknown",
                 api_key = (item.api_key_state == "set") and item.api_key_stored or nil,
                 priority = tonumber(item.priority) or 50,
                 cost = tonumber(item.cost) or 1.0,
                 labels = item.labels or {},
                 disable_health_check = (item.disable_health_check and true) or false,
+                -- Caps ride the create path too, so a worker the declaration layer
+                -- creates is born capped instead of waiting for the next drift tick:
+                -- the self-heal gap between add and the following reconcile would
+                -- otherwise let one uncapped request through a worker the operator had
+                -- already fenced. registry.add normalizes them with the same cap_limit.
+                max_concurrency = declared_cap(item.max_concurrency, true),
+                max_power_w = declared_cap(item.max_power_w, false),
                 discovery = "config",
             }, store_config() or {})
             if res then
@@ -1881,7 +2236,7 @@ function _M.reconcile_upstreams()
                     local ok_id, derived = pcall(reg.worker_id_for_url, item.url)
                     upd_id = ok_id and derived or nil
                 end
-                local res, uerr = reg.update(upd_id, upstream_patch(item))
+                local res, uerr = reg.update(upd_id, upstream_patch(item, record))
                 if res then
                     summary.updated = summary.updated + 1
                 else
@@ -2408,7 +2763,7 @@ function _M.handle_config_virtual()
 end
 
 --- POST /_ui/config/upstreams  {entries:[{url,model_id?,api_key?,priority?,
----   cost?,labels?,disable_health_check?}]}
+---   cost?,labels?,disable_health_check?,max_concurrency?,max_power_w?}]}
 --- Whole-list replace of the declared pool plus an immediate reconcile into
 --- lr_workers (contract 3.5). entries missing = empty list = reclaim every
 --- config row (root ruling 3: the UI always sends the full list and covers the

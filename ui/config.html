@@ -10,9 +10,11 @@
           POST ./config/model       每模型配置卡保存（字段缺省=不动；null=清除；remove:true=删除整条）
           POST ./config/apply       JSON 视图整体替换（缺省字段=清空；model_map 转发 watcher 落地）
           POST ./config/virtual     虚拟模型 profile 整表替换（body {entries:[{model,target,workers,policy,effort}]}，
-                                    workers=规范化 url 白名单，policy/effort 可选覆盖；空数组=清空；兼容旧 {model,target}）
+                                    workers=规范化 url 白名单，policy/effort 可选覆盖；空数组=清空；兼容旧 {model,target}；
+                                    candidates=[{worker,model?}] 逐候选绑定，JSON 视图无损读写（表单页不编辑它）
           POST ./config/upstreams   远程服务接入池整表替换（body {entries:[{url,model_id,priority,cost,labels,
-                                    disable_health_check,api_key}]}；api_key 缺失/null=不动，""=清除；响应含 reconcile 摘要）
+                                    disable_health_check,max_concurrency,max_power_w,api_key}]}；api_key 缺失/null=不动，
+                                    ""=清除；填值=设置；上限缺失/null/<=0/非数=不限；响应含 reconcile 摘要）
         模型下拉复用既有 GET ./v1/models。页面在 /_ui/config.html，因此 ./config 解析为 /_ui/config。
 
   两个视图（顶部 表单/JSON 分段按钮切换，共享同一份 state）：
@@ -964,8 +966,44 @@ function vmRow(r){
     target: (r && r.target) || '',
     workers: workers,
     policy: (r && typeof r.policy === 'string') ? r.policy : '',
-    effort: (r && typeof r.effort === 'string') ? r.effort : ''
+    effort: (r && typeof r.effort === 'string') ? r.effort : '',
+    // 逐候选绑定（后端 {worker, model}）。这一页没有它的编辑器，但草稿必须带着它，
+    // 否则任何一次提交都会把已配的 candidates 抹掉——后端把整表替换当成事实来源。
+    candidates: vmCandidates(r && r.candidates)
   };
+}
+/* candidates 的容错读法：形状不对就整条丢，绝不让一行脏数据掀翻整个视图。
+   worker 是唯一必填（规范化 url 或 worker id），model 可选、缺省继承 target，
+   与后端 build_candidate_bindings 的口径一致；url 作为 worker 的同义字段一并收下。 */
+function vmCandidates(list){
+  if (!Array.isArray(list)) return [];
+  var out = [];
+  list.forEach(function(item){
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    var raw = (typeof item.worker === 'string' && item.worker.trim())
+      ? item.worker : ((typeof item.url === 'string' && item.url.trim()) ? item.url : null);
+    if (!raw) return;
+    var cand = { worker: normU(raw) };
+    if (typeof item.model === 'string' && item.model.trim()) cand.model = item.model.trim();
+    out.push(cand);
+  });
+  return out;
+}
+/* 序列化草稿里的绑定：非空才写，且只写后端认识的形状（model 为空时省略该键）。
+   空数组必须整体缺席而不是写 [] —— 后端把 candidates 缺席与空数组都当"无绑定"，
+   但空数组会让 target 变成必填，写出来等于给操作员凭空加一条校验失败。 */
+function vmCandidatesJson(row){
+  var list = Array.isArray(row.candidates) ? row.candidates : [];
+  var out = [];
+  list.forEach(function(c){
+    if (!c || typeof c !== 'object') return;
+    var w = (typeof c.worker === 'string') ? normU(c.worker) : '';
+    if (!w) return;
+    var e = { worker: w };
+    if (typeof c.model === 'string' && c.model.trim()) e.model = c.model.trim();
+    out.push(e);
+  });
+  return out;
 }
 function vmRows(){
   if (vmDraft) return vmDraft;
@@ -976,7 +1014,15 @@ function vmRows(){
 }
 function vmEdit(){
   if (!vmDraft) vmDraft = vmRows().map(function(r){
-    return { model: r.model, target: r.target, workers: r.workers.slice(), policy: r.policy, effort: r.effort };
+    // candidates 逐个拷成新对象：草稿与 state 共享同一张表的话，一次表单编辑会就地
+    // 改掉服务端快照，normStr 的 dirty 比较就永远比不出差异。
+    return { model: r.model, target: r.target, workers: r.workers.slice(),
+      policy: r.policy, effort: r.effort,
+      candidates: vmCandidatesJson(r).map(function(c){
+        var copy = { worker: c.worker };
+        if (c.model) copy.model = c.model;
+        return copy;
+      }) };
   });
   return vmDraft;
 }
@@ -1290,6 +1336,10 @@ function vmJsonArray(){
     if (row.workers.length) e.workers = row.workers.slice();
     if (row.policy) e.policy = row.policy;
     if (row.effort) e.effort = row.effort;
+    // candidates 是这个视图唯一的无损保证：JSON 里读到的绑定必须原样写回，
+    // 否则「打开 JSON 视图 → 校验并应用」这一串无损操作会把池里已配的多绑定清空。
+    var cands = vmCandidatesJson(row);
+    if (cands.length) e.candidates = cands;
     return e;
   });
 }
@@ -1551,6 +1601,10 @@ document.getElementById('vm-save').addEventListener('click', function(){
       if (ws.length) e.workers = ws;
       if (r.policy) e.policy = r.policy;
       if (r.effort) e.effort = r.effort;
+      // 表单页没有 candidates 编辑器，但提交是整表替换：草稿里从服务端读来的绑定必须
+      // 一起交回去，否则在表单里改一个 policy 就把该别名的逐候选绑定全清了。
+      var cands = vmCandidatesJson(r);
+      if (cands.length) e.candidates = cands;
       return e;
     });
   submit('./config/virtual', { entries: entries },

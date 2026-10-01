@@ -107,6 +107,11 @@
                       <div>
                         <strong>{{ props.row.url }}</strong>
                         <span>{{ props.row.id }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span></span>
+                        <!-- 该实例真实覆盖的模型：只有引擎自己 /v1/models 答过的才算已验证 -->
+                        <span v-if="(props.row.models || []).length" class="mono" style="font-size:11px">{{ t.servedModels }} {{ props.row.models.join(', ') }}</span>
+                        <q-badge v-if="modelsVerifiedOf(props.row) !== null" outline
+                                 :color="modelsVerifiedOf(props.row) ? 'teal-4' : 'grey-6'" class="chip-soft"
+                                 :label="modelsVerifiedOf(props.row) ? t.modelsVerified : t.modelsDeclared"></q-badge>
                       </div>
                     </div>
                   </q-td>
@@ -124,6 +129,23 @@
                 <template v-slot:body-cell-load="props"><q-td :props="props" class="mono">{{ props.row.load }}</q-td></template>
                 <template v-slot:body-cell-priority="props"><q-td :props="props" class="mono">{{ props.row.priority }}</q-td></template>
                 <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
+                <template v-slot:body-cell-capacity="props">
+                  <q-td :props="props">
+                    <!-- 配置值与实测值分行读：瓦数是采样读数，不是操作员写的配置 -->
+                    <div style="display:flex;flex-direction:column;gap:2px">
+                      <div class="route-cell" style="gap:6px">
+                        <q-icon name="mdi-buffer" size="13px" :color="capExceeded(props.row, 'max_concurrency', 'concurrency') ? 'red-4' : 'grey-6'"></q-icon>
+                        <span class="mono" :class="{'text-red-4': capExceeded(props.row, 'max_concurrency', 'concurrency')}">{{ capConfigText(props.row, 'max_concurrency') }}</span>
+                        <span class="muted mono" style="font-size:11px">{{ capMeasuredText(props.row, 'concurrency') }}</span>
+                      </div>
+                      <div class="route-cell" style="gap:6px">
+                        <q-icon name="mdi-flash-outline" size="13px" :color="capExceeded(props.row, 'max_power_w', 'power') ? 'red-4' : 'grey-6'"></q-icon>
+                        <span class="mono" :class="{'text-red-4': capExceeded(props.row, 'max_power_w', 'power')}">{{ capConfigText(props.row, 'max_power_w') }}</span>
+                        <span class="muted mono" style="font-size:11px">{{ capMeasuredText(props.row, 'power') }}</span>
+                      </div>
+                    </div>
+                  </q-td>
+                </template>
                 <template v-slot:body-cell-metadata="props">
                   <q-td :props="props">
                     <div v-if="labelKeys(props.row).length" class="label-cell">
@@ -163,6 +185,10 @@
                     <q-input v-model="addForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint"></q-input>
                     <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint"></q-input>
                   </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]"></q-input>
+                    <q-input v-model="addForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]"></q-input>
+                  </div>
                   <q-input v-model="addForm.labels" dense outlined dark :label="t.labelsField" :placeholder="'gpu=0,engine=sglang'" :hint="t.labelsHint" :rules="[labelsRule]"></q-input>
                   <q-toggle v-model="addForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
                   <div class="muted">{{ t.disableHealthHint }}</div>
@@ -184,6 +210,10 @@
                   <div class="form-grid-2">
                     <q-input v-model="editForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint"></q-input>
                     <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint"></q-input>
+                  </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]"></q-input>
+                    <q-input v-model="editForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]"></q-input>
                   </div>
                   <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]"></q-input>
                   <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
@@ -227,8 +257,10 @@
         let refreshTimer
         let waitTimer
 
-        const addForm = reactive({ url: '', model_id: '', api_key: '', priority: '', cost: '', labels: '', disable_health_check: false })
-        const editForm = reactive({ priority: '', cost: '', labels: '', disable_health_check: false })
+        // 容量上限两个字段：空串 = 「没说话」，提交时整个字段省略；0 = 明确「不限」。
+        // 后端 cap_limit 把 <=0/非数归一为不限，所以这里不能把空串当 0 发出去。
+        const addForm = reactive({ url: '', model_id: '', api_key: '', priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false })
+        const editForm = reactive({ priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false })
         const pagination = reactive({ rowsPerPage: 20 })
 
         const c = computed(() => window.lmrI18n.messages[locale.value].common)
@@ -249,6 +281,7 @@
           { name: 'load', label: t.value.colLoad, field: 'load', align: 'left', sortable: true, style: 'width:70px' },
           { name: 'priority', label: t.value.colPriority, field: 'priority', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'cost', label: t.value.colCost, field: 'cost', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'capacity', label: t.value.colCapacity, field: 'max_concurrency', align: 'left', sortable: true, style: 'width:150px', sort: row => capacitySortValue(row) },
           { name: 'metadata', label: t.value.colLabels, field: 'metadata', align: 'left' },
           { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:130px' }
         ])
@@ -294,6 +327,85 @@
 
         function labelKeys (row) {
           return Object.keys(row.metadata || {}).sort()
+        }
+
+        // 该实例覆盖哪些模型的凭证来源：true = 引擎自己的 /v1/models 答过，
+        // false = 手填或 config 声明写进去的（只是备注，不构成"这台确实服务该模型"），
+        // null = 后端还没给出这个字段（旧版本），此时不显示徽章而不是猜一个。
+        function modelsVerifiedOf (row) {
+          const value = row && row.models_verified
+          if (value === true) return true
+          if (value === false) return false
+          return null
+        }
+
+        // ── 容量上限（配置）与实时读数 ──
+        // max_concurrency / max_power_w 是操作员写的阈值；inflight_requests 与 power_w
+        // 是网关自己的在飞计数和监控采到的瓦特。两者必须分行且视觉区分：实测值是只读的，
+        // 一旦被当成配置回写，就等于让监控采样替操作员改了选路规则。
+        // 读数缺席 = 未知（power_w 在没有新鲜采样时压根不出现），未知一律显示「—」而非 0。
+        function capNumber (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number) || number <= 0) return null
+          return number
+        }
+        function inflightOf (row) {
+          const number = Number(row && row.inflight_requests)
+          return Number.isFinite(number) ? number : null
+        }
+        function powerOf (row) {
+          const value = row && row.power_w
+          if (value === null || value === undefined || value === '') return null
+          const number = Number(value)
+          return Number.isFinite(number) ? number : null
+        }
+        function formatCapNumber (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number)) return '—'
+          return Number.isInteger(number) ? String(number) : number.toFixed(1)
+        }
+        function capConfigText (row, field) {
+          const cap = capNumber(row && row[field])
+          if (cap === null) return t.value.capUnlimited
+          return '≤' + formatCapNumber(cap) + (field === 'max_power_w' ? ' W' : '')
+        }
+        function capMeasuredText (row, kind) {
+          if (kind === 'power') {
+            const watts = powerOf(row)
+            return watts === null
+              ? t.value.capNoSample
+              : t.value.capMeasured + ' ' + formatCapNumber(watts) + ' W'
+          }
+          const inflight = inflightOf(row)
+          return t.value.capMeasured + ' ' + (inflight === null ? '—' : formatCapNumber(inflight))
+        }
+        // 达到上限 = 这条实例此刻被选路硬排除（即使 cache_aware 想留在本地）。
+        // 未知读数永不判超限，与后端 capacity_exclusion 的「未知不排除」同口径。
+        function capExceeded (row, field, kind) {
+          const cap = capNumber(row && row[field])
+          if (cap === null) return false
+          const measured = kind === 'power' ? powerOf(row) : inflightOf(row)
+          return measured !== null && measured >= cap
+        }
+        function capacitySortValue (row) {
+          const cap = capNumber(row && row.max_concurrency)
+          return cap === null ? -1 : cap
+        }
+        // 表单值 → 下发值：空串 = 不下发该字段（新增即「不限」，编辑即「保持不变」）；
+        // 0 与负数归一为 0，后端 cap_limit 把 <=0 读成「不限」，所以填 0 就是清除上限。
+        // 非数字返回 null，由 capRule 拦下提交。
+        function capFormValue (value, integer) {
+          const text = String(value === null || value === undefined ? '' : value).trim()
+          if (text === '') return undefined
+          const number = Number(text)
+          if (!Number.isFinite(number)) return null
+          if (number <= 0) return 0
+          return integer ? Math.floor(number) : number
+        }
+        function capRule (value) {
+          const text = String(value === null || value === undefined ? '' : value).trim()
+          if (!text) return true
+          return Number.isFinite(Number(text)) || t.value.capRule
         }
 
         function healthLabel (row) {
@@ -358,10 +470,28 @@
           if (String(form.api_key || '').trim()) spec.api_key = String(form.api_key).trim()
           if (String(form.priority || '').trim() !== '') spec.priority = Number(form.priority)
           if (String(form.cost || '').trim() !== '') spec.cost = Number(form.cost)
+          appendCaps(spec, form)
           if (form.disable_health_check) spec.disable_health_check = true
           const labels = parseLabels(form.labels)
           if (labels) spec.labels = labels
           return spec
+        }
+
+        // 两个上限共用一段读写：POST 与 PUT 走的是同一批字段名（registry 的 add 与
+        // UPDATE_NUMBER_FIELDS），三态都由 capFormValue 决定（undefined=省略 / 0=清除 / >0=设定）。
+        function appendCaps (target, form) {
+          const concurrency = capFormValue(form.max_concurrency, true)
+          if (concurrency !== undefined) target.max_concurrency = concurrency
+          const power = capFormValue(form.max_power_w, false)
+          if (power !== undefined) target.max_power_w = power
+          return target
+        }
+        function capsFromRow (row) {
+          const number = value => (value === undefined || value === null || value === false) ? '' : String(value)
+          return { max_concurrency: number(row && row.max_concurrency), max_power_w: number(row && row.max_power_w) }
+        }
+        function capsValid (form) {
+          return capRule(form.max_concurrency) === true && capRule(form.max_power_w) === true
         }
 
         async function loadQuiet () {
@@ -388,14 +518,14 @@
 
         // 提交注册 → 202 → 每 3s 轮询，等该行变绿；超时给负面提示
         async function submitAdd () {
-          if (!urlRule(addForm.url) || !labelsRule(addForm.labels)) return
+          if (!urlRule(addForm.url) || !labelsRule(addForm.labels) || !capsValid(addForm)) return
           submitting.value = true
           const spec = buildSpec(addForm)
           try {
             await window.lmrApi.addWorker(spec)
             notify(window.lmrI18n.translate(locale.value, 'workers', 'addedNotice', { url: spec.url }))
             addOpen.value = false
-            Object.assign(addForm, { url: '', model_id: '', api_key: '', priority: '', cost: '', labels: '', disable_health_check: false })
+            Object.assign(addForm, blankAddForm())
             watchHealth(spec.url)
             await load()
           } catch (error) {
@@ -446,6 +576,7 @@
           Object.assign(editForm, {
             priority: row.priority === undefined ? '' : String(row.priority),
             cost: row.cost === undefined ? '' : String(row.cost),
+            ...capsFromRow(row),
             labels: labelKeys(row).map(key => key + '=' + row.metadata[key]).join(','),
             disable_health_check: Boolean(row.disable_health_check)
           })
@@ -456,6 +587,7 @@
           const patch = {}
           if (String(form.priority || '').trim() !== '') patch.priority = Number(form.priority)
           if (String(form.cost || '').trim() !== '') patch.cost = Number(form.cost)
+          appendCaps(patch, form)
           if (labelsRule(form.labels)) {
             const labels = parseLabels(form.labels)
             if (labels) patch.labels = labels
@@ -465,6 +597,7 @@
         }
 
         async function submitEdit () {
+          if (!capsValid(editForm) || !labelsRule(editForm.labels)) return
           submitting.value = true
           try {
             await window.lmrApi.updateWorker(selected.value.id, buildPatch(editForm))
@@ -497,8 +630,12 @@
         }
 
         function openAdd () {
-          Object.assign(addForm, { url: '', model_id: '', api_key: '', priority: '', cost: '', labels: '', disable_health_check: false })
+          Object.assign(addForm, blankAddForm())
           addOpen.value = true
+        }
+
+        function blankAddForm () {
+          return { url: '', model_id: '', api_key: '', priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false }
         }
 
         function startAutoRefresh () {
@@ -546,6 +683,7 @@
           formatCost, healthInterval, healthyCount, healthColor, healthLabel, jobColor, jobLabel,
           groups, labelKeys, load, loading, loadError, openAdd, openEdit, openWorker, pagination,
           removeWorker, selected, labelsRule, submitting, submitAdd, submitEdit, t, urlRule,
+          capConfigText, capMeasuredText, capExceeded, capNumber, capRule, modelsVerifiedOf,
           waitingNotice, workers
         }
       }

@@ -1,9 +1,13 @@
-# GPU 负载源：两路外部负载采样接进 registry 的 worker 负载字段
+# GPU 负载源：两路外部负载采样 + 第三条功率通道接进 registry
 
 日期：2026-10-01（UTC）。对应 `doc/scope-trim.md` §5.1 的第 1 条缺口（"GPU 负载源"）
 与 `doc/architect.md` §5（lr_workers 共享态）/§6（策略消费端）。
 
-实现文件：[gpu_load.lua](../lualib/resty/luarouter/gpu_load.lua)（新增，1102 行：纯逻辑层
+**本文主体（§1–§8）讲的是 0..1 的负载打分通道。**同一次抓取顺带采回的**绝对瓦特**读数是
+第三条通道，它不改变 `registry.load()`，只服务每 worker 的 `max_power_w` 上限，口径与陷阱
+自成一篇：[gap-worker-caps.md](gap-worker-caps.md)（本文只登记搭载方式、env 与指标名，见 §9）。
+
+实现文件：[gpu_load.lua](../lualib/resty/luarouter/gpu_load.lua)（新增，1721 行：纯逻辑层
 + live 层）、[registry.lua](../lualib/resty/luarouter/registry.lua)（负载字段读写，
 +274/-5 行）、[hb.lua](../lualib/resty/luarouter/hb.lua)（定时器接线，+23/-1 行）、
 [config.lua](../lualib/resty/luarouter/config.lua)（env，+58 行）。
@@ -188,6 +192,10 @@ successful, failed}；非 2xx / 超时 / 缺字段一律记 -1（`/v1/loads/stre
 | `SMG_LOAD_STALE_SECS` | `0` | 一个样本算"新鲜"多久，`0`=`3×interval` | registry 侧再夹到 `5..3600` |
 | `SMG_LOAD_SCALE` | `100` | 满载（1.0）折算成多少个在飞请求 | `≤0` 回落 100 |
 
+功率那三个开关（`SMG_LOAD_POWER` / `SMG_LOAD_POWER_KEYS` / `SMG_LOAD_POWER_QUERY`）**不在本表**：
+它们没进 `config.lua`，由 `gpu_load` 自己现读环境变量，因此不可热改、也进不了 `/_ui/config`，
+并且必须三份 conf 都显式 `env` 声明。差异与后果见 §9。
+
 ## 6. 可观测性
 
 `source=none` 时 `lr_stats` 里没有任何 `lr_gpu_load*` 键，导出面与改动前逐字节相同。
@@ -205,6 +213,10 @@ successful, failed}；非 2xx / 超时 / 缺字段一律记 -1（`/v1/loads/stre
 `metrics-nogauge`（200 但没有目标 gauge）、`prom`、`prom-config`、`prom-raise` /
 `metrics-raise`（seam 抛错）、`source`（未知源名）。去重是必须的而不是修饰性的：
 挂掉的 Prometheus 会以每 tick 一次的频率把 error log 写满。
+
+功率通道的 WARN 类别另有一族（`power-source-none` / `power-query-ignored` / `power-nogauge` /
+`power-prom` / `power-prom-raise` / `power-prom-nogauge` / `power-prom-unassigned`），
+同一套 1 小时去重机制，见 §9 与 [gap-worker-caps.md](gap-worker-caps.md) §4。
 
 ## 7. 测试
 
@@ -271,3 +283,56 @@ WARN 1 小时去重、`publish_metrics`、`start` 的各拒绝分支、定时器
    组合是被有意支持的，不是漏洞。
 7. 单进程内 WARN 去重表是 Lua local，进程重启即清空，多进程各有一份；这是日志噪音
    抑制，不是计数器，不承担可审计性（可审计性在 `lr_gpu_load_failures_total`）。
+
+## 9. 第三条通道：绝对功率（搭载在本模块上）
+
+2026-10-01 追加。同一轮 pass 顺带把 GPU 的**绝对瓦特**采回来，写成 `pw:<id>`，服务
+`worker.max_power_w` 这个每服务上限。它**不是**第四个负载输入：`registry.load()` 的求值
+次序（§4）一字未动，功率不参与打分，只在选路装配候选时做硬排除。判定式、口径陷阱与取舍
+全部在 [gap-worker-caps.md](gap-worker-caps.md)（尤其 §2「读数未知 → 不排除」与 §3「本机最热那张卡」）；
+这里只登记它与本模块的搭载关系。
+
+**搭载方式**
+
+- 不新建定时器、不额外发 HTTP：`source=metrics` 复用**同一次** `GET` 抓到的同一份 exposition 正文，
+  在负载解析之外再跑一遍功率解析（`max_power_watts`）；`source=prom` 发**第二条独立 PromQL**
+  （`SMG_LOAD_POWER_QUERY`），不合并进负载查询——两条量纲不同（绝对瓦特 vs 0..1）、要能分别归因，
+  且功率常需要 `max by (Hostname)(...)` 这种只属于它的聚合。
+- `SMG_LOAD_SOURCE=none` 时压根没有定时器，因此设了功率开关也不会有任何读数。这不是 bug（不给
+  一个没在跑的模块装门面），但必须让人看见：该组合打一条去重 WARN `power-source-none`。
+- 功率折叠用 `host_powers()` 而**不是** `host_values()`：后者走 `normalize()`，照抄会把
+  96 W 夹成 1.0，于是「功率上限永不触发」。这一条在 gap-worker-caps.md §3 有完整的为什么。
+
+**env（与本文 §5 那批不同等待遇，不要混为一谈）**
+
+| env | 缺省 | 含义 |
+|---|---|---|
+| `SMG_LOAD_POWER` | 关 | `source=metrics` 是否顺带扫功率 gauge |
+| `SMG_LOAD_POWER_KEYS` | `DCGM_FI_DEV_POWER_USAGE` | 功率 gauge 名单（逗号/空格分隔） |
+| `SMG_LOAD_POWER_QUERY` | 空 = 不采功率 | `source=prom` 的第二条 PromQL |
+
+这三个名字由 `gpu_load` 自己 `os.getenv` 现读，**没有进 `config.lua`**（§5 那张表覆盖不到它们）。
+三点后果：① nginx 按 `env` 白名单重建 worker 环境，`conf/lua-router.conf`、
+`conf/nginx.conf.template`、`test/conf/nginx-lua-router.conf` **三份都要显式声明**，漏一份就静默
+失效（本仓库踩过）；② worker 环境在 fork 时固定，**不可热改**；③ 因此它们进不了 `/_ui/config`
+的 JSON 视图与管理台，与 AGENTS.md 重点 3/4 的口径不符，并进 config.lua 是收尾项。
+
+**缺省指标只有一个名字的理由**：实测 sglang 引擎自己的 `/metrics` 里没有功率指标（grep 0 行），
+vLLM 同理；`node_hwmon_power_average_watt` 只有整机口径，配「取最大」的折叠规则会把整台机器上的
+所有 worker 永久顶到上限之上，等于监控系统自己吃掉容量，所以**故意不进缺省名单**（确实要按机器配
+请显式写进 `SMG_LOAD_POWER_KEYS`，那时取最大是操作员的选择）。
+
+**新增指标（只在功率启用时渲染；缺省关闭时 `/metrics` 与本文 §6 描述的形态逐字节相同）**
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `lr_gpu_load_power_samples_total` | counter | 写进 registry 成功的瓦特样本数 |
+| `lr_gpu_load_power_parse_failures_total` | counter | 拨通了却拿不到可用瓦数（正文无该 gauge / 响应非合法向量） |
+| `lr_gpu_load_power_rejected_total` | counter | 被 registry 主动拒收的读数（近乎恒 0，非 0 = exporter 在撒谎） |
+| `lr_gpu_load_power_unmatched_total` | counter | 命名了「池里没有 worker 的机器」的 series 数 |
+| `lr_gpu_load_power_workers` | gauge | 有新鲜瓦特读数的 worker 数 |
+| `lr_gpu_load_power_watts{worker="url"}` | gauge | 该 worker 本机最热卡的绝对瓦特（与 0..1 的负载族刻意分开，两者不可互解） |
+
+失败语义沿用本文 §8 第 4 条：**一律只损失读数，不摘 worker、不碰健康与熔断**。差异在于功率这路
+多了一条硬约束——采不到时**什么都不写**，让 TTL（`SMG_LOAD_STALE_SECS`，同 §5）自然过期回到
+「`power_w()` 返回 nil」，绝不写 0、绝不沿用旧值；上限判定把 nil 读成「未知 → 不排除」。

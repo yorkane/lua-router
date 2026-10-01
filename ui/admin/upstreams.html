@@ -116,8 +116,21 @@
                 </q-td>
               </template>
               <template v-slot:body-cell-priority="props"><q-td :props="props" class="mono">{{ displayNumber(props.row.priority, 50) }}</q-td></template>
-              <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
-              <template v-slot:body-cell-labels="props">
+                <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
+                <template v-slot:body-cell-caps="props">
+                  <q-td :props="props">
+                    <!-- 声明层只写阈值；瓦特与在飞数取自同地址的池行，是实测、只读 -->
+                    <div v-if="declaredCapTexts(props.row)" style="display:flex;flex-direction:column;gap:2px">
+                      <div v-for="line in declaredCapTexts(props.row)" :key="line.icon" class="route-cell" style="gap:6px">
+                        <q-icon :name="line.icon" size="13px" :color="line.hot ? 'red-4' : 'grey-6'"></q-icon>
+                        <span class="mono" :class="{'text-red-4': line.hot}">{{ line.cap }}</span>
+                        <span class="muted mono" style="font-size:11px">{{ line.measured }}</span>
+                      </div>
+                    </div>
+                    <span v-else class="muted">—</span>
+                  </q-td>
+                </template>
+                <template v-slot:body-cell-labels="props">
                 <q-td :props="props">
                   <div v-if="labelKeys(props.row).length" class="label-cell">
                     <q-chip v-for="key in labelKeys(props.row)" :key="key" dense size="12px" class="chip-soft">{{ key }}={{ props.row.labels[key] }}</q-chip>
@@ -163,6 +176,11 @@
                     <q-input v-model="addForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :rules="[numberRule]"></q-input>
                     <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
                   </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="addForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
+                  </div>
+                  <q-input v-model="addForm.modelsText" dense outlined dark :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"></q-input>
                   <q-input v-model="addForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :placeholder="'{&quot;gpu&quot;:&quot;0&quot;,&quot;engine&quot;:&quot;sglang&quot;}'" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
                   <q-toggle v-model="addForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
                   <div class="muted">{{ t.disableHealthHint }}</div>
@@ -192,6 +210,11 @@
                     <q-input v-model="editForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :rules="[numberRule]"></q-input>
                     <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
                   </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="editForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
+                  </div>
+                  <q-input v-model="editForm.modelsText" dense outlined dark :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"></q-input>
                   <q-input v-model="editForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
                   <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
                   <div class="muted">{{ t.disableHealthHint }}</div>
@@ -238,7 +261,9 @@
         let unsubscribeLocale
         let refreshTimer
 
-        const blankForm = () => ({ url: '', model_id: '', api_key: '', clearKey: false, priority: '', cost: '', labelsText: '', disable_health_check: false })
+        // 上限两字段沿用三态：空串 = 不下发（保持声明原样），0 = 明确「不限」，>0 = 设定阈值。
+        // modelsText 是逗号分隔的模型列表（声明该端点覆盖哪些模型），空 = 交给探针。
+        const blankForm = () => ({ url: '', model_id: '', api_key: '', clearKey: false, priority: '', cost: '', max_concurrency: '', max_power_w: '', modelsText: '', labelsText: '', disable_health_check: false })
         const addForm = reactive(blankForm())
         const editForm = reactive(blankForm())
         const pagination = reactive({ rowsPerPage: 20 })
@@ -252,6 +277,7 @@
           { name: 'status', label: t.value.colStatus, field: 'url', align: 'left' },
           { name: 'priority', label: t.value.colPriority, field: 'priority', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'cost', label: t.value.colCost, field: 'cost', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'caps', label: t.value.colCaps, field: 'max_concurrency', align: 'left', style: 'width:120px' },
           { name: 'labels', label: t.value.colLabels, field: 'labels', align: 'left' },
           { name: 'key', label: t.value.colKey, field: 'api_key', align: 'left', style: 'width:96px' },
           { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:130px' }
@@ -318,6 +344,58 @@
           return Object.keys(row.labels || {}).sort()
         }
 
+        // ── 容量上限（声明层写的阈值）与实时读数 ──
+        // 阈值来自 upstreams 条目本身；瓦特与在飞数取自同地址的池行，是监控采样与网关
+        // 自己的计数，界面上必须与配置区分：实测值绝不能被当成配置回写。
+        // 读数缺席 = 未知，未知不判超限（与后端 capacity_exclusion 的「未知不排除」同口径）。
+        function capNumber (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number) || number <= 0) return null
+          return number
+        }
+        function formatCapNumber (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number)) return '—'
+          return Number.isInteger(number) ? String(number) : number.toFixed(1)
+        }
+        function measuredOf (row, field) {
+          const worker = poolRow(row)
+          const value = worker && worker[field]
+          if (value === null || value === undefined || value === '') return null
+          const number = Number(value)
+          return Number.isFinite(number) ? number : null
+        }
+        function declaredCapTexts (row) {
+          const out = []
+          const concurrency = capNumber(row && row.max_concurrency)
+          const power = capNumber(row && row.max_power_w)
+          if (concurrency !== null) {
+            const inflight = measuredOf(row, 'inflight_requests')
+            out.push({
+              icon: 'mdi-buffer', hot: inflight !== null && inflight >= concurrency,
+              cap: '≤' + formatCapNumber(concurrency),
+              measured: t.value.capMeasured + ' ' + (inflight === null ? '—' : formatCapNumber(inflight))
+            })
+          }
+          if (power !== null) {
+            const watts = measuredOf(row, 'power_w')
+            out.push({
+              icon: 'mdi-flash-outline', hot: watts !== null && watts >= power,
+              cap: '≤' + formatCapNumber(power) + ' W',
+              measured: watts === null ? t.value.capNoSample : t.value.capMeasured + ' ' + formatCapNumber(watts) + ' W'
+            })
+          }
+          return out
+        }
+        // 逗号或空格分隔的模型名 → 数组（去重、去空）。空 = 「交给探针」，字段整个省略。
+        function modelsList (text) {
+          const seen = []
+          String(text || '').split(/[,;\s]+/).forEach(part => {
+            const name = part.trim()
+            if (name && seen.indexOf(name) === -1) seen.push(name)
+          })
+          return seen
+        }
         function urlRuleFor (selfUrl) {
           return value => {
             const text = normUrl(value)
@@ -373,6 +451,21 @@
           const cost = String(form.cost === null || form.cost === undefined ? '' : form.cost).trim()
           if (cost !== '') entry.cost = Number(cost)
           else delete entry.cost
+          // 上限两字段：空串在声明层就是「不限」——整表替换语义下缺省字段等于未声明，
+          // 所以清空输入框是操作员有意的「撤掉上限」，不是「保持原值」。0/负数同样归为不限，
+          // 与后端 cap_limit 的归一口径一致（<=0 一律读成不限）。
+          const concurrency = capNumber(form.max_concurrency)
+          const concurrencyText = String(form.max_concurrency === null || form.max_concurrency === undefined ? '' : form.max_concurrency).trim()
+          if (concurrencyText !== '' && concurrency !== null) entry.max_concurrency = concurrency
+          else delete entry.max_concurrency
+          const power = capNumber(form.max_power_w)
+          const powerText = String(form.max_power_w === null || form.max_power_w === undefined ? '' : form.max_power_w).trim()
+          if (powerText !== '' && power !== null) entry.max_power_w = power
+          else delete entry.max_power_w
+          // 声明的模型列表：非空才下发，空 = 「交给探针」，字段缺席而不是空数组
+          const models = modelsList(form.modelsText)
+          if (models.length) entry.models = models
+          else delete entry.models
           const labels = labelsObject(form.labelsText)
           if (labels && Object.keys(labels).length) entry.labels = labels
           else delete entry.labels
@@ -389,6 +482,9 @@
             clearKey: false,
             priority: row.priority === undefined || row.priority === null ? '' : String(row.priority),
             cost: row.cost === undefined || row.cost === null ? '' : String(row.cost),
+            max_concurrency: row.max_concurrency === undefined || row.max_concurrency === null ? '' : String(row.max_concurrency),
+            max_power_w: row.max_power_w === undefined || row.max_power_w === null ? '' : String(row.max_power_w),
+            modelsText: Array.isArray(row.models) ? row.models.join(',') : '',
             labelsText: row.labels && Object.keys(row.labels).length ? JSON.stringify(row.labels) : '',
             disable_health_check: Boolean(row.disable_health_check)
           }
@@ -447,7 +543,9 @@
         }
 
         async function submitAdd () {
-          if (urlRule(addForm.url) !== true || numberRule(addForm.priority) !== true || numberRule(addForm.cost) !== true || labelsRule(addForm.labelsText) !== true) return
+          if (urlRule(addForm.url) !== true || numberRule(addForm.priority) !== true || numberRule(addForm.cost) !== true
+            || numberRule(addForm.max_concurrency) !== true || numberRule(addForm.max_power_w) !== true
+            || labelsRule(addForm.labelsText) !== true) return
           const entry = buildEntry(addForm, null)
           const entries = upstreams.value.slice()
           entries.push(entry)
@@ -467,7 +565,9 @@
         }
 
         async function submitEdit () {
-          if (editUrlRule(editForm.url) !== true || numberRule(editForm.priority) !== true || numberRule(editForm.cost) !== true || labelsRule(editForm.labelsText) !== true) return
+          if (editUrlRule(editForm.url) !== true || numberRule(editForm.priority) !== true || numberRule(editForm.cost) !== true
+            || numberRule(editForm.max_concurrency) !== true || numberRule(editForm.max_power_w) !== true
+            || labelsRule(editForm.labelsText) !== true) return
           const original = upstreams.value.find(row => normUrl(row.url) === normUrl(selectedUrl.value))
           if (!original) {
             notify(t.value.emptyPool, 'negative')
@@ -539,7 +639,8 @@
           addForm, addOpen, autoRefresh, c, columns, confirmRemove, displayNumber, editForm, editOpen,
           editUrlRule, filtered, formatCost, hasKey, healthyCount, keyedCount, labelKeys, load, loading,
           loadError, numberRule, labelsRule, openAdd, openEdit, openWorker, pagination, poolLabel, poolColor,
-          poolRow, submitting, submitAdd, submitEdit, t, upstreams, urlRule, unsupported
+          poolRow, submitting, submitAdd, submitEdit, t, upstreams, urlRule, unsupported,
+          capNumber, declaredCapTexts, modelsList
         }
       }
     })

@@ -1246,61 +1246,331 @@ _M.error_type_from_status = error_type_from_status
 
 -- ------------------------------------------------------------------ selection
 
----Healthy, breaker-not-open workers. With IGW off every worker is a candidate
----whatever model it serves, as in the Rust router (effective_model_id is nil
----unless enable_igw).
----@param profile table|nil @ optional virtual-model profile: a non-empty
----            profile.workers narrows the candidate set to whitelisted members
----            (normalized url or worker id match, gap-virtual-models 3.3)
-local function candidates_for(model, profile)
+---Match one record against a profile's candidate whitelist, and say *which* row
+---matched.
+---
+---The body is the one the legacy `workers` whitelist used, moved here unchanged:
+---the new `candidates` bindings are the same matching rule with a model name hung
+---off the winning row, and if the two spellings ever matched differently, the same
+---intent written two ways would route two ways. That is why this is a helper and
+---not a second copy of the loop.
+---@param record table
+---@param allow string[]
+---@return boolean hit, number|nil index @ 1-based position inside allow
+local function record_in_allow_list(record, allow)
+    local rec_url
+    if registry.normalize_url then
+        local ok, normalized = pcall(registry.normalize_url, record.url)
+        if ok and type(normalized) == "string" then
+            rec_url = normalized
+        end
+    end
+    for j = 1, #allow do
+        local want = allow[j]
+        local hit = want == record.id
+        if not hit and rec_url ~= nil then
+            local ok, normalized = pcall(registry.normalize_url, want)
+            if ok and type(normalized) == "string" then
+                hit = normalized == rec_url
+            end
+        end
+        if hit then
+            return true, j
+        end
+    end
+    return false, nil
+end
+
+---Per-candidate model bindings of a profile, flattened to two parallel arrays
+---(`allow[i]` matches the pool, `models[i]` is the name to forward there).
+---nil = the profile declares none, which is every pre-feature config: the alias
+---points at one target and the whole pool shares it.
+---
+---形状守卫与 profile_worker_list 同一套：store 在写入时已经校验过，这里只防一张手改过的
+---磁盘文档把选路热路径带崩。任一条缺 worker 或 worker 不是字符串就整体当作"没有绑定"，
+---回退到旧语义——半套绑定比没有绑定更危险，因为漏掉的那条会静默继承别的候选的模型名。
+---@param profile table|nil
+---@return string[]|nil allow, string[]|nil models
+local function profile_bindings(profile)
+    if type(profile) ~= "table" then
+        return nil
+    end
+    local raw = profile.candidates
+    if not is_array_table(raw) or #raw == 0 then
+        return nil
+    end
+    local allow, models = {}, {}
+    for i = 1, #raw do
+        local item = raw[i]
+        if type(item) ~= "table" then
+            return nil
+        end
+        local worker = item.worker
+        if type(worker) ~= "string" or worker == "" then
+            return nil
+        end
+        local model = item.model
+        allow[#allow + 1] = worker
+        models[#models + 1] = (type(model) == "string" and model ~= "") and model or nil
+    end
+    if #allow == 0 then
+        return nil
+    end
+    return allow, models
+end
+
+_M.profile_bindings = profile_bindings
+
+---The upstream model name whose config cards (effort, ctx cap) and policy hint apply.
+---
+---One function because three readers have to agree: the effort ladder, the context
+---card and the policy decision each key off a model name, and under per-candidate
+---bindings that name is only known once a worker is chosen. If they disagreed, one
+---request would get instance A's effort, instance B's max_tokens clamp and C's
+---routing tree -- three layers describing three different engines, which is exactly
+---what the override feature exists to prevent.
+---
+---Priority, and why the chosen instance's name comes first: an operator who bound two
+---instances to two models means two engines, and each engine's own effort/ctx card is
+---the only one that describes what it can actually do. The alias-level settings stay
+---as the fallback below, so anything configured there still applies whenever the
+---per-instance name is not a configured key.
+---  1. the binding of the selected candidate (explicit, or carried by the record);
+---  2. the profile's declared target, for a bindings profile read *before* selection;
+---  3. the resolved alias -- which is the requested name itself when the model is not
+---     an alias, i.e. exactly what the pre-feature code passed, so an unbound config
+---     cannot move.
+---@param profile table|nil
+---@param resolved string|nil @ alias target, or the requested name when not an alias
+---@param worker table|nil @ selected worker record (nil before selection)
+---@param bound string|nil @ binding carried by the selected candidate
+---@return string|nil card_key
+local function card_key_for(profile, resolved, worker, bound)
+    local named = function(value)
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+        return nil
+    end
+    return named(bound)
+        or named(type(worker) == "table" and worker.lr_bound_model or nil)
+        or (type(profile) == "table" and profile.candidates ~= nil
+            and named(profile.target) or nil)
+        or resolved
+end
+
+_M.card_key_for = card_key_for
+
+---The single upstream model name an explicitly bound alias stands for, or nil.
+---
+---nil whenever the answer is not single: an unbound profile (every pre-feature
+---config), or bindings that name more than one model, in which case the request's
+---destination really is undecided until the policy has spoken.
+---
+---Derived from the *declared* bindings and never from the surviving candidates, for
+---two reasons. Stability: a policy instance is keyed by model, so an answer that
+---flickered with the pool would move an alias's affinity tree between keys every time a
+---worker came or went, which is a worse cache_aware than a dumb one. Agreement: the
+---same function is called before the pick (to decide whether the routing text is worth
+---extracting) and at the pick itself, and the two must not disagree.
+---@param profile table|nil
+---@return string|nil
+local function profile_policy_model(profile)
+    if type(profile) ~= "table" or profile.candidates == nil then
+        return nil
+    end
+    local allow, models = profile_bindings(profile)
+    if not allow then
+        return nil
+    end
+    local named = models[1]
+    if type(named) ~= "string" or named == "" then
+        return nil
+    end
+    for i = 2, #models do
+        if models[i] ~= named then
+            return nil
+        end
+    end
+    return named
+end
+
+_M.profile_policy_model = profile_policy_model
+
+-- The two request-body edits forward() now applies per attempt. Both live further
+-- down with the rest of the body-rewriting family, so their names are forward declared
+-- here: a plain reference from forward() would compile to a *global* read and hand back
+-- nil at run time rather than failing at boot. Their definitions below assign to these
+-- names instead of declaring new locals.
+local apply_effort_policy, apply_ctx_cap
+
+
+---Model gate for one candidate: may this instance be handed a request for `want`?
+---
+---The IGW-shaped question is "may a request that *names* M be given to this row", and
+---the answer is the pre-feature equality widened in exactly one direction: a second
+---name the engine itself advertised also routes (that is what lets an instance serving
+---two names be addressed by either, with no binding needed). Every other combination
+---is refused, and the two refusals are load-bearing:
+---  * an unverified list (a config row, a hand-written POST /workers) is a note, not a
+---    fact, so it must not *widen* the narrowing switch;
+---  * the "unknown" placeholder cannot ride the three-way question -- no engine ever
+---    advertises it, so a probed row would be denied by definition (right, but by luck)
+---    while a never-discovered row is the one thing IGW-without-a-client-model is defined
+---    to match, since route_inference falls back to "unknown" precisely to make the
+---    lookup get_by_model("unknown"). Hence the literal comparison on the primary model.
+---@param record table
+---@param want string|nil
+---@return boolean
+local function candidate_may_serve(record, want)
+    if type(want) ~= "string" or want == "" then
+        -- IGW narrows a *name*; a client that named nothing gives the gate nothing to
+        -- ask, and it abstains exactly as the pre-feature `not model` branch did.
+        return true
+    end
+    local primary = record.model_id
+    if primary == want then
+        return true
+    end
+    if primary == "unknown" then
+        -- Never discovered: the pre-feature clause, kept verbatim. A row whose model is
+        -- still the placeholder answers to every name, because "we have not looked yet"
+        -- must never cost capacity -- and it is also the *only* row a request that named
+        -- nothing resolves to, since route_inference turns an omitted model into
+        -- get_by_model("unknown") while IGW is on.
+        return true
+    end
+    -- Widening beyond the primary model needs the engine itself to have named it.
+    -- `candidate_allows_model` answers "still routable" for an unverified list, which is
+    -- the right answer when the alternative is killing a healthy worker over a config
+    -- typo, but IGW is the narrowing switch: a name that was only ever typed into a
+    -- config row must not *widen* it. Concretely, renaming a config-declared upstream
+    -- clears models_verified in patch_record (registry.lua) and refresh_models then
+    -- sits behind its 300 s `mp:` cooldown, so a fold-leftover of the previous name
+    -- would keep routing a dead id for five minutes. Two pinned contracts say so:
+    -- test_lua_router.sh "IGW: unknown model is 503" and e2e_profiles "[S2] the old
+    -- model_id stopped routing under igw".
+    if registry.models_are_verified(record)
+        and registry.worker_serves_model(record, want) == true then
+        return true
+    end
+    return false
+end
+---Healthy, breaker-not-open workers that may take this request.
+---
+---One pass, three gates, ordered cheap-first:
+---  1. registry.is_available  -- health + pool membership + circuit breaker;
+---  2. the profile's whitelist (the legacy `workers` list, or the new
+---     `candidates` bindings, which are the same match with a model attached);
+---  3. the model permission, then the capacity caps.
+---
+---Why the model question goes to candidate_may_serve instead of a bare
+---`record.model_id == model`: with per-candidate bindings one alias spans several
+---model names, so "does *this* instance serve *that* name" has to be asked of the
+---advertised list, not of the one primary column. The gate still sits behind
+---`enable_igw` for the unbound shapes (that is the pre-feature meaning of the switch)
+---and widens the old equality in one direction only -- see candidate_may_serve for
+---why a name nobody but the engine itself wrote down must not widen it. An explicit
+---binding is operator intent and therefore applies whether or not IGW is on.
+---
+---Why the caps exclude here rather than rank: cache_aware's affinity hit reads its
+---tenant out of the tree by URL and never looks at load
+---(policies/cache_aware.lua), so an over-ceiling-but-sticky worker keeps exactly the
+---traffic this rule exists to move. Excluding it from the array handed to
+---`policy:select` is the one place where the two cannot disagree, and the tree's own
+---dirty-tenant cleanup plus the next rebalance relocate the affinity onto a
+---surviving candidate without any help from here.
+---@param model string|nil
+---@param profile table|nil @ virtual-model profile (whitelist / bindings, gap-virtual-models 3.3)
+---@param counted boolean|nil @ true = the selection pass, and the only caller allowed to
+---            count exclusions. log_inference_request runs this same filter again after
+---            the response to list what was selectable; letting it count would bill every
+---            exclusion twice per request and make the counter unreadable, so counting is
+---            opt-in rather than a side effect of asking the question.
+---@return table[] candidates, table|nil why
+local function candidates_for(model, profile, counted)
     local records = registry.records()
     local out = {}
     local igw = cfg().enable_igw
+    local bound_allow, bound_models = profile_bindings(profile)
+    local legacy_allow = profile_worker_list(profile)
+    local allow = bound_allow or legacy_allow
+    -- Registry-side cap predicate (doc/gap-worker-caps.md). Read-only from here:
+    -- the two numbers it compares are this gateway's own in-flight counter and
+    -- gpu_load's watt samples, both maintained elsewhere. Absent (a stripped unit
+    -- probe, an older build) means no gate at all, which is the fail-open direction
+    -- the rule itself demands -- a missing reading must never cost capacity.
+    local cap_check = registry.capacity_exclusion
+    local capped = 0
+    local refused = 0
     for i = 1, #records do
         local record = records[i]
-        if registry.is_available(record.id) then
-            if not igw or not model or record.model_id == model
-                or record.model_id == "unknown" then
-                -- The standalone policies read load and health off the worker
-                -- itself (Rust reads them through Worker::load()/is_healthy()),
-                -- so hand them a snapshot alongside the static record. records()
-                -- decodes fresh tables, so this cannot leak into the dict.
-                record.load = registry.load(record.id)
-                record.healthy = true
-                out[#out + 1] = record
+        local keep = registry.is_available(record.id)
+        local binding
+        if keep and allow then
+            local hit, index = record_in_allow_list(record, allow)
+            keep = hit
+            if hit and bound_models then
+                binding = bound_models[index]
+            end
+            -- Two lists at once take the *intersection*. The bindings say which name
+            -- a candidate is addressed by; the legacy whitelist says whether that
+            -- instance may be touched at all. Letting the bindings shadow it would
+            -- mean an operator who added `workers` next to the new `candidates` field
+            -- silently *lost* a restriction they had just written down -- a new field
+            -- must never widen what an old one already limited.
+            if keep and bound_allow ~= nil and legacy_allow ~= nil then
+                keep = record_in_allow_list(record, legacy_allow)
             end
         end
-    end
-    local allow = profile_worker_list(profile)
-    if not allow then
-        return out
-    end
-    local kept = {}
-    for i = 1, #out do
-        local record = out[i]
-        local rec_url
-        if registry.normalize_url then
-            local ok, normalized = pcall(registry.normalize_url, record.url)
-            if ok and type(normalized) == "string" then
-                rec_url = normalized
+        -- Model permission, and it is asked only of an *unbound* candidate under IGW.
+        -- A binding is the operator naming the pair himself, so the engine's advertised
+        -- list must not veto it: the whole point of a binding is to address an instance
+        -- under a name its own /v1/models need not carry (a second serving name, a
+        -- renamed checkpoint, a proxy that maps names). Refusing there would make
+        -- cross-binding unconfigurable, which is the feature being asked for. The IGW
+        -- narrowing, by contrast, is a guess about a client-supplied name, and a guess
+        -- the engine has explicitly contradicted is worth 4xx-ing locally.
+        if keep and binding == nil and igw then
+            if not candidate_may_serve(record, model) then
+                keep = false
+                refused = refused + 1
             end
         end
-        for j = 1, #allow do
-            local want = allow[j]
-            local hit = want == record.id
-            if not hit and rec_url ~= nil then
-                local ok, normalized = pcall(registry.normalize_url, want)
-                if ok and type(normalized) == "string" then
-                    hit = normalized == rec_url
+        -- Hard capacity gate (requirement B): exclusion, not a ranking term, so the
+        -- policy below cannot see a worker that is at its ceiling.
+        if keep and cap_check then
+            local ok, verdict = pcall(cap_check, record)
+            if ok and type(verdict) == "table" then
+                keep = false
+                capped = capped + 1
+                if counted then
+                    observability.counter("smg_worker_capacity_excluded_total", {
+                        { "reason", verdict.reason or "cap" } })
+                    observability.log_debug("capacity cap excluded ", record.url,
+                        ": ", verdict.reason, " (",
+                        tostring(verdict.inflight or verdict.power_w), " >= ",
+                        tostring(verdict.max_concurrency or verdict.max_power_w), ")")
                 end
             end
-            if hit then
-                kept[#kept + 1] = record
-                break
-            end
+        end
+        if keep then
+            -- The standalone policies read load and health off the worker itself
+            -- (Rust reads them through Worker::load()/is_healthy()), so hand them a
+            -- snapshot alongside the static record. records() decodes fresh tables,
+            -- so neither this field nor the binding can leak back into the dict.
+            record.load = registry.load(record.id)
+            record.healthy = true
+            record.lr_bound_model = binding
+            out[#out + 1] = record
         end
     end
-    return kept
+    -- Second return value: how many candidates the capacity gate removed, so the 503
+    -- can tell "nothing healthy" apart from "healthy, but every one of them is at its
+    -- cap", and how many the engine's own model answer refused. A second return is free
+    -- for callers that ignore it (Lua truncates the tuple), which is why this is not
+    -- module state that a retry or the request-log re-read would have to race with.
+    return out, { capped = capped, refused = refused }
 end
 
 local function compact_url(url)
@@ -2306,10 +2576,33 @@ _M.clear_stream_options_rejected = clear_stream_options_rejected
 ---@param model string|nil
 ---@param text string|nil @ routing text
 ---@param incoming table|nil @ request headers (defaults to the live request)
-local function forward(route, body, raw_body, model, text, incoming, profile)
+---@param alias string|nil @ client-facing model name (the effort card prefers it)
+---@param policy_model string|nil @ model the policy is keyed by (defaults to `model`)
+local function forward(route, body, raw_body, model, text, incoming, profile, alias,
+                       policy_model)
     local conf = cfg()
     local is_stream = body.stream == true
     local endpoint = endpoint_label(route)
+    if type(policy_model) ~= "string" or policy_model == "" then
+        policy_model = model
+    end
+    if alias == nil then
+        -- route_inference passes the client's own name; a caller that drives forward()
+        -- directly (the /_ui chat aliases, a test) still gets the same card resolution
+        -- instead of silently losing the alias layer.
+        alias = ngx.ctx.lr_requested_model
+    end
+    -- The two request-body edits that depend on *which* engine answers, and therefore
+    -- cannot be decided before the pick: the effort ladder and the context cap read
+    -- their card off a model name, and under per-candidate bindings that name belongs
+    -- to the chosen instance. Applying them per attempt from the *original* bytes,
+    -- rather than once on the shared raw, is what makes a retry honest -- the second
+    -- attempt gets the card of the engine that will actually serve it, never a clamp
+    -- inherited from the one that just refused. stream_options and dp_rank are already
+    -- attempt-scoped for the same reason.
+    -- /generate carries its own sampling fields, so both stay off that route (Rust
+    -- router.rs skips them too); payload is then byte-identical to the pre-feature path.
+    local cards = route ~= "/generate"
 
     -- Token accounting for streams (doc/gap-token-accounting.md). Without
     -- stream_options.include_usage the OpenAI-compatible engines send no usage
@@ -2338,7 +2631,9 @@ local function forward(route, body, raw_body, model, text, incoming, profile)
 
     while true do
         attempt = attempt + 1
-        local candidates = candidates_for(model, profile)
+        -- The selection pass: this is the one that counts cap exclusions (the log
+        -- re-read below passes no flag and stays free of side effects).
+        local candidates, why = candidates_for(model, profile, true)
         local worker
         if pinned then
             for i = 1, #candidates do
@@ -2349,12 +2644,12 @@ local function forward(route, body, raw_body, model, text, incoming, profile)
             end
         end
         if not worker then
-            worker = policy_for(model, profile):select({
+            worker = policy_for(policy_model, profile):select({
                 candidates = candidates,
                 routing_key = routing_key,
                 request_text = text,
                 headers = incoming,
-                model = model,
+                model = policy_model,
             })
         end
 
@@ -2365,14 +2660,47 @@ local function forward(route, body, raw_body, model, text, incoming, profile)
             -- The body is printed by route_inference, so the JSON content type
             -- has to be claimed here; Rust answers this path as application/json.
             ngx.header["Content-Type"] = "application/json"
-            return 503, error_body(503, "no_available_workers",
-                "No available workers (all circuits open or unhealthy)")
+            -- Same status, same code, one extra clause in the message: an operator
+            -- staring at a 503 has to know whether the pool is empty or *full*, since
+            -- the two have opposite fixes (add a worker vs raise a cap). The code stays
+            -- pinned to no_available_workers, which is what the contract asserts and
+            -- what the UI keys on.
+            -- No relaxation on this path, deliberately: falling back to the capped
+            -- workers when every candidate is over its ceiling would reproduce the exact
+            -- behaviour the caps exist to remove, and would do it under load, which is
+            -- when it hurts most. Failing closed also matches the neighbouring
+            -- concurrency gate, which answers 429 instead of queueing past its limit.
+            -- Candidates that are healthy but *unavailable* (breaker open, sweep down)
+            -- keep the original wording untouched, so a pre-feature 503 reads exactly as
+            -- it did before this feature existed.
+            local message = "No available workers (all circuits open or unhealthy)"
+            if why ~= nil and why.capped > 0 and #candidates == 0 then
+                message = "No available workers (" .. tostring(why.capped)
+                    .. " at their configured concurrency/power cap)"
+            end
+            return 503, error_body(503, "no_available_workers", message)
         end
 
         ngx.ctx.lr_worker = worker
         hold_load(worker)
 
-        local payload = rewrite_model(raw_body, worker.model_id)
+        -- Two places the chosen instance gets to speak for itself: the forwarded model
+        -- name is the *bound* one (a candidate may serve a model its record does not
+        -- head with), and the cards are looked up under that same name. With no binding
+        -- this is the pre-feature expression verbatim -- worker.model_id, and no card
+        -- rewrite at all on /generate.
+        local bound = worker.lr_bound_model
+        local payload = rewrite_model(raw_body, bound or worker.model_id)
+        if cards then
+            local key = card_key_for(profile, model, worker, bound)
+            local effort_raw, requested_effort, effective_effort =
+                apply_effort_policy(payload, body, key, profile, alias)
+            payload = (apply_ctx_cap(effort_raw, body, key))
+            -- The last attempt's numbers are the ones logged, because that is the
+            -- exchange the client actually received.
+            ngx.ctx.lr_requested_effort = requested_effort
+            ngx.ctx.lr_effort = effective_effort
+        end
         -- Per attempt and not per request: the mark that turns the injection off
         -- belongs to the selected worker, and a retry lands on a different one.
         local inject_usage = ask_usage and not stream_options_rejected(worker.id)
@@ -2573,7 +2901,7 @@ end
 ---@param profile table|nil @ virtual-model profile of the client-facing alias
 ---@param alias string|nil @ client-facing model name (profile effort lookup prefers it)
 ---@return string raw, string|nil requested, string|nil effective
-local function apply_effort_policy(raw, body, model, profile, alias)
+apply_effort_policy = function(raw, body, model, profile, alias)
     local requested
     if type(body.reasoning_effort) == "string" then
         requested = body.reasoning_effort
@@ -2621,7 +2949,7 @@ end
 ---Rust apply_ctx_cap: clamp max_tokens and its alias to the model context cap.
 ---Absent fields are written too, matching `current.is_none_or(|v| v > cap)`.
 ---@return string raw, number|nil cap
-local function apply_ctx_cap(raw, body, model)
+apply_ctx_cap = function(raw, body, model)
     local store_mod = store()
     if not store_mod or type(store_mod.ctx_cap) ~= "function" then
         return raw, nil
@@ -2680,14 +3008,12 @@ local function route_inference(route, body, raw)
     -- all) is nil here and every hook below degrades to the pre-feature path.
     local profile = profile_for_alias(model)
 
-    -- /generate carries its own sampling fields, so the effort ladder and the
-    -- context cap stay off that route (Rust router.rs skips them too).
-    local requested_effort, effective_effort
-    if route ~= "/generate" then
-        raw, requested_effort, effective_effort = apply_effort_policy(raw, body,
-            resolved, profile, model)
-        raw = (apply_ctx_cap(raw, body, resolved))
-    end
+    -- The effort ladder and the context cap used to be applied here, once, off
+    -- `resolved`. They now happen inside forward(), per attempt, against the model
+    -- name of the instance that will actually serve the request -- under
+    -- per-candidate bindings `resolved` names only the profile's representative, so
+    -- a clamp taken from it can belong to a different engine than the one being
+    -- asked. /generate still opts out of both (Rust router.rs skips them too).
 
     ngx.ctx.lr_session = router_session_key(body)
     ngx.ctx.lr_model = resolved or "unknown"
@@ -2695,18 +3021,31 @@ local function route_inference(route, body, raw)
     ngx.ctx.lr_model_query = resolved
     ngx.ctx.lr_endpoint = endpoint_label(route)
     ngx.ctx.lr_stream = (body.stream == true)
-    ngx.ctx.lr_requested_effort = requested_effort
-    ngx.ctx.lr_effort = effective_effort
+    -- The two effort fields are stamped by forward() once a worker is picked (the
+    -- last attempt wins, since that is the exchange the client receives). Cleared
+    -- here so a retried request cannot inherit a stale value from the attempt before.
+    ngx.ctx.lr_requested_effort = nil
+    ngx.ctx.lr_effort = nil
 
     -- Only extract routing text when the policy reads it: the flattening walks
     -- every message, which random / round_robin / the hash ring never look at.
-    local inst = policy_for(resolved, profile)
+    -- Which model the policy is asked about: the name every candidate of a bound
+    -- alias shares, otherwise the resolved id as before. A bound alias's clients ask
+    -- for a name that never appears in the pool, so the `labels.policy` hint lookup
+    -- used to miss and the alias fell through to the global policy while the
+    -- instances underneath were advertising their own; Rust's PolicyRegistry keys by
+    -- the model served, and this is what makes that reach an alias.
+    -- Computed once, here, and handed to forward(): the extract-the-text decision and
+    -- the select decision must consult the same instance, or a text-needing policy
+    -- would be run without its text.
+    local policy_model = profile_policy_model(profile) or resolved
+    local inst = policy_for(policy_model, profile)
     -- The request log calls this field route_type; the span reuses the same value
     -- so a trace and a log row name the same decision.
     ngx.ctx.lr_route_type = inst:policy_name()
     local text = inst:needs_request_text() and text_for(route, body) or nil
     local status, response_body = forward(route, body, raw, resolved, text,
-        ngx.req.get_headers(), profile)
+        ngx.req.get_headers(), profile, model, policy_model)
     if route == "/v1/responses" and status >= 200 and status < 300 then
         -- Rust patches the response Value before it answers (non_streaming.rs:
         -- 141-167). The response store is gone (scope-trim.md), so this is the

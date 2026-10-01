@@ -50,6 +50,22 @@ env SMG_WATCHER_ALLOW_PORT;
 env SMG_WATCHER_DENY_PORT;
 env SMG_WATCHER_MODEL_MAP;
 
+# GPU 功率通道（每 worker 的功率上限，registry.capacity_exclusion）：其余 SMG_LOAD_* 由
+# resty.luarouter.config 在 init_by_lua 里解析（fork 之前，不受白名单影响），而这三个由
+# gpu_load.lua 在 worker 定时器里用 os.getenv 现读，所以必须在这里声明——nginx 按 env
+# 白名单重建 worker 环境，漏声明的名字读回来是 nil，功能是静默失效的。生效方式是重启
+# 容器（worker 环境 fork 后不再变化），改 compose 里的值即可。
+#   SMG_LOAD_POWER       =1 时 metrics 路顺带扫功率 gauge（缺省 off）
+#   SMG_LOAD_POWER_KEYS  覆盖功率 gauge 名单，逗号/空格分隔
+#   SMG_LOAD_POWER_QUERY prom 路的第二条 PromQL，留空 = 不采功率
+# 注意：功率是**搭载**在负载源上的，SMG_LOAD_SOURCE 仍是总开关——它是 none 时定时器
+# 根本不启动，这里设了 SMG_LOAD_POWER 也不会有任何读数（不是 bug，是为了不给一个
+# 关掉的子系统留第二条独立抓取路径）。prom 路的合法组合是「SMG_LOAD_PROM_URL +
+# SMG_LOAD_PROM_QUERY（负载）+ 可选 SMG_LOAD_POWER_QUERY（功率）」，两条查询各自独立。
+env SMG_LOAD_POWER;
+env SMG_LOAD_POWER_KEYS;
+env SMG_LOAD_POWER_QUERY;
+
 
 worker_processes ${WORKER_PROCESSES};
 worker_rlimit_nofile ${NOFILE_LIMIT};

@@ -45,6 +45,8 @@ local K_IDURL  = "u:"    -- id -> url (cheap label lookup for metrics)
 local K_JOB = "job:"     -- url -> JobStatus JSON
 local K_DISC = "disc:"   -- id -> metadata discovery attempts
 local K_DPROBE = "dpr:"  -- id -> /server_info probes spent on DP expansion
+local K_MPROBE = "mp:"    -- id -> /v1/models coverage probes spent (failed ones)
+local K_MPROBE_OK = "mpok:" -- id -> TTL stamp of the last successful coverage probe
 -- Cached "this record may serve the HTTP inference plane" flag (see
 -- _M.http_selectable). A derived value, recomputed whenever the static record is
 -- written, so the selection path never has to decode the record to ask.
@@ -60,6 +62,16 @@ local K_HSEL = "isel:"
 --       是为了让「谁说了算」这件事在数据模型里就写清楚，而不是靠调用顺序。
 local K_XLOAD = "xl:"  -- external GPU sample, milli of a 0..1 load, TTL'd
 local K_SLOAD = "sl:"  -- engine self-report, same shape, lower priority
+-- Raw measured power (doc/gap-worker-caps.md): the third external channel, and
+-- deliberately *not* a load. `xl:` answers "how busy is this card" for the ranking
+-- policies; `pw:` answers "how many watts is it drawing" for the per-worker power
+-- cap, which is a hard admission gate and not a score. Folding watts into
+-- _M.load() would let an idle-but-thirsty co-tenant's GPU make a worker look
+-- overloaded to power_of_two, so the two numbers never share a field.
+--   value = integer milli-watts (watts x 1000), TTL'd like the load samples: an
+--   expired key means "no reading", and _M.capacity_exclusion reads that as
+--   *unknown*, which never excludes a worker.
+local K_POWER = "pw:"   -- raw power sample, milli-watts, TTL'd
 -- Weight of a fully busy worker: how many in-flight requests a 1.0 sample is
 -- worth. Published by gpu_load.run_pass on every tick so the selection path never
 -- reads the environment; the default keeps cache_aware's balance_abs_threshold (a
@@ -635,6 +647,145 @@ local function string_field(value)
     return nil
 end
 
+--- Normalized list of every model id one worker advertises.
+---
+--- 为什么要这个字段（root 裁定 2026-10-01，虚拟模型多绑定）：虚拟模型现在能把不同候选绑到
+--- 不同模型上，于是网关必须知道"某个实例到底提供哪些模型"。记录里原来只有一个 model_id，
+--- 探针在 /v1/models 看到的多模型列表只留了第一条、其余当场丢弃（watcher 那边），配置声明
+--- 更是只有一列 model_id。没有这份列表，多绑定的配置就只能靠"名字看起来像"来路由：绑错一个
+--- 就整条请求 4xx，而网关明明有能力当场判掉。
+---
+--- 三个入口都归一到同一形状：请求体里的 models 数组、只写了 model_id 的老形状、以及
+--- labels.served_model_name。缺省返回 nil 而不是空表——空表在 patch_record 的合并语义里是
+--- "声明了空集合"，与"没说过"必须可区分（见 merge_models）。
+--- 顺序保持调用方给定的顺序，去重；非字符串项忽略（上游把 models 写成对象时不该整条注册失败）。
+---@param value any @ raw models field from a registration request or a probe meta
+---@param fallback string|nil @ model_id / served_model_name to seed from
+---@return table|nil @ array of model ids, or nil when nothing was advertised
+local function norm_models(value, fallback)
+    local out, seen = {}, {}
+    local function note(model)
+        if type(model) ~= "string" then
+            return
+        end
+        local trimmed = model:match("^%s*(.-)%s*$")
+        -- "unknown" is our own placeholder for "not discovered yet" (see _M.add), never
+        -- something an engine advertises. Letting it in would make the multi-binding
+        -- filter route real traffic to a name no engine will accept.
+        if trimmed == "" or trimmed == "unknown" or seen[trimmed] then
+            return
+        end
+        seen[trimmed] = true
+        out[#out + 1] = trimmed
+    end
+    if type(value) == "table" then
+        for i = 1, #value do
+            note(value[i])
+        end
+    end
+    note(fallback)
+    if #out == 0 then
+        return nil
+    end
+    return out
+end
+
+--- Fold a new model list into a stored record without inventing coverage.
+---
+--- 三条规则，都来自"这份列表只能代表它自己的来源"：
+---   * 新来的是 nil（对方没说过模型列表）：保持原值。 discovery 那条路径就是典型——它只在
+---     model_id 还是 unknown 时才跑，手里根本没有 /v1/models 的完整列表，绝不能拿
+---     {model_id} 去覆盖 watcher 探到的全量列表。
+---   * 主模型变化（改名、纠正、配置声明了另一个模型）：整表替换。这时旧列表多半来自别的
+---     引擎或上一次注册，留着它等于让一个实例继续广告它已经不服务的模型。
+---   * 两者都没变：并集。 配置只声明 model_id 的运维补充场景里，探针后到补全列表，而声明值
+---     不能被探针悄悄抹掉（否则刚配好的绑定会随下一轮心跳消失）。
+---@param opts table|nil @{replace=true: the incoming list is an *observation* (the
+---            worker answered /v1/models), so it is authoritative and the stored list
+---            is dropped. Default is fold/union, for declarations: an operator naming
+---            one model must not delete what the probe already saw.}
+---@return table|nil @ the list to store, or nil when the field should stay unset
+local function merge_models(record, incoming, opts)
+    if incoming == nil then
+        return record.models
+    end
+    if opts and opts.replace then
+        return incoming
+    end
+    local primary = record.model_id
+    local current = record.models
+    if type(current) ~= "table" or #current == 0 then
+        return incoming
+    end
+    local merged, seen = {}, {}
+    local function note(model)
+        if type(model) == "string" and model ~= "" and not seen[model] then
+            seen[model] = true
+            merged[#merged + 1] = model
+        end
+    end
+    note(primary)
+    for i = 1, #current do
+        note(current[i])
+    end
+    for i = 1, #incoming do
+        note(incoming[i])
+    end
+    if #merged == 0 then
+        return nil
+    end
+    return merged
+end
+
+---Every model a record claims to serve: the advertised list when it has one, plus the
+---primary model_id. Shared by the answer below and by any listing that wants the truth
+---rather than the single column.
+---@param record table|nil
+---@return table @ array (possibly empty)
+local function models_of(record)
+    -- Empty is rendered as [], not {}: consumers index the field as an array
+    -- (jq .models[], the pool table), and cjson turns a bare {} table into an object.
+    local EMPTY = setmetatable({}, cjson.empty_array_mt)
+    if type(record) ~= "table" then
+        return EMPTY
+    end
+    -- Primary first: several readers (props.lua, the UI pool table) take models[1] as
+    -- "the" model of a worker, and that position has always been model_id. Keeping the
+    -- invariant means widening the field cannot silently re-point those readers at
+    -- whatever the probe happened to list first.
+    -- Built as one flat candidate list rather than via the fallback argument: that
+    -- position takes a *single* string, and passing record.models there would have
+    -- norm_models() ignore the array wholesale (its note() skips non-strings), leaving
+    -- every multi-advertised name invisible.
+    local list = { record.model_id }
+    if type(record.models) == "table" then
+        for i = 1, #record.models do
+            list[#list + 1] = record.models[i]
+        end
+    end
+    return norm_models(list, nil) or EMPTY
+end
+
+---Should the coverage probe run for this record?
+---
+--- 只有一种情况需要再探：记录已经有主模型、可广告列表却还没成型（缺省或只有一条）。这正是
+--- watcher / 单模型配置声明 / 手工 POST 三条入口的共同产物。已经有两条以上就没什么可问的——
+--- 那个列表是引擎亲口答的，重复探只会白占巡检时间。
+---@param record table|nil
+---@return boolean
+local function needs_models_refresh(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    local list = record.models
+    if type(list) ~= "table" or #list <= 1 then
+        return true
+    end
+    return false
+end
+_M.needs_models_refresh = needs_models_refresh
+
+
 ---Queue the registration of a worker (202 semantics live in router.lua).
 ---@param req table @ decoded POST /workers body
 ---@param cfg table @ router config providing the health-check defaults
@@ -721,8 +872,28 @@ function _M.add(req, cfg)
             url = url,
             model_id = req.model_id or (type(req.labels) == "table"
                 and req.labels.served_model_name) or "unknown",
+            -- Every model this endpoint advertises. Read from the request so each
+            -- registration entry point (POST /workers, the watcher, the config
+            -- declaration layer, the bootstrap seed, DP ranks) gets the same shape
+            -- without touching its own call site; a caller that knows only one model
+            -- keeps working because model_id seeds the list. "unknown" never enters
+            -- it: that is our placeholder for "not discovered yet", not something an
+            -- engine advertises, and a record claiming to serve "unknown" would make
+            -- the multi-binding filter route real traffic to a bogus name.
+            models = norm_models(rawget(req, "models"),
+                type(req.model_id) == "string" and req.model_id
+                    or (type(req.labels) == "table" and req.labels.served_model_name)),
             priority = tonumber(req.priority) or 50,
             cost = tonumber(req.cost) or 1.0,
+            -- Per-worker capacity caps (doc/gap-worker-caps.md): stored only when a
+            -- usable limit was declared, so a record built without them keeps its
+            -- exact pre-feature shape and the selection path short-circuits on
+            -- `cap == nil` before it touches a dict. Every registration entry
+            -- point (POST /workers, the watcher, the config declaration layer, the
+            -- bootstrap seed, DP ranks) gets them from here rather than its own
+            -- call site, which is what keeps the four paths identical.
+            max_concurrency = _M.cap_limit(rawget(req, "max_concurrency"), true),
+            max_power_w = _M.cap_limit(rawget(req, "max_power_w"), false),
             worker_type = worker_type or "regular",
             connection_mode = mode,
             api_key = req.api_key,
@@ -778,6 +949,7 @@ function _M.add(req, cfg)
         -- external channels start empty (the load source refills them on its tick).
         d:delete(K_XLOAD .. id)
         d:delete(K_SLOAD .. id)
+        d:delete(K_POWER .. id)
         local ids = read_ids(d)
         local seen = false
         for i = 1, #ids do
@@ -835,7 +1007,8 @@ function _M.remove(worker_id)
         dd:delete(K_IDURL .. id)
         for _, prefix in ipairs({ K_HEALTH, K_HFAIL, K_HSUCC, K_CBSTATE,
                                  K_CBF, K_CBS, K_CBO, K_LOAD, K_XLOAD, K_SLOAD,
-                                 K_DISC, K_DPROBE, K_HSEL }) do
+                                K_POWER,
+                                K_DISC, K_DPROBE, K_MPROBE, K_MPROBE_OK, K_HSEL }) do
             dd:delete(prefix .. id)
         end
         local kept = {}
@@ -898,6 +1071,11 @@ function _M.info(record, d)
         id = id,
         url = record.url,
         model_id = record.model_id or "unknown",
+        -- Advertised coverage, the shape the admin console and the multi-binding
+        -- config need: a worker that serves two engines' models shows both, and a
+        -- worker that has never been probed shows [] rather than the placeholder
+        -- "unknown" that model_id still carries for the pre-feature readers.
+        models = models_of(record),
         priority = record.priority or 50,
         cost = record.cost or 1.0,
         worker_type = record.worker_type or "regular",
@@ -911,6 +1089,22 @@ function _M.info(record, d)
         metadata = metadata,
         disable_health_check = record.disable_health_check or false,
         job_status = job,
+        -- Capacity caps and their two live readings (doc/gap-worker-caps.md).
+        -- A cap that was never declared is *absent* rather than 0 -- 0 would read
+        -- as "a limit of zero slots" to anything that does not know cap_limit's
+        -- normalization, and the admin console needs to tell "unlimited" apart from
+        -- "configured to 0 and therefore never selectable". inflight_requests is
+        -- the pure request count (what the concurrency cap compares against), which
+        -- is deliberately not `load` -- that field is the ranking number and mixes
+        -- in the GPU sample. power_w stays nil while no fresh watt sample exists,
+        -- which is the same "unknown, not zero" the power cap reads.
+        max_concurrency = _M.cap_limit(record.max_concurrency),
+        max_power_w = _M.cap_limit(record.max_power_w),
+        inflight_requests = d:get(K_LOAD .. id) or 0,
+        power_w = (function()
+            local milli = d:get(K_POWER .. id)
+            return milli and (milli / 1000) or nil
+        end)(),
         -- Provenance for GET /workers (doc/gap-virtual-models.md 3.1): config
         -- members are the config_store-declared upstreams; everything else
         -- (watcher, SMG_WORKER_URLS bootstrap, POST /workers, mesh mirror)
@@ -1025,6 +1219,211 @@ function _M.models()
     end
     table.sort(out)
     return out
+end
+
+--- Every model id advertised by any worker, primary and multi-advertised alike.
+---
+--- Kept separate from _M.models() on purpose: that one is the Rust-parity single
+--- column the /metrics pool gauge and the legacy /v1/models list are pinned to, so
+--- widening it would move a contract assertion. The admin console and the
+--- multi-binding config read *this* one, where "this instance also serves model X"
+--- has to be visible.
+---@return string[] @ sorted distinct model ids
+function _M.all_models()
+    local seen, out = {}, {}
+    local records = _M.records()
+    for i = 1, #records do
+        local list = models_of(records[i])
+        for j = 1, #list do
+            local model = list[j]
+            if not seen[model] then
+                seen[model] = true
+                out[#out + 1] = model
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+--- Advertised model list of one worker, by id. Empty array when nothing learned yet.
+---@param id string
+---@return table @ array of model ids (fresh table; the caller may keep it)
+function _M.worker_models(id)
+    if type(id) ~= "string" or id == "" then
+        return {}
+    end
+    return models_of(_M.record(id))
+end
+
+--- Advertised list of an already-decoded record, exported so the config layer can
+--- build its registered-model table (which wants every advertised name, not one
+--- column) without reimplementing the primary-first ordering rule.
+---@param record table|nil
+---@return table
+function _M.record_models(record)
+    return models_of(record)
+end
+
+--- HTTP-plane workers grouped by url as {url, api_key, models}, the shape props.lua
+--- asks for first (it prefers this function whenever the registry exports it, and
+--- only falls back to grouping records() by the single model_id column itself).
+---
+--- 为什么由 registry 提供：那是唯一同时看得见 records 与探针学到的 models 的地方。
+--- props.lua 的自带回退只读 model_id 一列，于是多广告的第二个模型在 /_ui/v1/models、
+--- /props 的候选匹配和 config 的 models 文档里都看不见——绑定了却看不到，等于需求没做完。
+--- 这里补上，props/ui/config 三个消费者不用改就一起看到全量。
+---
+--- 与 props 的回退分支保持同一套可用性判据（connection_mode=http），并在 registry 本身
+--- 不可用时（纯 Lua 单测没有 ngx.shared，records() 会抛）退回 props 原来会用的
+--- LMR_TEST_WORKERS 注入，避免导出这个函数反而把单测的注入口关死。
+---@return table[]
+function _M.http_workers()
+    local ok_records, records = pcall(_M.records)
+    if not ok_records or type(records) ~= "table" then
+        if ngx and ngx.shared then
+            return {}
+        end
+        local injected = rawget(_G, "LMR_TEST_WORKERS")
+        if type(injected) == "table" then
+            return injected
+        end
+        return {}
+    end
+    local by_url, out = {}, {}
+    for i = 1, #records do
+        local rec = records[i]
+        local url = rec.url
+        local mode = rec.connection_mode or "http"
+        local wtype = rec.worker_type or "regular"
+        if url and mode == "http" and wtype == "regular" then
+            local w = by_url[url]
+            if not w then
+                local key = rec.api_key
+                if key == false or key == cjson.null then key = nil end
+                w = { url = url, api_key = key, models = {}, seen = {} }
+                by_url[url] = w
+                out[#out + 1] = w
+            end
+            local list = models_of(rec)
+            for j = 1, #list do
+                local model = list[j]
+                if not w.seen[model] then
+                    w.seen[model] = true
+                    w.models[#w.models + 1] = model
+                end
+            end
+        end
+    end
+    for i = 1, #out do
+        out[i].seen = nil
+    end
+    return out
+end
+
+---Does one worker advertise model M?
+---
+---The multi-binding question the router asks per candidate (a virtual model may bind
+---different candidates to different models, so "is this instance usable for that
+---name" can no longer be a single model_id equality).
+---
+---Three-way answer, because the pool has a third state and guessing on it would
+---cost requests:
+---  true   -- the worker advertises M (probe list, or its primary model_id).
+---  false  -- the worker advertises a list that does not contain M. That is a real
+---            denial: it answered /v1/models and named what it serves, so routing
+---            the request there means a 4xx from the engine. How *trustworthy* that
+---            denial is depends on who named the list, so the caller that has to make
+---            a routing decision should also ask _M.models_are_verified(): an answer
+---            from the engine is a fact, a list that only ever came from a
+---            registration body or a config row is somebody's note, and dropping an
+---            otherwise healthy worker over a hand-filled config row is the mistake
+---            this feature exists to avoid.
+---  nil    -- we never learned what it serves (no probe list and model_id is still
+---            the placeholder). The caller decides whether an unknown engine is
+---            usable; a whitelist-style narrowing treats it as usable, because
+---            "we have not looked yet" must not become "this worker is broken" --
+---            the same rule that keeps a failed probe from ever removing a worker.
+---@param id_or_record string|table
+---@param model string|nil @ nil/"" = the question is meaningless; answered nil
+---@return boolean|nil
+function _M.worker_serves_model(id_or_record, model)
+    if type(model) ~= "string" or model == "" then
+        return nil
+    end
+    local record
+    if type(id_or_record) == "table" then
+        record = id_or_record
+    elseif type(id_or_record) == "string" and id_or_record ~= "" then
+        record = _M.record(id_or_record)
+    end
+    if type(record) ~= "table" then
+        return nil
+    end
+    -- Exact comparison, deliberately: an engine's model id is an opaque key that it
+    -- matches itself, and prefix/fuzzy "looks close enough" guessing is how a request
+    -- for qwen3-30b ends up on a qwen3-30b-instruct that 404s it.
+    local list = models_of(record)
+    if #list == 0 then
+        return nil
+    end
+    for i = 1, #list do
+        if list[i] == model then
+            return true
+        end
+    end
+    -- Denying a request is the expensive direction, so it needs the engine's own
+    -- word. Until a /v1/models answer backs the list, "not in it" is only "nobody
+    -- wrote it down", which must stay routable.
+    return false
+end
+
+---Was a worker's advertised list learned from the engine's own /v1/models answer?
+---
+---The provenance bit behind worker_serves_model's three-way answer. Exported so
+---the router (and the admin console) can tell "the engine says it does not serve M"
+---from "nobody ever wrote M into a config row" -- the first is a routable denial,
+---the second must never narrow traffic.
+---@param id_or_record string|table
+---@return boolean
+function _M.models_are_verified(id_or_record)
+    local record
+    if type(id_or_record) == "table" then
+        record = id_or_record
+    elseif type(id_or_record) == "string" and id_or_record ~= "" then
+        record = _M.record(id_or_record)
+    end
+    return type(record) == "table" and record.models_verified == true
+end
+
+---Can this worker be given a request for model M? The routing-shaped form of
+---worker_serves_model, and the one the selection path should call.
+---
+---为什么再来一个：worker_serves_model 是三值答案，"要不要把它从候选里剔掉"这个决定
+---得同时看来源（models_are_verified）才判得对。两个调用方各自拼这套逻辑，迟早有人只调
+---第一个就把 false 当死刑用——那等于让一条手填的配置声明（或一次没探到的巡检）替一个
+---健康的实例宣布不服务某模型，正是"监控故障不许吃掉流量"这条红线在选路上的形态。
+---合成一个函数、缺省方向是"仍可路由"，就把这个坑填在写它的人这一侧。
+---  false 只在一种情况下返回：引擎亲口答过 /v1/models，而它给的列表里没有 M。
+---  其余一律 true，包括"从没探到过"（未知 ≠ 不可用）与"列表只是声明出来的"
+---  （那人只写了他想到的名字）。
+---@param id_or_record string|table
+---@param model string|nil @ nil/"" = 问题不成立，不据此收窄
+---@return boolean
+function _M.candidate_allows_model(id_or_record, model)
+    if type(model) ~= "string" or model == "" then
+        return true
+    end
+    local verdict = _M.worker_serves_model(id_or_record, model)
+    if verdict ~= false then
+        return true
+    end
+    -- 用显式分支而不是 "verified and false or true"：Lua 里那个式子恒为 true
+    -- （false 会落到 or 的右侧），等于把唯一的排除条件写没了。
+    if _M.models_are_verified(id_or_record) then
+        return false
+    end
+    return true
 end
 
 -- ------------------------------------------------------------------ live state
@@ -1252,6 +1651,173 @@ function _M.clear_external_load(id)
     local d = shdict()
     d:delete(K_XLOAD .. id)
     d:delete(K_SLOAD .. id)
+end
+
+------------------------------------------------------------------ capacity caps
+--
+-- Per-worker ceilings on the two things that actually run a serving instance out
+-- of headroom: requests in flight and watts the GPU is drawing (the latter is the
+-- fleet's own reason for the feature -- a card pinned at its power limit decodes
+-- noticeably slower than one at half load, and neither the request count nor the
+-- utilization gauge shows it). doc/gap-worker-caps.md.
+
+---Normalize one declared cap. Absent, blank, non-numeric, NaN, +/-inf or a value
+---<= 0 all mean "no limit" and collapse to nil, so the selection path can test
+---`cap ~= nil` without re-reading the environment, and a record that never
+---declared a cap stores no key at all. Integers are floored for the concurrency
+---cap: a fractional 2.5 slots would read "third request allowed" one way and
+---"two slots" the other, and "at most 2" is the safe reading of both.
+---@param value any
+---@param integer boolean @ true for a request count, false for watts
+---@return number|nil limit
+function _M.cap_limit(value, integer)
+    local number = tonumber(value)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge or number <= 0 then
+        return nil
+    end
+    if integer then
+        return math.floor(number)
+    end
+    return number
+end
+
+---The router's own in-flight request count for one worker: the *pure* number,
+---without the external GPU term that _M.load() adds. `lo:` is maintained by the
+---hold/release pair in router.lua via shdict:incr, so it already spans every
+---nginx process, and it is the same raw counter smg_worker_requests_active
+---exports. The concurrency cap has to compare request counts, which is why it
+---reads this key rather than load() (a mixed load would make a busy-but-not-full
+---worker hit a request-count threshold it was never defined against).
+---nil-safe: a worker with no key reads 0, exactly as load_with treats it.
+---@param id string
+---@return number inflight
+function _M.inflight_requests(id)
+    return shdict():get(K_LOAD .. id) or 0
+end
+
+---Hard capacity gate for one candidate worker.
+---
+---Root ruling 2026-10-01: a worker at its configured in-flight or power ceiling
+---must leave the candidate set even when cache_aware's affinity tree would have
+---kept it here. So this is an *exclusion*, evaluated where candidates are
+---assembled, not another term in the ranking: the policies' own load escape
+---(balance_abs/rel thresholds, power_of_two's low-load branch) turns "busier"
+---into "less preferred", which under affinity keeps exactly the traffic this
+---rule is meant to move. Absent = selectable; a returned table = exclude, with
+---{reason="concurrency"|"power"} and the two numbers that decided it so the
+---caller can count and log which kind fired.
+---
+---The two readings are different in kind on purpose:
+---  * concurrency is this gateway's own counter, always known;
+---  * power is an external sample, and *missing means unknown, not zero*. A
+---    monitoring system that dies must cost accuracy, never capacity, so a nil
+---    sample never excludes -- the same rule the load samples follow, and the
+---    reason the key is TTL'd rather than last-value-wins.
+---Both caps default to unlimited, and an uncapped worker costs zero shdict reads.
+---@param record table @ static record (needs id; cap fields optional)
+---@param d table|nil @ shared dict (resolved when omitted)
+---@return table|nil exclusion @ nil = selectable
+function _M.capacity_exclusion(record, d)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local max_c = _M.cap_limit(record.max_concurrency)
+    local max_w = _M.cap_limit(record.max_power_w)
+    if max_c == nil and max_w == nil then
+        return nil
+    end
+    d = d or shdict()
+    local id = record.id
+    if max_c ~= nil then
+        local inflight = d:get(K_LOAD .. id) or 0
+        if inflight >= max_c then
+            return { reason = "concurrency", inflight = inflight,
+                max_concurrency = max_c }
+        end
+    end
+    if max_w ~= nil then
+        local milli = d:get(K_POWER .. id)
+        if milli ~= nil and milli >= max_w * 1000 then
+            return { reason = "power", power_w = milli / 1000,
+                max_power_w = max_w }
+        end
+    end
+    return nil
+end
+
+---Store one raw watt sample for a worker (gpu_load's power pass is the only
+---writer; unit tests may call it directly). Watts go in as milli-watts so gauge
+---noise below one watt does not widen the key's type, and a negative or unusable
+---reading is refused rather than clamped: "0 W" is a claim about the hardware
+---that no exporter in this fleet can honestly make, and a stored 0 would read
+---"far below any cap" for a worker whose exporter is misbehaving.
+---@param id string
+---@param watts number|nil
+---@param ttl_secs number|nil
+---@return boolean written
+function _M.set_power_w(id, watts, ttl_secs)
+    local number = tonumber(watts)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge or number < 0 then
+        return false
+    end
+    local seconds = _M.stale_ttl(ttl_secs)
+    local ok, err = shdict():set(K_POWER .. id,
+        math.floor(number * 1000 + 0.5), seconds)
+    if not ok then
+        -- No-capacity-on-the-dict is the only way this fails and it is worth one
+        -- line: the cap silently stops being enforceable for this worker until the
+        -- sample TTLs out or the exporter refills it.
+        if ngx and ngx.log then
+            ngx.log(ngx.WARN, "luarouter: power sample for ", tostring(id),
+                " not stored: ", tostring(err))
+        end
+        return false
+    end
+    return true
+end
+
+---The fresh watt sample for one worker: nil when there is none (an absent sample
+---is *unknown*, and never collapses to 0 -- that distinction is what makes the
+---power cap safe to leave switched on).
+---@param id string
+---@return number|nil watts
+function _M.power_w(id)
+    local milli = shdict():get(K_POWER .. id)
+    if milli == nil then
+        return nil
+    end
+    return milli / 1000
+end
+
+---Every fresh watt sample, keyed by worker id. The exporter and the UI pool
+---table both want the whole table (N single lookups over a shared dict is the
+---shape this module has already paid for in _M.records).
+---@return table @ worker id -> watts
+function _M.power_samples()
+    local out = {}
+    local d = shdict()
+    if type(d.get_keys) ~= "function" then
+        return out
+    end
+    for _, key in ipairs(d:get_keys(0)) do
+        if type(key) == "string" and #key > #K_POWER
+            and string.sub(key, 1, #K_POWER) == K_POWER then
+            local value = d:get(key)
+            if value ~= nil then
+                out[string.sub(key, #K_POWER + 1)] = value / 1000
+            end
+        end
+    end
+    return out
+end
+
+---Drop the power sample (an operator override, a re-registration, or a test;
+---TTL expiry is the ordinary life cycle).
+---@param id string
+function _M.clear_power_w(id)
+    shdict():delete(K_POWER .. id)
 end
 
 ---Normalized 0..1 -> milli integer, nil for anything unusable. NaN and the
@@ -1517,8 +2083,16 @@ local function patch_record(id, patch, opts)
         return nil
     end
     local changed = false
+    -- models is applied after every other key, on purpose: merge_models decides
+    -- "replace or fold" by comparing the incoming head against the record's *final*
+    -- model_id, and pairs() has no order. Left unordered, a config row that renames a
+    -- worker A -> C sometimes folds the old list back in ({"C","A","B"}) and sometimes
+    -- replaces it, so the same declaration would converge differently per tick.
+    local models_patch, models_seen = nil, false
     for key, value in pairs(patch) do
-        if key == "labels" then
+        if key == "models" then
+            models_patch, models_seen = value, true
+        elseif key == "labels" then
             if opts and opts.labels_replace then
                 local next_labels = {}
                 for name, label in pairs(value) do
@@ -1535,9 +2109,43 @@ local function patch_record(id, patch, opts)
                     end
                 end
             end
+        elseif key == "model_id" and record.model_id ~= value then
+            -- 换了主模型就是换了一次"这个实例到底是什么"的陈述：之前那份广告列表是
+            -- 围绕旧身份学到的，不能再当作引擎亲口答过的凭证（models_verified 的含义见
+            -- worker_serves_model）。清掉标记后，下一轮 /v1/models 观测会重新盖章。
+            record.model_id = value
+            record.models_verified = false
+            changed = true
         elseif record[key] ~= value then
             record[key] = value
             changed = true
+        end
+    end
+    if models_seen then
+        -- Wholesale assignment would be wrong here: half the writers only know the
+        -- single model they were configured with (a config-declared upstream names one
+        -- model_id), while the probe path knows the full advertised list. Each has to
+        -- be able to write without erasing what the other learned, so the fold lives in
+        -- merge_models and every caller shares it.
+        -- Two stances, told apart by the caller: an *observation* (the worker itself
+        -- answered /v1/models) is authoritative and replaces the list; a *declaration
+        -- or config reconcile* only states what it knows and folds into the stored list,
+        -- so naming one model never deletes what a sweep already saw.
+        local next_models = merge_models(record, models_patch,
+            { replace = (opts and opts.models_replace) and true or false })
+        if next_models ~= record.models then
+            record.models = next_models
+            changed = true
+        end
+        -- 只有"观测"才给这份列表盖章：opts.models_replace 是调用方在说"这些名字是
+        -- 对方 /v1/models 亲口答的"（refresh_models、metadata discovery 两条路径）。
+        -- 注册体与 config 声明行只是人在打字，不能凭它们宣称"这个实例就是不服务
+        -- 模型 M"，否则一条欠配置的声明会让一个本来能答上请求的实例被选路判掉。
+        if opts and opts.models_replace and next_models ~= nil then
+            if not record.models_verified then
+                record.models_verified = true
+                changed = true
+            end
         end
     end
     if not changed then
@@ -1556,6 +2164,95 @@ local function patch_record(id, patch, opts)
     return record
 end
 
+--- Ask one worker what it advertises, as a normalized id list.
+---
+--- Shared by the metadata-discovery fallback and by the coverage refresh below so
+--- both read /v1/models the same way (data[].id, tolerate a bare-string data[]).
+---@param url string
+---@param timeout_ms number
+---@param headers table|nil
+---@return table|nil @ array of ids, or nil when the endpoint did not answer
+function _M.probe_advertised_models(url, timeout_ms, headers)
+    local hb = require "resty.luarouter.hb"
+    local status, body = hb.http_get(url .. "/v1/models", timeout_ms, headers)
+    if status ~= 200 then
+        return nil
+    end
+    local listing = json_decode(body or "")
+    local data = type(listing) == "table" and listing.data or nil
+    if type(data) ~= "table" then
+        return nil
+    end
+    local ids = {}
+    for j = 1, #data do
+        ids[j] = type(data[j]) == "table" and data[j].id or data[j]
+    end
+    return norm_models(ids, nil)
+end
+
+--- How many coverage probes one worker may spend before we believe its list is final.
+--- Same order as the metadata-discovery ceiling: a genuinely single-model engine
+--- answers with one id every time, so without a ceiling this would be one wasted
+--- GET per sweep per worker for the life of the deployment.
+local MAX_MPROBE = 20
+_M.MAX_MPROBE = MAX_MPROBE
+
+--- Re-ask window for the coverage probe, in seconds. Exported so a test can shorten it.
+local MODELS_REFRESH_COOLDOWN_SECS = 300
+_M.MODELS_REFRESH_COOLDOWN_SECS = MODELS_REFRESH_COOLDOWN_SECS
+
+--- Learn the advertised model list for one worker, on the health sweep clock.
+---
+--- Called from discover(), i.e. only for a worker the sweep already reached, so it
+--- never blocks a request. An answer from the engine itself *replaces* the stored
+--- list (models_replace): it is the only source that states coverage, so a model the
+--- engine dropped must be able to leave our claim. Two budgets keep the steady state
+--- cheap while keeping that claim honest:
+---   * thin list (absent, or the single name a registration left behind) -- ask on
+---     every sweep up to MAX_MPROBE times, because filling this in is what makes a
+---     per-candidate binding verifiable at all;
+---   * complete list -- re-ask once per MODELS_REFRESH_COOLDOWN_SECS window, which is
+---     what stops an engine reloaded behind the same endpoint from being advertised
+---     forever by a row nobody refreshed.
+---@param record table
+---@param cfg table
+---@param opts table|nil @{force=true: skip both budgets (admin refresh, tests)}
+---@return table|nil updated
+function _M.refresh_models(record, cfg, opts)
+    local d = shdict()
+    if not (opts and opts.force) then
+        local fresh = d:get(K_MPROBE_OK .. record.id) ~= nil
+        if needs_models_refresh(record) then
+            -- Thin list: bounded by the attempt ceiling so a silent engine goes
+            -- quiet instead of being dialed on every sweep forever.
+            if fresh then
+                return nil
+            end
+            local attempts = d:incr(K_MPROBE .. record.id, 1, 0) or 1
+            if attempts > MAX_MPROBE then
+                return nil
+            end
+        elseif fresh then
+            -- Complete list inside the window: nothing to learn right now.
+            return nil
+        end
+    end
+    local timeout_ms = cfg.health_check_timeout_secs * 1000
+    local headers = record.api_key and { ["Authorization"] = "Bearer " .. record.api_key }
+        or nil
+    local list = _M.probe_advertised_models(record.url, timeout_ms, headers)
+    if not list then
+        -- No answer, or an engine without the endpoint: leave the coverage as it is.
+        -- worker_serves_model answers nil for "never learned", which the caller treats
+        -- as usable, so a failed probe costs nothing beyond the budgets above.
+        return nil
+    end
+    -- One stamp serves both budgets: a worker that answered gets its next look when
+    -- the window lapses, and a thin list that finally answered stops spending attempts.
+    d:set(K_MPROBE_OK .. record.id, 1, MODELS_REFRESH_COOLDOWN_SECS)
+    return patch_record(record.id, { models = list }, { models_replace = true })
+end
+
 -- ------------------------------------------------------------------ PUT update
 
 -- Fields PUT /workers/{id} may change. Mirrors the Rust update_worker_properties
@@ -1564,6 +2261,13 @@ end
 -- and any other body member is ignored rather than rejected.
 local UPDATE_NUMBER_FIELDS = {
     "priority", "cost",
+    -- Capacity caps ride the same PUT path as the scheduling knobs (root ruling
+    -- 2026-10-01), including the config-declaration reconcile's patch. Their
+    -- *meaning* is decided by cap_limit at read time, so a PUT of 0 (or a
+    -- negative, or a null the caller meant as "clear it") all land on
+    -- "unlimited" instead of needing a bespoke validator here; the contract's
+    -- non-numeric-400 rule applies unchanged.
+    "max_concurrency", "max_power_w",
     "health_check_timeout_secs", "health_check_interval_secs",
     "health_success_threshold", "health_failure_threshold",
 }
@@ -1643,6 +2347,22 @@ function _M.update(worker_id, patch)
         if type(patch.model_id) == "string" and patch.model_id ~= "" then
             changes.model_id = patch.model_id
         end
+        -- The advertised list is part of what a config row declares (a row may name
+        -- several models for one endpoint), so the config layer is allowed to write
+        -- it. A dynamic worker keeps the probe's answer as its own -- a PUT naming
+        -- models on a watcher-owned row is dropped by the same identity rule that
+        -- already ignores model_id there, which keeps a hand-typed override from
+        -- outliving the next sweep that knows better.
+        -- patch_record folds rather than replaces (see merge_models), so declaring
+        -- one model here cannot delete what the probe already learned.
+        if patch.models ~= nil and patch.models ~= cjson.null then
+            if type(patch.models) ~= "table" then
+                return nil, "field 'models' must be a JSON array", "validation"
+            end
+            changes.models = norm_models(patch.models, patch.model_id)
+        elseif changes.model_id then
+            changes.models = norm_models(nil, changes.model_id)
+        end
         labels_replace = true
     end
 
@@ -1687,7 +2407,20 @@ function _M.discover(record, cfg)
     end
 
     if record.model_id and record.model_id ~= "unknown" then
-        return nil
+        -- A worker that already has a primary model is normally finished with this
+        -- path, but its advertised *coverage* may still be a single name: the watcher
+        -- registers rows from its own probe and reports only one model, and a record
+        -- created from a one-model config row is in the same shape. Without the full
+        -- list here, a virtual-model binding naming that row's second model would be
+        -- answered `false` ("it advertised a list, and M is not in it") and the request
+        -- would be filtered away from an engine that can serve it -- the exact failure
+        -- mode the multi-binding feature is supposed to remove. Bounded by the same
+        -- attempt ceiling as the unknown-model path so a silent engine costs 20 probes
+        -- per worker and then stops; one /v1/models call per sweep for a talking one.
+        -- One decision point: refresh_models itself decides whether this worker is
+        -- worth asking (thin list on the attempt ceiling, complete list on the
+        -- cooldown window), so discover does not pre-empt it with a second rule.
+        return _M.refresh_models(record, cfg)
     end
     local attempts = d:incr(K_DISC .. record.id, 1, 0) or 1
     if attempts > 20 then
@@ -1697,6 +2430,9 @@ function _M.discover(record, cfg)
     local hb = require "resty.luarouter.hb"
     local timeout_ms = cfg.health_check_timeout_secs * 1000
     local labels = {}
+    -- Declared before the probes so the /v1/models branch (nested two conditionals
+    -- deep) can hand its full answer to the write at the bottom without shadowing.
+    local discovered_models
     local present = function(value)
         if type(value) == "string" and value ~= "" then
             return value
@@ -1730,13 +2466,9 @@ function _M.discover(record, cfg)
 
     if not labels.model_path and not labels.served_model_name then
         -- llama.cpp workers expose neither: ask the OpenAI discovery endpoint.
-        local models_status, models_body = hb.http_get(record.url .. "/v1/models", timeout_ms)
-        if models_status == 200 then
-            local listing = json_decode(models_body)
-            local data = type(listing) == "table" and listing.data or nil
-            if type(data) == "table" and type(data[1]) == "table" then
-                labels.served_model_name = present(data[1].id)
-            end
+        discovered_models = _M.probe_advertised_models(record.url, timeout_ms)
+        if discovered_models then
+            labels.served_model_name = present(discovered_models[1])
         end
     end
 
@@ -1752,7 +2484,15 @@ function _M.discover(record, cfg)
             merged[key] = value
         end
     end
-    return patch_record(record.id, { model_id = model_id, labels = merged })
+    -- models rides the same patch: patch_record folds it (merge_models) rather than
+    -- overwriting, so a sweep that only ever sees one name cannot shrink a list the
+    -- watcher already reported.
+    -- The list rides the same patch as an observation: the worker itself named these
+    -- models, so it replaces whatever was stored (a stale entry from an engine that
+    -- has since been reloaded with a different model set goes away on the next sweep
+    -- rather than lingering as a coverage claim).
+    return patch_record(record.id, { model_id = model_id, labels = merged,
+        models = discovered_models }, { models_replace = true })
 end
 
 -- ---------------------------------------------------------- DP-aware ranks
@@ -1841,6 +2581,19 @@ local function expansion_requests(base, dp_size, meta)
             -- a rank is routable on the sweep that created it rather than having to
             -- re-discover /model_info four times over.
             model_id = meta.model_id or base.model_id,
+            -- Ranks inherit the base engine's advertised coverage: every rank of a
+            -- data-parallel engine serves the same model set, and a rank that lost the
+            -- list would read as "we never learned what it serves" to the multi-binding
+            -- filter (nil) or, worse, be filtered out by a binding naming its second
+            -- model. meta.model_id leads so a probe that just corrected the name also
+            -- resets the coverage rather than folding a stale second model in.
+            -- The base list is inherited wholesale (norm_models puts the head first, so
+            -- the name the /server_info probe just reported leads it), which is what a
+            -- rank of a data-parallel engine means: every rank serves the same model
+            -- set. A rank that lost the list would read as never-learned to the
+            -- multi-binding filter, and a binding naming its second model would filter
+            -- the rank out of a pool that can actually serve it.
+            models = norm_models({ meta.model_id or base.model_id }, base.models),
             priority = base.priority,
             cost = base.cost,
             api_key = base.api_key,
