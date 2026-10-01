@@ -238,7 +238,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    for t in test_tree test_policies test_hash test_mesh; do
+    for t in test_tree test_policies test_hash test_mesh test_watcher; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done

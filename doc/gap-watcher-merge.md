@@ -7,7 +7,7 @@
 [observability.lua](../lualib/resty/luarouter/observability.lua)（`lr_watch_*` 登记点）、
 三份 conf（`env` 声明 + `lua_shared_dict lr_watch`）。
 单测：[test_watcher.lua](../test/unit/test_watcher.lua)（253 checks）。
-e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（56 checks）。
+e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（65 checks）。
 
 语义移植基准：`llm-router/watcher/llm_watcher.py`（1577 行）与同目录 `README.md`
 的守卫表。原守护进程通过 HTTP 控制面（`POST`/`DELETE` /workers，202=queued）间接
@@ -23,8 +23,8 @@ e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（56 checks）。
 |---|---|---|---|---|
 | 1 | No self-loop | `probe_all` 比对 router.port + `ROUTER_FINGERPRINT_KEYS` | `is_self_url()`（loopback + 自有端口）与 `classify()` 的 `/server_info` 指纹两道；`SMG_PORT`/`SMG_METRICS_PORT` 由 `new_config` 收进 `self_ports`，连候选都不是 | unit `normalize_url/split_http/is_self_url`、`guards 1/2 applied in reconcile`；e2e `[2] the router's own port is never a candidate` |
 | 2 | 只认真 OpenAI 端点 | `probe_worker`：`/v1/models` 必须 `data[].id` | `classify()` 同一条：非 2xx/4xx、无 `data[].id`、空 `data[]` 全部拒 | unit `classify`（HTML 404、`{"ok":true}`、空 data 三种形状）；e2e `[2] a non-OpenAI listener never becomes a worker` |
-| 3 | 首接触快照 protected | `first reconcile` 把 `GET /workers` 全量写进 `ledger.protected` | `reconcile()` 开头 `ledger.touched()` 未置位且 protected/owned 皆空时快照，`desired = discovered - protected` | unit `guard 3 first-contact protection`；e2e `[2] the seed worker is snapshotted as protected` + 消失后不被删 |
-| 4 | 只删自己 ledger 里的 | 删除循环走 `ledger.owned` | 同上，且 `unregister()` 先 `registry.get(id)` 确认记录仍在 | unit `guards 4/5`、`allow_remove false`；e2e `[3] the deletion is counted once` |
+| 3 | 首接触快照 protected | `first reconcile` 把 `GET /workers` 全量写进 `ledger.protected` | `reconcile()` 开头 `ledger.touched()` 未置位且 protected/owned 皆空时快照，`desired = discovered - protected` | unit `guard 3 first-contact protection`、`model map renames reach the pool`；e2e `[2] both pre-configured workers are protected`（停掉的保护 worker 越过 grace 仍在池内、removes 计数不增）与改名领养后 `[2] the untouched protected worker is still protected` |
+| 4 | 只删自己 ledger 里的 | 删除循环走 `ledger.owned` | 同上，且 `unregister()` 先 `registry.get(id)` 确认记录仍在 | unit `guards 4/5`、`allow_remove false`；e2e `[2] the ledger counted no removal`（保护 worker 消失也不删）、`[2] the adoption delete is counted`、`[3] the deletion is counted once` |
 | 5 | remove-grace 300 s | `missing_since` + `--remove-grace` | 同结构，`SMG_WATCHER_REMOVE_GRACE_SECS` 默认 300 | unit `guards 4/5`；e2e `[3]` 两条（窗口内保留 / 窗口后删除） |
 | 6 | Never empties a model | `_is_last_for_model` + `--keep-last-grace` 到期后才删 | `is_last_for_model()`（不健康的同模型兄弟不算覆盖）+ `keep_last_grace_secs`，`0`=永久保护，负值=关掉（`SMG_WATCHER_KEEP_LAST=false`） | unit `is_last_for_model`、`guard 6 keep-last`（含只警告一次、grace 到期、0=永久）；e2e `[4]` 三条 |
 | 7 | Releases stuck adds | 202 只代表 queued，AddWorker job 卡在死 URL 上会永久占住该 URL | 合并形态没有 job 队列，`reap_pending()` 保留下来管另一件事：ledger 声称拥有、但池子里没有的 URL（手工 DELETE、或 reload 把 `lr_workers` 清空而 `lr_watch` 还留着），超过 `add_confirm_timeout_secs` 就删掉释放 URL，同一轮即可重新注册 | unit `guard 7 stuck add released` |
@@ -159,7 +159,7 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
 | 语法 | luajit `loadfile`（watcher/config/init/router/observability） | 5 份 |
 | 语法 | `openresty -t`（conf/lua-router.conf、test/conf/nginx-lua-router.conf、模板渲染） | 3 份 |
 | 单测 | `test/unit/test_watcher.lua`（luajit 与 apisix resty 两种口径，注入 fetch/reader/store，无 ngx） | 253 checks |
-| e2e | `test/integration/e2e_watcher.py`（真容器 + 真 mock + 真 docker.sock + 容器重启） | 56 checks |
+| e2e | `test/integration/e2e_watcher.py`（真容器 + 真 mock + 真 docker.sock + 容器重启） | 65 checks |
 
 单测覆盖：`parse_model_map` 四分隔符与坏输入、`parse_model_map_body` 四形态 + 坏
 body + 删除语义、`merge_map`、url 形态与 IPv6、`model_name`、`parse_ports`、
@@ -168,13 +168,16 @@ body + 删除语义、`merge_map`、url 形态与 IPv6、`model_name`、`parse_p
 v6 loopback）、docker 候选去重、`local_candidates` 与 allow/deny、ledger 全部键操作、
 候选在拨号前就被自端口与 exclude 拦掉、ledger 条目每轮续期、九条守卫各自的时序断言、`new_config` 缺省值与钳制、`collect` 三源合并。
 
-e2e 六个场景：TARGET 注册 + env 改名 + 四形态 API + 改名回收 + 按 public id 真实路由；
-proc scan 发现 + 自端口排除 + 非 OpenAI 端口排除 + `SMG_WORKER_URLS` 保护快照（消失后
-仍不删）；grace 窗口内保留 / 窗口后删除（keep-last 关掉以隔离守卫 5）；keep-last 生效
-与自身宽限到期；docker unix socket 发现（容器名标签）+ 容器删除后离池；容器重启后重新
-发现并恢复流量。
+e2e 按 [1]–[5] 分五组、四个启动器（grace 与 keep-last 共用一个容器对，docker 发现与容器重启同理）：TARGET 注册 + env 改名 + 四形态 API + 改名回收 + 按 public id 真实路由；
+proc scan 发现 + 自端口排除 + 非 OpenAI 端口排除 + `SMG_WORKER_URLS` 保护快照（守卫 3
+的两面都测：停掉的保护 worker 越过 grace 仍在池内、计数不增，而一次 `POST /model-map`
+改名会让它被领养、改挂新 public id、此后才受 remove-grace 约束）；grace 窗口内保留 /
+窗口后删除（keep-last 关掉以隔离守卫 5）；keep-last 生效与自身宽限到期；docker unix
+socket 发现（容器名标签）+ 容器删除后离池；容器重启后重新发现并恢复流量。
 
-日志：`/data/tmp/lr-watch/e2e_watcher.log`、`/data/tmp/lr-watch/unit.log`。
+日志：`/data/tmp/lr-watch/e2e_final4.log`（65 checks）、
+`/data/tmp/lr-watch/unit_final.log`（253 checks，luajit 口径）、
+`/data/tmp/lr-watch/gate_contract3.log`（contract 门禁 580 checks，137 s）。
 
 ### 5.1 单测/e2e 期间发现并修掉的真问题
 

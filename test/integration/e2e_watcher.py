@@ -17,17 +17,18 @@ Scenarios, in order:
      the four POST body shapes, and a chat that actually routes to the worker.
   2  proc scan: a discovered worker joins, the router's own listeners do not (guard 1),
      a non-OpenAI port does not (guard 2), and SMG_WORKER_URLS rows are protected
-     (guard 3: never deleted, never re-registered, metadata carries no managed-by).
+     (guard 3: never deleted, never re-registered, metadata carries no managed-by)
+     until a POST /model-map rename adopts one of them -- the one case where the
+     watcher takes ownership over, which is then subject to the remove grace.
   3  remove-grace: a stopped worker survives the grace window and is deleted after it
      (guards 5 + 4, with keep-last switched off so nothing else holds it back).
   4  keep-last: the same stop, this time the worker is kept, warned about, and only
      removed once keep-last-grace itself expires (guard 6).
   5  docker discovery over the unix socket: a published container port becomes a
-     worker labelled with its container name, and disappears when the container is
-     removed.
-  6  container restart: the ledger and the pool are both shared dicts, so a restart
-     clears them together and rediscovery re-registers from scratch (guard 8 in its
-     merged form).
+     worker labelled with its container name, disappears when the container is
+     removed, and survives a router restart -- the ledger and the pool are both
+     shared dicts, so a restart clears them together and rediscovery re-registers
+     from scratch (guard 8 in its merged form). Those checks share the [5] tag.
 """
 import json
 import os
@@ -143,6 +144,36 @@ def metric(text, name):
 def metrics(port):
     status, body, _ = http("GET", "http://127.0.0.1:%d/metrics" % port)
     return body if status == 200 else ""
+
+
+def watch_metrics(text):
+    """The lr_watch_* block of the exporter, for a check's failure detail."""
+    return "\n".join(l for l in text.splitlines() if l.startswith("lr_watch"))
+
+
+def watch_counter(port, name):
+    """One lr_watch_* value read right now (no waiting)."""
+    return metric(metrics(port), name)
+
+
+def wait_metric(port, name, want, timeout=25):
+    """The watcher publishes its gauges once per pass, so read them on that clock
+    rather than racing the interval."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if metric(metrics(port), name) == want:
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def wait_until(fn, timeout=30, step=0.5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fn():
+            return True
+        time.sleep(step)
+    return False
 
 
 def stop_mock(proc):
@@ -268,12 +299,14 @@ def scenario_target_and_map():
 
 # --------------------------------------------------------------------------
 def scenario_proc_scan_protection():
-    tag = "proc"
+    """Discovery scope: what the watcher may add, and what it may never delete."""
     name = "lr-watch-2-%s" % RUN
-    seed_port = free_port()      # pre-configured through SMG_WORKER_URLS
-    found_port = free_port()     # discovered by the scan
+    seed_port = free_port()      # pre-configured through SMG_WORKER_URLS, renamed later
+    keep_port = free_port()      # pre-configured too, then stopped: must survive (guard 3)
+    found_port = free_port()     # discovered by the scan, then stopped: must be deleted
     noise_port = free_port()     # a listener that is not an OpenAI endpoint
     seed = start_mock(seed_port, "seed-model")
+    keep = start_mock(keep_port, "keep-model")
     found = start_mock(found_port, "found-model")
     # A plain HTTP server: answers /v1/models with a 404 page, the shape that kept
     # node_exporter out of the daemon's pool.
@@ -286,21 +319,28 @@ def scenario_proc_scan_protection():
 
     own_port = free_port()
     port = start_watcher({
-        "SMG_WORKER_URLS": "http://127.0.0.1:%d" % seed_port,
+        "SMG_WORKER_URLS": "http://127.0.0.1:%d,http://127.0.0.1:%d" % (seed_port, keep_port),
         "SMG_WATCHER_PROC_SCAN": "1",
-        # Narrow the scan to the four ports this scenario owns: the box has a hundred
+        # Guard 6 would hold the scanned worker forever (it is the only worker of
+        # its model) and this scenario is about guards 1/2/3/4/5, so keep-last is
+        # switched off -- scenario 4 owns that guard.
+        "SMG_WATCHER_KEEP_LAST": "false",
+        # Narrow the scan to the ports this scenario owns: the box has a hundred
         # real listeners and an unbounded scan would probe all of them. The router's
         # own listener is deliberately inside the scanned set, which is what makes the
         # self-port assertion below a real test rather than an accident of the filter.
-        "SMG_WATCHER_ALLOW_PORT": "%d,%d,%d,%d" % (seed_port, found_port, noise_port, own_port),
+        "SMG_WATCHER_ALLOW_PORT": ",".join(str(p) for p in
+                                           (seed_port, keep_port, found_port,
+                                            noise_port, own_port)),
     }, name, port=own_port)
     seed_url = "http://127.0.0.1:%d" % seed_port
+    keep_url = "http://127.0.0.1:%d" % keep_port
     found_url = "http://127.0.0.1:%d" % found_port
 
-    # The seed row comes from SMG_WORKER_URLS; discovery must neither duplicate nor
-    # delete it, and the scanned worker must arrive on its own.
-    ok = check("[2] seed + discovered worker, nothing else",
-               wait_workers(port, 2, timeout=40), logs(name))
+    # The two seed rows come from SMG_WORKER_URLS; discovery must neither duplicate
+    # nor delete them, and the scanned worker must arrive on its own.
+    ok = check("[2] two seeded + one discovered worker, nothing else",
+               wait_workers(port, 3, timeout=40), logs(name))
     rows = by_url(port)
     if ok:
         check("[2] the scanned worker was registered",
@@ -310,15 +350,35 @@ def scenario_proc_scan_protection():
               json.dumps(rows.get(seed_url, {}).get("metadata")))
         check("[2] the discovered worker carries router-watch",
               rows.get(found_url, {}).get("metadata", {}).get("managed-by") == "router-watch")
-        check("[2] a non-OpenAI listener never becomes a worker",
+        check("[2] a non-OpenAI listener never becomes a worker (guard 2)",
               "http://127.0.0.1:%d" % noise_port not in rows,
               json.dumps(sorted(rows)))
         check("[2] the router's own port is never a candidate (guard 1)",
               "http://127.0.0.1:%d" % port not in rows,
               json.dumps(sorted(rows)))
-        # A protected row is never deleted -- until a rename asks for its public id,
-        # which is the one case where the daemon hands itself ownership. Over real
-        # HTTP that is a POST /model-map against the router port, so the control-plane
+        check("[2] both pre-configured workers are protected (guard 3)",
+              wait_metric(port, "lr_watch_protected_workers", 2),
+              watch_metrics(metrics(port)))
+        check("[2] only the discovered worker is owned",
+              wait_metric(port, "lr_watch_owned_workers", 1),
+              watch_metrics(metrics(port)))
+
+        # Guard 3, first half: a protected worker that dies is *not* deleted, even
+        # long past the remove grace. Only the watcher's own ledger may be deleted
+        # from (guard 4), so nothing happens here at all.
+        stop_mock(keep)
+        time.sleep(9)          # interval 2 s, remove-grace 4 s: several passes over
+        rows = by_url(port)
+        check("[2] a vanished protected worker is kept, not deleted (guard 3)",
+              keep_url in rows, json.dumps(sorted(rows)))
+        check("[2] and the ledger counted no removal",
+              watch_counter(port, "lr_watch_removes_total") == 0,
+              watch_metrics(metrics(port)))
+
+        # Guard 3, second half: protection is spent the moment a rename asks for the
+        # worker's public id, because that is the one case where the watcher has to
+        # hand itself ownership (the daemon's eviction hand-off). Over real HTTP that
+        # is a POST /model-map against the router's own port, so the control-plane
         # route, the ledger and the registry all have to agree.
         status, body, _ = http("POST", "http://127.0.0.1:%d/model-map" % port,
                                '{"seed-model":"adopted-seed"}')
@@ -331,34 +391,33 @@ def scenario_proc_scan_protection():
         check("[2] and it is watcher-owned from then on",
               rows.get(seed_url, {}).get("metadata", {}).get("managed-by")
               == "router-watch", json.dumps(rows.get(seed_url, {}).get("metadata")))
-        # the scanned worker must be untouched by that churn
         check("[2] the discovered worker survived the adoption",
               found_url in rows and rows[found_url].get("model_id") == "found-model",
               json.dumps(sorted(rows)))
+        check("[2] the untouched protected worker is still protected",
+              wait_metric(port, "lr_watch_owned_workers", 2)
+              and watch_counter(port, "lr_watch_protected_workers") == 1,
+              watch_metrics(metrics(port)))
+        check("[2] the adoption delete is counted (guard 4: only its own ledger)",
+              wait_metric(port, "lr_watch_removes_total", 1),
+              watch_metrics(metrics(port)))
 
-        text = metrics(port)
-        check("[2] the seed worker is snapshotted as protected (guard 3)",
-              metric(text, "lr_watch_protected_workers") == 1,
-              "\n".join(l for l in text.splitlines() if l.startswith("lr_watch")))
-        check("[2] only the discovered worker is owned",
-              metric(text, "lr_watch_owned_workers") == 1,
-              "\n".join(l for l in text.splitlines() if l.startswith("lr_watch")))
-
-        # Guard 3 has a second half worth pinning: the worker that was protected at
-        # first contact and then adopted by a rename is now owned, so it is subject to
-        # the remove grace -- unlike a row that stayed protected.
+        # Now that ownership moved, the remove grace applies to the adopted row --
+        # and only the scanned worker can be deleted for vanishing. Stopping it has
+        # to remove exactly it: the adopted worker still answers /v1/models, and the
+        # protected worker is off-limits whatever it does.
         stop_mock(found)
-        deadline = time.time() + 30
-        dropped = False
-        while time.time() < deadline:
-            if found_url not in by_url(port):
-                dropped = True
-                break
-            time.sleep(0.5)
-        check("[2] an owned (adopted) worker is deleted once its service is gone",
-              dropped, logs(name))
+        check("[2] an owned worker is deleted once its service is gone (guards 4+5)",
+              wait_until(lambda: found_url not in by_url(port), 30), logs(name))
+        check("[2] neither the adopted nor the protected worker went with it",
+              seed_url in by_url(port) and keep_url in by_url(port),
+              json.dumps(sorted(by_url(port))))
+        check("[2] and the ledger counted exactly one more removal",
+              wait_metric(port, "lr_watch_removes_total", 2)
+              and watch_counter(port, "lr_watch_removes_total") == 2,
+              watch_metrics(metrics(port)))
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    for proc in (seed, found):
+    for proc in (seed, keep, found):
         stop_mock(proc)
     noise.terminate()
 
