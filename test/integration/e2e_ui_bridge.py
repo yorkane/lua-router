@@ -106,6 +106,44 @@ active = [float(l.split()[-1]) for l in text.splitlines()
 check("[parity] per-worker load released", active and max(active) == 0, str(active))
 stop_router(name)
 
+# 3. /_ui static bundle MIME types: browsers hard-fail ES module scripts served
+#    as application/octet-stream (strict MIME checking per HTML spec). The http{}
+#    block must include mime.types and add webmanifest/mjs mappings.
+import re as _re
+name = "lr-uimime-" + RUN
+port = start_router({"SMG_POLICY": "cache_aware"}, name)
+_mime_up = False
+for _ in range(60):
+    if http("GET", "http://127.0.0.1:%d/health" % port)[0] == 200:
+        _mime_up = True
+        break
+    time.sleep(0.5)
+check("[ui-mime] healthy", _mime_up, logs(name))
+st, html, hdrs = http("GET", "http://127.0.0.1:%d/_ui/" % port)
+check("[ui-mime] index is text/html (%s)" % st, st == 200 and
+      hdrs.get("Content-Type", "").startswith("text/html"), hdrs.get("Content-Type", "?"))
+js = _re.search(r'(?:src|href)="(?:\./|/_ui/)(_app/[^"]+\.js)"', html)
+css = _re.search(r'(?:src|href)="(?:\./|/_ui/)(_app/[^"]+\.css)"', html)
+if js:
+    st, _, hdrs = http("GET", "http://127.0.0.1:%d/_ui/%s" % (port, js.group(1)))
+    check("[ui-mime] module js served as javascript (%s)" % hdrs.get("Content-Type", "?"),
+          st == 200 and hdrs.get("Content-Type", "") in
+          ("application/javascript", "text/javascript"),
+          "%s %s" % (st, hdrs.get("Content-Type", "?")))
+else:
+    check("[ui-mime] index references an _app js bundle", False, html[-200:])
+if css:
+    st, _, hdrs = http("GET", "http://127.0.0.1:%d/_ui/%s" % (port, css.group(1)))
+    check("[ui-mime] css served as text/css", st == 200 and
+          hdrs.get("Content-Type", "").startswith("text/css"),
+          "%s %s" % (st, hdrs.get("Content-Type", "?")))
+st, _, hdrs = http("GET", "http://127.0.0.1:%d/_ui/manifest.webmanifest" % port)
+check("[ui-mime] webmanifest served as application/manifest+json",
+      st == 200 and hdrs.get("Content-Type", "").startswith("application/manifest+json"),
+      "%s %s" % (st, hdrs.get("Content-Type", "?")))
+check("[ui-mime] no lua errors", "lua entry thread aborted" not in logs(name), logs(name)[-300:])
+stop_router(name)
+
 failed = [r for r in RESULTS if not r[0]]
 print("\n=== %d checks, %d failed ===" % (len(RESULTS), len(failed)))
 for _, n, d in failed:
