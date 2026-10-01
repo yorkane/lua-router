@@ -16,15 +16,14 @@
 -- a status for JSON with an explicit code, and return '' once the response has
 -- been written by hand. A number in 100..599 with no result is a bare status.
 --
--- Kubernetes discovery, the tokenizer and parser proxies
--- (resty.luarouter.tokenizer / resty.luarouter.parse), OTel tracing and cluster
--- mesh are all wired: the first two behind their own knobs
--- (SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with SMG_ENABLE_MESH
--- off, /ha/* answers the fixed 503, which is the contract for a node that has
--- not opted in. The gRPC transport plane, the prefill/decode pool split and the
--- conversation/response store were removed (doc/scope-trim.md): this gateway
--- speaks plain HTTP to its workers, and /v1/responses is a pure inference
--- route.
+-- Kubernetes discovery, OTel tracing and cluster mesh are all wired: the first
+-- behind its own knob (SMG_SERVICE_DISCOVERY), mesh behind SMG_MESH_PEERS - with
+-- SMG_ENABLE_MESH off, /ha/* answers the fixed 503, which is the contract for a
+-- node that has not opted in. The gRPC transport plane, the prefill/decode pool
+-- split, the conversation/response store and the tokenize/parse proxy plane
+-- were removed (doc/scope-trim.md): this gateway speaks plain HTTP to its
+-- workers, /v1/responses is a pure inference route, and the token-counting and
+-- tool-parser proxy family answers from the 404 sink.
 --
 -- What is genuinely not implemented is tracked in doc/feature-gap.md: wasm
 -- middleware is a deferred TODO (doc/todo-deferred.md, feasibility in
@@ -39,14 +38,12 @@ local observability = require "resty.luarouter.observability"
 local otel = require "resty.luarouter.otel"
 local policy_mod = require "resty.luarouter.policy"
 local registry = require "resty.luarouter.registry"
--- Wired gap modules: the tokenizer/parse proxies (doc/gap-tokenizer-parse.md)
--- and cluster mesh (doc/gap-mesh.md). Both are load-safe without ngx (they only
--- read ngx inside their handlers), so the init_by_lua syntax gate can require
--- them. The conversation/response store was removed with the history plane
--- (doc/scope-trim.md): /v1/responses stays as a pure inference route.
+-- Wired gap module: cluster mesh (doc/gap-mesh.md). It is load-safe without ngx
+-- (it only reads ngx inside its handlers), so the init_by_lua syntax gate can
+-- require it. The conversation/response store went with the history plane and
+-- the tokenize/parse proxies went with it (doc/scope-trim.md): /v1/responses
+-- stays as a pure inference route and that proxy family is not routed.
 local mesh_mod = require "resty.luarouter.mesh"
-local parse_mod = require "resty.luarouter.parse"
-local tokenizer_mod = require "resty.luarouter.tokenizer"
 -- Control-plane JWT verifier (doc/gap-dp-jwt.md). Load-safe without ngx, so the
 -- init_by_lua syntax gate can require it; it never reaches back into this file.
 local jwt = require "resty.luarouter.jwks"
@@ -3336,34 +3333,6 @@ local function build()
             return inference_handler({ route = route })
         end)
     end
-
-    -- Tokenizer / parse plane (doc/gap-tokenizer-parse.md). The module handlers
-    -- write their own responses (byte-exact proxy passthrough), so they are
-    -- registered raw rather than through exact_json. Auth is injected explicitly
-    -- instead of relying on package.loaded load order: the data plane covers
-    -- /v1/tokenize + /v1/detokenize (Rust protected_routes) and the control plane
-    -- covers /v1/tokenizers* and /parse/* (Rust admin_routes).
-    tokenizer_mod.auth_checks = {
-        data = check_data_auth, control = check_control_auth,
-    }
-    parse_mod.auth_checks = {
-        data = check_data_auth, control = check_control_auth,
-    }
-    app:post("v1/tokenize", tokenizer_mod.handle_tokenize)
-    app:post("v1/detokenize", tokenizer_mod.handle_detokenize)
-    app:get("v1/tokenizers", tokenizer_mod.handle_list_tokenizers)
-    app:post("v1/tokenizers", tokenizer_mod.handle_add_tokenizer)
-    app:get("v1/tokenizers/:tokenizer_id", tokenizer_mod.handle_get_tokenizer)
-    app:delete("v1/tokenizers/:tokenizer_id", tokenizer_mod.handle_delete_tokenizer)
-    app:get("v1/tokenizers/:tokenizer_id/status",
-        tokenizer_mod.handle_tokenizer_status)
-    -- axum's get() answers HEAD on the read-only tokenizer routes too.
-    app:head("v1/tokenizers", tokenizer_mod.handle_list_tokenizers)
-    app:head("v1/tokenizers/:tokenizer_id", tokenizer_mod.handle_get_tokenizer)
-    app:head("v1/tokenizers/:tokenizer_id/status",
-        tokenizer_mod.handle_tokenizer_status)
-    app:post("parse/function_call", parse_mod.handle_function_call)
-    app:post("parse/reasoning", parse_mod.handle_reasoning)
 
     -- Endpoints the Rust gateway serves but this router does not implement.
     -- Registered per path section because a klib.router `:param` matches exactly

@@ -6,7 +6,7 @@ and the live Rust gateway on <rust-box>:8800 confirms it — HEAD returns the GE
 status with a zero-length body on /health, /liveness, /readiness, /v1/models,
 /model_info, /get_model_info, /server_info, /get_server_info, /engine_metrics,
 /metrics(404 there), /workers, /workers/{id}(400), /v1/loads, /get_loads,
-/v1/tokenizers, /ha/status. router.lua mirrors each ``app:get`` with an explicit
+/ha/status. router.lua mirrors each ``app:get`` with an explicit
 ``app:head``, and ui.lua's method gate folds HEAD into GET
 (``m == "HEAD" and a == "GET"``). Before this suite the repo's only HEAD check
 was ``HEAD /health has no body`` in test_lua_router.sh, so a missing app:head
@@ -108,14 +108,10 @@ head_case(port, "/workers/%s" % ids[0])
 # Unknown id: Rust answers 400 BAD_REQUEST (sampled), as does this router.
 head_case(port, "/workers/does-not-exist", get_status=400)
 
-# 3. Tokenizer read-only trio (app:head on list / get / status).
-head_case(port, "/v1/tokenizers")
-head_case(port, "/v1/tokenizers/nope", get_status=404)
-
-# 4. Mesh surface with the feature off: HEAD rides the same 503 gate.
+# 3. Mesh surface with the feature off: HEAD rides the same 503 gate.
 head_case(port, "/ha/status", get_status=503)
 
-# 5. /_ui aliases from ui.conf (chunked JSON answers).
+# 4. /_ui aliases from ui.conf (chunked JSON answers).
 for p in ("/_ui/v1/models", "/_ui/props", "/_ui/logs", "/_ui/stats", "/_ui/slots",
           "/_ui/tools", "/_ui/logs/backends"):
     head_case(port, p, chunked=True)
@@ -123,14 +119,15 @@ for p in ("/_ui/v1/models", "/_ui/props", "/_ui/logs", "/_ui/stats", "/_ui/slots
 # A POST-only /_ui alias must refuse HEAD the same way it refuses GET.
 head_case(port, "/_ui/config/effort", get_status=405, chunked=True)
 
-# 6. The route that used to diverge (doc/gap-test-gates.md §3, doc/gap-http-semantics.md):
+# 5. The route that used to diverge (doc/gap-test-gates.md §3, doc/gap-http-semantics.md):
 # /_ui/config is read by ui.conf, whose exact location now folds HEAD into the GET
-# branch. The check is the regression gate for that fold. (/_ui/history was pinned
-# here as well until the conversation store was removed by the scope trim.)
+# branch. The check is the regression gate for that fold. (/_ui/history and the
+# /v1/tokenizers trio were pinned here as well until the scope trim removed both
+# planes; they now answer from the 404 sink, covered by section 6 below.)
 head_case(port, "/_ui/config", get_status=200, chunked=True,
           label="/_ui/config HEAD follows the GET branch")
 
-# 7. The 404 sink answers HEAD without a body. The sink's message embeds the
+# 6. The 404 sink answers HEAD without a body. The sink's message embeds the
 # request method, so the body length differs by the length of "HEAD" - only
 # Content-Type and the error-code header are comparable.
 g = http("GET", "http://127.0.0.1:%d/nope" % port)
@@ -141,7 +138,7 @@ check("[HEAD /nope] 404 sink answers HEAD with the same shape",
       and norm(h[2]).get("x-smg-error-code") == "not_found",
       "%s/%s %r" % (g[0], h[0], h[1][:120]))
 
-# 8. Static SPA root: HEAD on the served bundle.
+# 7. Static SPA root: HEAD on the served bundle.
 head_case(port, "/_ui/", chunked=False)
 
 check("[HEAD] no lua errors", "lua entry thread aborted" not in logs(name),

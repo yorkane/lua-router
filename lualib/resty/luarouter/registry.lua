@@ -669,15 +669,10 @@ function _M.add(req, cfg)
             connection_mode = mode,
             api_key = req.api_key,
             labels = type(req.labels) == "table" and req.labels or {},
-            -- Model-card capabilities (core/model_card.rs, previously
-            -- WorkerMetadata.labels): the tokenizer and parser proxies in
-            -- resty.luarouter.{tokenizer,parse} read these three names to decide
-            -- which worker may serve /v1/tokenize and /parse/*. Kept as plain
-            -- strings so a missing field stays absent rather than cjson.null.
-            tokenizer_path = string_field(req.tokenizer_path),
-            tool_parser = string_field(req.tool_parser),
-            reasoning_parser = string_field(req.reasoning_parser),
-            vocab_size = tonumber(req.vocab_size),
+            -- The model-card capability fields (tokenizer_path / tool_parser /
+            -- reasoning_parser / vocab_size) went with the proxy plane they were
+            -- read by (doc/scope-trim.md). A POST /workers body that still
+            -- carries them ignores them: they are not stored and not echoed.
             disable_health_check = (req.disable_health_check and true)
                 or (cfg.disable_health_check and true)
                 or false,

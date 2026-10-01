@@ -4,7 +4,7 @@
 # ============================================================================
 #仓库化的最终门禁（取代 /data/tmp/lr-core2/final_gates.sh 那个一次性脚本）。
 # 与旧脚本的差异：补齐了 probes.py、e2e_errors.py、e2e_effort.py、
-# 未接线模块的单测（mesh / tokenizer_parse）以及新增的两个
+# 未接线模块的单测（mesh）以及新增的两个
 # HTTP 面集成测试（test_head_routes.py、test_mesh_http.py），并改成
 # 首个失败即退出。
 #
@@ -19,7 +19,7 @@
 #   build          docker build lua-router:integration (the e2e suites boot it)
 #   conf           openresty -t on test/conf/nginx-lua-router.conf + conf/lua-router.conf
 #   unit           tree / policies / hash / mesh (authz luajit)
-#                  + tree / policies / hash / integration / tokenizer_parse (apisix resty)
+#                  + tree / policies / hash / integration (apisix resty)
 #   contract       test_lua_router.sh, strict (first FAIL aborts the suite)
 #   probes         integration/probes.py (policy factory, knobs, re_split, json-edit)
 #   e2e_stateful   integration/e2e_stateful.py
@@ -43,8 +43,8 @@
 # What skipping costs (read this before using SKIP_ENV):
 #   build          e2e_* and mesh_http then run against a possibly stale image.
 #   conf           nothing checks the two shipped configs still parse.
-#   unit           the pure-Lua modules (tree/hash/policies/mesh/
-#                  tokenizer_parse) have no other gate — router.lua only
+#   unit           the pure-Lua modules (tree/hash/policies/mesh) have no
+#                  other gate — router.lua only
 #                  exercises them through HTTP, so a regression can hide.
 #   contract       the whole 659-check wire contract is unverified.
 #   probes         the policy factory / config-knob / raw-JSON-editor probes.
@@ -244,7 +244,7 @@ gate_unit() {
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
-    for t in test_tree test_policies test_hash test_integration test_tokenizer_parse; do
+    for t in test_tree test_policies test_hash test_integration; do
         printf '\n-- resty %s\n' "$t"
         run_unit_resty "$t" || rc=1
     done
