@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Model overrides · llm-router</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="./app.css?v=5">
+</head>
+<body>
+  <div id="q-app">
+    <q-layout container class="workspace-layout">
+      <q-page-container>
+        <q-page class="workspace-page">
+          <header class="page-heading">
+            <div>
+              <h1>{{ t.title }}</h1>
+              <p>{{ t.description }}</p>
+            </div>
+            <div class="heading-actions">
+              <q-badge outline :color="watcherColor" class="chip-soft">{{ watcherLabel }}</q-badge>
+              <q-btn outline no-caps icon="mdi-refresh" :label="c.retry" class="secondary-button" :loading="loading" @click="load"></q-btn>
+            </div>
+          </header>
+
+          <q-banner v-if="loadError" rounded dense class="error-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>
+            {{ loadError }}
+          </q-banner>
+          <q-banner v-if="warningMessage" rounded dense class="warn-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-alert-outline"></q-icon></template>
+            {{ warningMessage }}
+          </q-banner>
+          <div class="muted q-mb-md mono">{{ persistNote }}</div>
+
+          <q-spinner v-if="loading && !doc" color="purple-3" size="30px"></q-spinner>
+
+          <!-- 生效预览：本地静态推算，不发请求 -->
+          <q-card flat class="surface-card preview-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.previewSection }}</div>
+                <div class="surface-subtitle">{{ t.previewCopy }}</div>
+              </div>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="preview-box">
+              <div class="preview-fields">
+                <q-select v-model="preview.model" dense outlined dark use-input
+                          :label="t.previewModel" :options="modelOptions" :option-label="modelOptionLabel"
+                          @filter="filterModelOptions" map-options emit-value input-debounce="120">
+                  <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
+                </q-select>
+                <q-select v-model="preview.effort" dense outlined dark :label="t.previewEffort"
+                          :options="effortOptions" map-options emit-value clearable></q-select>
+              </div>
+              <div class="preview-out">
+                <div><span class="k">{{ t.previewResultModel }}</span><span class="code-pill">{{ previewResult.model }}</span>
+                  <q-badge v-if="previewResult.alias" outline color="teal-4" class="chip-soft q-ml-sm">{{ t.previewAliasNote }}: {{ preview.model }} → {{ previewResult.resolved }}</q-badge></div>
+                <div><span class="k">{{ t.previewResultEffort }}</span><span class="code-pill">{{ previewResult.effortText }}</span>
+                  <span class="muted q-ml-sm">({{ previewResult.effortChain }})</span></div>
+                <div><span class="k">{{ t.previewResultCtx }}</span><span class="code-pill">{{ previewResult.ctxText }}</span>
+                  <span v-if="previewResult.ctx" class="muted q-ml-sm">{{ t.previewCtxNote }}</span></div>
+                <div v-if="mapNote" class="preview-note">{{ mapNote }}</div>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 按模型覆盖 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.cardsSection }}</div>
+                <div class="surface-subtitle">{{ t.cardsCopy }}</div>
+              </div>
+              <q-input v-model="cardFilter" dense outlined dark debounce="200" :placeholder="c.search" class="search-input">
+                <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
+              </q-input>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-table flat dense dark :rows="cardRows" :columns="cardColumns" row-key="model"
+                     :filter="cardFilter" :loading="loading" :pagination="pagination" class="linear-table"
+                     :rows-per-page-options="[10, 20, 0]">
+              <template v-slot:body-cell-model="props">
+                <q-td :props="props">
+                  <div class="identity-cell">
+                    <div><strong>{{ props.row.model }}</strong>
+                      <span v-if="props.row.target">{{ t.virtualTarget }} → {{ props.row.target }}</span></div>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-registered="props">
+                <q-td :props="props">
+                  <q-badge outline :color="props.row.registered ? 'teal-4' : 'grey-6'" class="chip-soft"
+                         :label="props.row.registered ? t.registeredYes : t.registeredNo"></q-badge>
+                  <div v-if="(props.row.sources || []).length" class="muted mono" style="font-size:11px">
+                    {{ props.row.sources.join(', ') }}
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-ctx="props"><q-td :props="props"><span class="code-pill">{{ props.row.ctx === null || props.row.ctx === undefined ? t.previewNoCtx : props.row.ctx }}</span></q-td></template>
+              <template v-slot:body-cell-default_effort="props"><q-td :props="props"><span class="muted">{{ effortText(props.row.default_effort) }}</span></q-td></template>
+              <template v-slot:body-cell-effort_map="props">
+                <q-td :props="props">
+                  <div v-if="(props.row.effort_map || []).length" class="route-cell" style="flex-wrap:wrap;gap:4px">
+                    <q-chip v-for="entry in props.row.effort_map" :key="entry.from" dense size="12px" class="chip-soft">{{ entry.from }} → {{ entry.to }}</q-chip>
+                  </div>
+                  <span v-else class="muted">—</span>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-modalities="props"><q-td :props="props"><span class="muted">{{ modalitiesText(props.row.modalities) }}</span></q-td></template>
+              <template v-slot:body-cell-actions="props">
+                <q-td :props="props">
+                  <div class="row-actions">
+                    <q-btn flat round dense icon="mdi-pencil-outline" @click="openCard(props.row)"><q-tooltip>{{ c.edit }}</q-tooltip></q-btn>
+                    <q-btn flat round dense icon="mdi-backup-restore" color="orange-4" @click="clearCard(props.row)"><q-tooltip>{{ t.cardRemove }}</q-tooltip></q-btn>
+                  </div>
+                </q-td>
+              </template>
+              <template v-slot:no-results><div class="empty-state"><span>{{ c.empty }}</span></div></template>
+            </q-table>
+          </q-card>
+
+          <!-- 全局档位策略 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.globalSection }}</div>
+                <div class="surface-subtitle">{{ t.globalCopy }}</div>
+              </div>
+              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="t.globalSave" @click="saveGlobal"></q-btn>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="dialog-fields">
+                <q-select v-model="globalForm.default_effort" dense outlined dark :label="t.defaultEffort" :options="effortOptions"
+                          map-options emit-value clearable :hint="t.defaultEffortHint"></q-select>
+                <div>
+                  <div class="rows-head q-mb-xs">{{ t.effortMapTitle }} · {{ t.effortMapCopy }}</div>
+                  <div class="rows-list">
+                    <div v-for="(row, index) in globalForm.effort_map" :key="'em' + index" class="row-edit">
+                      <q-select v-model="row.from" dense outlined dark :options="effortOptions" map-options emit-value :label="t.mapFrom"></q-select>
+                      <q-select v-model="row.to" dense outlined dark :options="effortOptions" map-options emit-value :label="t.mapTo"></q-select>
+                      <span></span>
+                      <q-btn flat round dense icon="mdi-close" color="red-4" @click="globalForm.effort_map.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                    </div>
+                    <div v-if="!globalForm.effort_map.length" class="muted">{{ t.rowsEmpty }}</div>
+                    <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.addRow" @click="globalForm.effort_map.push({ from: 'high', to: 'max' })"></q-btn></div>
+                  </div>
+                </div>
+                <div>
+                  <div class="rows-head q-mb-xs">{{ t.modelEffortTitle }} · {{ t.modelEffortCopy }}</div>
+                  <div class="rows-list">
+                    <div v-for="(row, index) in globalForm.model_effort" :key="'me' + index" class="row-edit">
+                      <q-input v-model="row.model" dense outlined dark class="mono" :label="t.modelField"></q-input>
+                      <q-select v-model="row.effort" dense outlined dark :options="effortOptions" map-options emit-value :label="t.effortField"></q-select>
+                      <span></span>
+                      <q-btn flat round dense icon="mdi-close" color="red-4" @click="globalForm.model_effort.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                    </div>
+                    <div v-if="!globalForm.model_effort.length" class="muted">{{ t.rowsEmpty }}</div>
+                    <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.addRow" @click="globalForm.model_effort.push({ model: '', effort: 'high' })"></q-btn></div>
+                  </div>
+                </div>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 旧字段：上下文上限 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.legacyCtxTitle }}</div>
+                <div class="surface-subtitle">{{ t.legacyCtxCopy }}</div>
+              </div>
+              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="t.legacySave" @click="saveLegacyCtx"></q-btn>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="rows-list">
+                <div v-for="(row, index) in legacyCtx" :key="'lc' + index" class="row-edit">
+                  <q-input v-model="row.model" dense outlined dark class="mono" :label="t.modelField"></q-input>
+                  <q-input v-model="row.ctx" dense outlined dark type="number" :label="t.ctxField" :hint="t.ctxHint"></q-input>
+                  <span></span>
+                  <q-btn flat round dense icon="mdi-close" color="red-4" @click="legacyCtx.splice(index, 1)"><q-tooltip>{{ t.legacyDelete }}</q-tooltip></q-btn>
+                </div>
+                <div v-if="!legacyCtx.length" class="muted">{{ t.rowsEmpty }}</div>
+                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.addRow" @click="legacyCtx.push({ model: '', ctx: 8192 })"></q-btn></div>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 虚拟模型别名 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.virtualSection }}</div>
+                <div class="surface-subtitle">{{ t.virtualCopy }}</div>
+              </div>
+              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="t.virtualSave" @click="saveVirtual"></q-btn>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="rows-list">
+                <div v-for="(row, index) in virtualRows" :key="'va' + index" class="row-edit">
+                  <q-input v-model="row.model" dense outlined dark class="mono" :label="t.virtualAlias" :rules="[virtualAliasRule]"></q-input>
+                  <q-select v-model="row.target" dense outlined dark use-input :options="modelOptions" :option-label="modelOptionLabel"
+                            map-options emit-value :label="t.virtualTarget" :rules="[virtualTargetRule]" input-debounce="120"></q-select>
+                  <span class="muted" style="font-size:11px">{{ t.virtualDeleteHint }}</span>
+                  <q-btn flat round dense icon="mdi-close" color="red-4" @click="virtualRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                </div>
+                <div v-if="!virtualRows.length" class="muted">{{ t.rowsEmpty }}</div>
+                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.virtualAdd" @click="virtualRows.push({ model: '', target: '' })"></q-btn></div>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 改名映射（watcher） -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.modelMapSection }}</div>
+                <div class="surface-subtitle">{{ t.modelMapCopy }}</div>
+              </div>
+              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="t.modelMapAdd" @click="saveModelMap"></q-btn>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="rows-list">
+                <div v-for="(row, index) in mapRows" :key="'mm' + index" class="row-edit">
+                  <q-input v-model="row.original" dense outlined dark class="mono" :label="t.modelMapOriginal"></q-input>
+                  <q-input v-model="row.value" dense outlined dark class="mono" :label="t.modelMapNew" :hint="t.modelMapDeleteHint"></q-input>
+                  <span class="muted" style="font-size:11px">{{ t.modelMapDeleteHint }}</span>
+                  <q-btn flat round dense icon="mdi-close" color="red-4" @click="deleteMapRow(row)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                </div>
+                <div v-if="!mapRows.length" class="muted">{{ t.rowsEmpty }}</div>
+              </div>
+            </q-card-section>
+          </q-card>
+
+          <!-- 模型卡片编辑 -->
+          <q-dialog v-model="cardOpen">
+            <q-card class="dialog-card">
+              <q-card-section><div class="dialog-title">{{ t.cardTitle }}</div><div class="dialog-copy">{{ cardCopyText }}</div></q-card-section>
+              <q-card-section>
+                <div class="dialog-fields">
+                  <q-input v-model="cardForm.model" dense outlined dark readonly class="mono" :label="t.colModel"></q-input>
+                  <div class="form-grid-2">
+                    <q-input v-model="cardForm.ctx" dense outlined dark type="number" :label="t.ctxField" :hint="t.ctxHint" :rules="[ctxRule]"></q-input>
+                    <q-select v-model="cardForm.default_effort" dense outlined dark :options="effortOptions" map-options emit-value clearable
+                              :label="t.colDefaultEffort"></q-select>
+                  </div>
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ t.cardEffortMapTitle }}</div>
+                    <div class="rows-list">
+                      <div v-for="(row, index) in cardForm.effort_map" :key="'ce' + index" class="row-edit">
+                        <q-select v-model="row.from" dense outlined dark :options="effortOptions" map-options emit-value :label="t.mapFrom"></q-select>
+                        <q-select v-model="row.to" dense outlined dark :options="effortOptions" map-options emit-value :label="t.mapTo"></q-select>
+                        <span></span>
+                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="cardForm.effort_map.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                      </div>
+                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.addRow" @click="cardForm.effort_map.push({ from: 'low', to: 'high' })"></q-btn></div>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ t.modalitiesTitle }}</div>
+                    <q-option-group v-model="cardForm.modalities" type="checkbox" inline
+                                    :options="modalityOptions" color="purple-4" dense></q-option-group>
+                    <div class="muted" style="font-size:11px">{{ t.modalitiesHint }}</div>
+                  </div>
+                </div>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps color="red-4" :label="t.cardRemove" :loading="saving" @click="clearCard()"></q-btn>
+                <q-btn flat no-caps :label="c.cancel" :disable="saving" @click="cardOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="t.cardSave" @click="saveCard"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+        </q-page>
+      </q-page-container>
+    </q-layout>
+  </div>
+
+  <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="./i18n.js?v=3"></script>
+  <script src="./api.js?v=2"></script>
+  <script>
+    const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+    const EFFORTS = window.lmrApi.effortLevels
+    const MODALITIES = window.lmrApi.modalityLevels
+
+    const app = Vue.createApp({
+      setup () {
+        const doc = ref(null)
+        const models = ref([])
+        const locale = ref(window.lmrI18n.getLocale())
+        const loading = ref(false)
+        const saving = ref(false)
+        const loadError = ref('')
+        const warningMessage = ref('')
+        const cardFilter = ref('')
+        const cardOpen = ref(false)
+        const globalForm = reactive({ default_effort: null, effort_map: [], model_effort: [] })
+        const legacyCtx = ref([])
+        const virtualRows = ref([])
+        const mapRows = ref([])
+        const cardForm = reactive({ model: '', ctx: '', default_effort: null, effort_map: [], modalities: [] })
+        const preview = reactive({ model: '', effort: null, modelFilter: '' })
+        const filteredModelOptions = ref([])
+        let unsubscribeLocale
+
+        const c = computed(() => window.lmrI18n.messages[locale.value].common)
+        const t = computed(() => window.lmrI18n.messages[locale.value].models)
+        const pagination = reactive({ rowsPerPage: 15 })
+
+        const effortOptions = computed(() => EFFORTS.map(value => ({ label: value, value })))
+        const modalityOptions = computed(() => MODALITIES.filter(item => item !== 'text').map(value => ({ label: value, value })))
+
+        // 所有可引用的模型名：已注册 + 已配置 + 虚拟别名
+        const modelOptions = computed(() => {
+          const names = new Set(models.value.map(row => row.model))
+          ;(doc.value && doc.value.model_ctx ? doc.value.model_ctx : []).forEach(row => names.add(row.model))
+          ;(doc.value && doc.value.model_effort ? doc.value.model_effort : []).forEach(row => names.add(row.model))
+          virtualRows.value.forEach(row => { if (row.target) names.add(row.target) })
+          return [...names].filter(Boolean).sort()
+        })
+        function modelOptionLabel (option) { return option }
+        function filterModelOptions (value, update) {
+          update(() => {
+            const needle = String(value || '').toLowerCase()
+            filteredModelOptions.value = needle ? modelOptions.value.filter(name => name.toLowerCase().includes(needle)) : modelOptions.value
+          })
+        }
+
+        const watcherLabel = computed(() => {
+          const watcher = doc.value && doc.value.watcher
+          if (!watcher || !watcher.url) return t.value.watcherNotConfigured
+          return watcher.reachable ? t.value.watcherReachable : t.value.watcherUnreachable
+        })
+        const watcherColor = computed(() => {
+          const watcher = doc.value && doc.value.watcher
+          if (!watcher || !watcher.url) return 'grey-6'
+          return watcher.reachable ? 'teal-4' : 'red-4'
+        })
+        const persistNote = computed(() => {
+          const file = doc.value && doc.value.persist && doc.value.persist.file
+          return window.lmrI18n.translate(locale.value, 'models', 'persistHint', { file: file || '—' })
+        })
+        const mapNote = computed(() => (mapRows.value.length ? t.value.previewMapNote : ''))
+
+        const cardColumns = computed(() => [
+          { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
+          { name: 'registered', label: t.value.colRegistered, field: 'registered', align: 'left', sortable: true },
+          { name: 'ctx', label: t.value.colCtx, field: 'ctx', align: 'left', sortable: true, style: 'width:120px' },
+          { name: 'default_effort', label: t.value.colDefaultEffort, field: 'default_effort', align: 'left', style: 'width:120px' },
+          { name: 'effort_map', label: t.value.colCardMap, field: 'effort_map', align: 'left' },
+          { name: 'modalities', label: t.value.colModalities, field: 'modalities', align: 'left', style: 'width:150px' },
+          { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:90px' }
+        ])
+
+        const cardRows = computed(() => {
+          const cards = new Map(models.value.map(row => [row.model, row]))
+          const configured = (doc.value && doc.value.model_configs) || []
+          configured.forEach(card => {
+            if (!cards.has(card.model)) cards.set(card.model, { ...card, registered: false, sources: [] })
+          })
+          return [...cards.values()]
+        })
+
+        function effortText (value) {
+          if (value === null || value === undefined || value === '') return c.value.unset
+          return value
+        }
+        function modalitiesText (value) {
+          if (!value || !value.length) return c.value.unset
+          return value.join(', ')
+        }
+
+        // ── 生效预览：复刻 config_store.lua 的三步推算（resolve / effort / ctx cap） ──
+        function normalizeEffort (value) {
+          const text = String(value === null || value === undefined ? '' : value).trim().toLowerCase()
+          if (!text || text === 'null' || text === 'default') return null
+          return EFFORTS.includes(text) ? text : null
+        }
+        function pairList (rows, key) {
+          const map = {}
+          ;(rows || []).forEach(row => {
+            if (!row || !row.model) return
+            map[row.model] = key === 'ctx' ? Number(row[key]) : row[key]
+          })
+          return map
+        }
+        function previewResolve (requested) {
+          const virtual = pairList((doc.value && doc.value.virtual_models) || [], 'target')
+          return virtual[requested] || requested
+        }
+        function previewEffort (model, requested) {
+          const cfg = doc.value || {}
+          const wanted = normalizeEffort(requested)
+          const forced = (cfg.model_effort || []).find(row => row.model === model)
+          if (forced && forced.effort) return { effort: forced.effort, chain: t.value.previewChainLegacy }
+          const card = (cfg.model_configs || []).find(row => row.model === model)
+          const globalMap = {}
+          ;(cfg.effort_map || []).forEach(row => { globalMap[row.from] = row.to })
+          const globalDefault = normalizeEffort(cfg.default_effort)
+          if (card) {
+            const cardMap = {}
+            ;(card.effort_map || []).forEach(row => { cardMap[row.from] = row.to })
+            const cardDefault = normalizeEffort(card.default_effort)
+            if (wanted) {
+              if (cardMap[wanted]) return { effort: cardMap[wanted], chain: `${t.value.previewChainCard} · ${t.value.mapFrom} ${wanted} → ${cardMap[wanted]}` }
+              if (Object.keys(cardMap).length || cardDefault) {
+                return { effort: cardDefault || wanted, chain: `${t.value.previewChainCard} · ${t.value.defaultEffort}` }
+              }
+              return { effort: globalMap[wanted] || wanted, chain: globalMap[wanted] ? `${t.value.previewChainMap} · ${wanted} → ${globalMap[wanted]}` : t.value.previewChainNone }
+            }
+            if (cardDefault) return { effort: cardDefault, chain: `${t.value.previewChainCard} · ${t.value.defaultEffort}` }
+            if (wanted) return { effort: cardDefault || globalDefault || wanted, chain: t.value.previewChainCard }
+            return { effort: globalDefault, chain: globalDefault ? t.value.previewChainDefault : t.value.previewChainNone }
+          }
+          if (wanted) return { effort: globalMap[wanted] || wanted, chain: globalMap[wanted] ? `${t.value.previewChainMap} · ${wanted} → ${globalMap[wanted]}` : t.value.previewChainNone }
+          return { effort: globalDefault, chain: globalDefault ? t.value.previewChainDefault : t.value.previewChainNone }
+        }
+        function previewCtx (model) {
+          const cfg = doc.value || {}
+          const card = (cfg.model_configs || []).find(row => row.model === model)
+          if (card && card.ctx) return Number(card.ctx)
+          const legacy = (cfg.model_ctx || []).find(row => row.model === model)
+          return legacy ? Number(legacy.ctx) : null
+        }
+        const previewResult = computed(() => {
+          const requested = preview.model || ''
+          const resolved = requested ? previewResolve(requested) : requested
+          const effort = previewEffort(resolved, preview.effort)
+          const cap = resolved ? previewCtx(resolved) : null
+          return {
+            model: resolved || '—',
+            resolved,
+            alias: resolved !== requested && requested !== '',
+            effortText: effort.effort || c.value.unset,
+            effortChain: effort.chain || '',
+            ctx: cap,
+            ctxText: cap ? String(cap) : t.value.previewNoCtx
+          }
+        })
+
+        // ── 载入 ──
+        function hydrate (document_) {
+          doc.value = document_
+          models.value = document_.models || []
+          globalForm.default_effort = document_.default_effort || null
+          globalForm.effort_map = (document_.effort_map || []).map(row => ({ from: row.from, to: row.to }))
+          globalForm.model_effort = (document_.model_effort || []).map(row => ({ model: row.model, effort: row.effort }))
+          legacyCtx.value = (document_.model_ctx || []).map(row => ({ model: row.model, ctx: row.ctx }))
+          virtualRows.value = (document_.virtual_models || []).map(row => ({ model: row.model, target: row.target }))
+          const map = (document_.watcher && document_.watcher.model_map) || {}
+          mapRows.value = Object.entries(map).map(([original, value]) => ({ original, value }))
+          if (!preview.model) preview.model = models.value.length ? models.value[0].model : (modelOptions.value[0] || '')
+          filteredModelOptions.value = modelOptions.value
+        }
+
+        async function load () {
+          loading.value = true
+          loadError.value = ''
+          try {
+            hydrate(await window.lmrApi.config())
+          } catch (error) {
+            loadError.value = error.message
+          } finally {
+            loading.value = false
+          }
+        }
+
+        // 保存后统一重新拉取：不同 handler 返回的 document 字段不完全一致
+        async function mutate (action, messageKey, values) {
+          saving.value = true
+          try {
+            await action()
+            Quasar.Notify.create({
+              message: values
+                ? window.lmrI18n.translate(locale.value, 'models', messageKey, values)
+                : window.lmrI18n.translate(locale.value, 'models', messageKey),
+              type: 'positive', position: 'top-right', timeout: 2400
+            })
+            warningMessage.value = ''
+            await load()
+            return true
+          } catch (error) {
+            Quasar.Notify.create({ message: error.message, type: 'negative', position: 'top-right', timeout: 5200 })
+            return false
+          } finally {
+            saving.value = false
+          }
+        }
+
+        async function saveGlobal () {
+          const patch = {
+            default_effort: globalForm.default_effort || null,
+            effort_map: globalForm.effort_map.filter(row => row.from && row.to).map(row => ({ from: row.from, to: row.to })),
+            model_effort: globalForm.model_effort.filter(row => row.model && row.effort).map(row => ({ model: row.model, effort: row.effort }))
+          }
+          await mutate(() => window.lmrApi.configEffort(patch), 'globalSaved')
+        }
+
+        async function saveLegacyCtx () {
+          const rows = legacyCtx.value.filter(row => row.model && Number(row.ctx) > 0)
+          const before = ((doc.value && doc.value.model_ctx) || []).map(row => row.model)
+          saving.value = true
+          try {
+            for (const row of rows) await window.lmrApi.configCtx(row.model, Number(row.ctx))
+            for (const model of before) {
+              if (!rows.some(row => row.model === model)) await window.lmrApi.configCtx(model, null)
+            }
+            Quasar.Notify.create({ message: t.value.globalSaved, type: 'positive', position: 'top-right', timeout: 2400 })
+            await load()
+          } catch (error) {
+            Quasar.Notify.create({ message: error.message, type: 'negative', position: 'top-right', timeout: 5200 })
+            await load()
+          } finally {
+            saving.value = false
+          }
+        }
+
+        function virtualAliasRule (value) { return Boolean(String(value || '').trim()) || t.value.virtualRuleAlias }
+        function virtualTargetRule (value) { return Boolean(String(value || '').trim()) || t.value.virtualRuleTarget }
+
+        async function saveVirtual () {
+          const rows = virtualRows.value.map(row => ({ model: String(row.model || '').trim(), target: String(row.target || '').trim() }))
+            .filter(row => row.model || row.target)
+          const invalid = rows.find(row => !row.model || !row.target)
+          if (invalid) { Quasar.Notify.create({ message: t.value.virtualNeedBoth, type: 'negative', position: 'top-right' }); return }
+          const same = rows.find(row => row.model === row.target)
+          if (same) { Quasar.Notify.create({ message: `${same.model} · ${t.value.virtualSame}`, type: 'negative', position: 'top-right' }); return }
+          await mutate(() => window.lmrApi.configVirtual(rows), 'virtualSaved')
+        }
+
+        async function saveModelMap () {
+          const rows = mapRows.value.filter(row => row.original && row.value)
+          if (!rows.length) { Quasar.Notify.create({ message: c.value.required, type: 'negative', position: 'top-right' }); return }
+          const mapping = {}
+          rows.forEach(row => { mapping[row.original.trim()] = row.value.trim() })
+          const ok = await mutate(() => window.lmrApi.configModelMap(mapping), 'modelMapSaved')
+          if (!ok) return
+        }
+
+        async function deleteMapRow (row) {
+          if (!row.original) { mapRows.value.splice(mapRows.value.indexOf(row), 1); return }
+          const execute = async () => {
+            await mutate(() => window.lmrApi.configModelMap({ [row.original]: '' }), 'modelMapDeleted', { orig: row.original })
+          }
+          Quasar.Dialog.create({
+            title: t.value.modelMapSection,
+            message: `${row.original} → ${row.value} · ${t.value.modelMapDeleteHint}`,
+            cancel: true, persistent: true, ok: { label: c.value.del, color: 'negative', flat: true }
+          }).onOk(execute)
+        }
+
+        function openCard (row) {
+          Object.assign(cardForm, {
+            model: row.model,
+            ctx: row.ctx === null || row.ctx === undefined ? '' : String(row.ctx),
+            default_effort: row.default_effort || null,
+            effort_map: (row.effort_map || []).map(entry => ({ from: entry.from, to: entry.to })),
+            modalities: (row.modalities || []).filter(item => item !== 'text')
+          })
+          cardOpen.value = true
+        }
+        const cardCopyText = computed(() => window.lmrI18n.translate(locale.value, 'models', 'cardCopy', { model: cardForm.model }))
+        function ctxRule (value) {
+          if (value === '' || value === null) return true
+          return (/^\d+$/.test(String(value)) && Number(value) >= 1) || t.value.ctxRule
+        }
+
+        async function saveCard () {
+          if (!ctxRule(cardForm.ctx)) { Quasar.Notify.create({ message: t.value.ctxRule, type: 'negative', position: 'top-right' }); return }
+          const patch = {
+            model: cardForm.model,
+            ctx: cardForm.ctx === '' ? null : Number(cardForm.ctx),
+            default_effort: cardForm.default_effort || null,
+            effort_map: cardForm.effort_map.filter(row => row.from && row.to).map(row => ({ from: row.from, to: row.to })),
+            modalities: cardForm.modalities.length ? ['text', ...cardForm.modalities] : null
+          }
+          const ok = await mutate(() => window.lmrApi.configModel(patch), 'cardSaved', { model: cardForm.model })
+          if (ok) cardOpen.value = false
+        }
+
+        function clearCard (row) {
+          const model = row ? row.model : cardForm.model
+          Quasar.Dialog.create({
+            title: t.value.cardRemoveTitle,
+            message: `${model} · ${t.value.cardRemoveConfirm}`,
+            cancel: true, persistent: true, ok: { label: t.value.cardRemove, color: 'negative', flat: true }
+          }).onOk(async () => {
+            const ok = await mutate(() => window.lmrApi.configModel({ model, remove: true }), 'clearedNotice', { model })
+            if (ok) cardOpen.value = false
+          })
+        }
+
+        function applyLocale (nextLocale) {
+          locale.value = nextLocale
+          document.documentElement.lang = nextLocale
+          document.title = window.lmrI18n.messages[nextLocale].models.title + ' · llm-router'
+          window.lmrI18n.applyQuasarLang(nextLocale)
+        }
+
+        onMounted(() => {
+          applyLocale(locale.value)
+          unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
+          load()
+        })
+        onBeforeUnmount(() => { if (unsubscribeLocale) unsubscribeLocale() })
+
+        return {
+          c, cardColumns, cardCopyText, cardFilter, cardForm, cardOpen, cardRows, clearCard, ctxRule,
+          deleteMapRow, doc, effortOptions, effortText, filterModelOptions, globalForm, legacyCtx, load,
+          loading, loadError, mapNote, mapRows, modelOptionLabel, modelOptions, modalityOptions,
+          modalitiesText, mutate, openCard, pagination, persistNote, preview, previewResult, saving, saveCard, saveGlobal,
+          saveLegacyCtx, saveModelMap, saveVirtual, t, virtualAliasRule, virtualRows, virtualTargetRule,
+          watcherColor, watcherLabel, warningMessage
+        }
+      }
+    })
+
+    app.use(Quasar, { config: { dark: true } })
+    Quasar.Dark.set(true)
+    window.lmrI18n.applyQuasarLang(window.lmrI18n.getLocale())
+    Quasar.IconSet.set(Quasar.IconSet.mdiV7)
+    app.mount('#q-app')
+  </script>
+</body>
+</html>

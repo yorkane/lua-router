@@ -33,9 +33,15 @@
       ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide h-4 w-4">' +
       '<path d="M15 12h3v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>' +
       '<path d="m9 11 2 2 4-4"/></svg>';
-    /* 只注入 Logs 一项：Config 与 Metrics 通过 logs.html 顶部的共享标签条到达 */
+    var SVG_ADMIN = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"' +
+      ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide h-4 w-4">' +
+      '<rect width="7" height="9" x="9" y="3" rx="1"/><rect width="7" height="5" x="14" y="16" rx="1"/>' +
+      '<rect width="7" height="5" x="3" y="16" rx="1"/><path d="M21 16v-2a2 2 0 0 0-2-2h-3"/>' +
+      '<path d="M7 16V8a2 2 0 0 1 2-2h7"/></svg>';
+    /* Logs 同页跳转；Admin（Quasar 管理控制台）新开标签页，避免丢掉当前会话状态 */
     var ENTRIES = [
-      { mark: 'logs', label: 'Logs', icon: SVG_LOGS, href: 'logs.html' }
+      { mark: 'logs', label: 'Logs', icon: SVG_LOGS, href: 'logs.html' },
+      { mark: 'admin', label: 'Admin', icon: SVG_ADMIN, href: 'admin/index.html', blank: true }
     ];
 
     function findNav() {
@@ -67,12 +73,19 @@
           btn.setAttribute('aria-label', entry.label);
           btn.title = entry.label;
           btn.innerHTML = entry.icon;                            // 图标是本文内联常量，不含外部内容
-          btn.addEventListener('click', (function (href) {
+          btn.addEventListener('click', (function (href, blank) {
             return function () {
               // 用 baseURI 解析，保证在 /_ui/ 与 /_ui/index.html 两种 URL 下都指向 /_ui/<页>
-              try { window.location.assign(new URL(href, document.baseURI).href); } catch (e) {}
+              try {
+                var url = new URL(href, document.baseURI).href;
+                if (blank) {
+                  var w = window.open(url, '_blank', 'noopener');
+                  if (w) return;                                // 被拦截时退回同页跳转
+                }
+                window.location.assign(url);
+              } catch (e) {}
             };
-          })(entry.href));
+          })(entry.href, entry.blank === true));
           wrap.appendChild(btn);
           nav.appendChild(wrap);
         }

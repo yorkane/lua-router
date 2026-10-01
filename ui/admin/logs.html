@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Logs · llm-router</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="./app.css?v=5">
+</head>
+<body>
+  <div id="q-app">
+    <q-layout container class="workspace-layout">
+      <q-page-container>
+        <q-page class="workspace-page">
+          <header class="page-heading">
+            <div>
+              <h1>{{ t.title }}</h1>
+              <p>{{ t.description }}</p>
+            </div>
+            <div class="heading-actions">
+              <div class="route-cell">
+                <span class="live-dot" :class="{ off: !streamConnected }"></span>
+                <q-toggle v-model="live" dense color="teal-4" :label="t.live"></q-toggle>
+                <span class="muted" style="font-size:11.5px">{{ streamLabel }}</span>
+              </div>
+              <q-btn outline no-caps icon="mdi-filter-remove-outline" class="secondary-button" :label="t.clearFilters" @click="resetFilters"></q-btn>
+              <q-btn outline no-caps icon="mdi-broom" class="secondary-button" :label="t.clear" @click="clearList"><q-tooltip>{{ t.clearHint }}</q-tooltip></q-btn>
+              <q-btn outline no-caps icon="mdi-refresh" :label="c.refresh" class="secondary-button" :loading="loading" @click="reload"></q-btn>
+            </div>
+          </header>
+
+          <q-banner v-if="disabledReason" rounded dense class="warn-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-database-off-outline"></q-icon></template>
+            {{ disabledReason }}
+          </q-banner>
+          <q-banner v-else-if="loadError" rounded dense class="error-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>
+            {{ loadError }}
+            <template v-slot:action><q-btn flat dense no-caps :label="c.retry" @click="reload"></q-btn></template>
+          </q-banner>
+
+          <section class="stat-grid cols-4">
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-airballoon" class="stat-icon purple"></q-icon>
+              <div class="stat-label">{{ t.summaryInflight }}</div>
+              <div class="stat-value">{{ fmtInt(stats.inflight) }}</div>
+              <div class="stat-note">{{ windowNote }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-chart-bell-curve-cumulative" class="stat-icon blue"></q-icon>
+              <div class="stat-label">{{ t.summaryReqWindow }} / {{ t.summaryErrors }}</div>
+              <div class="stat-value">{{ fmtInt(stats.requests_window) }} <span class="muted" style="font-size:15px">/ {{ fmtInt(stats.errors_window) }}</span></div>
+              <div class="stat-note">{{ t.summaryDuration }} {{ fmtMs(stats.avg_duration_ms) }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
+              <div class="stat-label">{{ t.summaryOut }} / {{ t.summaryIn }}</div>
+              <div class="stat-value">{{ fmtRate(stats.output_tok_s) }} <span class="muted" style="font-size:15px">/ {{ fmtRate(stats.input_tok_s) }}</span></div>
+              <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-database-sync" class="stat-icon red"></q-icon>
+              <div class="stat-label">{{ t.summaryBuffer }}</div>
+              <div class="stat-value">{{ fmtInt(stats.buffered) }}</div>
+              <div class="stat-note">{{ bufferNote }} · {{ t.summaryUptime }} {{ fmtUptime(stats.uptime_s) }}</div>
+            </q-card-section></q-card>
+          </section>
+
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading filter-bar">
+              <div class="filter-group">
+                <q-select v-model="filters.status" dense outlined dark options-dense :options="statusOptions"
+                          map-options emit-value :label="t.filterStatus" popup-content-style="min-width:150px"></q-select>
+                <q-select v-model="filters.model" dense outlined dark options-dense use-input input-debounce="120"
+                          :options="modelFilterOptions" map-options emit-value :label="t.filterModel" @filter="modelFilter"></q-select>
+                <q-select v-model="filters.path" dense outlined dark options-dense use-input input-debounce="120"
+                          :options="pathFilterOptions" map-options emit-value :label="t.filterPath" @filter="pathFilter"></q-select>
+              </div>
+              <q-input v-model="filters.text" dense outlined dark debounce="200" :placeholder="t.filterTextPlaceholder" class="search-input">
+                <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
+              </q-input>
+            </q-card-section>
+            <q-separator dark></q-separator>
+
+            <q-table
+              flat
+              dense
+              dark
+              :rows="visibleRows"
+              :columns="columns"
+              :loading="loading"
+              :pagination="pagination"
+              :rows-per-page-options="[25, 50, 100, 0]"
+              :expanded="expandedRows"
+              @update:expanded="value => (expandedRows = value)"
+              row-key="seq"
+              class="linear-table logs-table"
+            >
+              <!-- 该 Quasar 版本（2.26.0）已无 body-expansion 插槽，body-cell-* 的 props 里
+                   也没有 toggleExpand：展开必须自己接管整行（v-slot:body 按行调用），
+                   详情行走第二个 <q-tr>，展开态由 :expanded + expandedRows 驱动。 -->
+              <template v-slot:body="props">
+                <q-tr :props="props">
+                  <q-td key="detail" :props="props">
+                    <q-btn flat round dense size="sm" :icon="props.expand ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+                           :aria-label="props.expand ? t.collapse : t.expand" @click="toggleRow(props.row)"></q-btn>
+                  </q-td>
+                  <q-td key="time" :props="props"><span class="mono">{{ formatTime(props.row.ts_ms) }}</span></q-td>
+                  <q-td key="model" :props="props">
+                    <div class="model-cell">
+                      <strong>{{ props.row.model }}</strong>
+                      <span v-if="props.row.requested_model && props.row.requested_model !== props.row.model" class="muted mono">
+                        {{ props.row.requested_model }} →</span>
+                    </div>
+                  </q-td>
+                  <q-td key="path" :props="props"><span class="mono">{{ props.row.path || '—' }}</span></q-td>
+                  <q-td key="status" :props="props">
+                    <span class="st-code" :class="statusClass(props.row.status)">{{ props.row.status }}</span>
+                    <q-badge v-if="props.row.stream" outline color="blue-4" class="chip-soft q-ml-xs">SSE</q-badge>
+                  </q-td>
+                  <q-td key="duration" :props="props"><span class="mono">{{ fmtMs(props.row.duration_ms) }}</span></q-td>
+                  <q-td key="ttft" :props="props"><span class="mono">{{ fmtMs(props.row.ttft_ms) }}</span></q-td>
+                  <q-td key="tokens" :props="props"><span class="mono">{{ fmtInt(props.row.completion_tokens) }} / {{ fmtInt(props.row.prompt_tokens) }}</span></q-td>
+                  <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
+                  <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
+                  <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span></q-td>
+                  <q-td key="route" :props="props"><span class="mono">{{ props.row.route_type || '—' }}</span></q-td>
+                </q-tr>
+                <q-tr v-show="props.expand" :key="'exp-' + props.row.seq" class="lmr-detail-row">
+                  <q-td colspan="100%" class="expansion-cell">
+                    <div class="kv-grid">
+                      <div>
+                        <h4 class="detail-title">{{ t.colRoute }} / {{ t.detailSelected }}</h4>
+                        <div class="kv">
+                          <span class="k">{{ t.detailId }}</span><span class="v mono">{{ props.row.id }}</span>
+                          <span class="k">{{ t.detailSeq }}</span><span class="v mono">{{ props.row.seq }}</span>
+                          <span class="k">{{ t.colRoute }}</span><span class="v mono">{{ props.row.route_type || '—' }}</span>
+                          <span class="k">{{ t.detailSelected }}</span><span class="v mono">{{ props.row.selected || props.row.worker || '—' }}</span>
+                          <span class="k">{{ t.detailCandidates }}</span>
+                          <span class="v mono">{{ (props.row.candidates || []).join(', ') || '—' }}</span>
+                          <span class="k">{{ t.detailProvider }}</span><span class="v mono">{{ props.row.provider || '—' }}</span>
+                          <span class="k">{{ t.detailEndpoint }}</span><span class="v mono">{{ props.row.endpoint || '—' }}</span>
+                          <span class="k">{{ t.detailStream }}</span><span class="v">{{ props.row.stream ? t.yes : t.no }}</span>
+                        </div>
+                      </div>
+                      <div>
+                        <h4 class="detail-title">{{ t.detailRequestedModel }} / {{ t.detailEffort }}</h4>
+                        <div class="kv">
+                          <span class="k">{{ t.colModel }}</span><span class="v mono">{{ props.row.model }}</span>
+                          <span class="k">{{ t.detailRequestedModel }}</span><span class="v mono">{{ props.row.requested_model || '—' }}</span>
+                          <span class="k">{{ t.detailEffort }}</span>
+                          <span class="v mono">{{ (props.row.requested_effort || '—') + ' → ' + (props.row.effort || '—') }}</span>
+                          <span class="k">{{ t.colTokens }}</span>
+                          <span class="v mono">{{ fmtInt(props.row.completion_tokens) }} / {{ fmtInt(props.row.prompt_tokens) }}
+                            <span class="muted">({{ t.detailCached }} {{ fmtInt(props.row.cached_tokens) }} · {{ t.detailReasoning }} {{ fmtInt(props.row.reasoning_tokens) }})</span>
+                            <span v-if="props.row.tokens_estimated"> · {{ t.detailEstimated }}</span>
+                          </span>
+                          <span class="k">{{ t.colRate }}</span><span class="v mono">{{ fmtRate(props.row.tok_per_s) }}</span>
+                          <span class="k">{{ t.detailSession }}</span><span class="v mono">{{ props.row.session || '—' }}</span>
+                          <span class="k">{{ t.detailError }}</span>
+                          <span class="v mono" :class="props.row.error ? 'st-code s5' : 'muted'">{{ props.row.error || '—' }}</span>
+                          <span class="k">{{ t.detailTs }}</span><span class="v mono">{{ formatTime(props.row.ts_ms, true) }}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </q-td>
+                </q-tr>
+              </template>
+
+              <template v-slot:no-data>
+                <div class="empty-state">
+                  <q-icon name="mdi-clipboard-text-clock-outline" size="18px"></q-icon>
+                  <span>{{ rows.length === 0 ? t.emptyLogs : t.emptyFilter }}</span>
+                </div>
+              </template>
+            </q-table>
+
+            <div class="table-footer">
+              <q-btn flat dense no-caps icon="mdi-arrow-up" class="secondary-button" :label="t.loadMore"
+                     :loading="olderLoading" :disable="cursor <= 0" @click="loadOlder"></q-btn>
+              <span class="muted">{{ loadedNote }}</span>
+            </div>
+          </q-card>
+        </q-page>
+      </q-page-container>
+    </q-layout>
+  </div>
+
+  <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="./i18n.js?v=3"></script>
+  <script src="./api.js?v=2"></script>
+  <script>
+    const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+    const PAGE_LIMIT = 500          // /_ui/logs 单次上限（后端 2000）
+    const LOCAL_CAP = 4000          // 本地列表上限，超出丢弃最旧
+    const STATS_POLL_MS = 5000
+
+    const app = Vue.createApp({
+      setup () {
+        const rows = ref([])
+        const stats = ref({})
+        const cursor = ref(0)
+        const capacity = ref(0)
+        const locale = ref(window.lmrI18n.getLocale())
+        const loading = ref(false)
+        const olderLoading = ref(false)
+        const loadError = ref('')
+        const disabledReason = ref('')
+        const live = ref(true)
+        const streamConnected = ref(false)
+        const filters = reactive({ status: '', model: '', path: '', text: '' })
+        const modelSuggest = ref([])
+        const pathSuggest = ref([])
+        const pagination = reactive({ rowsPerPage: 50, sortBy: 'seq', descending: true })
+        let source = null
+        let statsTimer
+        let unsubscribeLocale
+
+        const c = computed(() => window.lmrI18n.messages[locale.value].common)
+        const t = computed(() => window.lmrI18n.messages[locale.value].logs)
+
+        const columns = computed(() => [
+          { name: 'detail', label: '', field: 'seq', align: 'center', style: 'width:34px' },
+          { name: 'time', label: t.value.colTime, field: 'ts_ms', align: 'left', sortable: true, style: 'width:110px' },
+          { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
+          { name: 'path', label: t.value.colPath, field: 'path', align: 'left', sortable: true, style: 'width:190px' },
+          { name: 'status', label: t.value.colStatus, field: 'status', align: 'left', sortable: true, style: 'width:90px' },
+          { name: 'duration', label: t.value.colDuration, field: 'duration_ms', align: 'left', sortable: true, style: 'width:90px' },
+          { name: 'ttft', label: t.value.colTtft, field: 'ttft_ms', align: 'left', sortable: true, style: 'width:90px' },
+          { name: 'tokens', label: t.value.colTokens, field: 'completion_tokens', align: 'left', sortable: true, style: 'width:110px' },
+          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'effort', label: t.value.detailEffort, field: 'effort', align: 'left', style: 'width:90px' },
+          { name: 'worker', label: t.value.colWorker, field: 'worker', align: 'left', sortable: true, style: 'width:150px' },
+          { name: 'route', label: t.value.colRoute, field: 'route_type', align: 'left', style: 'width:110px' }
+        ])
+
+        const statusOptions = computed(() => [
+          { label: t.value.statusAll, value: '' },
+          { label: t.value.status2xx, value: '2' },
+          { label: t.value.status4xx, value: '4' },
+          { label: t.value.status5xx, value: '5' }
+        ])
+        const distinctModels = computed(() => unique(rows.value.map(row => row.model)))
+        const distinctPaths = computed(() => unique(rows.value.map(row => row.path)))
+        const modelFilterOptions = computed(() => [{ label: t.value.modelAll, value: '' }].concat(
+          mergeOptions(modelSuggest.value, distinctModels.value)))
+        const pathFilterOptions = computed(() => [{ label: '/ (all)', value: '' }].concat(
+          mergeOptions(pathSuggest.value, distinctPaths.value)))
+
+        const visibleRows = computed(() => {
+          const needle = String(filters.text || '').trim().toLowerCase()
+          return rows.value.filter(row => {
+            if (filters.status && String(row.status).charAt(0) !== filters.status) return false
+            if (filters.model && row.model !== filters.model) return false
+            if (filters.path && row.path !== filters.path) return false
+            if (needle) {
+              const haystack = [row.id, row.worker, row.session, row.provider, row.model, row.selected, row.error]
+                .map(value => (value === null || value === undefined ? '' : String(value))).join(' ').toLowerCase()
+              if (!haystack.includes(needle)) return false
+            }
+            return true
+          })
+        })
+
+        const loadedNote = computed(() => {
+          const total = rows.value.length
+          if (!total) return t.value.emptyLogs
+          const head = cursor.value
+          const oldest = Math.max(0, head - total)
+          const base = oldest > 0 ? window.lmrI18n.translate(locale.value, 'logs', 'truncated', { n: total }) : t.value.loadedAll
+          return `${base} · seq ${oldest + 1}–${head}`
+        })
+        const bufferNote = computed(() => window.lmrI18n.translate(locale.value, 'logs', 'bufferNote', {
+          n: fmtInt(stats.value.buffered), c: fmtInt(stats.value.capacity === undefined ? capacity.value : stats.value.capacity)
+        }))
+        const windowNote = computed(() => window.lmrI18n.translate(locale.value, 'logs', 'windowNote', { n: fmtOne(stats.value.window_s) }))
+        const streamLabel = computed(() => {
+          if (!live.value) return t.value.liveOff
+          return streamConnected.value ? t.value.liveOn : t.value.liveReconnecting
+        })
+
+        function unique (list) {
+          return [...new Set(list.filter(value => value !== null && value !== undefined && value !== ''))].sort()
+        }
+        function mergeOptions (suggested, distinct) {
+          const names = [...new Set(suggested.concat(distinct))].sort()
+          return names.map(value => ({ label: value, value }))
+        }
+        function modelFilter (value, update) {
+          update(() => { modelSuggest.value = value ? distinctModels.value.filter(name => name.toLowerCase().includes(value.toLowerCase())) : [] })
+        }
+        function pathFilter (value, update) {
+          update(() => { pathSuggest.value = value ? distinctPaths.value.filter(name => name.toLowerCase().includes(value.toLowerCase())) : [] })
+        }
+
+        function cellText (col, row) {
+          if (col.name === 'time') return formatTime(row.ts_ms)
+          if (col.name === 'path' || col.name === 'worker') return row[col.field] || '—'
+          if (col.name === 'route') return row.route_type || '—'
+          if (col.name === 'rate') return fmtRate(row.tok_per_s)
+          return row[col.field] === null || row[col.field] === undefined ? '—' : row[col.field]
+        }
+
+        function fmtInt (value) { return Number.isFinite(Number(value)) ? String(Math.round(Number(value))) : '—' }
+        function fmtOne (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
+        function fmtRate (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
+        function fmtMs (value) {
+          if (!Number.isFinite(Number(value))) return '—'
+          const ms = Number(value)
+          return ms >= 1000 ? (ms / 1000).toFixed(2) + ' s' : Math.round(ms) + ' ms'
+        }
+        function fmtUptime (seconds) {
+          if (!Number.isFinite(Number(seconds))) return '—'
+          const total = Math.floor(Number(seconds))
+          const days = Math.floor(total / 86400)
+          const hours = Math.floor((total % 86400) / 3600)
+          const minutes = Math.floor((total % 3600) / 60)
+          if (days) return `${days}d ${hours}h`
+          if (hours) return `${hours}h ${minutes}m`
+          return `${minutes}m ${total % 60}s`
+        }
+        function formatTime (ts, withDate) {
+          if (!Number.isFinite(Number(ts))) return '—'
+          const options = withDate
+            ? { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }
+            : { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }
+          return new Intl.DateTimeFormat(locale.value, options).format(new Date(Number(ts)))
+        }
+        function statusClass (status) {
+          const digit = String(status).charAt(0)
+          if (digit === '2') return 's2'
+          if (digit === '4') return 's4'
+          if (digit === '5') return 's5'
+          return 'sc'
+        }
+
+        // 环形缓冲：seq 递增，SSE 推一条追加一条，重复 seq 忽略
+        function append (record) {
+          if (!record || typeof record !== 'object') return
+          if (!Number.isFinite(Number(record.seq))) return
+          if (rows.value.some(row => row.seq === record.seq)) return
+          rows.value = rows.value.concat([record])
+          const overflow = rows.value.length - LOCAL_CAP
+          if (overflow > 0) rows.value = rows.value.slice(overflow)
+          if (Number(record.seq) > cursor.value) cursor.value = Number(record.seq)
+        }
+
+        async function initialLoad () {
+          loading.value = true
+          loadError.value = ''
+          try {
+            const result = await window.lmrApi.logs(0, PAGE_LIMIT)
+            rows.value = (result.requests || []).slice(-LOCAL_CAP)
+            cursor.value = Number(result.cursor) || 0
+            capacity.value = Number(result.capacity) || 0
+            disabledReason.value = ''
+          } catch (error) {
+            rows.value = []
+            if (error.status === 503) disabledReason.value = t.value.logsDisabled
+            else loadError.value = error.message
+          } finally {
+            loading.value = false
+          }
+          await refreshStats()
+        }
+
+        async function loadOlder () {
+          if (cursor.value <= 0) return
+          const oldestSeq = rows.value.length ? Math.min(...rows.value.map(row => row.seq)) : cursor.value + 1
+          olderLoading.value = true
+          try {
+            const result = await window.lmrApi.logs(0, PAGE_LIMIT)
+            const earlier = (result.requests || []).filter(row => row.seq < oldestSeq)
+            if (earlier.length) rows.value = earlier.concat(rows.value).slice(-LOCAL_CAP)
+            cursor.value = Number(result.cursor) || cursor.value
+            if (!earlier.length) Quasar.Notify.create({ message: t.value.loadedAll, type: 'info', position: 'top-right', timeout: 1800 })
+          } catch (error) {
+            Quasar.Notify.create({ message: error.message, type: 'negative', position: 'top-right', timeout: 5200 })
+          } finally {
+            olderLoading.value = false
+          }
+        }
+
+        async function refreshStats () {
+          try {
+            stats.value = await window.lmrApi.stats()
+            if (stats.value.capacity) capacity.value = Number(stats.value.capacity)
+          } catch (error) {
+            // 日志关闭或瞬时故障：摘要保持上一次的值，原因由列表侧提示
+          }
+        }
+
+        // SSE：开关打开才连接；断开由 EventSource 自动重连，统计走轮询
+        function openStream () {
+          if (source || !live.value) return
+          if (typeof EventSource !== 'function') return
+          source = new EventSource(window.lmrApi.logsStreamUrl())
+          source.onopen = () => { streamConnected.value = true }
+          source.onerror = () => { streamConnected.value = false }
+          source.onmessage = event => {
+            streamConnected.value = true
+            try { append(JSON.parse(event.data)) } catch (err) { /* 心跳/半截帧：忽略 */ }
+          }
+        }
+        function closeStream () {
+          if (source) { source.close(); source = null }
+          streamConnected.value = false
+        }
+
+        async function reload () {
+          await initialLoad()
+          closeStream()
+          openStream()
+        }
+        function clearList () {
+          rows.value = []
+        }
+        function resetFilters () {
+          Object.assign(filters, { status: '', model: '', path: '', text: '' })
+        }
+        // 行展开交给 QTable：expanded 存 row-key 数组，点击详情按钮翻转
+        const expandedRows = ref([])
+
+        function toggleRow (row) {
+          const key = row.seq
+          const current = expandedRows.value
+          expandedRows.value = current.includes(key)
+            ? current.filter(item => item !== key)
+            : [...current, key]
+        }
+
+        // 档位列显示「请求 → 生效」；未指定请求档位或两者相同时只显示生效值
+        function effortCell (row) {
+          if (!row.effort && !row.requested_effort) return '—'
+          if (!row.requested_effort || row.requested_effort === row.effort) return row.effort || '—'
+          return row.requested_effort + ' → ' + row.effort
+        }
+
+        function applyLocale (nextLocale) {
+          locale.value = nextLocale
+          document.documentElement.lang = nextLocale
+          document.title = window.lmrI18n.messages[nextLocale].logs.title + ' · llm-router'
+          window.lmrI18n.applyQuasarLang(nextLocale)
+        }
+
+        onMounted(() => {
+          applyLocale(locale.value)
+          unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
+          initialLoad().then(openStream)
+          statsTimer = window.setInterval(refreshStats, STATS_POLL_MS)
+        })
+        onBeforeUnmount(() => {
+          closeStream()
+          window.clearInterval(statsTimer)
+          if (unsubscribeLocale) unsubscribeLocale()
+        })
+
+        Vue.watch(live, on => (on ? openStream() : closeStream()))
+
+        return {
+          bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters, fmtInt, fmtMs, fmtRate,
+          fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
+          effortCell, toggleRow,
+          live, modelFilterOptions, olderLoading, pagination, pathFilter, pathFilterOptions, refreshStats,
+          reload, resetFilters, rows, stats, statusClass, statusOptions, streamConnected, streamLabel, t,
+          visibleRows, windowNote
+        }
+      }
+    })
+
+    app.use(Quasar, { config: { dark: true } })
+    Quasar.Dark.set(true)
+    window.lmrI18n.applyQuasarLang(window.lmrI18n.getLocale())
+    Quasar.IconSet.set(Quasar.IconSet.mdiV7)
+    app.mount('#q-app')
+  </script>
+</body>
+</html>

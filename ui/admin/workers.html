@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Service pool · llm-router</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="./app.css?v=5">
+</head>
+<body>
+  <div id="q-app">
+    <q-layout container class="workspace-layout">
+      <q-page-container>
+        <q-page class="workspace-page">
+          <header class="page-heading">
+            <div>
+              <h1>{{ t.title }}</h1>
+              <p>{{ t.description }}</p>
+            </div>
+            <div class="heading-actions">
+              <q-toggle v-model="autoRefresh" dense color="teal-4" :label="t.autoRefreshOn"></q-toggle>
+              <q-btn outline no-caps icon="mdi-refresh" :label="t.probeNow" class="secondary-button" :loading="loading" @click="load"></q-btn>
+              <q-btn unelevated no-caps icon="mdi-server-plus-outline" :label="t.addWorker" class="primary-button" @click="openAdd"></q-btn>
+            </div>
+          </header>
+
+          <q-banner v-if="loadError" rounded dense class="error-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>
+            {{ loadError }}
+            <template v-slot:action><q-btn flat dense no-caps :label="c.retry" @click="load"></q-btn></template>
+          </q-banner>
+          <q-banner v-if="waitingNotice" rounded dense class="info-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-progress-clock"></q-icon></template>
+            {{ waitingNotice }}
+          </q-banner>
+
+          <section class="stat-grid">
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-server-network" class="stat-icon purple"></q-icon>
+              <div class="stat-label">{{ t.statWorkers }}</div>
+              <div class="stat-value">{{ workers.length }}</div>
+              <div class="stat-note">{{ healthyCount }} / {{ workers.length }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-heart-pulse" class="stat-icon teal"></q-icon>
+              <div class="stat-label">{{ t.statHealthy }}</div>
+              <div class="stat-value">{{ healthyCount }}</div>
+              <div class="stat-note">{{ t.statHealthyNote }}</div>
+            </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-sitemap" class="stat-icon blue"></q-icon>
+              <div class="stat-label">{{ t.statModels }}</div>
+              <div class="stat-value">{{ groups.length }}</div>
+              <div class="stat-note">{{ t.statModelsNote }}</div>
+            </q-card-section></q-card>
+          </section>
+
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ t.poolTitle }}</div>
+                <div class="surface-subtitle">{{ t.groupNote }}</div>
+              </div>
+              <q-input v-model="filter" dense outlined dark debounce="200" :placeholder="t.searchPlaceholder" class="search-input">
+                <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
+              </q-input>
+            </q-card-section>
+            <q-separator dark></q-separator>
+
+            <q-inner-loading :showing="loading && workers.length === 0" dark>
+              <q-spinner-gears size="34px" color="purple-3"></q-spinner-gears>
+              <div class="q-mt-sm muted">{{ c.loading }}</div>
+            </q-inner-loading>
+
+            <div v-if="!loading && groups.length === 0" class="empty-state">
+              <q-icon name="mdi-server-off" size="18px"></q-icon>
+              <span>{{ workers.length === 0 ? t.emptyPool : t.emptyFilter }}</span>
+            </div>
+
+            <section v-for="group in groups" :key="group.model" class="model-group">
+              <div class="group-bar">
+                <q-icon name="mdi-cube-outline" size="15px"></q-icon>
+                <strong>{{ group.model }}</strong>
+                <q-badge outline :color="group.healthy ? 'teal-4' : 'red-4'" :label="group.healthy + ' / ' + group.rows.length"></q-badge>
+                <span class="muted">{{ t.groupNote }}</span>
+              </div>
+              <q-table
+                flat
+                dense
+                dark
+                :rows="group.rows"
+                :columns="columns"
+                :pagination="pagination"
+                :rows-per-page-options="[10, 20, 0]"
+                row-key="id"
+                class="linear-table"
+              >
+                <template v-slot:body-cell-url="props">
+                  <q-td :props="props">
+                    <div class="identity-cell">
+                      <q-icon v-if="props.row.is_healthy" name="mdi-check-decagram" color="teal-4" size="18px"></q-icon>
+                      <q-icon v-else name="mdi-alert-octagon" color="red-4" size="18px"></q-icon>
+                      <div>
+                        <strong>{{ props.row.url }}</strong>
+                        <span>{{ props.row.id }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span></span>
+                      </div>
+                    </div>
+                  </q-td>
+                </template>
+                <template v-slot:body-cell-status="props">
+                  <q-td :props="props">
+                    <div class="route-cell">
+                      <q-badge :color="healthColor(props.row)" :label="healthLabel(props.row)" text-color="white"></q-badge>
+                      <q-badge v-if="props.row.job_status" outline :color="jobColor(props.row.job_status.status)" class="chip-soft">
+                        {{ jobLabel(props.row.job_status) }}
+                      </q-badge>
+                    </div>
+                  </q-td>
+                </template>
+                <template v-slot:body-cell-load="props"><q-td :props="props" class="mono">{{ props.row.load }}</q-td></template>
+                <template v-slot:body-cell-priority="props"><q-td :props="props" class="mono">{{ props.row.priority }}</q-td></template>
+                <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
+                <template v-slot:body-cell-metadata="props">
+                  <q-td :props="props">
+                    <div v-if="labelKeys(props.row).length" class="label-cell">
+                      <q-chip v-for="key in labelKeys(props.row)" :key="key" dense size="12px" class="chip-soft">{{ key }}={{ props.row.metadata[key] }}</q-chip>
+                    </div>
+                    <span v-else class="muted">—</span>
+                  </q-td>
+                </template>
+                <template v-slot:body-cell-actions="props">
+                  <q-td :props="props">
+                    <div class="row-actions">
+                      <q-btn flat round dense icon="mdi-open-in-new" @click="openWorker(props.row)"><q-tooltip>{{ t.openWorker }}</q-tooltip></q-btn>
+                      <q-btn flat round dense icon="mdi-pencil-outline" @click="openEdit(props.row)"><q-tooltip>{{ c.edit }}</q-tooltip></q-btn>
+                      <q-btn flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removeWorker(props.row)"><q-tooltip>{{ t.deleteTitle }}</q-tooltip></q-btn>
+                    </div>
+                  </q-td>
+                </template>
+                <template v-slot:no-results><div class="empty-state"><span>{{ t.emptyFilter }}</span></div></template>
+              </q-table>
+            </section>
+          </q-card>
+
+          <!-- 添加远程服务 -->
+          <q-dialog v-model="addOpen" persistent>
+            <q-card class="dialog-card">
+              <q-card-section><div class="dialog-title">{{ t.addTitle }}</div><div class="dialog-copy">{{ t.addCopy }}</div></q-card-section>
+              <q-card-section>
+                <q-form class="dialog-fields" @submit.prevent="submitAdd">
+                  <q-input v-model="addForm.url" dense outlined dark autofocus :rules="[urlRule]" :label="t.urlField" :placeholder="t.urlPlaceholder" class="mono">
+                    <template v-slot:append><q-icon name="mdi-link-variant"></q-icon></template>
+                  </q-input>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.model_id" dense outlined dark :label="t.modelField"></q-input>
+                    <q-input v-model="addForm.api_key" dense outlined dark type="password" :label="t.apiKeyField"></q-input>
+                  </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint"></q-input>
+                    <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint"></q-input>
+                  </div>
+                  <q-input v-model="addForm.labels" dense outlined dark :label="t.labelsField" :placeholder="'gpu=0,engine=sglang'" :hint="t.labelsHint" :rules="[labelsRule]"></q-input>
+                  <q-toggle v-model="addForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
+                  <div class="muted">{{ t.disableHealthHint }}</div>
+                </q-form>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="addOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.addSubmit" type="submit" @click="submitAdd"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+
+          <!-- 编辑实例（PUT /workers/{id}） -->
+          <q-dialog v-model="editOpen">
+            <q-card class="dialog-card">
+              <q-card-section><div class="dialog-title">{{ t.updateTitle }}</div><div class="dialog-copy">{{ selected.url }} · {{ t.editFieldsHint }}</div></q-card-section>
+              <q-card-section>
+                <div class="dialog-fields">
+                  <div class="form-grid-2">
+                    <q-input v-model="editForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint"></q-input>
+                    <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint"></q-input>
+                  </div>
+                  <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]"></q-input>
+                  <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
+                </div>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="editOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.updateSubmit" @click="submitEdit"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+        </q-page>
+      </q-page-container>
+    </q-layout>
+  </div>
+
+  <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="./i18n.js?v=3"></script>
+  <script src="./api.js?v=2"></script>
+  <script>
+    const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+    const HEALTH_WAIT_MS = 150000       // 生产健康探测 30s 一轮 × 成功阈值 2 → 需要约 60-90s
+    const HEALTH_POLL_MS = 3000
+
+    const app = Vue.createApp({
+      setup () {
+        const workers = ref([])
+        const locale = ref(window.lmrI18n.getLocale())
+        const loading = ref(false)
+        const loadError = ref('')
+        const filter = ref('')
+        const autoRefresh = ref(true)
+        const submitting = ref(false)
+        const addOpen = ref(false)
+        const editOpen = ref(false)
+        const selected = ref({})
+        const waitingUrl = ref('')
+        const waitingNotice = ref('')
+        const healthInterval = ref(30)
+        let unsubscribeLocale
+        let refreshTimer
+        let waitTimer
+
+        const addForm = reactive({ url: '', model_id: '', api_key: '', priority: '', cost: '', labels: '', disable_health_check: false })
+        const editForm = reactive({ priority: '', cost: '', labels: '', disable_health_check: false })
+        const pagination = reactive({ rowsPerPage: 20 })
+
+        const c = computed(() => window.lmrI18n.messages[locale.value].common)
+
+        // 带插值的键在这里补齐，模板里不写死文案
+        const t = computed(() => {
+          const dict = window.lmrI18n.messages[locale.value].workers
+          return {
+            ...dict,
+            groupManagementTitle: dict.title,
+            statHealthyNote: dict.statHealthyNote.replace('{n}', healthInterval.value)
+          }
+        })
+
+        const columns = computed(() => [
+          { name: 'url', label: t.value.colUrl, field: 'url', align: 'left', sortable: true },
+          { name: 'status', label: t.value.colHealth, field: 'is_healthy', align: 'left', sortable: true, sort: row => (row.is_healthy ? 1 : 0) },
+          { name: 'load', label: t.value.colLoad, field: 'load', align: 'left', sortable: true, style: 'width:70px' },
+          { name: 'priority', label: t.value.colPriority, field: 'priority', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'cost', label: t.value.colCost, field: 'cost', align: 'left', sortable: true, style: 'width:80px' },
+          { name: 'metadata', label: t.value.colLabels, field: 'metadata', align: 'left' },
+          { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:130px' }
+        ])
+
+        const healthyCount = computed(() => workers.value.filter(worker => worker.is_healthy).length)
+
+        // 过滤：地址 / 模型 / 标签值，忽略大小写
+        const filtered = computed(() => {
+          const needle = filter.value.trim().toLowerCase()
+          if (!needle) return workers.value
+          return workers.value.filter(worker => {
+            const labels = Object.entries(worker.metadata || {}).map(([key, value]) => key + '=' + value).join(' ')
+            return [worker.url, worker.model_id, worker.id, labels].join(' ').toLowerCase().includes(needle)
+          })
+        })
+
+        // 按 model_id 分组（unknown 排最后，其余按名称）
+        const groups = computed(() => {
+          const byModel = new Map()
+          filtered.value.forEach(worker => {
+            const model = worker.model_id || 'unknown'
+            if (!byModel.has(model)) byModel.set(model, [])
+            byModel.get(model).push(worker)
+          })
+          const out = []
+          for (const [model, rows] of byModel) {
+            rows.sort((a, b) => String(a.url).localeCompare(String(b.url)))
+            out.push({ model, rows, healthy: rows.filter(row => row.is_healthy).length })
+          }
+          out.sort((a, b) => (a.model === 'unknown') - (b.model === 'unknown') || a.model.localeCompare(b.model))
+          return out
+        })
+
+        function notify (message, type = 'positive') {
+          Quasar.Notify.create({ message, type, position: 'top-right', timeout: type === 'negative' ? 5200 : 2400 })
+        }
+
+        function formatCost (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number)) return '—'
+          return Number.isInteger(number) ? String(number) : number.toFixed(2)
+        }
+
+        function labelKeys (row) {
+          return Object.keys(row.metadata || {}).sort()
+        }
+
+        function healthLabel (row) {
+          if (row.disable_health_check) return t.value.healthDisabled
+          if (row.is_healthy) return t.value.healthHealthy
+          if (isPending(row)) return t.value.healthPending
+          return t.value.healthUnhealthy
+        }
+        function healthColor (row) {
+          if (row.disable_health_check) return 'grey-7'
+          if (row.is_healthy) return 'teal-6'
+          if (isPending(row)) return 'amber-8'
+          return 'red-8'
+        }
+        // 刚提交注册、还没跑过第一轮探测：job 排队中或是新增且无 job
+        function isPending (row) {
+          if (row.is_healthy) return false
+          const status = row.job_status && row.job_status.status
+          if (status === 'pending' || status === 'processing') return true
+          return waitingUrl.value !== '' && row.url === waitingUrl.value
+        }
+
+        function jobLabel (job) {
+          const key = job.job_type === 'remove_worker' ? 'jobRemoveWorker' : 'jobAddWorker'
+          const statusKey = { pending: 'jobPending', processing: 'jobProcessing', completed: 'jobCompleted', failed: 'jobFailed' }[job.status] || 'jobPending'
+          const dict = window.lmrI18n.messages[locale.value].workers
+          const label = `${dict[key]} · ${dict[statusKey]}`
+          return job.message ? label + ' — ' + job.message : label
+        }
+        function jobColor (status) {
+          if (status === 'completed') return 'teal-4'
+          if (status === 'failed') return 'red-4'
+          return 'amber-4'
+        }
+
+        function urlRule (value) {
+          const text = String(value || '').trim()
+          if (!text) return c.value.required
+          return /^https?:\/\/[^/]+$/i.test(text.replace(/\/+$/, '')) || t.value.urlRule
+        }
+        function labelsRule (value) {
+          const text = String(value || '').trim()
+          if (!text) return true
+          return text.split(/[,;]/).every(part => /^[^=,\s]+=.*$/.test(part.trim()) || part.trim() === '') || t.value.labelsRule
+        }
+
+        function parseLabels (text) {
+          const labels = {}
+          String(text || '').split(/[,;]/).forEach(part => {
+            const trimmed = part.trim()
+            if (!trimmed) return
+            const index = trimmed.indexOf('=')
+            if (index < 1) return
+            labels[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1).trim()
+          })
+          return Object.keys(labels).length ? labels : undefined
+        }
+
+        function buildSpec (form) {
+          const spec = { url: String(form.url || '').trim().replace(/\/+$/, '') }
+          if (String(form.model_id || '').trim()) spec.model_id = String(form.model_id).trim()
+          if (String(form.api_key || '').trim()) spec.api_key = String(form.api_key).trim()
+          if (String(form.priority || '').trim() !== '') spec.priority = Number(form.priority)
+          if (String(form.cost || '').trim() !== '') spec.cost = Number(form.cost)
+          if (form.disable_health_check) spec.disable_health_check = true
+          const labels = parseLabels(form.labels)
+          if (labels) spec.labels = labels
+          return spec
+        }
+
+        async function loadQuiet () {
+          try {
+            const result = await window.lmrApi.workers()
+            workers.value = (result && result.workers) || []
+            loadError.value = ''
+            return true
+          } catch (error) {
+            loadError.value = error.message
+            return false
+          }
+        }
+
+        async function load () {
+          loading.value = true
+          await loadQuiet()
+          loading.value = false
+        }
+
+        function openWorker (row) {
+          window.open(row.url + '/', '_blank', 'noopener')
+        }
+
+        // 提交注册 → 202 → 每 3s 轮询，等该行变绿；超时给负面提示
+        async function submitAdd () {
+          if (!urlRule(addForm.url) || !labelsRule(addForm.labels)) return
+          submitting.value = true
+          const spec = buildSpec(addForm)
+          try {
+            await window.lmrApi.addWorker(spec)
+            notify(window.lmrI18n.translate(locale.value, 'workers', 'addedNotice', { url: spec.url }))
+            addOpen.value = false
+            Object.assign(addForm, { url: '', model_id: '', api_key: '', priority: '', cost: '', labels: '', disable_health_check: false })
+            watchHealth(spec.url)
+            await load()
+          } catch (error) {
+            notify(error.message, 'negative')
+          } finally {
+            submitting.value = false
+          }
+        }
+
+        function watchHealth (url) {
+          waitingUrl.value = url
+          const deadline = Date.now() + HEALTH_WAIT_MS
+          clearWait()
+          refreshTimer && window.clearInterval(refreshTimer)
+          waitTimer = window.setInterval(async () => {
+            await loadQuiet()
+            const row = workers.value.find(worker => worker.url === url)
+            if (row && row.is_healthy) {
+              notify(window.lmrI18n.translate(locale.value, 'workers', 'healthGreenNotice', { url }))
+              clearWait()
+              startAutoRefresh()
+              return
+            }
+            const job = row && row.job_status
+            if (job && job.status === 'failed') {
+              notify(`${url} — ${job.message || ''}`.trim(), 'negative')
+              clearWait()
+              startAutoRefresh()
+              return
+            }
+            if (Date.now() > deadline) {
+              notify(window.lmrI18n.translate(locale.value, 'workers', 'healthTimeoutNotice', { url, n: Math.round(HEALTH_WAIT_MS / 1000) }), 'negative')
+              clearWait()
+              startAutoRefresh()
+            }
+          }, HEALTH_POLL_MS)
+          waitingNotice.value = window.lmrI18n.translate(locale.value, 'workers', 'waitingHealth')
+        }
+        function clearWait () {
+          if (waitTimer) window.clearInterval(waitTimer)
+          waitTimer = null
+          waitingUrl.value = ''
+          waitingNotice.value = ''
+        }
+
+        function openEdit (row) {
+          selected.value = row
+          Object.assign(editForm, {
+            priority: row.priority === undefined ? '' : String(row.priority),
+            cost: row.cost === undefined ? '' : String(row.cost),
+            labels: labelKeys(row).map(key => key + '=' + row.metadata[key]).join(','),
+            disable_health_check: Boolean(row.disable_health_check)
+          })
+          editOpen.value = true
+        }
+
+        function buildPatch (form) {
+          const patch = {}
+          if (String(form.priority || '').trim() !== '') patch.priority = Number(form.priority)
+          if (String(form.cost || '').trim() !== '') patch.cost = Number(form.cost)
+          if (labelsRule(form.labels)) {
+            const labels = parseLabels(form.labels)
+            if (labels) patch.labels = labels
+          }
+          patch.disable_health_check = Boolean(form.disable_health_check)
+          return patch
+        }
+
+        async function submitEdit () {
+          submitting.value = true
+          try {
+            await window.lmrApi.updateWorker(selected.value.id, buildPatch(editForm))
+            notify(window.lmrI18n.translate(locale.value, 'workers', 'updatedNotice', { url: selected.value.url }))
+            editOpen.value = false
+            await load()
+          } catch (error) {
+            notify(error.message, 'negative')
+          } finally {
+            submitting.value = false
+          }
+        }
+
+        function removeWorker (row) {
+          Quasar.Dialog.create({
+            title: t.value.deleteTitle,
+            message: `${row.url} · ${row.model_id} · ${t.value.deleteConfirm}`,
+            cancel: true,
+            persistent: true,
+            ok: { label: c.value.del, color: 'negative', flat: true }
+          }).onOk(async () => {
+            try {
+              await window.lmrApi.removeWorker(row.id)
+              notify(window.lmrI18n.translate(locale.value, 'workers', 'deletedNotice', { url: row.url }))
+              await load()
+            } catch (error) {
+              notify(error.message, 'negative')
+            }
+          })
+        }
+
+        function openAdd () {
+          Object.assign(addForm, { url: '', model_id: '', api_key: '', priority: '', cost: '', labels: '', disable_health_check: false })
+          addOpen.value = true
+        }
+
+        function startAutoRefresh () {
+          window.clearInterval(refreshTimer)
+          if (autoRefresh.value && !waitTimer) refreshTimer = window.setInterval(loadQuiet, 3000)
+        }
+        function stopAutoRefresh () {
+          window.clearInterval(refreshTimer)
+          refreshTimer = null
+        }
+
+        async function loadHealthInterval () {
+          // 摘要里显示探测周期：读不到就保留默认 30s
+          try {
+            const props = await window.lmrApi.props()
+            if (props && props.health_check_interval_secs) healthInterval.value = Number(props.health_check_interval_secs)
+          } catch (error) { /* 保持默认 */ }
+        }
+
+        function applyLocale (nextLocale) {
+          locale.value = nextLocale
+          document.documentElement.lang = nextLocale
+          document.title = window.lmrI18n.messages[nextLocale].workers.title + ' · llm-router'
+          window.lmrI18n.applyQuasarLang(nextLocale)
+          if (waitingUrl.value) {
+            waitingNotice.value = window.lmrI18n.translate(nextLocale, 'workers', 'waitingHealth')
+          }
+        }
+
+        onMounted(() => {
+          applyLocale(locale.value)
+          unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
+          load()
+          loadHealthInterval()
+          startAutoRefresh()
+        })
+        onBeforeUnmount(() => {
+          stopAutoRefresh()
+          clearWait()
+          if (unsubscribeLocale) unsubscribeLocale()
+        })
+
+        return {
+          addForm, addOpen, autoRefresh, c, clearWait, columns, editForm, editOpen, filter,
+          formatCost, healthInterval, healthyCount, healthColor, healthLabel, jobColor, jobLabel,
+          groups, labelKeys, load, loading, loadError, openAdd, openEdit, openWorker, pagination,
+          removeWorker, selected, labelsRule, submitting, submitAdd, submitEdit, t, urlRule,
+          waitingNotice, workers
+        }
+      }
+    })
+
+    app.use(Quasar, { config: { dark: true } })
+    Quasar.Dark.set(true)
+    window.lmrI18n.applyQuasarLang(window.lmrI18n.getLocale())
+    Quasar.IconSet.set(Quasar.IconSet.mdiV7)
+    app.mount('#q-app')
+  </script>
+</body>
+</html>

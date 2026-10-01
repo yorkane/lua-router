@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>llm-router Admin</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="./app.css?v=5">
+</head>
+<body class="shell-body">
+  <div id="q-app">
+    <q-layout view="lHh Lpr lFf" class="shell-shell">
+      <q-drawer
+        v-model="drawerVisible"
+        :width="220"
+        :mini-width="40"
+        :mini="drawerMini"
+        :breakpoint="0"
+        show-if-above
+        class="shell-drawer"
+        :class="{ 'shell-drawer-mini': drawerMini }"
+      >
+        <div class="menu-shell">
+          <div class="brand-row">
+            <q-avatar rounded size="32px" class="brand-mark"><q-icon name="mdi-router-wireless" size="20px"></q-icon></q-avatar>
+            <strong class="menu-copy brand-label">{{ t.brand }}<span class="brand-sub">{{ t.brandSub }}</span></strong>
+            <q-btn flat round dense :icon="toggleIcon" class="collapse-button" :aria-label="toggleLabel" @click="toggleDrawer">
+              <q-tooltip>{{ toggleLabel }}</q-tooltip>
+            </q-btn>
+          </div>
+
+          <q-list class="menu-list">
+            <section v-for="group in groups" :key="group.id" class="menu-group-section">
+              <div class="menu-group-title menu-copy">{{ group.label }}</div>
+              <q-item
+                v-for="item in group.items"
+                :key="item.id"
+                clickable
+                :active="item.external ? false : activeApp === item.page"
+                active-class="menu-item-active"
+                class="menu-item"
+                @click="select(item, $event)"
+              >
+                <q-tooltip v-if="item.external" anchor="top right" self="top left" :offset="[8, 0]">{{ chatHref }}</q-tooltip>
+                <q-item-section avatar><q-icon :name="item.icon" size="16px"></q-icon></q-item-section>
+                <q-item-section class="menu-copy">
+                  <span class="menu-item-label">{{ item.label }}</span>
+                  <span class="menu-item-note">{{ item.note }}</span>
+                </q-item-section>
+                <q-item-section v-if="!item.external && activeApp === item.page" side class="menu-copy"><span class="active-dot"></span></q-item-section>
+              </q-item>
+            </section>
+          </q-list>
+
+          <div class="shell-status">
+            <span class="dot" :class="{ bad: !online }"></span>{{ online ? t.online : t.offline }}
+            <div v-if="workerSummary" class="menu-copy">{{ workerSummary }}</div>
+            <div v-if="propsLine" class="menu-copy">{{ propsLine }}</div>
+          </div>
+
+          <div class="menu-footer-actions">
+            <q-btn flat dense stack no-caps icon="mdi-open-in-new" class="footer-action" :aria-label="t.chat" @click="openChat">
+              <span class="menu-copy footer-label">{{ t.chat }}</span>
+            </q-btn>
+            <q-btn flat dense stack no-caps icon="mdi-translate" class="footer-action" :aria-label="t.language" @click="toggleLocale">
+              <span class="menu-copy footer-label">{{ t.language }}</span>
+            </q-btn>
+          </div>
+        </div>
+      </q-drawer>
+
+      <q-page-container class="shell-content">
+        <q-page class="shell-page">
+          <iframe :src="activeApp" :title="activeTitle" class="app-frame"></iframe>
+        </q-page>
+      </q-page-container>
+    </q-layout>
+  </div>
+
+  <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="./i18n.js?v=3"></script>
+  <script src="./api.js?v=2"></script>
+  <script src="./app.js?v=3"></script>
+</body>
+</html>
