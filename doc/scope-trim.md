@@ -87,6 +87,14 @@ gRPC policy hint；conf/ 删 grpc-server.conf.template、grpc-readiness.conf、g
 3. **远程服务接入体验**：POST /workers 与 LMR_CONFIG_FILE 种子已有；补 UI 表单、
    连通性/模型预检与一键下线。
 4. **UI 面板**：GPU 负载、策略分布、请求日志已有底座（/_ui/logs、/engine_metrics、props）。
+5. **token 核算与性能计数（不需要 tokenizer）**：事后核算一律走后端自报的 usage——
+   router.lua:1262 已有 usage_from_object（prompt/completion/cached/reasoning 四类，含
+   prompt_tokens_details.cached_tokens），TTFT/TPOT/吞吐/时长指标已从 timing+usage 派生。
+   唯一缺口是流式请求客户端未开 stream_options.include_usage 时后端不发 usage：在转发泵
+   上游方向透明注入 include_usage=true、下游在末尾 usage 帧读完后按客户端原意决定透传或剥除。
+   覆盖不到的裸 /generate 用可校准的启发式预估（chars/token 比值按模型从观测 usage 回归），
+   标记为 estimate。事前预估（拒超长/预算）同用启发式；**不在网关实现 BPE，也不复活被删的
+   tokenizer 代理模块**（它是客户端 /v1/tokenize 代理面，本来就不在热路径）。
 
 ## 6. 执行顺序建议（每步一个 commit，独立可回退）
 
