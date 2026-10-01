@@ -9,11 +9,13 @@
 # 首个失败即退出。
 #
 # Usage:
-#   bash test/final_gates.sh                    # full run, strict
-#   SKIP_ENV=mesh_http bash test/final_gates.sh # skip named gates
-#   KEEP_GOING=1 bash test/final_gates.sh       # run all, count fails
-#   GATE_ONLY=unit bash test/final_gates.sh     # single gate
-#   LR_GATE_LOG=/path/log bash ...                         # log location
+#   bash test/final_gates.sh                    # quick tier (default, ~3 min)
+#   GATE_TIER=full bash test/final_gates.sh     # all 20 gates (release/count/
+#                                               # pre-production changes)
+#   SKIP_ENV=mesh_http GATE_TIER=full bash ...  # skip named gates (recorded)
+#   GATE_ONLY=unit bash test/final_gates.sh     # single gate (any tier)
+#   KEEP_GOING=1 bash test/final_gates.sh       # run all selected, count fails
+#   LR_GATE_LOG=/path/log bash ...              # log location
 #
 # Gate ids, in run order (SKIP_ENV takes a comma/space separated list of these):
 #   build          docker build lua-router:integration (the e2e suites boot it)
@@ -50,13 +52,20 @@
 #                  expired / wrong-name / non-CA-issuer / self-signed refusals,
 #                  RSA and ECDSA x TLSv1.2/1.3, SNI two names on one port)
 #
+# Tiers (GATE_TIER=quick|full, default quick):
+#   quick = build conf unit contract probes — the fast-verifiable core
+#           (~3 min). Enough for ordinary edits.
+#   full  = all 20 gates (~12-17 min serial). Required for release builds,
+#           README/handover count updates and production image replacement;
+#           a quick-tier green log never counts as a full-green anchor.
+#
 # What skipping costs (read this before using SKIP_ENV):
 #   build          e2e_* and mesh_http then run against a possibly stale image.
 #   conf           nothing checks the two shipped configs still parse.
 #   unit           the pure-Lua modules (tree/hash/policies/mesh) have no
 #                  other gate — router.lua only
 #                  exercises them through HTTP, so a regression can hide.
-#   contract       the whole 580-check wire contract is unverified.
+#   contract       the whole 650-check wire contract is unverified.
 #   probes         the policy factory / config-knob / raw-JSON-editor probes.
 #   e2e_*          that behaviour family over a real container.
 #   e2e_watcher    the merged watcher (was a separate llm-watcher container):
@@ -110,6 +119,22 @@ GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bri
             e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
             e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain)
 
+# quick tier: only the gates that verify in seconds-to-minutes without the
+# slow e2e container suites. The default for ordinary changes.
+QUICK_GATES=(build conf unit contract probes)
+GATE_TIER=${GATE_TIER:-quick}
+case "$GATE_TIER" in
+    quick|full) ;;
+    *) printf 'GATE_TIER must be quick or full (got: %s)\n' "$GATE_TIER" >&2; exit 2 ;;
+esac
+
+in_tier() {
+    local g=$1 want
+    [[ "$GATE_TIER" == "full" ]] && return 0
+    for want in "${QUICK_GATES[@]}"; do [[ "$want" == "$g" ]] && return 0; done
+    return 1
+}
+
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
 for want in ${raw_skips//,/ }; do
@@ -131,6 +156,7 @@ is_selected() {
     local g=$1
     [[ -n "$GATE_ONLY" && "$GATE_ONLY" != "$g" ]] && return 1
     [[ -n "${SKIP[$g]:-}" ]] && return 1
+    in_tier "$g" || return 1
     return 0
 }
 
@@ -138,6 +164,12 @@ is_selected() {
 # result. A gate is a shell function name defined below (gate_<name>).
 gate() {
     local name=$1; shift
+    if [[ -z "$GATE_ONLY" ]] && ! in_tier "$name"; then
+        # not in this tier and not singled out: simply not part of this run.
+        # Deliberately NOT recorded as a skip — a quick log must not read as
+        # a shrunk full log.
+        return 0
+    fi
     if [[ -n "${SKIP[$name]:-}" ]]; then
         SKIPPED_GATES=$((SKIPPED_GATES + 1))
         printf '\n== gate: %-14s SKIPPED (SKIP_ENV) ==\n' "$name"
@@ -179,12 +211,12 @@ gate() {
 
 summary() {
     printf '\n----------------------------------------\n'
-    printf 'final gates: %d passed, %d failed, %d skipped (SKIP_ENV=%s)\n' \
-        "$PASSED_GATES" "$FAILED_GATES" "$SKIPPED_GATES" "${raw_skips:-none}"
+    printf 'final gates [tier=%s]: %d passed, %d failed, %d skipped (SKIP_ENV=%s)\n' \
+        "$GATE_TIER" "$PASSED_GATES" "$FAILED_GATES" "$SKIPPED_GATES" "${raw_skips:-none}"
     [[ ${#FAILURES[@]} -eq 0 ]] || printf 'failed: %s\n' "${FAILURES[*]}"
     [[ ${#SKIP[@]} -eq 0 ]] || printf 'skipped: %s\n' "${!SKIP[*]}"
     printf 'log: %s\n' "$LOG"
-    { echo; echo "== summary: $PASSED_GATES passed, $FAILED_GATES failed, $SKIPPED_GATES skipped =="; } >>"$LOG"
+    { echo; echo "== summary: $PASSED_GATES passed, $FAILED_GATES failed, $SKIPPED_GATES skipped (tier=$GATE_TIER) =="; } >>"$LOG"
     [[ "$FAILED_GATES" == "0" ]] || exit 1
     return 0
 }

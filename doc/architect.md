@@ -2,8 +2,8 @@
 
 > 本文是架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略子系统、周边集成、
 > 部署形态与测试框架。计数对应 2026-10-01 当前 main 树：15 个 Lua 模块 + policies/ 6 文件 /
-> 22 057 行、单测 9 文件、契约 644 项 / 23 段、20 门禁全绿（日志
-> `/data/tmp/lr-gates/gates-20261001-113951.log`）。裁剪判定与执行记录见
+> 22 057 行、单测 9 文件、契约 650 项 / 23 段、20 门禁全绿（日志
+> `/data/tmp/lr-gates/gates-20261001-145420.log`）。裁剪判定与执行记录见
 > [scope-trim.md](scope-trim.md)；已删平面的描述在 git 历史，本文只描述现状。
 
 ## 0. 定位与全景
@@ -221,8 +221,9 @@ scope-trim 删除，git 历史可恢复。
 
 ## 10. 测试与质量框架
 
-`test/final_gates.sh` 是唯一入口（SKIP_ENV/GATE_ONLY/KEEP_GOING，串行硬门，**不可并发**——
-host 网络 + 固定容器名前缀会争用）。20 门：build、conf、unit、contract（23 段 644 项）、probes、
+`test/final_gates.sh` 是唯一入口（GATE_TIER=quick|full 缺省 quick、SKIP_ENV/GATE_ONLY/KEEP_GOING，
+串行硬门，**不可并发**——host 网络 + 固定容器名前缀会争用；发版/计数/生产替换必须 full 档）。
+20 门：build、conf、unit、contract（23 段 650 项）、probes、
 e2e_stateful、e2e_policies、e2e_ui_bridge、e2e_errors、e2e_effort、head_routes、mesh_http、
 e2e_policy_parity、e2e_watcher、e2e_profiles、e2e_token_accounting、e2e_gpu_load、
 e2e_routing_dyn、mesh_two、e2e_tls_chain；逐门计数与覆盖见 README 基线表。

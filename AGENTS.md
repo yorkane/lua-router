@@ -22,7 +22,9 @@
 
 1. **测试纪律**：`test/final_gates.sh` / `test/test_lua_router.sh` / `test/integration/e2e_*.py` 全部
    host 网络 + 容器名前缀，**严禁并发**（跑前 `ps` 查）；luajit/resty 单测（无端口绑定）可并发。
-   精确 kill PID，禁止 pkill。测试容器全部 `lr-*` 前缀，收尾必须清零。
+   精确 kill PID，禁止 pkill。测试容器全部 `lr-*` 前缀，收尾必须清零。门禁两档：
+   `GATE_TIER=quick`（缺省，build/conf/unit/contract/probes 约 3 分钟）供普通修改快速验证；
+   发版、文档计数更新、生产镜像替换必须 `GATE_TIER=full` 全量 20 门全绿（快速档绿不算全绿锚点）。
 2. **临时文件一律 /data/tmp/**；生产验证文档更新进 doc/。
 3. **生产容器白名单**：本仓只许动 `lua-router-8800`（compose 在 /data/app/lua-router/）；
    `authz`、`searxng-*`、`qdrant-faces`、`face-*`、`va-*`、`pg18-video`、`n8nc`、`resdown-*`、

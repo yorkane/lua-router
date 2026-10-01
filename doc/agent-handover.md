@@ -1,7 +1,7 @@
 # Agent 交接说明（lua-router）
 
 > 写给接手本仓库的 agent：目标是用最少考古成本进入正确的工作状态。本文只写**当前事实**与**操作纪律**，
-> 设计推导在 git 历史与保留文档里（§7 地图）。最后核对：2026-10-01（契约 644/23 段，
+> 设计推导在 git 历史与保留文档里（§7 地图）。最后核对：2026-10-01（契约 650/23 段，
 > 全量门禁日志锚点见 README 基线节）。
 
 ## 0. 30 秒速览
@@ -14,7 +14,7 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-01）：**20 门禁全绿**（含契约 644/23 段）、Lua 22 057 行 / 15 个模块 + policies/6 文件、
+基线（2026-10-01）：**20 门禁全绿**（含契约 650/23 段）、Lua 22 057 行 / 15 个模块 + policies/6 文件、
 单测 9 文件、文档 20 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
@@ -61,13 +61,16 @@ docker-entrypoint.sh env 校验→envsubst→openresty -t→exec；cache_aware/m
 5. 改完先语法门（luajit -bl / openresty -t）再跑对应门禁子集，最后 root 全量。
 6. 门禁验收只认 **0 skipped**：日志里出现 `SKIP_ENV` 就是假绿（历史上外部依赖门禁被 SKIP
    掩盖过 require 失败的先例）。
+7. 两档门禁：缺省 quick（build/conf/unit/contract/probes，约 3 分钟）；发版、文档计数更新、
+   生产镜像替换必须 GATE_TIER=full 全量绿——快速档日志不作全绿锚点。
 
 **命令**：
 
 ```bash
 cd /home/aigc/ChatGPT/lua-router
-bash test/final_gates.sh                     # 全量 20 门（串行约 12 分钟）
-GATE_ONLY=contract bash test/final_gates.sh  # 单门；GATE_ORDER 见脚本头
+bash test/final_gates.sh                     # 快速档（缺省 5 门，约 3 分钟）——普通修改够用
+GATE_TIER=full bash test/final_gates.sh      # 全量 20 门（串行 12–17 分钟）——发版/计数/生产替换
+GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 TEST_ONLY=inflight_age bash test/test_lua_router.sh   # 契约单段
 ```
 

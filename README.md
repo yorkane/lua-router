@@ -17,14 +17,14 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261001-134753.log`（串行独占，**20 passed /
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261001-145420.log`（串行独占，**20 passed /
 0 failed / 0 skipped**）。代码基线：Lua 22 057 行 / 15 个模块 + policies/ 6 文件、单测 9 文件。
 
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
 | unit | luajit 8 + resty 1 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 267 / gpu_load 274 / routing_dyn 122 / profiles 421；resty 侧 integration 125（全部 0 failed） |
-| contract | **644 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
+| contract | **650 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
 | e2e_stateful | 91 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
 | e2e_policies | 65 / 0 | 各策略真流量 + `LMR_MODEL_CTX` clamp |
@@ -40,8 +40,8 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | e2e_routing_dyn | 51 / 0 | 路由动态变更：全局与 per-model 策略热切换免重启、非法名 400 不生效 |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
-契约 644 的 23 段构成：gate 3、public 30、workers 75、inference 38、headers 13、mesh 44、
-not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 51、tls_upstream 11、
+契约 650 的 23 段构成：gate 3、public 30、workers 75、inference 38、headers 13、mesh 44、
+not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 57、tls_upstream 11、
 cb_race 6、igw 7、discovery 5、prometheus 14、probes 29、cors 37、virtual_models 15、ratelimit 14、
 inflight_age 32、tls_server 19、profiles_upstreams 64。
 
@@ -267,9 +267,9 @@ engine 仍是单条 base 记录。关时逐字节不变。
 
 ```bash
 cd /path/to/lua-router
-bash test/final_gates.sh                     # 全量 20 门（串行约 12 分钟）
-GATE_ONLY=contract bash test/final_gates.sh  # 单门；GATE_ORDER 见脚本头
-SKIP_ENV=mesh_http bash test/final_gates.sh  # 显式跳过（会记进日志）
+bash test/final_gates.sh                     # 快速档（缺省）：build/conf/unit/contract/probes，约 3 分钟
+GATE_TIER=full bash test/final_gates.sh      # 全量 20 门（串行 12–17 分钟）
+GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 KEEP_GOING=1 bash test/final_gates.sh        # 跑完并计数
 
 bash test/test_lua_router.sh                 # 契约套件单独调试（独占约 2.5 min）
@@ -281,6 +281,9 @@ TEST_ONLY=workers bash test/test_lua_router.sh   # 单段调试
 `e2e_policy_parity` 的 random χ² 检验约 5% 假阳率（临界 5.991），失败先单独重跑该门。生产机上
 proc 扫描会把门禁轮的 mock 短暂注册进生产池，跑完清一次（`GET /workers` 找 unhealthy 测试模型名
 → `DELETE /workers/{id}`）。
+
+快速档绿只证明核心面（语法、单测、wire 契约、探针）；README/交接文档的计数更新、发版与生产
+镜像替换必须以 `GATE_TIER=full` 的全绿日志为锚点。
 
 单测两个口径（门禁已包含，用于调试单个模块）：
 
