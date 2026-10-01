@@ -2607,6 +2607,73 @@ end
 
 -- ------------------------------------------------------------------ control plane
 
+---Raw request bytes, read the same way inference_handler reads them (the hot path
+---keeps its own inlined copy so this adds no call to it).
+---@return string
+local function raw_body_text()
+    ngx.req.read_body()
+    local raw = ngx.req.get_body_data()
+    if not raw then
+        local file = ngx.req.get_body_file()
+        if file then
+            local handle = io.open(file, "rb")
+            if handle then
+                raw = handle:read("*a")
+                handle:close()
+            end
+        end
+    end
+    return raw or ""
+end
+
+---GET/POST /model-map - the watcher's rename table (doc/gap-watcher-merge.md).
+---
+---The standalone daemon served this on its metrics port; merged into the router it
+---moves to the main port, which is what LMR_WATCHER_URL now points at. All four body
+---shapes the daemon accepted are accepted here (plain object, `{"map":{...}}`, bare
+---`a:b,c:d`, `{"map":"a:b,c:d"}`), a POST merges rather than replaces, and an empty
+---new id deletes the entry. Owned workers are recycled by the next reconcile pass, so
+---the response says "queued" instead of pretending the pool already moved.
+---
+---The keys follow the task's contract (`renamed` + `status`) and keep the daemon's
+---(`model_map` + `note`) so the config UI and any script written against the old
+---endpoint keep reading the same document.
+local function model_map_handler()
+    local ok, watcher = pcall(require, "resty.luarouter.watcher")
+    if not ok or type(watcher) ~= "table" then
+        return send_error(503, "watcher_unavailable",
+            "the watcher module is not loadable")
+    end
+    if ngx.req.get_method() ~= "POST" then
+        local map = watcher.effective_map(cfg())
+        return {
+            model_map = map,
+            renamed = map,
+            enabled = ((watcher.config() or cfg().watcher) or {}).enabled or false,
+        }
+    end
+    local merged, failure = watcher.apply_model_map(raw_body_text())
+    if not merged then
+        if failure and failure.kind == "config" then
+            -- The deployment is missing its ledger dict, not the client's body.
+            return send_error(503, "watcher_unavailable", failure.error)
+        end
+        -- 400 with the daemon's {error,ignored} document: the ignored list names the
+        -- offending entries, so it rides in the body rather than only the message.
+        -- exact_json stamps the status, so this stays a plain table return.
+        return {
+            error = failure and failure.error or "invalid body",
+            ignored = failure and failure.ignored or cjson.null,
+        }, 400
+    end
+    return {
+        renamed = merged,
+        status = "queued",
+        model_map = merged,
+        note = "owned workers are re-registered on the next pass",
+    }
+end
+
 ---POST /workers - queue a registration and answer 202 with a Location header.
 local function create_worker_handler(params, ctx, req)
     local body, err = req.get_body(ctx)
@@ -3109,6 +3176,11 @@ local function build()
     app:put("workers/:worker_id", exact_json(update_worker_handler))
     app:delete("workers/:worker_id", delete_worker_handler)
     app:post("flush_cache", exact_json(flush_cache_handler))
+    -- Watcher rename table. GET answers the effective map, POST merges into it;
+    -- both are exact_json so the JSON content type and HEAD parity hold.
+    app:get("model-map", exact_json(model_map_handler))
+    app:head("model-map", exact_json(model_map_handler))
+    app:post("model-map", exact_json(model_map_handler))
     app:get("v1/loads", exact_json(loads_handler))
     app:get("get_loads", exact_json(loads_handler))
     app:head("v1/loads", exact_json(loads_handler))
@@ -3196,6 +3268,7 @@ _M.log_inference_request = log_inference_request
 _M.hold_load = hold_load
 _M.release_load = release_load
 _M.metrics_handler = metrics_handler
+_M.model_map_handler = model_map_handler
 _M.cors_apply = cors_apply
 _M.cors_preflight = cors_preflight
 _M.mesh_disabled_handler = mesh_disabled_handler

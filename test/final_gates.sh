@@ -30,6 +30,8 @@
 #   head_routes    integration/test_head_routes.py (HEAD mirror of the GET surface)
 #   mesh_http      integration/test_mesh_http.py (mesh enabled over real HTTP)
 #   e2e_policy_parity prefix_hash/bucket/power_of_two/random quantitative parity
+#   e2e_watcher    integration/e2e_watcher.py (in-process watcher: targets/proc/docker
+#                  discovery, 9 guards, model-map, restart rediscovery)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
 #   e2e_tls_chain  integration/e2e_tls_chain.py (server-side TLS: runtime-built
@@ -46,6 +48,8 @@
 #   contract       the whole 580-check wire contract is unverified.
 #   probes         the policy factory / config-knob / raw-JSON-editor probes.
 #   e2e_*          that behaviour family over a real container.
+#   e2e_watcher    the merged watcher (was a separate llm-watcher container):
+#                  without it nothing proves discovery/guards/ledger work.
 #   head_routes    the HEAD mirror (Rust axum answers HEAD on every GET route).
 #   mesh_http      mesh enablement over real HTTP: peer apply/sync, worker
 #                  mirror, /ha/policies, /_mesh/internal/{state,apply}.
@@ -85,7 +89,7 @@ mkdir -p "$LOG_DIR"
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort head_routes mesh_http
-            e2e_policy_parity mesh_two e2e_tls_chain)
+            e2e_policy_parity e2e_watcher mesh_two e2e_tls_chain)
 
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
@@ -263,6 +267,7 @@ gate_e2e_effort()    { run_integration e2e_effort.py; }
 gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
 gate_e2e_policy_parity() { run_integration e2e_policy_parity.py 1800; }
+gate_e2e_watcher()    { run_integration e2e_watcher.py 900; }
 gate_mesh_two()        { run_integration test_mesh_two.py 900; }
 gate_e2e_tls_chain()   { run_integration e2e_tls_chain.py 1500; }
 
@@ -286,6 +291,7 @@ gate e2e_effort
 gate head_routes
 gate mesh_http
 gate e2e_policy_parity
+gate e2e_watcher
 gate mesh_two
 gate e2e_tls_chain
 

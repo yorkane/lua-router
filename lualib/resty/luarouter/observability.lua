@@ -708,6 +708,32 @@ function _M.record_cb_outcome(worker_url, outcome)
         { { "worker", worker_url }, { "outcome", outcome } })
 end
 
+-- ------------------------------------------------------------------ watcher
+--
+-- Registration points for the in-process watcher (doc/gap-watcher-merge.md). The
+-- standalone daemon published these as llm_watcher_* on its own metrics port;
+-- merged into the router they ride the normal exporter under lr_watch_*, and the
+-- counters accumulate in lr_stats exactly like the smg_* families above - watcher.lua
+-- calls this once per reconcile pass, and nothing here reads or reorganises the
+-- existing logic.
+---@param stats table @ the {reconciles, adds, add_fails, removes, discovered,
+---                     adds_stuck_released} a pass produced
+---@param owned number @ ledger-owned worker URLs
+---@param protected number @ first-contact protected worker URLs
+---@param map_entries number @ active model-map renames
+function _M.record_watch_pass(stats, owned, protected, map_entries)
+    _M.counter("lr_watch_reconciles_total", {}, stats.reconciles or 0)
+    _M.counter("lr_watch_adds_total", {}, stats.adds or 0)
+    _M.counter("lr_watch_add_fails_total", {}, stats.add_fails or 0)
+    _M.counter("lr_watch_removes_total", {}, stats.removes or 0)
+    _M.counter("lr_watch_adds_stuck_released_total", {},
+        stats.adds_stuck_released or 0)
+    _M.gauge("lr_watch_discovered_workers", {}, stats.discovered or 0)
+    _M.gauge("lr_watch_owned_workers", {}, owned or 0)
+    _M.gauge("lr_watch_protected_workers", {}, protected or 0)
+    _M.gauge("lr_watch_model_map_entries", {}, map_entries or 0)
+end
+
 -- ------------------------------------------------------------------ request log
 
 ---Append one RequestRecord to the ring buffer.
@@ -1036,6 +1062,18 @@ local HELP = {
     smg_worker_routing_keys_active = "Active routing keys per worker",
     -- Lua-side superset: the Rust cache_aware tree exposes no tenant gauge.
     smg_cache_aware_tenant_count = "Tenants tracked by the cache_aware policy trees",
+    -- Lua-side superset: the in-process watcher (merged llm-watcher daemon), so a
+    -- dashboard can see discovery churn without a second scrape target. Names
+    -- mirror the daemon's llm_watcher_* families.
+    lr_watch_reconciles_total = "Reconcile passes completed by the in-process watcher",
+    lr_watch_adds_total = "Workers registered by the in-process watcher",
+    lr_watch_add_fails_total = "Worker registrations the in-process watcher rejected",
+    lr_watch_removes_total = "Workers removed by the in-process watcher",
+    lr_watch_adds_stuck_released_total = "Stuck watcher registrations released",
+    lr_watch_discovered_workers = "Workers discovered by the last watcher pass",
+    lr_watch_owned_workers = "Workers the in-process watcher currently owns",
+    lr_watch_protected_workers = "Pre-existing workers the in-process watcher will never delete",
+    lr_watch_model_map_entries = "Active watcher model-map renames",
 }
 
 ---Pool membership labels for one worker record, in the spelling Rust uses.

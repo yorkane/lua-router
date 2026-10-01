@@ -122,6 +122,26 @@ end
 local POLICIES = { "random", "round_robin", "cache_aware", "power_of_two",
                    "prefix_hash", "manual", "bucket", "consistent_hashing" }
 
+---Build the watcher sub-config, or a disabled stub when the module is unusable.
+---@param cfg table @ partially built router config (owns the two self ports)
+---@return table
+local function watcher_snapshot(cfg)
+    local ok, watcher = pcall(require, "resty.luarouter.watcher")
+    if ok and type(watcher) == "table"
+        and type(watcher.new_config) == "function" then
+        -- The two self ports go in as numbers: they are the listeners the watcher
+        -- must never turn into candidates (guard 1).
+        local built_ok, result = pcall(watcher.new_config, os.getenv,
+            cfg.port, cfg.metrics_port)
+        if built_ok and type(result) == "table" then
+            return result
+        end
+    end
+    return { enabled = false, targets = {}, model_map = {}, self_ports = { cfg.port },
+             interval_secs = 15, probe_timeout_secs = 4, remove_grace_secs = 300,
+             max_models = 8, keep_last_grace_secs = 1800 }
+end
+
 function _M.load()
     local cfg = {
         -- ==================== server ====================
@@ -253,8 +273,19 @@ function _M.load()
         log_level = log_level_from_env(),
         started_at_ms = math.floor(ngx.now() * 1000),
     }
+
+    -- ==================== in-process watcher ====================
+    -- Discovery + registration (doc/gap-watcher-merge.md). Parsed by the watcher
+    -- module itself - one parser owns the SMG_WATCHER_* vocabulary and the guard
+    -- defaults - and attached here so /probe/config reports it and init_worker can
+    -- hand the same table to watcher.start() without a second read of the
+    -- environment. A module load failure degrades to "watcher off" rather than
+    -- taking the router down.
+    cfg.watcher = watcher_snapshot(cfg)
+
     return cfg
 end
+
 
 -- init_by_lua runs before the error-log level is applied, so keep the message
 -- plain and let the caller decide whether it is fatal.

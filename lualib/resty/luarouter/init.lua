@@ -304,8 +304,21 @@ function _M.worker_init()
 
     hb.start()
     -- The Kubernetes pod poller was removed (doc/scope-trim.md): workers arrive
-    -- through SMG_WORKER_URLS, POST /workers, or whatever watcher pushes them,
-    -- and the health sweep above is the only registry writer left.
+    -- through SMG_WORKER_URLS, POST /workers, or the in-process watcher below,
+    -- and the health sweep above is the only other registry writer.
+    --
+    -- The watcher is the merged form of the standalone llm-watcher daemon
+    -- (doc/gap-watcher-merge.md): same worker-0-only shape as hb.start(), same
+    -- captured-at-init config hand-off as the mesh, and its own lr_watch single
+    -- flight inside the module. SMG_WATCHER_ENABLED defaults to off, so a box
+    -- that never opted in runs exactly the pre-merge code path.
+    local ok_watcher, watcher = pcall(require, "resty.luarouter.watcher")
+    if ok_watcher and type(watcher) == "table" then
+        local started, why = watcher.start(conf.watcher)
+        if started == false and why ~= "disabled (set SMG_WATCHER_ENABLED=1)" then
+            ngx.log(ngx.WARN, "luarouter: watcher not started: ", tostring(why))
+        end
+    end
     return true
 end
 

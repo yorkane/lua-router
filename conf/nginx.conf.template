@@ -22,6 +22,32 @@
 env LR_INFLIGHT_SAMPLE_SECS;
 env LR_INFLIGHT_TTL_SECS;
 
+# 进程内 watcher（doc/gap-watcher-merge.md，独立 llm-watcher 守护进程的合并形态）：
+# SMG_WATCHER_* 由 resty.luarouter.config 在 init_by_lua 里解析（与其余 SMG_* 同一
+# 读法，fork 之前完成）；这里的 env 声明把它们再放行到 worker 进程，请求期
+# （GET/POST /model-map、/_ui/config）才读得到。全部可省略：SMG_WATCHER_ENABLED
+# 默认 off，不开就没有定时器、没有 discovery、也没有 lr_watch 的写入。
+env SMG_WATCHER_ENABLED;
+env SMG_WATCHER_TARGETS;
+env SMG_WATCHER_DOCKER;
+env SMG_WATCHER_PROC_SCAN;
+env SMG_WATCHER_CONTAINER_IPS;
+env SMG_WATCHER_DOCKER_SOCKET;
+env SMG_WATCHER_INTERVAL_SECS;
+env SMG_WATCHER_PROBE_TIMEOUT_SECS;
+env SMG_WATCHER_REMOVE_GRACE_SECS;
+env SMG_WATCHER_KEEP_LAST_GRACE_SECS;
+env SMG_WATCHER_ALLOW_REMOVE;
+env SMG_WATCHER_MAX_MODELS;
+env SMG_WATCHER_REQUIRE_HEALTH;
+env SMG_WATCHER_ALLOW_MODELS_ONLY;
+env SMG_WATCHER_SHORT_MODEL_NAMES;
+env SMG_WATCHER_ADD_CONFIRM_TIMEOUT_SECS;
+env SMG_WATCHER_EXCLUDE;
+env SMG_WATCHER_ALLOW_PORT;
+env SMG_WATCHER_DENY_PORT;
+env SMG_WATCHER_MODEL_MAP;
+
 
 worker_processes ${WORKER_PROCESSES};
 worker_rlimit_nofile ${NOFILE_LIMIT};
@@ -77,6 +103,9 @@ http {
     lua_shared_dict lr_stats       5m;
     lua_shared_dict lr_request_log 20m;
     lua_shared_dict lr_locks       1m;
+    # 进程内 watcher 的 ledger：protected / owned / pending / back-off / model-map
+    # （resty.luarouter.watcher）。缺失时 watcher 拒绝启动并留一条 WARN，其余功能不受影响。
+    lua_shared_dict lr_watch        64k;
     # 并发限流的 token / 活跃 / 排队计数（SMG_MAX_CONCURRENT_REQUESTS），
     # 跨 nginx 进程共享同一份预算
     lua_shared_dict lr_limit      64k;
