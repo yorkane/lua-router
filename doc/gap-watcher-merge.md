@@ -6,7 +6,7 @@
 [router.lua](../lualib/resty/luarouter/router.lua)（`GET`/`HEAD`/`POST /model-map`）、
 [observability.lua](../lualib/resty/luarouter/observability.lua)（`lr_watch_*` 登记点）、
 三份 conf（`env` 声明 + `lua_shared_dict lr_watch`）。
-单测：[test_watcher.lua](../test/unit/test_watcher.lua)（253 checks）。
+单测：[test_watcher.lua](../test/unit/test_watcher.lua)（267 checks）。
 e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（65 checks）。
 
 语义移植基准：`llm-router/watcher/llm_watcher.py`（1577 行）与同目录 `README.md`
@@ -149,6 +149,25 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
     （没有 reconcile 去回收），这是有意的。
 12. 一 URL 一模型、不展开 DP rank、remote target 也会因不可达被 grace 摘掉——这三条
     README 里的 Limitations 原样成立，未在合并时改变。
+13. **timer 阶段的 cosocket recv 失败会被 nginx 记 [error]，deny 清单是唯一消音手段**。
+    探针走 `hb.http_request`，其首行读取是 `sock:receive("*l")`；对端接受 TCP 后不回
+    HTTP/1.1 文本（gRPC 的二进制 HTTP/2 帧、rpcbind 直接 RST），这条读就以 ECONNRESET
+    结束，而该错误是 nginx **核心**在 `ngx.timer` 上下文里记的，`lua_socket_log_errors
+    off` 挡不住（那条只压 lua 层的 cosocket 错误日志）。独立守护进程没有这个问题，因为
+    Python 的 `http.client` 把 RST 当成普通异常吞掉——这是合并形态独有的日志噪音，只能
+    在拨号之前消除。实测（2026-10-01 本机，间隔 15 s）每轮一条 `recv() failed (104:
+    Connection reset by peer), context: ngx.timer`，归因到 `http://127.0.0.1:6334/v1/models`
+    （qdrant 的 gRPC 口）：探针日志显示它每轮 `err=no response: connection reset by
+    peer`。修法是两件事叠加：(a) `6334` 进 `DEFAULT_DENY_PORTS`（gRPC 永远不可能提供
+    `/v1/models`，deny 掉零成本）；(b) 修好 deny 的合并语义（见下）。同时操作员可用
+    `SMG_WATCHER_DENY_PORT` 追加本机特有的一次性 RST 口。
+    **deny 语义修正**：`collect()` 原先在 `SMG_WATCHER_ALLOW_PORT` 为空时把整个 deny 变量
+    赋成 `DEFAULT_DENY_PORTS`，操作员清单被整体丢弃（Python 版是
+    `deny = cfg.deny_ports | (set() if cfg.allow_ports else DEFAULT_DENY_PORTS)`，是并集）。
+    现在改成 `union_port_sets(cfg.deny_ports, DEFAULT_DENY_PORTS)`，allow 非空时仍只用操作员
+    清单；allow-list 那一支仍无条件追加（与 daemon 一致：显式点名要探的口，两份 deny 都不
+    拦），这条由单测 case 22b 钉住。守卫语义没有放宽：deny 只影响「拨不拨」，探针判定、
+    protected/owned 账本与删除路径一行未动。
 
 ---
 
@@ -158,14 +177,15 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
 |---|---|---|
 | 语法 | luajit `loadfile`（watcher/config/init/router/observability） | 5 份 |
 | 语法 | `openresty -t`（conf/lua-router.conf、test/conf/nginx-lua-router.conf、模板渲染） | 3 份 |
-| 单测 | `test/unit/test_watcher.lua`（luajit 与 apisix resty 两种口径，注入 fetch/reader/store，无 ngx） | 253 checks |
+| 单测 | `test/unit/test_watcher.lua`（luajit 与 apisix resty 两种口径，注入 fetch/reader/store，无 ngx） | 267 checks |
 | e2e | `test/integration/e2e_watcher.py`（真容器 + 真 mock + 真 docker.sock + 容器重启） | 65 checks |
 
 单测覆盖：`parse_model_map` 四分隔符与坏输入、`parse_model_map_body` 四形态 + 坏
 body + 删除语义、`merge_map`、url 形态与 IPv6、`model_name`、`parse_ports`、
 `gpu_from_name`、`is_excluded`、`classify`（拒连/HTML/无 id/聚合器/路由器指纹/双 5xx
 判活/`require_health`/三种引擎嗅探）、`/proc/net/tcp{,6}` 解码（含 v4-mapped 与
-v6 loopback）、docker 候选去重、`local_candidates` 与 allow/deny、ledger 全部键操作、
+v6 loopback）、docker 候选去重、`local_candidates` 与 allow/deny（含 case 22b：
+deny 是 default ∪ 操作员、allow 非空时 default 让位、显式 allow  outranks 两份 deny、`union_port_sets` 对 nil 参数与字符串键的健壮性）、ledger 全部键操作、
 候选在拨号前就被自端口与 exclude 拦掉、ledger 条目每轮续期、九条守卫各自的时序断言、`new_config` 缺省值与钳制、`collect` 三源合并。
 
 e2e 按 [1]–[5] 分五组、四个启动器（grace 与 keep-last 共用一个容器对，docker 发现与容器重启同理）：TARGET 注册 + env 改名 + 四形态 API + 改名回收 + 按 public id 真实路由；
@@ -175,9 +195,27 @@ proc scan 发现 + 自端口排除 + 非 OpenAI 端口排除 + `SMG_WORKER_URLS`
 窗口后删除（keep-last 关掉以隔离守卫 5）；keep-last 生效与自身宽限到期；docker unix
 socket 发现（容器名标签）+ 容器删除后离池；容器重启后重新发现并恢复流量。
 
-日志：`/data/tmp/lr-watch/e2e_final4.log`（65 checks）、
-`/data/tmp/lr-watch/unit_final.log`（253 checks，luajit 口径）、
+日志：`/data/tmp/lr-watch/e2e_deny.log`（65 checks）、
+`/data/tmp/lr-watch/unit_final.log` 与 `unit_deny.log`（267 checks，luajit 口径）、
 `/data/tmp/lr-watch/gate_contract3.log`（contract 门禁 580 checks，137 s）。
+
+### 5.2 recv-RST 噪音的 A/B 证据（偏差 13）
+
+同一台机器、同一份生产 env（`SMG_WATCHER_PROC_SCAN=1`、`SMG_WATCHER_DOCKER=1`、
+`SMG_WATCHER_DENY_PORT=111,5432,11022,14389,42209`、四个远程 TARGET、docker.sock 只读挂载）、
+同一套缺省节奏（interval 15 s / probe timeout 4 s），差别只有镜像：
+
+| 镜像 | 70 s 内 `recv() failed (104` | 其他 timer 上下文 [error] | `watcher: registered` |
+|---|---|---|---|
+| `lua-router:pre-deny`（修复前） | 4 | 4 | 1 |
+| `lua-router:integration`（修复后） | **0** | **0** | 1 |
+
+两侧都注册了同一个 worker，所以零错误不是空转出来的。原始日志
+`/data/tmp/lr-watch/ab2_pre.log`、`ab2_post.log`，脚本 `ab2.sh`。归因证据在
+`inst.log`（插桩探针：23 条 `lrwatch-probe http://127.0.0.1:6334/v1/models -> nil
+err=no response: connection reset by peer`，且 `:111` 探针行数为 0 —— 111 从未被拨，
+前手「111 漏网」的判断不成立，默认清单本来就挡住了它）与 `deny_diff.lua`
+（修复前操作员清单被丢弃：11022/14389/42209 仍在候选里；修复后 `denied-but-present: 0`）。
 
 ### 5.1 单测/e2e 期间发现并修掉的真问题
 

@@ -48,13 +48,43 @@ _M.ROUTER_FINGERPRINT_KEYS = { "router_manager", "workers_count", "routers_count
 ---Infrastructure ports never worth probing (llm_watcher.py DEFAULT_DENY_PORTS).
 ---Deliberately short: the probe is the real gate, this only trims noise, and
 ---inference servers do sit on web-default ports like 8080 or 3000.
+---6334 (qdrant's gRPC listener) joins the inherited list on measured evidence:
+---it accepts the TCP connection and answers the HTTP/1.1 probe with a binary
+---HTTP/2 frame, so hb.http_request's receive("*l") never sees a newline and the
+---read ends in ECONNRESET. nginx logs that recv failure as [error] from its own
+---core (lua_socket_log_errors off does not cover it), which is one log line per
+---pass per such port. A gRPC endpoint can never serve /v1/models, so denying it
+---costs nothing and is the only available mute (doc/gap-watcher-merge.md, dev. 13).
 _M.DEFAULT_DENY_PORTS = {
     [22] = true, [25] = true, [53] = true, [111] = true, [135] = true,
     [139] = true, [445] = true, [631] = true, [1433] = true, [1521] = true,
     [2049] = true, [3306] = true, [3389] = true, [5432] = true, [5900] = true,
     [6379] = true, [6443] = true, [9100] = true, [9400] = true,
     [11211] = true, [27017] = true,
+    [6334] = true,
 }
+
+---Port set union, the `|` of the daemon's
+---`deny = cfg.deny_ports | (set() if cfg.allow_ports else DEFAULT_DENY_PORTS)`.
+---The operator's list and the default list are additive: the default trims known
+---noise, the operator's adds to it. It is *not* a replacement, and a replacement
+---silently un-denies whatever the default covers but the operator was relying on.
+---@vararg table|nil @ sets of ports keyed by number
+---@return table
+function _M.union_port_sets(...)
+    local out = {}
+    -- select("#") rather than {...} so a nil in the argument list does not shorten
+    -- the table and hide the sets after it.
+    for i = 1, select("#", ...) do
+        local set = select(i, ...)
+        if type(set) == "table" then
+            for port in pairs(set) do
+                out[tonumber(port) or port] = true
+            end
+        end
+    end
+    return out
+end
 
 -- ------------------------------------------------------------------ small utils
 
@@ -1647,12 +1677,19 @@ function _M.collect(cfg, reader)
     end
 
     if cfg.scan_proc then
-        -- Same rule as the daemon: the default deny list only trims noise when the
-        -- operator did not narrow the scan with SMG_WATCHER_ALLOW_PORT.
+        -- Same rule as the daemon (llm_watcher.py:769): the operator's deny list and
+        -- the default list are a *union*, and the default only applies while the scan
+        -- has not been narrowed with SMG_WATCHER_ALLOW_PORT (an explicit allow list is
+        -- "probe exactly these", so trimming it further by default is pointless).
+        -- An earlier shape of this branch assigned one list or the other, so with no
+        -- allow list SMG_WATCHER_DENY_PORT was dropped wholesale and every port the
+        -- operator named (11022/14389/42209 on this box) kept being probed.
         local narrowed = next(cfg.allow_ports) ~= nil
-        local deny = cfg.deny_ports
-        if not narrowed then
-            deny = _M.DEFAULT_DENY_PORTS
+        local deny
+        if narrowed then
+            deny = cfg.deny_ports
+        else
+            deny = _M.union_port_sets(cfg.deny_ports, _M.DEFAULT_DENY_PORTS)
         end
         local sockets = _M.listening_sockets(reader)
         local cands = _M.local_candidates(sockets, deny, cfg.allow_ports)

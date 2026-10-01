@@ -1255,6 +1255,91 @@ do
 end
 
 --------------------------------------------------------------------------
+-- 22b. deny 清单：default ∪ 操作员（回归：操作员清单不得被整体丢弃）
+--------------------------------------------------------------------------
+new_case("proc deny is the union of the default and the operator list")
+do
+    -- The /proc lines a real box contributes: an OpenAI worker on 8000, rpcbind on
+    -- 111 (accepts, then RSTs), the qdrant gRPC port 6334 (binary HTTP/2 frame, so
+    -- the probe's receive("*l") ends in ECONNRESET and nginx logs the recv failure
+    -- from its own core), and a Win32-OpenSSH on 11022 -- the three noise sources an
+    -- operator explicitly named in SMG_WATCHER_DENY_PORT.
+    local proc_text = "  sl  local_address rem_address   st\n"
+        .. "   0: 0100007F:1F40 00000000:0000 0A\n"   -- 127.0.0.1:8000
+        .. "   1: 00000000:006F 00000000:0000 0A\n"   -- 0.0.0.0:111   (rpcbind)
+        .. "   2: 0100007F:18BE 00000000:0000 0A\n"   -- 127.0.0.1:6334 (qdrant gRPC)
+        .. "   3: 00000000:2B0E 00000000:0000 0A\n"   -- 0.0.0.0:11022 (ssh)
+    local function reader(path)
+        if path == "/proc/net/tcp" then return proc_text end
+        return nil
+    end
+    local function urls_of(cands)
+        local out = {}
+        for i = 1, #cands do
+            out[cands[i].url] = cands[i]
+        end
+        return out
+    end
+
+    -- (a) no allow list: the operator's list is honoured *and* the default still
+    -- trims, because they are a union. This is the regression: the branch used to
+    -- assign one list or the other, so SMG_WATCHER_DENY_PORT was dropped here.
+    local cfg = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_DENY_PORT" then return "11022,14389,42209" end
+        return nil
+    end, 30000, 0)
+    cfg.scan_proc = true
+    local seen = urls_of(watcher.collect(cfg, reader))
+    check(seen["http://127.0.0.1:8000"] ~= nil, "the real worker is still a candidate")
+    check(seen["http://127.0.0.1:11022"] == nil,
+        "an operator-denied port is never probed (was dropped by the old branch)")
+    check(seen["http://127.0.0.1:111"] == nil,
+        "rpcbind 111 is not probed (default list still applies alongside the operator's)")
+    check(seen["http://127.0.0.1:6334"] == nil,
+        "the qdrant gRPC port is not probed (default list, measured recv-RST source)")
+
+    -- (b) with an allow list the default stays out of the way: naming a port is
+    -- "probe exactly this", even one the default would have trimmed.
+    local cfg2 = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_ALLOW_PORT" then return "111" end
+        return nil
+    end, 30000, 0)
+    cfg2.scan_proc = true
+    local seen2 = urls_of(watcher.collect(cfg2, reader))
+    check(seen2["http://127.0.0.1:111"] ~= nil,
+        "an allow-listed port beats the default deny (allow means exactly these)")
+    check(seen2["http://127.0.0.1:8000"] == nil,
+        "and nothing else is probed")
+
+    -- (c) the allow list is an explicit instruction and outranks both deny lists,
+    -- which is the daemon's shape too: llm_watcher.py appends every sorted
+    -- cfg.allow_ports entry unconditionally, so naming a port probes it even when
+    -- the default or the operator would have denied it. Pinned here so the deny fix
+    -- cannot quietly turn allow into a hint.
+    local cfg3 = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_ALLOW_PORT" then return "111,6334" end
+        if name == "SMG_WATCHER_DENY_PORT" then return "111" end
+        return nil
+    end, 30000, 0)
+    cfg3.scan_proc = true
+    local seen3 = urls_of(watcher.collect(cfg3, reader))
+    check(seen3["http://127.0.0.1:6334"] ~= nil,
+        "allow-listed and not operator-denied: probed even though the default denies it")
+    check(seen3["http://127.0.0.1:111"] ~= nil,
+        "an explicitly allow-listed port outranks deny (both lists), as in the daemon")
+    eq(seen3["http://127.0.0.1:111"].source, "allow-list",
+        "and it arrives through the allow-list source")
+
+    -- (d) the union helper itself: number keys, nil-tolerant, no shared state
+    local u = watcher.union_port_sets({ [22] = true }, nil, { ["80"] = true })
+    eq(u[22], true, "union keeps the first set")
+    eq(u[80], true, "union accepts a string key and normalises it to a number")
+    eq(watcher.union_port_sets(nil)[22], nil, "union of nothing denies nothing")
+    eq(watcher.DEFAULT_DENY_PORTS[111], true, "rpcbind 111 is in the default list")
+    eq(watcher.DEFAULT_DENY_PORTS[6334], true, "qdrant gRPC 6334 joined the default list")
+end
+
+--------------------------------------------------------------------------
 -- 23. effective_map / merge 语义（请求期 POST /model-map 的纯逻辑半边）
 --------------------------------------------------------------------------
 new_case("map merge keeps env entries and lets the API win")
