@@ -1,6 +1,24 @@
 # AGENTS.md（lua-router）
 
-完整交接说明读 [doc/agent-handover.md](doc/agent-handover.md)。以下是不可违反的硬规则：
+完整交接说明读 [doc/agent-handover.md](doc/agent-handover.md)。
+
+## 项目定位与重点（用户裁定 2026-10-01）
+
+本项目的主要目的，按优先级：
+
+1. **更灵活的模型服务调度策略**：在现有 8 策略骨架上继续演进——策略可按模型/别名粒度组合，
+   感知健康、熔断、负载与 GPU 利用率；新调度能力的落点是 `policies/` 与 `policy.lua`。
+2. **覆盖与弥补下游请求的配置**：网关侧对请求做顶层改写与补齐（model 别名、effort/ctx 卡片、
+   `stream_options`、per-alias policy/profile 收窄），让不完美或欠配置的客户端请求也能被正确
+   调度——改写一律走 `set_top_field` 式顶层精确改写，不整表重编码。
+3. **UI 的配置与可视化**：`/_ui/admin/` 管理台（服务池、模型覆盖、日志监控、路由策略四页）
+   是第一公民；新增配置面必须同步落到可视化，而不是只给 env。
+4. **JSON 格式的 API 修改与保存**：`/_ui/config` 的 JSON 查看/编辑/保存、`LMR_CONFIG_FILE`
+   原子落盘与 reload 恢复是核心链路；配置变更走 `config_store` 热配置（免重启生效）。
+
+与 Rust 版的行为对拍是护住既有行为的手段，不是目标；排期与新功能优先对齐以上四点。
+
+以下是不可违反的硬规则：
 
 1. **测试纪律**：`test/final_gates.sh` / `test/test_lua_router.sh` / `test/integration/e2e_*.py` 全部
    host 网络 + 容器名前缀，**严禁并发**（跑前 `ps` 查）；luajit/resty 单测（无端口绑定）可并发。
