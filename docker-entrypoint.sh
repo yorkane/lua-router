@@ -124,6 +124,16 @@ if [ "$METRICS_PORT" -gt 0 ] && [ "$METRICS_PORT" != "$LISTEN_PORT" ]; then
         location = /health {
             return 200 \"OK\";
         }
+        # Anything else gets a clean 404. Without this the request falls
+        # through to the default static root and nginx logs an [error]
+        # for every probe that hits the metrics port with a non-metrics
+        # path (e.g. the llm-watcher port scanner trying GET /v1/models
+        # on every local listener). The Rust prometheus listener also
+        # answers non-metrics paths with a plain 404; this matches it and
+        # keeps the error log clean.
+        location / {
+            return 404;
+        }
     }"
 else
     METRICS_EXTRA=""
