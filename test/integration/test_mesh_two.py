@@ -35,12 +35,10 @@ window, not the partition label.
 Both routers are launched on explicit ports because _lib.start_router allocates
 its own: mutual seeds have to name a port that is already known.
 
-A control-plane key is configured on both instances: the sync dials travel to
-the LAN address (host network), and the internal fence (router.lua
-mesh_control_auth) only waves loopback through when *no* key is configured at
-all. With SMG_CONTROL_PLANE_API_KEY the client presents it as Bearer
-(mesh.auth_token, init.lua), /ha/* and POST /workers need it too, and the data
-plane stays open because SMG_API_KEY is deliberately unset.
+Nothing is authenticated any more (doc/scope-trim.md): the sync dials travel
+to the LAN address (host network) open, and /ha/*, /_mesh/internal/* and the
+control plane answer every caller, from loopback or from the LAN, without a
+credential. The two-suite history of key-gated mesh access is kept in git.
 """
 import json, os, socket, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -95,7 +93,7 @@ def poll(fn, timeout=45.0, every=0.5):
 
 def ha(port, path):
     st, body, _ = http("GET", "http://127.0.0.1:%d%s" % (port, path),
-                       headers=AUTH, timeout=5)
+                       timeout=5)
     if st != 200:
         return None
     try:
@@ -113,8 +111,6 @@ def ghost_keys(doc, lan):
 
 
 TAG = "[mesh two]"
-CTL_KEY = "sk-mesh2-ctl"
-AUTH = {"authorization": "Bearer " + CTL_KEY}
 LAN = lan_address()
 if not LAN:
     print("FATAL  no non-loopback address: the seed-vs-self spelling needs one")
@@ -125,8 +121,7 @@ MESH_ENV = {"SMG_ENABLE_MESH": "1",
             "SMG_MESH_UNREACHABLE_TIMEOUT_SECS": "5",
             "SMG_MESH_SUSPECT_THRESHOLD": "2",
             "SMG_POLICY": "round_robin",
-            "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
-            "SMG_CONTROL_PLANE_API_KEY": CTL_KEY}
+            "SMG_HEALTH_CHECK_INTERVAL_SECS": "1"}
 pa = free_port()
 start_mock(pa, "alpha")
 port_a, port_b = free_port(), free_port()
@@ -144,11 +139,7 @@ start_router_at(dict(MESH_ENV, SMG_MESH_SELF_NAME="lr-mesh2b",
 check("%s both containers come up and pin worker_processes 1" % TAG,
       "workers: 1" in logs(name_a) and "workers: 1" in logs(name_b), logs(name_a)[:300])
 st, _, _ = http("GET", "http://%s:%d/ha/status" % (LAN, port_a), timeout=5)
-check("%s /ha/* from the lan address requires the control key" % TAG,
-      st == 401, str(st))
-st, _, _ = http("GET", "http://%s:%d/ha/status" % (LAN, port_a), headers=AUTH,
-                timeout=5)
-check("%s /ha/* answers with the control key" % TAG, st == 200, str(st))
+check("%s /ha/* from the lan address is open" % TAG, st == 200, str(st))
 
 
 def converged(port):
@@ -183,7 +174,7 @@ for who, port in (("A", port_a), ("B", port_b)):
 
 # --- B. worker mirror + data plane -----------------------------------------
 st, body, _ = http("POST", "http://127.0.0.1:%d/workers" % port_a,
-                   {"url": "http://127.0.0.1:%d" % pa}, AUTH)
+                   {"url": "http://127.0.0.1:%d" % pa})
 wid_a = json.loads(body).get("worker_id") if st in (200, 202) else None
 check("%s registering a worker on A accepted" % TAG, bool(wid_a), "%s %s" % (st, body[:150]))
 ok, seen = poll(lambda: wid_a in [w.get("worker_id") for w in
@@ -192,7 +183,7 @@ check("%s A's worker mirrored into B's /ha/workers" % TAG, ok, str(seen)[:200])
 pb = free_port()
 start_mock(pb, "beta")
 st, body, _ = http("POST", "http://127.0.0.1:%d/workers" % port_b,
-                   {"url": "http://127.0.0.1:%d" % pb}, AUTH)
+                   {"url": "http://127.0.0.1:%d" % pb})
 wid_b = json.loads(body).get("worker_id") if st in (200, 202) else None
 ok, seen = poll(lambda: wid_b in [w.get("worker_id") for w in
                                   (ha(port_a, "/ha/workers") or [])] or None)
@@ -204,8 +195,9 @@ check("%s A's /v1/models still serves its own registry (mesh did not eat it)" % 
 
 
 def healthy_count(port, want=1):
-    """/workers is control-plane auth'd, so _lib.wait_ready cannot be used."""
-    st, body, _ = http("GET", "http://127.0.0.1:%d/workers" % port, headers=AUTH,
+    """Reads the control surface directly instead of _lib.wait_ready so the
+    poll keeps its own timeout budget."""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/workers" % port,
                        timeout=5)
     if st != 200:
         return False
@@ -308,7 +300,7 @@ check("%s chat through A still works after the heal" % TAG, st == 200,
       "%s %s" % (st, body[:150]))
 
 # --- F. graceful retire ----------------------------------------------------
-st, body, _ = http("POST", "http://127.0.0.1:%d/ha/shutdown" % port_b, {}, AUTH,
+st, body, _ = http("POST", "http://127.0.0.1:%d/ha/shutdown" % port_b, {},
                    timeout=10)
 try:
     doc = json.loads(body)

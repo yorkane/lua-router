@@ -28,7 +28,6 @@
 #   e2e_errors     integration/e2e_errors.py
 #   e2e_effort     integration/e2e_effort.py
 #   e2e_discovery_dp integration/e2e_discovery_dp.py
-#   e2e_jwt        integration/e2e_jwt.py (JWT/JWKS control-plane gate)
 #   head_routes    integration/test_head_routes.py (HEAD mirror of the GET surface)
 #   mesh_http      integration/test_mesh_http.py (mesh enabled over real HTTP)
 #   e2e_otel       integration/e2e_otel.py (W3C trace propagation + OTLP/HTTP export)
@@ -89,7 +88,7 @@ mkdir -p "$LOG_DIR"
 
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
-            e2e_errors e2e_effort e2e_discovery_dp e2e_jwt head_routes mesh_http
+            e2e_errors e2e_effort e2e_discovery_dp head_routes mesh_http
             e2e_otel e2e_policy_parity mesh_two e2e_tls_chain)
 
 declare -A SKIP=()
@@ -240,7 +239,7 @@ run_unit_resty() {
 gate_unit() {
     local rc=0 t
     for t in test_tree test_policies test_hash test_mesh \
-             test_service_discovery test_jwks test_otel; do
+             test_service_discovery test_otel; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
@@ -267,7 +266,6 @@ gate_e2e_ui_bridge() { run_integration e2e_ui_bridge.py; }
 gate_e2e_errors()    { run_integration e2e_errors.py; }
 gate_e2e_effort()    { run_integration e2e_effort.py; }
 gate_e2e_discovery_dp() { run_integration e2e_discovery_dp.py 1500; }
-gate_e2e_jwt()       { run_integration e2e_jwt.py 900; }
 gate_head_routes()   { run_integration test_head_routes.py 900; }
 gate_mesh_http()     { run_integration test_mesh_http.py 900; }
 gate_e2e_otel()      { run_integration e2e_otel.py 1500; }
@@ -293,7 +291,6 @@ gate e2e_ui_bridge
 gate e2e_errors
 gate e2e_effort
 gate e2e_discovery_dp
-gate e2e_jwt
 gate head_routes
 gate mesh_http
 gate e2e_otel

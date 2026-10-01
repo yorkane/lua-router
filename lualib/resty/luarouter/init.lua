@@ -369,9 +369,8 @@ function _M.worker_init()
         local ok_mesh, mesh = pcall(require, "resty.luarouter.mesh")
         if ok_mesh then
             local inst = mesh.instance()
-            -- The same key gates /_mesh/internal/* on the receiving side, so the
-            -- sync client has to present it; without this every peer answers 401.
-            mesh.auth_token = conf.control_plane_api_key or conf.api_key
+            -- No sync credential: the gateway auth surface was removed
+            -- (doc/scope-trim.md), so peers are reached (and reached) open.
             if inst then
                 mirror_mesh_state(inst, policy)
                 if ngx.worker.id() == 0 then

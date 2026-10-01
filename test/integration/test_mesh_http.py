@@ -16,8 +16,9 @@ the container, plus the internal endpoints' request/response framing:
     400;
   * GET /ha/policies/{model} answers for the mirrored default policy and 404s
     for an unknown model;
-  * the internal fence: from a non-loopback address with no key configured,
-    /_mesh/internal/* is 403 forbidden (doc/gap-mesh.md 6.1).
+  * the internal surface: from a non-loopback address /_mesh/internal/* answers
+    exactly like it does from loopback - the auth layer and its fence were
+    removed (doc/scope-trim.md), so there is no credential anywhere on mesh.
 
 Two behaviours used to be pinned as DIVERGENT notes with today's (wrong) value;
 both are fixed and the suite now asserts the intended value — see
@@ -335,20 +336,22 @@ st, body, _ = http("POST", "http://127.0.0.1:%d/_mesh/internal/sync" % port, "zz
 check("[mesh http] sync with a broken envelope is 400",
       st == 400 and "bad mesh envelope" in body, "%s %s" % (st, body[:200]))
 
-# 8. Internal fence from a non-loopback address (no key configured).
+# 8. The internal fence went with the auth layer (doc/scope-trim.md): from a
+# non-loopback address the internal endpoints answer the same way they do from
+# loopback. Anyone who can route to this box can forge cluster state, which is
+# the declared trade-off - the trust boundary is the edge/network, not here.
 lan = lan_address()
 if lan:
     st, body, _ = http("GET", "http://%s:%d/_mesh/internal/state" % (lan, port))
-    code = (json.loads(body).get("error") or {}).get("code") if st else None
-    check("[mesh http] /_mesh/internal/state from %s is 403 forbidden" % lan,
-          st == 403 and code == "forbidden", "%s %s" % (st, body[:200]))
+    check("[mesh http] /_mesh/internal/state from %s is open" % lan,
+          st == 200, "%s %s" % (st, body[:200]))
     st, body, _ = http("POST", "http://%s:%d/_mesh/internal/apply" % (lan, port), envelope)
-    check("[mesh http] /_mesh/internal/apply from %s is refused" % lan,
-          st == 403, "%s %s" % (st, body[:200]))
+    check("[mesh http] /_mesh/internal/apply from %s is served" % lan,
+          st == 200, "%s %s" % (st, body[:200]))
     st, body, _ = http("GET", "http://%s:%d/ha/status" % (lan, port))
-    check("[mesh http] /ha/* stays open without a key", st == 200, "%s %s" % (st, body[:150]))
+    check("[mesh http] /ha/* stays open", st == 200, "%s %s" % (st, body[:150]))
 else:
-    print("NOTE  no non-loopback address found; internal-fence checks skipped")
+    print("NOTE  no non-loopback address found; internal-surface checks skipped")
 
 # 9. Divergences pinned at today's value (reported, not hidden): see doc §4.
 # Instance 2 boot-seeds a worker from SMG_WORKER_URLS instead of POST /workers.

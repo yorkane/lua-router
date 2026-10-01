@@ -432,7 +432,8 @@ REASON
 start_mesh_peer() {
     # A stand-in for a second lua-router: it speaks the mesh wire format (b64
     # snapshots) so a single router instance can be checked for convergence,
-    # outbound auth and the shutdown broadcast. It records what it was told.
+    # the sync handshake and the shutdown broadcast. It records what it was
+    # told. $1 (key) stays empty: nothing authenticates anything anymore.
     # $2 is the docker bridge address the peer advertises for itself (built from
     # the port chosen here, so the caller does not need to know it). Without it
     # the seed-vs-self-report hostport dedup never matches and /ha/status grows
@@ -1290,45 +1291,42 @@ if section mesh; then
     request "$BASE" GET /ha/deeply/nested/path
     assert_eq "/ha deep path is 503 via the 404 fallback" "$STATUS" "503"
     assert_eq "/ha deep path body" "$BODY" '{"error":"mesh not enabled"}'
-    # With mesh disabled the internal fence is still live: a non-loopback peer
-    # without a control key cannot even probe membership (doc/gap-mesh.md 6.1).
+    # The internal fence is gone with the auth layer (doc/scope-trim.md): the
+    # ping reaches the handler itself, and with mesh disabled that answers the
+    # same 503 as the /ha/* surface, not a 403.
     request "$BASE" GET /_mesh/internal/ping
-    assert_eq "/_mesh/internal/ping without a key is refused" "$STATUS" "403"
-    assert_eq "internal 403 error code" "$(header_of X-SMG-Error-Code)" "forbidden"
+    assert_eq "/_mesh/internal/ping with mesh off is 503" "$STATUS" "503"
+    assert_eq "internal 503 body" "$BODY" '{"error":"mesh not enabled"}'
 
     # ---------------------------------------------------------------- enabled
     # SMG_ENABLE_MESH=1 with one fake peer that speaks the real wire format.
-    # The instance carries SMG_API_KEY, so every /ha/* and /_mesh/internal/*
-    # call must present the control key (fallback to the data key), and the
-    # router's outbound sync must carry it too - the peer counts rejections.
-    start_mesh_peer sk-mesh-ct "$GW"
+    # Nothing is configured and nothing is presented: the whole surface, inbound
+    # and outbound, is open (doc/scope-trim.md), and the peer counts rejections
+    # only to prove that none happen.
+    start_mesh_peer "" "$GW"
     MESH_PUB=$(free_port)
     FIXPORT=$MESH_PUB start_container lr-mesh-$SUIT "$BASE_CONF" \
         SMG_ENABLE_MESH=1 SMG_MESH_SYNC_INTERVAL_SECS=1 SMG_HEALTH_CHECK_INTERVAL_SECS=1 \
-        SMG_API_KEY=sk-mesh-ct SMG_MESH_SELF_NAME=lr-contract \
+        SMG_MESH_SELF_NAME=lr-contract \
         SMG_MESH_SELF=http://$GW:$MESH_PUB SMG_MESH_PEERS=http://$GW:$PEER_PORT
     MESH_BASE=$BASE
-    MESH_AUTH="Authorization: Bearer sk-mesh-ct"
 
     request "$MESH_BASE" GET /ha/status
-    assert_eq "/ha/status without a key is 401" "$STATUS" "401"
-    assert_eq "/ha/status 401 error code" "$(header_of X-SMG-Error-Code)" "unauthorized"
+    assert_eq "/ha/status is open" "$STATUS" "200"
     request "$MESH_BASE" GET /_mesh/internal/ping
-    assert_eq "/_mesh/internal/ping without a key is 401" "$STATUS" "401"
-
-    request "$MESH_BASE" GET /ha/status -H "$MESH_AUTH"
-    assert_eq "/ha/status with the key is 200" "$STATUS" "200"
+    assert_eq "/_mesh/internal/ping is open" "$STATUS" "200"
+    request "$MESH_BASE" GET /ha/status
     assert_json "/ha/status names this node" '.node_name' "lr-contract"
     # Convergence: the fake peer must show up as a member and mirror its worker.
     mesh_wait_peer() {
         local i
         for i in $(seq 1 80); do
-            request "$MESH_BASE" GET /ha/workers -H "$MESH_AUTH"
+            request "$MESH_BASE" GET /ha/workers
             if [[ "$BODY" == *wk-fake* ]]; then
                 # A seed that only matches once the peer self-reports lingers as
                 # a hostport-keyed "init" member; the cluster has converged once
                 # that duplicate merged into the peer's own name.
-                request "$MESH_BASE" GET /ha/status -H "$MESH_AUTH"
+                request "$MESH_BASE" GET /ha/status
                 if [[ "$(jq -r '.node_count' "$TMP_DIR/body" 2>/dev/null)" == "2" ]] \
                     && [[ "$BODY" == *lr-contract* && "$BODY" == *fake-peer* ]]; then
                     return 0
@@ -1343,65 +1341,65 @@ if section mesh; then
     else
         fail "/ha/workers mirrors the peer worker and the roster converged (status ${BODY:0:300})"
     fi
-    request "$MESH_BASE" GET /ha/status -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/status
     assert_json "/ha/status converged on two nodes" '.node_count' "2"
     assert_json "/ha/status nodes" \
         '[.nodes[].name] | (index("lr-contract") != null and index("fake-peer") != null) | tostring' "true"
     assert_json "/ha/status self is alive" \
         '[.nodes[] | select(.name == "lr-contract")][0].status' "alive"
-    request "$MESH_BASE" GET /ha/health -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/health
     assert_eq "/ha/health is 200" "$STATUS" "200"
     assert_json "/ha/health cluster size" '.cluster_size' "2"
     assert_json "/ha/health should_serve" '.should_serve | tostring' "true"
-    request "$MESH_BASE" GET /ha/workers/wk-fake -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/workers/wk-fake
     assert_eq "/ha/workers/:id serves the mirrored worker" "$STATUS" "200"
     assert_json "/ha/workers/:id model" '.model_id' "fake-model"
-    request "$MESH_BASE" GET /ha/policies -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/policies
     assert_contains "/ha/policies carries the default policy" "$BODY" "cache_aware"
 
-    request "$MESH_BASE" POST /ha/config -H "$MESH_AUTH" \
+    request "$MESH_BASE" POST /ha/config \
         -H 'Content-Type: application/json' --data '{"key":"ct-key","value":"616263"}'
     assert_eq "/ha/config put is 200" "$STATUS" "200"
-    request "$MESH_BASE" GET /ha/config/ct-key -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/config/ct-key
     assert_eq "/ha/config get returns the hex value" "$STATUS" "200"
     assert_json "/ha/config value" '.value' "616263"
-    request "$MESH_BASE" GET /ha/rate-limit -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/rate-limit
     assert_eq "/ha/rate-limit unset is 404" "$STATUS" "404"
-    request "$MESH_BASE" POST /ha/rate-limit -H "$MESH_AUTH" \
+    request "$MESH_BASE" POST /ha/rate-limit \
         -H 'Content-Type: application/json' --data '{"limit_per_second":7}'
     assert_eq "/ha/rate-limit set is 200" "$STATUS" "200"
-    request "$MESH_BASE" GET /ha/rate-limit -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/rate-limit
     assert_eq "/ha/rate-limit reads back" "$STATUS" "200"
     assert_json "/ha/rate-limit value" '.limit_per_second' "7"
-    request "$MESH_BASE" GET /ha/stats -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/stats
     assert_eq "/ha/stats is 200" "$STATUS" "200"
     assert_json "/ha/stats ran sync rounds" '.stats.sync_rounds >= 1 | tostring' "true"
-    request "$MESH_BASE" GET /ha/deeply/nested/path -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/deeply/nested/path
     assert_eq "enabled /ha deep path is 404" "$STATUS" "404"
     assert_contains "enabled 404 names the route" "$BODY" "unknown ha route"
 
-    # Internal endpoints with the key: ping answers, a broken envelope is 400.
-    request "$MESH_BASE" GET /_mesh/internal/ping -H "$MESH_AUTH"
-    assert_eq "/_mesh/internal/ping with the key is 200" "$STATUS" "200"
+    # Internal endpoints: ping answers, a broken envelope is 400.
+    request "$MESH_BASE" GET /_mesh/internal/ping
+    assert_eq "/_mesh/internal/ping answers" "$STATUS" "200"
     assert_json "internal ping node name" '.node' "lr-contract"
     assert_json "internal ping protocol" '.protocol' "1"
-    request "$MESH_BASE" POST /_mesh/internal/sync -H "$MESH_AUTH" --data 'zzz'
+    request "$MESH_BASE" POST /_mesh/internal/sync --data 'zzz'
     assert_eq "internal sync with a broken envelope is 400" "$STATUS" "400"
     assert_contains "internal sync 400 wording" "$BODY" "bad mesh envelope"
 
-    # Outbound auth: the router synced (a few times by now) and the peer never
-    # rejected one of its requests as unauthenticated.
+    # Outbound: the router synced (a few times by now) and the peer, which
+    # requires nothing, never had a reason to reject one.
     PEER=$(peer_state)
     assert_matches "the peer was synced with" "$(jq -r '.sync' <<<"$PEER")" "^[1-9]"
     assert_eq "the peer saw no rejected syncs" "$(jq -r '.bad_auth' <<<"$PEER")" "0"
     assert_contains "the peer saw this node alive" "$(jq -r '.seen[]' <<<"$PEER" | tr '\n' ' ')" "lr-contract:alive"
 
     # Shutdown: 202, self flips to leaving, and the broadcast reaches the peer.
-    request "$MESH_BASE" POST /ha/shutdown -H "$MESH_AUTH"
+    request "$MESH_BASE" POST /ha/shutdown
     assert_eq "/ha/shutdown is 202" "$STATUS" "202"
     assert_json "shutdown status field" '.status' "shutdown initiated"
     sleep 1
-    request "$MESH_BASE" GET /ha/status -H "$MESH_AUTH"
+    request "$MESH_BASE" GET /ha/status
     assert_json "self is leaving after shutdown" \
         '[.nodes[] | select(.name == "lr-contract")][0].status' "leaving"
     assert_json "shutdown marked the node draining" '.draining | tostring' "true"
@@ -2270,62 +2268,6 @@ if section cb_race; then
 fi
 
 # ==========================================================================
-if section ui_auth; then
-    # M6: the Rust ui_api_routes group carries route_layer(auth_middleware), so
-    # with SMG_API_KEY set every alias answers a bare 401 (empty body, axum
-    # Err(StatusCode) style) unless the Bearer token matches. logs / stats /
-    # config are separate route groups with no layer: they stay open.
-    start_container lr-uiauth-$SUIT "$BASE_CONF" SMG_API_KEY=sk-ui-test LMR_UI_DIR=/repo/ui
-    UIA_BASE=$BASE
-
-    for path in /_ui/props /_ui/v1/models /_ui/slots /_ui/tools \
-                /_ui/v1/streams/lookup /_ui/v1/stream /_ui/v1/chat/completions/control; do
-        request "$UIA_BASE" GET "$path"
-        assert_eq "$path without a key is 401" "$STATUS" "401"
-        assert_eq "$path 401 carries an empty body" "${#BODY}" "0"
-    done
-    for pair in "/_ui/models/load POST" "/_ui/models/unload POST"; do
-        set -- $pair
-        request "$UIA_BASE" "$2" "$1"
-        assert_eq "$1 without a key is 401" "$STATUS" "401"
-        assert_eq "$1 401 carries an empty body" "${#BODY}" "0"
-    done
-    request "$UIA_BASE" GET /_ui/models/sse
-    assert_eq "/_ui/models/sse without a key is 401" "$STATUS" "401"
-    request "$UIA_BASE" GET /_ui/props -H 'Authorization: Bearer sk-wrong-key'
-    assert_eq "/_ui/props with the wrong key is 401" "$STATUS" "401"
-    request "$UIA_BASE" GET /_ui/props -H 'x-api-key: sk-ui-test'
-    assert_eq "/_ui/props accepts only Bearer (Rust parity)" "$STATUS" "401"
-    request "$UIA_BASE" GET /_ui/props -H 'Authorization: Bearer sk-ui-test'
-    assert_eq "/_ui/props with the key is 200" "$STATUS" "200"
-    request "$UIA_BASE" GET /_ui/v1/models -H 'Authorization: Bearer sk-ui-test'
-    assert_eq "/_ui/v1/models with the key is 200" "$STATUS" "200"
-
-    # chat aliases keep the pipeline's own data-plane auth (OpenAI JSON body)
-    request "$UIA_BASE" POST /_ui/v1/chat/completions -H 'Content-Type: application/json' \
-        --data '{"model":"test-model","messages":[]}'
-    assert_eq "/_ui chat alias without a key is 401" "$STATUS" "401"
-    assert_json "/_ui chat alias 401 has the JSON error document" '.error.code' "unauthorized"
-    # with the key the gate lets it through and the pipeline answers with its
-    # own "no workers" verdict (nothing is registered on this instance)
-    request "$UIA_BASE" POST /_ui/v1/chat/completions -H 'Content-Type: application/json' \
-        -H 'Authorization: Bearer sk-ui-test' \
-        --data '{"model":"test-model","messages":[{"role":"user","content":"keyed"}]}'
-    assert_eq "/_ui chat alias with the key reaches the pipeline" "$STATUS" "503"
-    assert_eq "/_ui chat alias 503 error code" "$(header_of X-SMG-Error-Code)" "no_available_workers"
-
-    # unauthenticated surfaces (Rust ui_logs_routes / ui_config_routes)
-    for path in /_ui/logs /_ui/logs/backends /_ui/stats /_ui/config; do
-        request "$UIA_BASE" GET "$path"
-        assert_eq "$path stays open without a key" "$STATUS" "200"
-    done
-    request "$UIA_BASE" GET /_ui/
-    assert_eq "the static SPA stays open without a key" "$STATUS" "200"
-    # the data plane still authenticates against the same key
-    request "$UIA_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
-        --data '{"model":"test-model","messages":[]}'
-    assert_eq "/v1 without a key is 401" "$STATUS" "401"
-fi
 
 # ==========================================================================
 if section igw; then
@@ -3118,174 +3060,6 @@ if section inflight_age; then
     assert_json "inflight_age: and so does the occupancy gauge" \
         '.slots_rendered | tostring' 'true'
     age_wait
-fi
-
-# ==========================================================================
-if section auth_rbac; then
-    # Control-plane multi-key auth (doc/gap-auth-tls.md): SMG_CONTROL_PLANE_API_KEYS
-    # carries `id:name:role:key` entries and replaces the single-key gate, so a
-    # `user` key authenticates and is then refused with 403 while only `admin`
-    # reaches the control plane. The audit trail is written at info level, hence
-    # the derived conf that drops error_log from notice to info.
-    sed 's/^error_log stderr notice;/error_log stderr info;/' \
-        "$SCRIPT_DIR/conf/nginx-lua-router.conf" >"$TMP_DIR/auth-rbac.conf" \
-        || fail "could not derive the info-level conf"
-    start_container lr-rbac-$SUIT /gen/auth-rbac.conf \
-        SMG_API_KEY=sk-data-ct \
-        SMG_CONTROL_PLANE_API_KEYS='ops:SRE Admin:admin:sk-admin-ct,ro:Readonly:user:sk-user-ct'
-    RBAC_BASE=$BASE
-
-    # ---- admin key on the control plane ----
-    request "$RBAC_BASE" GET /workers -H 'Authorization: Bearer sk-admin-ct'
-    assert_eq "auth_rbac: admin key lists workers" "$STATUS" "200"
-    request "$RBAC_BASE" GET /v1/loads -H 'Authorization: Bearer sk-admin-ct'
-    assert_eq "auth_rbac: admin key reaches /v1/loads" "$STATUS" "200"
-
-    # ---- user key: authenticated, then refused ----
-    request "$RBAC_BASE" GET /workers -H 'Authorization: Bearer sk-user-ct'
-    assert_eq "auth_rbac: user key is refused on /workers" "$STATUS" "403"
-    assert_eq "auth_rbac: 403 error code" "$(header_of X-SMG-Error-Code)" "forbidden"
-    assert_contains "auth_rbac: 403 message" "$BODY" "Admin role required for control plane access"
-    request "$RBAC_BASE" DELETE /workers/nope-ct -H 'Authorization: Bearer sk-user-ct'
-    assert_eq "auth_rbac: user key refused on a worker write" "$STATUS" "403"
-    request "$RBAC_BASE" POST /flush_cache -H 'Authorization: Bearer sk-user-ct'
-    assert_eq "auth_rbac: user key refused on /flush_cache" "$STATUS" "403"
-    request "$RBAC_BASE" GET /_mesh/internal/ping -H 'Authorization: Bearer sk-user-ct'
-    assert_eq "auth_rbac: user key refused on the mesh internal plane" "$STATUS" "403"
-
-    # ---- bad / missing token: 401 with the bearer challenge ----
-    request "$RBAC_BASE" GET /workers -H 'Authorization: Bearer sk-not-a-key'
-    assert_eq "auth_rbac: unknown key is 401" "$STATUS" "401"
-    assert_contains "auth_rbac: 401 carries the bearer challenge" \
-        "$(header_of WWW-Authenticate)" 'realm="control-plane"'
-    request "$RBAC_BASE" GET /workers
-    assert_eq "auth_rbac: anonymous control request is 401" "$STATUS" "401"
-    assert_contains "auth_rbac: anonymous 401 carries the challenge" \
-        "$(header_of WWW-Authenticate)" 'realm="control-plane"'
-
-    # ---- the single data key no longer grants control access ----
-    request "$RBAC_BASE" GET /workers -H 'Authorization: Bearer sk-data-ct'
-    assert_eq "auth_rbac: data key loses control-plane access once multi-key is set" "$STATUS" "401"
-
-    # ---- data plane keeps using SMG_API_KEY only ----
-    request "$RBAC_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
-        -H 'Authorization: Bearer sk-admin-ct' \
-        --data '{"model":"rbac-model","messages":[{"role":"user","content":"hi"}]}'
-    assert_eq "auth_rbac: an admin control key is not a data key" "$STATUS" "401"
-    request "$RBAC_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
-        -H 'Authorization: Bearer sk-data-ct' \
-        --data '{"model":"rbac-model","messages":[{"role":"user","content":"hi"}]}'
-    assert_eq "auth_rbac: the data key still reaches the pipeline" "$STATUS" "503"
-    request "$RBAC_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
-        -H 'x-api-key: sk-data-ct' \
-        --data '{"model":"rbac-model","messages":[{"role":"user","content":"hi"}]}'
-    assert_eq "auth_rbac: x-api-key still works on the data plane" "$STATUS" "503"
-
-    # ---- x-api-key also authenticates the control plane ----
-    request "$RBAC_BASE" GET /workers -H 'x-api-key: sk-user-ct'
-    assert_eq "auth_rbac: x-api-key reaches the role gate (403)" "$STATUS" "403"
-
-    # ---- audit trail ----
-    docker logs lr-rbac-$SUIT >"$TMP_DIR/rbac-logs.txt" 2>&1
-    assert_contains "audit: allow line names the admin key id" "$(cat "$TMP_DIR/rbac-logs.txt")" "outcome=allow principal=ops name=SRE Admin"
-    assert_contains "audit: deny line for the user role" "$(cat "$TMP_DIR/rbac-logs.txt")" "outcome=deny principal=ro"
-    assert_contains "audit: unauthenticated deny line" "$(cat "$TMP_DIR/rbac-logs.txt")" "outcome=deny principal=unauthenticated"
-    assert_contains "audit: carries method and path" "$(cat "$TMP_DIR/rbac-logs.txt")" "method=GET path=/workers"
-    assert_not_contains "audit: the admin key value never reaches the log" "$(cat "$TMP_DIR/rbac-logs.txt")" "sk-admin-ct"
-    assert_not_contains "audit: the user key value never reaches the log" "$(cat "$TMP_DIR/rbac-logs.txt")" "sk-user-ct"
-    assert_not_contains "audit: the data key value never reaches the log" "$(cat "$TMP_DIR/rbac-logs.txt")" "sk-data-ct"
-
-    # ---- a worker id shows up in the audit line ----
-    request "$RBAC_BASE" GET /workers/wid-audit-ct -H 'Authorization: Bearer sk-admin-ct'
-    docker logs lr-rbac-$SUIT >"$TMP_DIR/rbac-logs2.txt" 2>&1
-    assert_contains "audit: worker id extracted from the path" "$(cat "$TMP_DIR/rbac-logs2.txt")" "worker_id=wid-audit-ct"
-
-    # ---- SMG_DISABLE_AUDIT_LOGGING turns the trail off ----
-    sed 's/^error_log stderr notice;/error_log stderr info;/' \
-        "$SCRIPT_DIR/conf/nginx-lua-router.conf" >"$TMP_DIR/auth-noaudit.conf"
-    start_container lr-noaudit-$SUIT /gen/auth-noaudit.conf \
-        SMG_API_KEY=sk-data-ct \
-        SMG_DISABLE_AUDIT_LOGGING=1 \
-        SMG_CONTROL_PLANE_API_KEYS='ops:SRE Admin:admin:sk-admin-ct'
-    request "$BASE" GET /workers -H 'Authorization: Bearer sk-admin-ct'
-    assert_eq "audit off: the admin key still works" "$STATUS" "200"
-    docker logs lr-noaudit-$SUIT >"$TMP_DIR/noaudit-logs.txt" 2>&1
-    assert_not_contains "audit off: no audit lines" "$(cat "$TMP_DIR/noaudit-logs.txt")" "luarouter audit:"
-
-    # ---- malformed entries are skipped, a good entry in the same string wins ----
-    start_container lr-mal-$SUIT "$BASE_CONF" \
-        SMG_CONTROL_PLANE_API_KEYS='broken-entry,weird:Role:nope:key1,noid:Anon:ADMIN:sk-admin-ct'
-    request "$BASE" GET /workers -H 'Authorization: Bearer sk-admin-ct'
-    assert_eq "multi-key: malformed entries are skipped and the role is case-insensitive" "$STATUS" "200"
-    request "$BASE" GET /workers -H 'Authorization: Bearer nope'
-    assert_eq "multi-key: a key from a malformed entry is not accepted" "$STATUS" "401"
-
-    # ---- a key containing colons survives the split-on-first-three ----
-    start_container lr-colon-$SUIT "$BASE_CONF" \
-        SMG_CONTROL_PLANE_API_KEYS='deep:Deep Admin:admin:sk:a:key:with:colons'
-    request "$BASE" GET /workers -H 'Authorization: Bearer sk:a:key:with:colons'
-    assert_eq "multi-key: colons inside the key are preserved" "$STATUS" "200"
-
-    # ---- without the multi-key list the old single-key gate is unchanged ----
-    start_container lr-plain-$SUIT "$BASE_CONF" SMG_API_KEY=sk-only-ct
-    request "$BASE" GET /workers -H 'Authorization: Bearer sk-only-ct'
-    assert_eq "single key still grants the control plane when no list is set" "$STATUS" "200"
-    request "$BASE" GET /workers -H 'Authorization: Bearer wrong'
-    assert_eq "single-key 401 wording survives" "$(jq -r '.error.message' "$TMP_DIR/body")" "invalid control plane key"
-    assert_eq "single-key 401 has no role gate" "$STATUS" "401"
-fi
-
-# ==========================================================================
-if section jwt_gate; then
-    # Control-plane JWT (doc/gap-dp-jwt.md). The contract suite cannot verify a
-    # signature -- that needs a JWKS server and real keys, which e2e_jwt.py owns --
-    # so these checks pin the two things only a contract run can see: that the
-    # SMG_JWT_* names actually reach a worker (nginx rebuilds the worker
-    # environment, so an `env` directive missing from test/conf would make the
-    # whole gate silently inert, and `openresty -t` cannot detect that), and that a
-    # configured-but-unusable JWT plane leaves the pre-JWT key contract untouched.
-    # {"alg":"RS256","kid":"k1","typ":"JWT"} . {} . signature
-    JWT_WELLFORMED='eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.e30.AAAA'
-    start_container lr-jwt-ct-$SUIT "$BASE_CONF" \
-        SMG_CONTROL_PLANE_API_KEYS='ops:SRE:admin:sk-jwt-ct' \
-        SMG_JWT_ISSUER=https://idp.internal.example \
-        SMG_JWT_AUDIENCE=smg-control-plane \
-        SMG_JWT_JWKS_URI=http://127.0.0.1:1/jwks.json
-    request "$BASE" GET /workers -H 'Authorization: Bearer not-a-jwt'
-    assert_eq "jwt_gate: a non-JWS bearer still authenticates as a key" "$STATUS" "401"
-    request "$BASE" GET /workers -H 'Authorization: Bearer sk-jwt-ct'
-    assert_eq "jwt_gate: the admin key works with the JWT gate configured" "$STATUS" "200"
-    # A structurally valid JWS against an unreachable JWKS endpoint: the gate cannot
-    # decide, so it steps aside and the key list answers -- the refusal names the key
-    # path, not JWT. (e2e_jwt.py covers the full key material; this only pins the
-    # fall-through rule and the env plumbing.)
-    request "$BASE" GET /workers -H "Authorization: Bearer $JWT_WELLFORMED"
-    assert_eq "jwt_gate: an unreachable JWKS falls back to the key list" "$STATUS" "401"
-    assert_eq "jwt_gate: the refusal comes from the key matcher" \
-        "$(jq -r '.error.message' "$TMP_DIR/body")" "invalid control plane key"
-    # A three-part value whose header segment is not JSON is a *definitive* JWT
-    # failure, which Rust answers 401 without consulting the keys at all.
-    request "$BASE" GET /workers -H 'Authorization: Bearer aaa.bbb.ccc'
-    assert_eq "jwt_gate: a malformed JWS header is refused by the JWT path" "$STATUS" "401"
-    assert_eq "jwt_gate: the refusal names JWT" \
-        "$(jq -r '.error.message' "$TMP_DIR/body")" "invalid JWT: invalid JWS header"
-    docker logs lr-jwt-ct-$SUIT >"$TMP_DIR/jwt-gate-logs.txt" 2>&1
-    assert_contains "jwt_gate: the fallback is logged with its reason" \
-        "$(cat "$TMP_DIR/jwt-gate-logs.txt")" "control-plane JWT unavailable"
-    assert_not_contains "jwt_gate: the bearer value never reaches the log" \
-        "$(cat "$TMP_DIR/jwt-gate-logs.txt")" "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0"
-
-    # Without the URI the gate is off entirely, which is the pre-JWT contract.
-    start_container lr-jwtoff-ct-$SUIT "$BASE_CONF" \
-        SMG_CONTROL_PLANE_API_KEYS='ops:SRE:admin:sk-jwt-ct' \
-        SMG_JWT_ISSUER=https://idp.internal.example
-    request "$BASE" GET /workers -H 'Authorization: Bearer aaa.bbb.ccc'
-    assert_eq "jwt_gate: a JWS is refused when no JWKS URI is set" "$STATUS" "401"
-    request "$BASE" GET /workers -H 'Authorization: Bearer sk-jwt-ct'
-    assert_eq "jwt_gate: keys are unaffected with the gate off" "$STATUS" "200"
-    docker logs lr-jwtoff-ct-$SUIT >"$TMP_DIR/jwt-off-logs.txt" 2>&1
-    assert_not_contains "jwt_gate: the disabled gate logs nothing" \
-        "$(cat "$TMP_DIR/jwt-off-logs.txt")" "control-plane JWT"
 fi
 
 # ==========================================================================

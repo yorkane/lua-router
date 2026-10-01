@@ -44,9 +44,6 @@ local registry = require "resty.luarouter.registry"
 -- the tokenize/parse proxies went with it (doc/scope-trim.md): /v1/responses
 -- stays as a pure inference route and that proxy family is not routed.
 local mesh_mod = require "resty.luarouter.mesh"
--- Control-plane JWT verifier (doc/gap-dp-jwt.md). Load-safe without ngx, so the
--- init_by_lua syntax gate can require it; it never reaches back into this file.
-local jwt = require "resty.luarouter.jwks"
 -- service_discovery carries the data-parallel rank injection helper. Loaded
 -- lazily (same shape as registry's sd()) so the module stays optional for the
 -- init_by_lua syntax gate and a broken discovery file can never take the
@@ -348,256 +345,6 @@ local function begin_trace()
 end
 
 _M.begin_trace = begin_trace
-
--- ------------------------------------------------------------------ auth
-
----Constant-time compare: a wrong key of the right length costs the same.
-local function constant_eq(a, b)
-    if #a ~= #b then
-        return false
-    end
-    local diff = 0
-    for i = 1, #a do
-        diff = bit.bor(diff, bit.bxor(string.byte(a, i), string.byte(b, i)))
-    end
-    return diff == 0
-end
-
-local function bearer_token()
-    local auth = ngx.req.get_headers()["authorization"]
-    if type(auth) ~= "string" then
-        return nil
-    end
-    return string.match(auth, "^[Bb][Ee][Aa][Rr][Ee][Rr]%s+(.*)$")
-end
-
-local function check_key(expected)
-    if not expected then
-        return true
-    end
-    local token = bearer_token()
-    if token and constant_eq(token, expected) then
-        return true
-    end
-    local header_key = ngx.req.get_headers()["x-api-key"]
-    if type(header_key) == "string" and constant_eq(header_key, expected) then
-        return true
-    end
-    return false
-end
-
-local function check_data_auth()
-    if check_key(cfg().api_key) then
-        return true
-    end
-    send_error(401, "unauthorized", "invalid api key")
-    return false
-end
-
----Truthy spellings for an env switch; unset or any other value is false.
-local function env_truthy(name)
-    local ok, value = pcall(os.getenv, name)
-    if not ok or type(value) ~= "string" then
-        return false
-    end
-    value = string.lower(value)
-    return value == "1" or value == "true" or value == "yes" or value == "on"
-end
-
-local function warn(msg)
-    if ngx and ngx.log then
-        pcall(ngx.log, ngx.WARN or 6, msg)
-    end
-end
-
----Parse SMG_CONTROL_PLANE_API_KEYS, the `id:name:role:key` list that mirrors
----gateway's parse_control_plane_api_key (splitn(4, ':')). Entries are separated
----by comma or semicolon and each value is split on its first three colons, so
----the key itself may contain colons. Roles are case-insensitive admin|user; a
----malformed entry is skipped with a warning rather than aborting the boot, which
----keeps one bad token in an env string from taking the whole router down.
-local function parse_control_plane_keys(raw)
-    local list = {}
-    if type(raw) ~= "string" then
-        return list
-    end
-    for field in string.gmatch(raw, "[^,;]+") do
-        field = string.match(field, "^%s*(.-)%s*$")
-        local id, name, role, key = string.match(field, "^([^:]*):([^:]*):([^:]*):(.+)$")
-        role = role and string.lower(role)
-        if id and (role == "admin" or role == "user") and key ~= "" then
-            list[#list + 1] = { id = id, name = name, role = role, key = key }
-        else
-            warn("luarouter: ignoring malformed SMG_CONTROL_PLANE_API_KEYS entry (need id:name:role:key with role admin|user)")
-        end
-    end
-    return list
-end
-
-local cp_keys
----List once per process: the env cannot change under a running worker.
-local function control_plane_keys()
-    if cp_keys == nil then
-        cp_keys = parse_control_plane_keys(os.getenv("SMG_CONTROL_PLANE_API_KEYS"))
-    end
-    return cp_keys
-end
-
-local function audit_enabled()
-    if not env_truthy("SMG_DISABLE_AUDIT_LOGGING") then
-        return true
-    end
-    return false
-end
-
----One audit line per control-plane decision, in the shape smg::audit writes
----(outcome/principal/auth_method/role/method/path plus request_id). The key
----itself is never part of the line.
-local function cp_audit(outcome, principal, reason)
-    if not audit_enabled() then
-        return
-    end
-    if not (ngx and ngx.var and ngx.log) then
-        return
-    end
-    local method = ngx.var.request_method or "-"
-    local path = ngx.var.uri or "-"
-    local line = string.format(
-        "luarouter audit: outcome=%s principal=%s name=%s auth_method=%s role=%s method=%s path=%s",
-        outcome,
-        (principal and principal.id) or "unauthenticated",
-        (principal and principal.name) or "-",
-        principal and (principal.auth_method or "api_key") or "none",
-        (principal and principal.role) or "-",
-        method, path)
-    local worker_id = type(path) == "string" and string.match(path, "^/workers/([^/]+)") or nil
-    if worker_id and worker_id ~= "" then
-        line = line .. " worker_id=" .. worker_id
-    end
-    if reason then
-        line = line .. " reason=" .. reason
-    end
-    local request_id = ngx.ctx and ngx.ctx.lr_request_id
-    if request_id then
-        line = line .. " request_id=" .. tostring(request_id)
-    end
-    pcall(ngx.log, ngx.INFO or 8, line)
-end
-
----Token for the control plane: Authorization: Bearer, with x-api-key accepted as
----the repo already does for the single-key path.
-local function control_token()
-    local token = bearer_token()
-    if type(token) == "string" and token ~= "" then
-        return token
-    end
-    local header_key = ngx.req.get_headers()["x-api-key"]
-    if type(header_key) == "string" and header_key ~= "" then
-        return header_key
-    end
-    return nil
-end
-
----JWT branch of the control-plane gate, tried before the key list the same way
----smg-auth's middleware does. Return value says what the caller should do:
----  "allow" -- an admin JWT principal was recorded, proceed with the request
----  "deny"  -- the answer (401 or 403) has already been sent
----  "skip"  -- the JWT plane cannot decide this credential, so keep matching the
----             API keys exactly as before
----
----"skip" is what keeps an operator who only half-configured JWT from locking
----themselves out, and it is the case the task calls "JWT 不可用": no JWKS endpoint,
----the endpoint unreachable, or a bearer value that is not a JWS at all (an API key
----that reached the JWT branch by accident). A real JWS whose signature or claims do
----not check out is NOT skipped -- Rust answers 401 there, and falling through would
----let a forged token be waved through by a shared key.
----@return string verdict
-local function jwt_control_gate()
-    if not jwt.enabled() then
-        return "skip"
-    end
-    -- Only Authorization: Bearer, which is all Rust's middleware reads.
-    local token = bearer_token()
-    if type(token) ~= "string" or token == "" then
-        return "skip"
-    end
-
-    local principal, err, unavailable = jwt.authenticate(token)
-    if principal then
-        if ngx.ctx then
-            ngx.ctx.lr_cp_principal = principal
-        end
-        if principal.role ~= "admin" then
-            cp_audit("deny", principal, "admin_role_required")
-            send_error(403, "forbidden", "Admin role required for control plane access")
-            return "deny"
-        end
-        cp_audit("allow", principal)
-        return "allow"
-    end
-    if unavailable then
-        warn("luarouter: control-plane JWT unavailable (" .. tostring(err)
-            .. "); falling back to the API key list")
-        return "skip"
-    end
-    -- The token is never logged, only the reason it failed.
-    cp_audit("deny", nil, "invalid_jwt")
-    ngx.header["WWW-Authenticate"] = 'Bearer realm="control-plane"'
-    send_error(401, "unauthorized", "invalid JWT: " .. tostring(err))
-    return "deny"
-end
-
----Control plane gate. With SMG_CONTROL_PLANE_API_KEYS present the control plane
----accepts only those keys -- the same precedence as the Rust control-plane
----middleware, which replaces the simple-key authenticator -- and an `admin`
----entry passes while a `user` entry authenticates and is then refused with 403.
----Without them the previous fallback (dedicated control key, else data key) is
----used unchanged. Every comparison runs against every entry so a hit costs the
----same as a miss.
-local function check_control_auth()
-    local verdict = jwt_control_gate()
-    if verdict == "allow" then
-        return true
-    end
-    if verdict == "deny" then
-        return false
-    end
-
-    local keys = control_plane_keys()
-    if #keys == 0 then
-        if check_key(cfg().control_plane_api_key or cfg().api_key) then
-            return true
-        end
-        send_error(401, "unauthorized", "invalid control plane key")
-        return false
-    end
-
-    local token = control_token()
-    local matched
-    for i = 1, #keys do
-        if not matched and token and constant_eq(token, keys[i].key) then
-            matched = keys[i]
-        end
-    end
-    if not matched then
-        cp_audit("deny", nil, "invalid_control_plane_key")
-        ngx.header["WWW-Authenticate"] = 'Bearer realm="control-plane"'
-        send_error(401, "unauthorized", "invalid control plane key")
-        return false
-    end
-
-    local principal = { id = matched.id, name = matched.name, role = matched.role }
-    if ngx.ctx then
-        ngx.ctx.lr_cp_principal = principal
-    end
-    if matched.role ~= "admin" then
-        cp_audit("deny", principal, "admin_role_required")
-        send_error(403, "forbidden", "Admin role required for control plane access")
-        return false
-    end
-    cp_audit("allow", principal)
-    return true
-end
 
 -- ------------------------------------------------------------------ text extract
 
@@ -2169,13 +1916,8 @@ end
 
 ---Shared handler for every inference route.
 local function inference_handler(params)
-    if not check_data_auth() then
-        return ""
-    end
-    -- Rust orders the inference route layers so auth runs before the limiter
-    -- (server.rs:1313-1322: concurrency, then auth, then wasm, so the last
-    -- declared layer is outermost). An unauthenticated request is therefore
-    -- never charged against the concurrency budget.
+    -- The gateway authenticates nothing (doc/scope-trim.md): the whole surface
+    -- is open and the concurrency gate is the first thing a request meets.
     if not limit().acquire() then
         -- Empty body, like StatusCode::TOO_MANY_REQUESTS.into_response(); the
         -- rejection counter is bumped inside limit.acquire().
@@ -2223,11 +1965,6 @@ local function ui_pipeline(route, body, raw_body)
     local path = ngx.var.uri or route
     observability.record_http_request(method, path)
     begin_trace()
-
-    if not check_data_auth() then
-        finish_request(started, method, path)
-        return ""
-    end
 
     -- Forward the caller's bytes whenever they exist. Re-encoding the decoded
     -- table is the last resort only: cjson cannot tell [] from {}, so a UI body
@@ -2836,9 +2573,6 @@ end
 
 ---POST /workers - queue a registration and answer 202 with a Location header.
 local function create_worker_handler(params, ctx, req)
-    if not check_control_auth() then
-        return ""
-    end
     local body, err = req.get_body(ctx)
     if type(body) ~= "table" then
         return send_error(400, "invalid_json",
@@ -2873,9 +2607,6 @@ local function create_worker_handler(params, ctx, req)
 end
 
 local function list_workers_handler()
-    if not check_control_auth() then
-        return ""
-    end
     local workers = registry.list()
     local count = #workers
     if count == 0 then
@@ -2891,9 +2622,6 @@ local function list_workers_handler()
 end
 
 local function get_worker_handler(params)
-    if not check_control_auth() then
-        return ""
-    end
     local worker_id = param_text(params, "worker_id")
     local info, err = registry.get(worker_id)
     if not info then
@@ -2908,9 +2636,6 @@ local function get_worker_handler(params)
 end
 
 local function delete_worker_handler(params)
-    if not check_control_auth() then
-        return ""
-    end
     local worker_id = param_text(params, "worker_id")
     local result, err = registry.remove(worker_id)
     if not result then
@@ -2971,9 +2696,6 @@ end
 ---UpdateWorkerResult::into_response at :138-146) replies with exactly
 ---{status,worker_id,message}: unlike POST there is no url key and no Location.
 local function update_worker_handler(params, ctx, req)
-    if not check_control_auth() then
-        return ""
-    end
     local worker_id = param_text(params, "worker_id")
     local body = object_body(ctx, req)
     if not body then
@@ -3002,9 +2724,6 @@ end
 
 ---POST /flush_cache - best-effort fan-out to each worker's own /flush_cache.
 local function flush_cache_handler()
-    if not check_control_auth() then
-        return ""
-    end
     local records = registry.records()
     local results = {}
     local all_failed = #records > 0
@@ -3041,9 +2760,6 @@ end
 ---@param _params table|nil
 ---@return table|nil doc @ the response body
 local function loads_handler()
-    if not check_control_auth() then
-        return ""
-    end
     local records = registry.records()
     local workers = {}
     local successful, failed = 0, 0
@@ -3112,30 +2828,6 @@ local function ui_stats_handler()
     return observability.stats()
 end
 
----Gate for the mesh surface. /ha/* follows the Rust placement: control-plane key
----(which falls back to the data key), and open when no key is configured at all.
----/_mesh/internal/* has no Rust equivalent on the business port (Rust keeps it on
----a dedicated mesh port), so it gets the strictest fence we can do here: with a
----key configured it requires the control key; without one only a loopback peer is
----served, because an anonymous POST /_mesh/internal/apply would otherwise let
----anyone inject forged cluster state (doc/gap-mesh.md §6.1).
-local function mesh_control_auth(internal)
-    if #control_plane_keys() == 0
-        and not cfg().control_plane_api_key and not cfg().api_key then
-        if not internal then
-            return true
-        end
-        local addr = ngx.var.remote_addr
-        if addr == "127.0.0.1" or addr == "::1" then
-            return true
-        end
-        send_error(403, "forbidden",
-            "mesh internal endpoints require loopback or a control-plane key")
-        return false
-    end
-    return check_control_auth()
-end
-
 ---Mirror one worker into the cluster view (doc/gap-mesh.md 4.2). Only the local
 ---worker's own control-plane events are mirrored here, so a peer sees the same
 ---worker set the registry has; health/load freshness is whatever the sweep saw last.
@@ -3164,9 +2856,6 @@ end
 
 local function mesh_disabled_handler(params)
     local path = ngx.var.uri or "/"
-    if not mesh_control_auth(path:sub(1, 16) == "/_mesh/internal/") then
-        return ""
-    end
     local inst = mesh_mod.instance()
     if not inst then
         return text_response(503, '{"error":"mesh not enabled"}',
@@ -3442,7 +3131,7 @@ _M.handle = function()
     -- on every response, including the ones this router answers itself (health,
     -- models, error bodies). Proxied responses re-apply the same cached value.
     ngx.header["X-Request-Id"] = request_id()
-    -- The CorsLayer sits outside the auth route_layer in Rust, so a preflight
+    -- The CorsLayer sits outside the (now removed) auth route_layer in Rust, so a preflight
     -- never carries credentials far enough to be rejected: short-circuit first.
     cors_apply()
     if method == "OPTIONS" then
@@ -3473,12 +3162,6 @@ _M.forward = forward
 _M.stream_response = stream_response
 _M.request_id = request_id
 _M.generate_request_id = generate_request_id
-_M.check_data_auth = check_data_auth
-_M.check_control_auth = check_control_auth
-_M.parse_control_plane_keys = parse_control_plane_keys
-_M.control_principal = function()
-    return ngx.ctx and ngx.ctx.lr_cp_principal
-end
 _M.send_error = send_error
 _M.error_body = error_body
 _M.log_inference_request = log_inference_request
@@ -3488,7 +3171,6 @@ _M.metrics_handler = metrics_handler
 _M.cors_apply = cors_apply
 _M.cors_preflight = cors_preflight
 _M.mesh_disabled_handler = mesh_disabled_handler
-_M.mesh_control_auth = mesh_control_auth
 _M.mesh_observe_worker = mesh_observe_worker
 _M.mesh_forget_worker = mesh_forget_worker
 _M.ui_logs_handler = ui_logs_handler

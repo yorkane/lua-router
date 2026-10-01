@@ -1,7 +1,8 @@
 -- /_ui API aliases for the llama.cpp webui (lua-router).
 --
 -- Mirrors gateway/src/server.rs ui_api_routes(): the chat/completions aliases
--- reuse the shared routing pipeline (auth/body-limit/metrics live in core),
+-- reuse the shared routing pipeline (body-limit/metrics live in core; the
+-- auth layer was removed with the whole gateway auth surface, doc/scope-trim.md),
 -- the picker endpoints answer fixed responses, and everything else forwards
 -- to the sibling modules (props.lua, config_store.lua, observability.lua).
 --
@@ -25,64 +26,6 @@ local store_ok, store = pcall(require, "resty.luarouter.config_store")
 
 local JSON_NULL = cjson.null
 local EMPTY_ARRAY = setmetatable({}, cjson.empty_array_mt)
-
--- -------------------------------------------------------------- API key gate
-
---- Constant-time compare, same shape as the one in router.lua (kept local
---- because router.lua does not export it and a wrong key of the right length
---- should not be cheaper than a wrong key of the wrong length).
-local function constant_eq(a, b)
-    if #a ~= #b then
-        return false
-    end
-    local diff = 0
-    for i = 1, #a do
-        diff = bit.bor(diff, bit.bxor(string.byte(a, i), string.byte(b, i)))
-    end
-    return diff == 0
-end
-
---- Data-plane API-key gate for the /_ui API aliases.
----
---- Parity: gateway/src/server.rs registers the ui_api_routes group with
---- `route_layer(auth_middleware)`, so the key check runs before any handler.
---- middleware::auth_middleware only answers when SMG_API_KEY is set, and a
---- failure is a bare 401 with an empty body (axum turns Err(StatusCode) into a
---- status-only response) - no JSON error document. Only the `Bearer ` prefix is
---- recognised, case-sensitively, and x-api-key is NOT accepted here: that
---- header belongs to the OpenAI-style plane, not to the ui group.
----
---- Deliberately left open, exactly like Rust: /_ui/logs*, /_ui/stats and
---- /_ui/config* are separate route groups without the layer (the webui runs on
---- a trusted LAN), and the static SPA is served by ServeDir.
----
---- The /_ui chat/completions aliases keep going through the shared pipeline,
---- which runs the data-plane auth itself (with the OpenAI JSON error body, the
---- same answer /v1 gives).
-function _M.api_auth()
-    local ok, luarouter = pcall(require, "resty.luarouter")
-    if not ok then
-        return
-    end
-    local conf = luarouter.config()
-    local expected = conf and conf.api_key
-    if not expected or expected == "" then
-        return
-    end
-    local auth = ngx.req.get_headers()["authorization"]
-    if type(auth) == "string" and auth:sub(1, 7) == "Bearer "
-        and constant_eq(auth:sub(8), expected) then
-        return
-    end
-    -- Status-only answer. Without an explicit empty Content-Length, nginx
-    -- replaces the exit with its own HTML error page (185 bytes), which Rust's
-    -- Err(StatusCode) never sends.
-    ngx.status = ngx.HTTP_UNAUTHORIZED
-    ngx.header.content_type = nil
-    ngx.header.content_length = 0
-    ngx.send_headers()
-    return ngx.exit(ngx.HTTP_UNAUTHORIZED)
-end
 
 -- ---------------------------------------------------------------- responses
 

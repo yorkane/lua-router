@@ -131,8 +131,11 @@ function _M.load()
         -- (auto, or 1 for cache_aware); nginx.conf.template owns that rule, so
         -- this stays the informational value /probe/config reports.
         worker_processes = num("NGINX_WORKER_PROCESSES", 2),
-        api_key = str("SMG_API_KEY"),
-        control_plane_api_key = str("SMG_CONTROL_PLANE_API_KEY"),
+        -- The gateway's own API keys (SMG_API_KEY / SMG_CONTROL_PLANE_API_KEY /
+        -- the JWT plane) were removed with the auth layer (doc/scope-trim.md):
+        -- every endpoint is open and the trust boundary is the edge. A worker's
+        -- api_key field stays -- that is the credential this router presents to
+        -- an upstream, not a gate in front of itself.
 
         -- ==================== workers ====================
         worker_urls = list("SMG_WORKER_URLS"),
