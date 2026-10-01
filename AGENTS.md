@@ -30,7 +30,14 @@
    `authz`、`searxng-*`、`qdrant-faces`、`face-*`、`va-*`、`pg18-video`、`n8nc`、`resdown-*`、
    `wx-liushi-monitor` 及一切名字不带 lr- 的容器不许碰。已退役的 `llm-watcher`（Exited）不要重启。
 4. **设计红线**：推理体字节透传（顶层精确改写，不整表重编码）；流式不缓冲；跨请求状态只走 shdict；
-   新开关缺省零行为变化；探测失败绝不摘 worker。详见 doc/agent-handover.md §4。
+   新开关缺省零行为变化；**探针失败按分档定性，后果不同**——转发路径上的探测（hb 健康巡检、gpu_load 抓
+   `/metrics` 与远程 Prom）失败只损失精度，绝不摘 worker；watcher 严格探针按用户裁定（2026-10-01）分档
+   摘除：确定性否定（对方答了 HTTP 却读不出 `/v1/models` 的 `data[].id`、命中 router 自指纹、超
+   `max_models`）当轮立即摘并跳过 remove-grace/keep-last；传输层未知（连不上／超时／无应答）累计到
+   `SMG_WATCHER_PROBE_FAILURES`（缺省 2）才摘；`no probe transport` 与 `require_health` 未通过属
+   「不触发摘除」档，既不摘也不计数；两档摘除同受单轮摘除保险丝（`SMG_WATCHER_PROBE_FUSE`）约束。
+   完整口径见 doc/agent-handover.md §4 与 doc/gap-watcher-merge.md §1.1。**不得把这行红线写回成
+   「凡探测失败都不摘 worker」的一刀切表述**（那是第 10 条守卫之前的旧文案，照它改就会把守卫连根拔掉）。
 5. **信任边界**：网关层零鉴权（已按用户裁定删除），本服务只许部署在 authz 边缘之后或可信内网。
 6. **TODO 不实现**：wasm、MCP（doc/todo-deferred.md）；已删平面（gRPC/PD、history、tokenizer/parse、
    auth、K8s discovery、OTel）恢复只能 git revert 对应 commit，不要在 main 上重写。

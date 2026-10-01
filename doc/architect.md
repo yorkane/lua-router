@@ -2,7 +2,7 @@
 
 > 本文是架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略子系统、周边集成、
 > 部署形态与测试框架。计数对应 2026-10-01 当前 main 树：15 个 Lua 模块 + policies/ 6 文件 /
-> 22 057 行、单测 9 文件、契约 650 项 / 23 段、20 门禁全绿（日志
+> 22 319 行、单测 9 文件、契约 650 项 / 23 段、20 门禁全绿（日志
 > `/data/tmp/lr-gates/gates-20261001-145420.log`）。裁剪判定与执行记录见
 > [scope-trim.md](scope-trim.md)；已删平面的描述在 git 历史，本文只描述现状。
 
@@ -11,7 +11,7 @@
 lua-router 是 Rust 网关 smg（源码在上游 llm-router 仓库的 gateway/）的 **OpenResty/Lua 等价重写**：
 一个面向 LLM 推理后端的路由网关，负责多 worker 选路、流式透传、健康检查、熔断、并发限流、
 观测与控制面。它跑在 authz 同源镜像（OpenResty 1.31 + LuaJIT）上，不依赖任何原生扩展。
-对外行为以 Rust 版为契约基准做行为对拍（当前 23 段 644 项，裁剪前 841 项）。
+对外行为以 Rust 版为契约基准做行为对拍（当前 23 段 650 项，裁剪前 841 项）。
 
 ```mermaid
 flowchart LR
@@ -121,7 +121,7 @@ sequenceDiagram
 | config_store.lua | 2509 | 热配置：别名/profile/upstreams/effort/ctx/policy（`LMR_CONFIG_FILE` 原子落盘 + shdict 快照） | router/init |
 | registry.lua | 2042 | worker 注册表（shdict 持久）、健康状态、`/model_info` 元数据发现、DP 展开 url@rank、负载字段折叠 | router/hb/mesh/watcher |
 | mesh.lua | 2525 | HA gossip：成员表、快照同步、/ha/* 端点、身份统一（sync_with 并键）、suspect/down 状态机 | init 定时器 |
-| watcher.lua | 2120 | 进程内服务发现：targets/docker.sock/proc 三源、严格 /v1/models 探针、九条守卫、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
+| watcher.lua | ~2.2k（描述性，非计数口径） | 进程内服务发现：targets/docker.sock/proc 三源、严格 /v1/models 探针、十条守卫（1-9 移植自 Python 守护进程，第 10 条=探针确认不可用即按分档摘除，见 gap-watcher-merge.md §1.1）、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
 | observability.lua | 1407 | Prometheus 家族渲染（HELP/TYPE 对齐 Rust）、请求日志环形缓冲、inflight 年龄槽表 | router/metrics handler |
 | gpu_load.lua | 1102 | GPU 负载源：worker /metrics 抓取 + 远程 Prometheus 查询，写 registry 负载字段 | hb 定时器挂载 |
 | hash.lua | 964 | BLAKE3 环位（与 Rust 逐位兼容）、ketama 序、粘滞键 | consistent_hashing/prefix_hash |
@@ -192,8 +192,8 @@ per-model policy hint：worker 注册元数据可携带策略提示（`metadata.
 
 | 系统 | 方向 | 机制与注意 |
 |---|---|---|
-| 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | worker 0 三源发现（targets/dockersock/proc）、严格探针、九条守卫、宽限期；独立容器已退役。测试 mock 仍会短暂入池，根治需端口黑白名单（见 [gap-watcher-merge.md](gap-watcher-merge.md)） |
-| GPU 负载源 | worker/监控 → registry | `gpu_load.lua` 两路：抓 worker `/metrics` 的 DCGM 类指标 + 远程 Prometheus 查询；keep-last/grace，探测失败只损失精度不摘 worker（见 [gap-gpu-load.md](gap-gpu-load.md)） |
+| 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | worker 0 三源发现（targets/dockersock/proc）、严格 `/v1/models` 探针、十条守卫、宽限期；独立容器已退役。探针确认不可用按分档摘除：确定性否定当轮摘、传输层未知攒 `SMG_WATCHER_PROBE_FAILURES`(2) 轮再摘、单轮摘除超 owned 一半降级为只 warn。测试 mock 仍会短暂入池，根治需端口黑白名单（见 [gap-watcher-merge.md](gap-watcher-merge.md)） |
+| GPU 负载源 | worker/监控 → registry | `gpu_load.lua` 两路：抓 worker `/metrics` 的 DCGM 类指标 + 远程 Prometheus 查询；keep-last/grace。这类**转发路径上的**探测失败只损失选路精度、不参与摘除判定（摘除分档只属于上一行的 watcher 严格探针，见 agent-handover.md §4），详见 [gap-gpu-load.md](gap-gpu-load.md) |
 | mesh peer | router↔router | `SMG_MESH_PEERS` 种子 + gossip 同步 worker 视图；身份统一由 sync_with 并键（幻影键已修，mesh_two 门钉住）；`/_mesh/internal/*` 无鉴权，只能开在可信网络 |
 | authz 边缘 | client→router | 生产经隧道域名时 authz 闸门加会话登录或 x-api-key；网关自身零鉴权，全部端点开放 |
 

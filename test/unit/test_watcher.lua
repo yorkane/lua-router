@@ -1,5 +1,7 @@
 #!/usr/bin/env luajit
--- watcher.lua 单测：探针分类、候选发现、ledger、reconcile 九条守卫。
+-- watcher.lua 单测：探针分类、候选发现、ledger、reconcile 九条守卫，以及第 10 条
+-- 「确认不可用即摘除」的分档（确定性否定当轮摘／传输层未知攒连续失败／与对方无关的
+-- 理由不判定）、滞回阈值与单轮保险丝。
 --
 -- 与 test_mesh.lua 同形状：先把 _G.ngx 摘掉再 require，watcher 在加载时记录
 -- 「没有 ngx」，于是所有语义走注入的 fetch / reader / store / register 分支，
@@ -603,6 +605,9 @@ local function harness(overrides)
         registered = {},
         unregistered = {},
         probed = {},
+        -- 按 URL 指定「探针这一轮给出的失败理由」（classify 的第二返回值）。
+        -- 分档测试全靠它：不写 reason 的老夹具等于「传输层未知」，要两轮才摘。
+        probe_reason = {},
     }
     env.cfg = {
         enabled = true,
@@ -634,7 +639,7 @@ local function harness(overrides)
         probe = function(url)
             local entry = env.probed[url]
             if entry == nil then
-                return nil
+                return nil, env.probe_reason[url]
             end
             return {
                 url = url, models = entry.models or { "m" },
@@ -661,7 +666,7 @@ local function harness(overrides)
             end
             env.unregistered[#env.unregistered + 1] = worker_id
             if url and env.actual then
-                env.actual[url] = nil
+                env.state.actual[url] = nil
             end
             return true
         end,
@@ -721,7 +726,7 @@ do
     eq(#env.registered, 0, "protected URLs stay out of the desired set")
 
     -- and a protected URL that disappears is not deleted either
-    env.actual["http://seed:8000"] = nil
+    env.state.actual["http://seed:8000"] = nil
     env.now = env.now + 100000
     env.state.now = env.now
     env.probed["http://seed:8000"] = nil
@@ -756,10 +761,14 @@ do
     -- it is now owned, not protected: the first-contact snapshot skipped it
     eq(env.ledger.is_protected("http://new:8000"), false, "owned is not protected")
 
-    -- undiscovered: grace has not elapsed -> keep
+    -- Undiscovered (not "probe failed"): the discovery source stops reporting
+    -- the URL, so the probe never runs. That is what guard 5 is about -- a short
+    -- restart must not empty the pool. A URL that is still a candidate but fails
+    -- the probe is a different case (confirmed unavailable, removed at once) and
+    -- lives in the probe-failure case further down.
     env.now = 2000
     env.state.now = env.now
-    env.probed["http://new:8000"] = nil
+    env.state.candidates = {}
     watcher.reconcile(env.state)
     eq(#env.unregistered, 0, "inside remove-grace nothing is deleted")
     eq(env.ledger.get_owned("http://new:8000").missing_since, 2000,
@@ -813,8 +822,12 @@ do
     env.state.actual = models_of(url, "only-model")
     watcher.reconcile(env.state)
 
-    -- it disappears: the first absent pass only stamps missing_since
+    -- It disappears from discovery (not "probe failed" -- a candidate that is
+    -- still reported but unreadable is removed at once, see the probe-failure
+    -- case; keep-last is about a service that stopped being reported at all):
+    -- the first absent pass only stamps missing_since.
     env.probed[url] = nil
+    env.state.candidates = {}
     env.now = 2000
     env.state.now = env.now
     watcher.reconcile(env.state)
@@ -862,7 +875,12 @@ do
     watcher.reconcile(env2.state)
     env2.state.actual = models_of(url, "only-model")
     watcher.reconcile(env2.state)
+    -- 发现源消失（不是探针失败）：清空 candidates，探针压根不会被拨。
+    -- 只置 probed[url] = nil 测的是「仍是候选但读不到 /v1/models」=确认不可用，
+    -- 那条路径不等宽限、也不受 keep-last 保护（见文件末尾的探针失败用例），
+    -- 两个状态必须区分，否则这里测的就不再是守卫 5/6。
     env2.probed[url] = nil
+    env2.state.candidates = {}
     env2.now = 1500
     env2.state.now = env2.now
     watcher.reconcile(env2.state)            -- stamps missing_since = 1500
@@ -881,7 +899,13 @@ do
     env3.probed[url] = { models = { "only-model" } }
     watcher.reconcile(env3.state)
     env3.state.actual = models_of(url, "only-model")
+    -- 认领：pass 1 只把 add 挂成 pending，必须再走一轮才是 owned；
+    -- 且 unregister 靠 id_to_url 才会真删池行（否则「留在池里」是夹具假象）。
+    env3.id_to_url = { ["id-" .. url] = url }
+    watcher.reconcile(env3.state)
     env3.probed[url] = nil
+    -- 同上：这条测的是「发现源消失 + keep-last 永久保护」，必须清空 candidates。
+    env3.state.candidates = {}
     env3.now = 5000
     env3.state.now = env3.now
     watcher.reconcile(env3.state)            -- stamps
@@ -927,7 +951,13 @@ do
     env.probed[url] = { models = { "m" } }
     watcher.reconcile(env.state)
     env.state.actual = models_of(url, "m")
+    env.id_to_url = { ["id-" .. url] = url }
+    watcher.reconcile(env.state)             -- 认领：pending -> owned
     env.probed[url] = nil
+    -- 这条钉的是「发现源消失 + allow_remove=false」：探针没被拨过，走的是
+    -- remove_grace 后只警告不删除的分支。探针失败时的 allow_remove 行为是另一
+    -- 条语义（同样不删、warn 文案不同），在文件末尾单独钉。
+    env.state.candidates = {}
     env.now = 2000
     env.state.now = env.now
     watcher.reconcile(env.state)             -- stamps missing_since
@@ -1164,6 +1194,8 @@ do
     eq(defaults.max_models, 8, "max-models default")
     eq(defaults.keep_last_grace_secs, 1800, "keep-last default")
     eq(defaults.add_confirm_timeout_secs, 180, "add-confirm default")
+    eq(defaults.probe_failures, 2, "the transport-level hysteresis needs a run of two")
+    eq(defaults.probe_fuse, true, "the pass fuse is on by default")
     eq(defaults.docker_socket, "/var/run/docker.sock", "docker socket default")
     eq(#defaults.self_ports, 2, "both own listeners are self ports")
     eq(defaults.self_ports[1], 30000, "main port")
@@ -1177,6 +1209,8 @@ do
             SMG_WATCHER_PROC_SCAN = "false",
             SMG_WATCHER_INTERVAL_SECS = "7",
             SMG_WATCHER_REMOVE_GRACE_SECS = "2",
+            SMG_WATCHER_PROBE_FAILURES = "4",
+            SMG_WATCHER_PROBE_FUSE = "false",
             SMG_WATCHER_MAX_MODELS = "0",
             SMG_WATCHER_ALLOW_PORT = "8000-8001",
             SMG_WATCHER_DENY_PORT = "9100",
@@ -1192,6 +1226,8 @@ do
     eq(overrides.interval_secs, 7, "interval override")
     eq(overrides.remove_grace_secs, 2, "grace override (what the e2e uses)")
     eq(overrides.max_models, 0, "max-models 0 accepted")
+    eq(overrides.probe_failures, 4, "SMG_WATCHER_PROBE_FAILURES override")
+    eq(overrides.probe_fuse, false, "SMG_WATCHER_PROBE_FUSE=false turns the fuse off")
     eq(overrides.allow_ports[8000] and overrides.allow_ports[8001], true,
         "allow-port parsed")
     eq(overrides.deny_ports[9100], true, "deny-port parsed")
@@ -1211,6 +1247,18 @@ do
     eq(clamped.probe_timeout_secs, 1, "probe timeout floored at 1 s")
     eq(clamped.max_models, 0, "negative max-models clamps to 0 (disabled)")
     eq(clamped.remove_grace_secs, 300, "a non-numeric grace keeps the default")
+    -- 滞回阈值在 reconcile 里钳制（floor，且 0/负数 = 显式的"首次即摘"），
+    -- new_config 必须原样保留操作员写的数字，钳到 1 会偷走"立即摘除"这个档位。
+    local explicit = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_PROBE_FAILURES" then return "0" end
+        return nil
+    end, 30000, 0)
+    eq(explicit.probe_failures, 0, "an explicit 0 survives new_config")
+    local garbage = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_PROBE_FAILURES" then return "lots" end
+        return nil
+    end, 30000, 0)
+    eq(garbage.probe_failures, 2, "nonsense falls back to the default, not to 0")
 end
 
 --------------------------------------------------------------------------
@@ -1352,6 +1400,528 @@ do
     eq(merged["api-only"], "x", "the API adds")
     -- and the model_name resolution the pass will use
     eq(watcher.model_name("both", merged, false), "new", "resolution reads the merged map")
+end
+
+--------------------------------------------------------------------------
+-- 24. 探针失败即摘除（2026-10-01 用户裁定：注册必须拿到 /v1/models 的真实
+--     模型信息；周期检查判定不可用的服务不应继续出现在服务池里）
+--
+--     夹具必须区分两条路径，它们的语义完全不同：
+--       * 「确认不可用」：URL 仍在 state.candidates 里，但严格探针读不到
+--         /v1/models 的 data[].id（probed[url] = nil）。网关亲眼看见它答不出
+--         模型列表，必须立刻摘除，不等 remove_grace、也不受 keep-last 保护，
+--         否则池里留一行只会回 5xx 的僵尸。
+--       * 「发现源消失」：URL 从 state.candidates 里没了（进程停了、容器删了），
+--         探针根本没被拨过。这是「看不见」而不是「不健康」，短暂重启不该清空池，
+--         所以仍走 remove_grace / keep-last 宽限。
+--     只把 probed[url] 置 nil 而留着候选，测的是前者；要模拟后者必须同时清空
+--     state.candidates。下面 keep-last 与 allow_remove 的用例走的是后者。
+--------------------------------------------------------------------------
+
+---把 url 放进 reconcile 真正读取的池（state.actual），并补上 id -> url 映射，
+---让 unregister 回调真的删掉那一行；否则「池里没有残留」测的是夹具忘了删，
+---而且下一轮会因为 state.actual[url] 仍在而跳过 add。
+local function serve(env, url, model_id)
+    env.state.actual = models_of(url, model_id)
+    env.state.actual[url].id = "id-" .. url
+    env.id_to_url = { ["id-" .. url] = url }
+    -- harness 的 unregister 只在 env.actual 非空时才真去删 state.actual[url]
+    -- （它是夹具里"池由外部提供"的标记）。这里把它指向同一张表，否则
+    -- "摘除后池里没有残留"测的是夹具没删行，而且下一轮会因为 state.actual[url]
+    -- 仍在而跳过 add，恢复用例也跟着失真。
+    env.actual = env.state.actual
+end
+
+---假时钟：reconcile 读 state.now，用例写 env.now，两个必须一起动，否则
+---missing_since 会钉在旧时间上，宽限断言就变成了测夹具。
+local function advance(env, now)
+    env.now = now
+    env.state.now = now
+end
+
+---数一下日志里提到 needle 的行数（warn 只许出现一次的断言用）。
+local function logged(env, needle)
+    local n = 0
+    for i = 1, #env.log do
+        if string.find(env.log[i].message, needle, 1, true) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+---健康服务登记进池：先只给候选（首接触快照时池是空的，谁都不会被 protected），
+---再补池行，让 URL 走正常认领变成 owned。
+local function register_and_claim(env, url, model_id)
+    env.probed[url] = { models = { model_id } }
+    watcher.reconcile(env.state)
+    serve(env, url, model_id)
+    watcher.reconcile(env.state)   -- reap_pending 确认，条目转为 owned
+    env.probed[url] = { models = { model_id } }
+    watcher.reconcile(env.state)   -- 稳态：desired 命中，清掉 missing/warned
+end
+
+new_case("a probe failure removes the worker at once, without the undiscovered grace")
+do
+    local url = "http://flaky:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "m")
+    eq(#env.registered, 1, "the healthy service is registered once")
+    local stats = watcher.reconcile(env.state)
+    eq(stats.removes, 0, "nothing is removed while it is healthy")
+
+    -- 仍是发现源候选，但严格探针读不到 /v1/models 的 data[].id。这条 reason 是
+    -- 确定性否定（对方答了 HTTP、内容不合要求），所以第 1 轮就摘，不等滞回。
+    env.probed[url] = nil
+    env.probe_reason[url] = "/v1/models answers without data[].id"
+    advance(env, 2000)
+    local after = watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "the unavailable service leaves the pool immediately")
+    eq(after.removes, 1, "and it counts as one removal")
+    eq(env.ledger.get_owned(url), nil, "its ledger entry is dropped, not just hidden")
+    check(env.state.actual[url] == nil, "no pool row survives the failed probe")
+    eq(logged(env, "undiscovered for"), 0, "the undiscovered grace never runs here")
+    eq(logged(env, "last worker"), 0, "keep-last never excuses it either")
+    check(logged(env, "without data[].id") >= 1,
+        "the classify reason travels into the removal line")
+end
+
+new_case("keep-last does not excuse a service that fails the probe")
+do
+    local url = "http://solo:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "only-model")
+    eq(env.ledger.get_owned(url) ~= nil, true, "it is owned while it serves")
+
+    -- keep_last_grace_secs = 1800：发现源消失的路径会把它保到 30 分钟，
+    -- 探针确认不可用这条不能沾这个光
+    env.cfg.keep_last_grace_secs = 1800
+    env.probed[url] = nil
+    env.probe_reason[url] = "/v1/models answers without data[].id"
+    advance(env, 2100)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "the last worker of a model still leaves when its probe fails")
+    check(env.state.actual[url] == nil, "no half-serving row is left behind for a dead model")
+    eq(logged(env, "last worker"), 0, "and the keep-last branch never logged a keep")
+
+    -- 反证（让这一条自己讲清它在区分什么）：同一个服务、同一份 keep-last 配置，
+    -- 只要换成「发现源不再报它」而不是「探针确认它答不出模型」，keep-last 就把
+    -- 它留过 remove-grace。也就是说决定后果的不是开关，而是证据的种类。
+    local keep = harness({ candidates = { candidate(url, "proc") } })
+    keep.cfg.keep_last_grace_secs = 1800
+    register_and_claim(keep, url, "only-model")
+    keep.state.candidates = {}
+    advance(keep, 2200)
+    watcher.reconcile(keep.state)                 -- stamps missing_since
+    advance(keep, 2200 + 301)                     -- past remove-grace, inside keep-last
+    watcher.reconcile(keep.state)
+    eq(#keep.unregistered, 0,
+        "counter-evidence: the same URL survives remove-grace once it merely vanishes")
+    check(logged(keep, "last worker") == 1, "and that pass really took the keep-last branch")
+end
+
+new_case("allow_remove=false still refuses to delete a probe failure, but warns once")
+do
+    -- SMG_WATCHER_ALLOW_REMOVE=0 是操作员「只许加不许删」的总开关：探针结论再
+    -- 确定也不能替他们做删除决定，否则严格探针就成了绕过这道保险的后门。
+    local url = "http://hands-off:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    env.cfg.allow_remove = false
+    register_and_claim(env, url, "m")
+
+    env.probed[url] = nil
+    env.probe_reason[url] = "/v1/models answers without data[].id"
+    advance(env, 2000)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "a probe failure does not delete while removal is disabled")
+    check(env.state.actual[url] ~= nil, "the pool row is left for the operator to judge")
+    eq(env.ledger.get_owned(url) ~= nil, true, "and the ledger keeps its claim so it can act later")
+    eq(logged(env, "removal is disabled"), 1, "the refusal is warned about once")
+
+    advance(env, 2100)
+    watcher.reconcile(env.state)
+    advance(env, 2200)
+    watcher.reconcile(env.state)
+    eq(logged(env, "removal is disabled"), 1, "and the warn is not repeated on every pass")
+    eq(#env.unregistered, 0, "still nothing deleted after three passes")
+end
+
+new_case("a recovered service comes back through the same probe and add gates")
+do
+    local url = "http://flap:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "m")
+    local before = #env.registered
+    -- stats 是跨轮累积的，所以"这是一次普通 add"要按增量算
+    local adds_before = env.state.stats.adds
+
+    env.probed[url] = nil
+    env.probe_reason[url] = "/v1/models answers without data[].id"
+    advance(env, 2000)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "the failure removed it")
+
+    -- 服务恢复：探针又能读到 /v1/models 的模型信息，走普通 add 通道回来
+    env.probed[url] = { models = { "m" } }
+    advance(env, 2100)
+    local back = watcher.reconcile(env.state)
+    eq(#env.registered, before + 1, "recovery re-registers the service")
+    eq(back.adds - adds_before, 1, "and it is a normal add, not a bypass")
+    eq(env.ledger.get_owned(url) ~= nil, true, "the ledger owns it again")
+    advance(env, 2200)
+    watcher.reconcile(env.state)
+    eq(#env.registered, before + 1, "the re-added service stays registered")
+end
+
+new_case("a service that merely leaves discovery still uses the undiscovered grace")
+do
+    local url = "http://vanish:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "m")
+
+    -- 发现源不再报它（进程停了、容器删了），探针没被拨过：这是「看不见」
+    -- 而不是「看见了但不健康」，短暂重启不该清空池，先起宽限时钟。
+    env.state.candidates = {}
+    advance(env, 2000)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "an undiscovered URL is not deleted on the first pass")
+    eq(env.ledger.get_owned(url).missing_since, 2000, "it starts the grace clock instead")
+
+    -- 宽限内回来：missing_since 清掉，什么都不删
+    env.state.candidates = { candidate(url, "proc") }
+    env.probed[url] = { models = { "m" } }
+    advance(env, 2100)
+    watcher.reconcile(env.state)
+    eq(env.ledger.get_owned(url).missing_since, nil, "coming back clears the grace clock")
+    eq(#env.unregistered, 0, "and nothing was ever deleted")
+
+    -- 对比：同样的时间线，只要它仍是候选而探针读不到模型，就没有宽限可言
+    env.probed[url] = nil
+    env.probe_reason[url] = "/v1/models answers without data[].id"
+    advance(env, 2150)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "the same URL goes at once once it is back in discovery")
+end
+
+--------------------------------------------------------------------------
+-- 25. 探针结论分档（第 10 条守卫的粒度那一半）
+--
+--     classify() 的拒绝不是一个结论而是三类，后果必须各不相同：
+--       * 确定性否定（对方答了 HTTP，内容不合要求）→ 当轮摘；
+--       * 传输层未知（拨号本身没给出可归因于对方的回答）→ 连续失败攒到
+--         SMG_WATCHER_PROBE_FAILURES（缺省 2）才摘，任一轮成功即清零；
+--       * 与对方能否服务无关的理由（网关自身缺 fetch、require_health 准入）
+--         → 既不摘也不置计数，也不起 missing_since 时钟。
+--     用例一律喂 classify() 的真实 reason 文案，而不是随手编一个字符串：
+--     分档是按 reason 文案匹配的，文案与档位必须在这里钉死在一起。
+--------------------------------------------------------------------------
+
+---把若干 url 一次性登记进池并认领成 owned（多 worker 场景不能用
+---register_and_claim：serve() 会整表替换 state.actual，把前一个 worker 的池行抹掉）。
+local function claim_workers(env, specs)
+    env.actual = env.state.actual
+    env.id_to_url = env.id_to_url or {}
+    for i = 1, #specs do
+        local url = specs[i].url
+        env.probed[url] = { models = { specs[i].model_id } }
+        env.id_to_url["id-" .. url] = url
+    end
+    watcher.reconcile(env.state)                      -- adds queued as pending
+    for i = 1, #specs do
+        local url, model_id = specs[i].url, specs[i].model_id
+        env.state.actual[url] = { id = "id-" .. url, url = url,
+                                  model_id = model_id, is_healthy = true }
+    end
+    advance(env, env.now + 1)
+    watcher.reconcile(env.state)                      -- reap_pending confirms
+    advance(env, env.now + 1)
+    watcher.reconcile(env.state)                      -- steady pass
+    env.registered, env.unregistered = {}, {}         -- 只关心之后发生的动作
+end
+
+---把 url 标成「本轮探针给出的失败结论」。
+local function fail_probe(env, url, reason)
+    env.probed[url] = nil
+    env.probe_reason[url] = reason
+end
+
+---读 owned 条目上的一个字段。滞回计数与宽限时钟的断言必须走它：条目可能已经被摘掉，
+---直接 `get_owned(url).field` 会让整个文件崩在索引 nil 上，看不到后面的用例。
+local function owned_field(env, url, field)
+    local entry = env.ledger.get_owned(url)
+    return entry and entry[field]
+end
+
+new_case("probe_verdict buckets the classify reasons")
+do
+    -- 分档表本身先钉住：它是摘除后果的唯一入口，文案一改就会悄悄换档。
+    eq(watcher.probe_verdict("/v1/models answers without data[].id"), "reject",
+        "no data[].id is a deterministic rejection")
+    eq(watcher.probe_verdict("it is a router, not a worker"), "reject",
+        "the router self-fingerprint is a deterministic rejection")
+    eq(watcher.probe_verdict("advertises 9 models (> max-models 8), looks like a proxy"),
+        "reject", "the max_models ceiling is a deterministic rejection")
+    eq(watcher.probe_verdict("no /v1/models answer"), "count",
+        "an unreachable or non-2xx /v1/models is a transport-level unknown")
+    eq(watcher.probe_verdict("/v1/models answers but /health and /metrics both 5xx -- an "
+        .. "upstream/gateway, not a worker (or set SMG_WATCHER_ALLOW_MODELS_ONLY=1)"),
+        "count", "the double 5xx signal is evidence-incomplete, not a rejection")
+    eq(watcher.probe_verdict("no probe transport"), nil,
+        "a missing transport says nothing about the worker")
+    eq(watcher.probe_verdict("no usable /health endpoint"), nil,
+        "require_health is an admission gate, not an eviction reason")
+    eq(watcher.probe_verdict(nil), "count", "an unnamed failure stays conservative")
+    eq(watcher.probe_verdict(""), "count", "an empty reason stays conservative")
+    eq(watcher.probe_verdict("some future wording"), "count",
+        "unrecognised wording defaults to the hysteresis bucket")
+    eq(watcher.probe_verdict(500), "count", "a non-string reason is not evidence either")
+    -- "advertises" 只在句首算 max_models；正文里出现这四个字符的其它文案不得误档。
+    eq(watcher.probe_verdict("nginx says advertises nothing"), "count",
+        "the max_models match is anchored at the start of the line")
+end
+
+new_case("a deterministic rejection evicts on the first pass, whatever its wording")
+do
+    local reasons = {
+        "/v1/models answers without data[].id",
+        "it is a router, not a worker",
+        "advertises 9 models (> max-models 8), looks like a proxy",
+    }
+    for i = 1, #reasons do
+        local url = "http://nope" .. i .. ":8000"
+        local env = harness({ candidates = { candidate(url, "proc") } })
+        register_and_claim(env, url, "m")
+        fail_probe(env, url, reasons[i])
+        advance(env, 2000)
+        local stats = watcher.reconcile(env.state)
+        eq(#env.unregistered, 1, "pass one evicts: " .. reasons[i])
+        eq(env.ledger.get_owned(url), nil, "and the ledger entry goes with it")
+        eq(stats.removes, 1, "counted as a removal")
+        check(env.state.actual[url] == nil, "the pool row is gone")
+        eq(logged(env, "probe fuse"), 0, "a single eviction never trips the fuse")
+    end
+end
+
+new_case("a transport-level unknown needs a run of failures before it evicts")
+do
+    local url = "http://slow:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "m")
+
+    fail_probe(env, url, "no /v1/models answer")
+    advance(env, 2000)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "the first transport-level failure keeps the row")
+    eq(owned_field(env, url, "probe_fails"), 1, "and records one strike")
+    check(env.state.actual[url] ~= nil, "the pool row is untouched")
+    eq(logged(env, "(1/2)"), 1, "the wait is visible in the log, at warn level")
+
+    advance(env, 2015)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "the second consecutive failure evicts")
+    eq(env.ledger.get_owned(url), nil, "and the ledger forgets the worker")
+    check(logged(env, "probe failed (no /v1/models): no /v1/models answer") >= 1,
+        "the removal line carries the classify reason verbatim")
+
+    -- 阈值确实可配：SMG_WATCHER_PROBE_FAILURES=1 等于「回到当轮即摘」
+    local url2 = "http://slow-tight:8000"
+    local tight = harness({ candidates = { candidate(url2, "proc") } })
+    tight.cfg.probe_failures = 1
+    register_and_claim(tight, url2, "m")
+    fail_probe(tight, url2, "no /v1/models answer")
+    advance(tight, 2000)
+    watcher.reconcile(tight.state)
+    eq(#tight.unregistered, 1, "with the threshold at 1 the same reason evicts at once")
+
+    -- 双 5xx 与传输层失败同档：/metrics 抖一下不能给 vLLM 定罪
+    local url3 = "http://flapping-metrics:8000"
+    local dual = harness({ candidates = { candidate(url3, "proc") } })
+    register_and_claim(dual, url3, "m")
+    fail_probe(dual, url3, "/v1/models answers but /health and /metrics both 5xx -- an "
+        .. "upstream/gateway, not a worker (or set SMG_WATCHER_ALLOW_MODELS_ONLY=1)")
+    advance(dual, 2000)
+    watcher.reconcile(dual.state)
+    eq(#dual.unregistered, 0, "one double-5xx pass does not evict")
+    advance(dual, 2015)
+    watcher.reconcile(dual.state)
+    eq(#dual.unregistered, 1, "a second one does")
+end
+
+new_case("a probe success clears the hysteresis counter")
+do
+    -- 滞回最容易被写坏的地方：计数只增不减的话，一个反复抖动的服务迟早被
+    -- 「攒够两次」收掉，而那正是滞回要避免的误判。
+    local url = "http://flapper:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "m")
+
+    fail_probe(env, url, "no /v1/models answer")
+    advance(env, 2000)
+    watcher.reconcile(env.state)
+    eq(owned_field(env, url, "probe_fails"), 1, "the first failure records a strike")
+
+    env.probed[url] = { models = { "m" } }
+    advance(env, 2015)
+    watcher.reconcile(env.state)
+    eq(owned_field(env, url, "probe_fails"), nil, "answering again clears it")
+    eq(#env.unregistered, 0, "and nothing was deleted in between")
+
+    fail_probe(env, url, "no /v1/models answer")
+    advance(env, 2030)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "a fresh failure starts the run over, not at two")
+    eq(owned_field(env, url, "probe_fails"), 1, "and the counter is back to one")
+
+    advance(env, 2045)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "the run only evicts when it really is consecutive")
+end
+
+new_case("reasons about the gateway, not the worker, change nothing")
+do
+    local cases = {
+        { url = "http://no-transport:8000", reason = "no probe transport" },
+        { url = "http://no-health:8000", reason = "no usable /health endpoint" },
+    }
+    for i = 1, #cases do
+        local url = cases[i].url
+        local env = harness({ candidates = { candidate(url, "proc") } })
+        env.cfg.require_health = true
+        register_and_claim(env, url, "m")
+        fail_probe(env, url, cases[i].reason)
+        advance(env, 2000)
+        watcher.reconcile(env.state)
+        eq(#env.unregistered, 0, "no eviction for: " .. cases[i].reason)
+        local entry = env.ledger.get_owned(url)
+        check(entry ~= nil, "the entry survives")
+        eq(owned_field(env, url, "probe_fails"), nil, "no strike is counted")
+        eq(owned_field(env, url, "missing_since"), nil, "and the grace clock does not start either")
+        eq(logged(env, "failed the strict"), 0, "no hysteresis warn for a non-verdict")
+    end
+end
+
+new_case("the pass fuse spares more than half the pool from one probe verdict")
+do
+    local urls = { "http://a:8000", "http://b:8000", "http://c:8000" }
+    local function pool(probe_fuse)
+        local env = harness({ candidates = {
+            candidate(urls[1], "proc"), candidate(urls[2], "proc"), candidate(urls[3], "proc"),
+        } })
+        if probe_fuse ~= nil then
+            env.cfg.probe_fuse = probe_fuse
+        end
+        claim_workers(env, {
+            { url = urls[1], model_id = "m1" },
+            { url = urls[2], model_id = "m2" },
+            { url = urls[3], model_id = "m3" },
+        })
+        eq(env.ledger.get_owned(urls[3]) ~= nil, true, "the healthy worker is owned")
+        -- 两条同时被传输层判死刑，第三条照常应答：整池被清空更像是网关出事
+        fail_probe(env, urls[1], "no /v1/models answer")
+        fail_probe(env, urls[2], "no /v1/models answer")
+        return env
+    end
+
+    local env = pool(nil)                                       -- 缺省：保险丝开
+    advance(env, 2000)
+    watcher.reconcile(env.state)                                -- 第一轮只是累计
+    eq(#env.unregistered, 0, "below the threshold nothing is at stake yet")
+    advance(env, 2015)
+    local stats = watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "two of three owned workers condemned in one pass is not acted on")
+    eq(stats.probe_fuse_skips, 2, "and the pass says which verdict it overrode")
+    check(logged(env, "probe fuse kept 2/3") == 1, "the fuse warn names the count and the total")
+    check(env.state.actual[urls[1]] ~= nil and env.state.actual[urls[2]] ~= nil,
+        "both pool rows survive the spared pass")
+    eq(owned_field(env, urls[1], "probe_fails"), 2,
+        "the counter still climbs while spared, so a real outage is not waited out forever")
+
+    -- 前提一消失（这次只有一条被判定）就立刻动手：保险丝不是免死牌
+    env.probed[urls[2]] = { models = { "m2" } }
+    advance(env, 2030)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "once the pass condemns only one, it goes")
+    eq(env.unregistered[1], "id-" .. urls[1], "and it is the one still failing")
+
+    local off = pool(false)                                      -- SMG_WATCHER_PROBE_FUSE=0
+    advance(off, 2000)
+    watcher.reconcile(off.state)
+    advance(off, 2015)
+    watcher.reconcile(off.state)
+    eq(#off.unregistered, 2, "with the fuse off the same pass evicts both")
+    eq(logged(off, "probe fuse"), 0, "and nothing is claimed to be rescued")
+    eq(off.ledger.get_owned(urls[3]) ~= nil, true, "the healthy worker was never touched")
+
+    -- 一半以下不触发：owned=4 摘 2 条是正常规模的动作
+    local four = harness({ candidates = {
+        candidate(urls[1], "proc"), candidate(urls[2], "proc"),
+        candidate("http://d:8000", "proc"), candidate("http://e:8000", "proc"),
+    } })
+    claim_workers(four, {
+        { url = urls[1], model_id = "m1" }, { url = urls[2], model_id = "m2" },
+        { url = "http://d:8000", model_id = "m4" }, { url = "http://e:8000", model_id = "m5" },
+    })
+    fail_probe(four, urls[1], "no /v1/models answer")
+    fail_probe(four, urls[2], "no /v1/models answer")
+    advance(four, 2000)
+    watcher.reconcile(four.state)
+    advance(four, 2015)
+    watcher.reconcile(four.state)
+    eq(#four.unregistered, 2, "half the pool is not more than half: no fuse")
+    eq(logged(four, "probe fuse"), 0, "and no fuse warn is logged")
+end
+
+new_case("a whole discovery source vanishing is not a pool-wide eviction")
+do
+    -- 最容易在后续改动里被写坏的一条：发现源整体挂掉（docker.sock 读不到、
+    -- /proc 读不到）会让所有 owned 条目「本轮没被探到」，那既不是探针失败
+    -- 也不是整池死刑，必须仍旧只起 missing_since 时钟。
+    local urls = { "http://x:8000", "http://y:8000", "http://z:8000" }
+    local env = harness({ candidates = {
+        candidate(urls[1], "docker"), candidate(urls[2], "docker"), candidate(urls[3], "docker"),
+    } })
+    claim_workers(env, {
+        { url = urls[1], model_id = "m1" },
+        { url = urls[2], model_id = "m2" },
+        { url = urls[3], model_id = "m3" },
+    })
+    local registered = #env.registered
+
+    env.state.candidates = {}
+    advance(env, 2000)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "an empty discovery pass deletes nothing")
+    eq(logged(env, "probe failed"), 0, "and nothing is blamed on the probe")
+    eq(logged(env, "probe fuse"), 0, "the fuse is a probe device, not a discovery one")
+    for i = 1, #urls do
+        eq(env.ledger.get_owned(urls[i]).missing_since, 2000,
+            "each owned entry starts the grace clock instead")
+    end
+
+    -- 时钟走完仍旧走守卫 5/6 的正常分支（这里 keep-last 关掉，免得三条同模型互保）
+    env.cfg.keep_last_grace_secs = -1
+    advance(env, 2000 + 301)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 3, "past the grace the undiscovered path still reaps them")
+    eq(#env.registered, registered, "no extra add happened on the way")
+    eq(logged(env, "(undiscovered, gone"), 3, "each removal is attributed to discovery, not the probe")
+end
+
+new_case("a config-declared upstream is immune to the probe verdict")
+do
+    -- 守卫 4 的边界不因第 10 条守卫松动：config_store 声明的 upstream 由配置拥有，
+    -- 探针结论再确定也不能替操作员删它（判定与保险丝的计数也都排除它）。
+    local url = "http://by-config:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    register_and_claim(env, url, "m")
+    env.state.actual[url].discovery = "config"
+    fail_probe(env, url, "/v1/models answers without data[].id")
+    advance(env, 2000)
+    local stats = watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "the deterministic rejection does not delete a config member")
+    check(env.state.actual[url] ~= nil, "its pool row stays")
+    eq(env.ledger.get_owned(url), nil, "the ledger only stops claiming it (config owns the row)")
+    eq(stats.probe_removes or 0, 0, "and the pass records no probe eviction")
 end
 
 io.write(string.format("\n=== %d checks, %d failed ===\n", passed, failed))

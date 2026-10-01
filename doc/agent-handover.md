@@ -14,7 +14,7 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-01）：**20 门禁全绿**（含契约 650/23 段）、Lua 22 057 行 / 15 个模块 + policies/6 文件、
+基线（2026-10-01）：**20 门禁全绿**（含契约 650/23 段）、Lua 22 319 行 / 15 个模块 + policies/6 文件、
 单测 9 文件、文档 20 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
@@ -36,7 +36,9 @@ lualib/resty/luarouter/  15 模块 + policies/（6 个复杂策略文件；rando
   router.lua(4071)   入口总装：klib.router 分发、转发泵、重试、熔断、指标/_ui/mesh/model-map 挂载
   init.lua           fork 前接线：env 快照、hb/watcher/mesh/负载定时器（worker0 + lr_locks 单飞）、on_log 兜底
   registry.lua       worker 注册表（lr_workers shdict）、健康态、DP 展开、负载字段折叠
-  watcher.lua(2120)  进程内服务发现：targets/docker/proc 三源、严格探针、九条守卫、ledger、model-map
+  watcher.lua(~2.2k 行，描述性)  进程内服务发现：targets/docker/proc 三源、严格 /v1/models 探针、
+                     十条守卫（1-9 移植自 Python 守护进程；第 10 条=探针按分档摘除不可用条目，
+                     见 §4 与 gap-watcher-merge.md §1.1）、ledger、model-map
   gpu_load.lua(1102) GPU 负载源：worker /metrics 抓取 + 远程 Prom 查询，写 registry 负载字段
   policy.lua+policies/  8 策略；cache_aware=亲和树+负载逃逸（per-process 树，多 worker 亲和率衰减）
   hb.lua             健康巡检 + 熔断计数 + /v1/loads 扇出 + gpu_load 定时器挂载点
@@ -87,6 +89,13 @@ e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain。
 - watcher 探针读到「接受 TCP 后不回 HTTP」的口（qdrant gRPC 6334 类）会被 nginx 记 [error]；
   消音手段是 `SMG_WATCHER_DENY_PORT`（lua_socket_log_errors off 在 timer 阶段挡不住），机制见
   doc/gap-watcher-merge.md 偏差 13。
+- 写 watcher 相关用例时记住 §4 的分档：**还在发现源里但 `/v1/models` 答不出 `data[].id`**（确定性否定）
+  的实例会在下一轮（`SMG_WATCHER_INTERVAL_SECS`，缺省 15 s）被直接摘除，不等 grace；**连不上／无应答**
+  （传输层未知）要连够 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）轮才摘，中途成功即清零；**从发现源消失**才走
+  `SMG_WATCHER_REMOVE_GRACE_SECS`(300)/`KEEP_LAST_GRACE_SECS`(1800)。探针摘除还受单轮保险丝（超过 owned
+  一半则只 warn，`SMG_WATCHER_PROBE_FUSE=0` 关闭）约束，写「一批全摘」的用例时记得它。想让一个不答
+  `/v1/models` 的 mock 留在池里测别的维度，得把它从发现源里摘掉（而不是让它继续被报出来），或置
+  `SMG_WATCHER_ALLOW_REMOVE=0`（此时只警告一次、不删），见 gap-watcher-merge.md §1.1。
 
 ## 4. 设计红线（改动前必读）
 
@@ -96,8 +105,29 @@ e2e_routing_dyn e2e_profiles mesh_two e2e_tls_chain。
   luarouter_config）；进程内可变状态只许 cache_aware 树、bucket 计数、mesh 成员表（三者都已钉 worker=1 或有衰减文档）。
 - **缺省零行为变化**：所有新开关（SMG_WATCHER_ENABLED、SMG_LOAD_SOURCE、policy 覆盖）缺省时对外行为
   与旧版逐字节一致，这是门禁判据的一部分。
-- **失败不摘 worker**：watcher/gpu_load 的探测失败只损失精度（keep-last/grace/降级纯在飞），绝不让
-  监控故障拖垮转发。
+- **探针失败分档，后果不同**（用户裁定 2026-10-01，改这块前先读；完整口径与表格见
+  gap-watcher-merge.md §1.1，本节与它必须逐字同义）：
+  - **转发路径上的探测**（hb 健康巡检、gpu_load 抓 /metrics 与远程 Prom）失败只损失精度——降级、keep-last、
+    grace、纯在飞计数，绝不让监控故障拖垮转发，也不因单次探测失败摘 worker。健康判定本来就是
+    连续失败到 failure_threshold 才翻健康位，翻位也只是退出选路，不删行。
+  - **watcher 严格探针**（每轮 `classify()` 读 `GET /v1/models` 的 `data[].id`）按「对方到底答没答」分三档：
+    - **确定性否定**——探针拨通并拿到了 HTTP 回答，但内容不合要求（读不出 `data[].id`、`/server_info`
+      命中 router 自指纹、模型数超 `max_models`）：当轮立即 `release()`，跳过
+      `SMG_WATCHER_REMOVE_GRACE_SECS`(300) 与 `SMG_WATCHER_KEEP_LAST_GRACE_SECS`(1800)。
+    - **传输层未知**——连不上／超时／TLS 失败／接受 TCP 后无应答：计入该 owned 条目的连续失败数，
+      达到 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）才摘；未达阈值保留原行，任一轮成功即清零。
+    - **不触发摘除**——`no probe transport`（网关自身缺 fetch）与 `require_health` 未通过（注册准入
+      开关，不是摘除理由）：既不摘也不计数。
+  - 两档摘除都受**单轮保险丝**约束：一次 reconcile 内被探针摘掉的 owned 条目超过 owned 总数一半时降级为
+    只 warn 不摘（防网关自身故障一次清空全池），`SMG_WATCHER_PROBE_FUSE=0` 关闭。
+  - 都不放宽原有守卫：config upstream 与守卫 3 首接触快照的 protected 条目仍不由 watcher 删除，
+    `SMG_WATCHER_ALLOW_REMOVE=false` 时只警告一次、不删。恢复无旁路：下一轮读到真实 `data[].id` 就按新
+    服务同一套门槛重新注册，但 `registry.add` 会重置健康位与外部负载读数，重新接流要等
+    `health_success_threshold` 个巡检周期。
+  - 关键区分是**「探针失败」≠「发现源消失」**：本轮仍被发现源报告、探针也执行了，才谈得上上面三档；
+    发现源不再报它（进程停、容器删）走的是 remove-grace + keep-last 宽限，以免短暂重启清空服务池。
+    注意 `/metrics` 与 `/health` 双 5xx 那条判据归「传输层未知」而不是确定性否定：vLLM／llama.cpp 的身份
+    标签正来自 `/metrics` 正文，`/metrics` 一 5xx 引擎就退回 `openai` 而使判据成立，健康引擎也会被说服。
 - **生产 worker 池清理**：删 worker 走 DELETE /workers/{id}；watcher 会自动重发现仍在监听的（这是设计）。
 - **镜像约束**：authz 基础镜像没有 `resty.http`（也没有 python3/perl），转发 / 健康检查 / watcher
   全部手写 cosocket，新代码不要 `require "resty.http"`；shdict 无原子 cas，「检查再翻转」的路径

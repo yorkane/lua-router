@@ -22,6 +22,12 @@
 --   8. survive a router restart       -> refresh_ids() re-reads the worker ids
 --   9. blind by design                -> no GPU reads, no service control, only
 --      /v1/models, /server_info, /get_server_info, /props, /metrics and /health
+--  10. probe eviction is graded       -> probe_verdict() splits the classify()
+--      rejections: a deterministic "this is not a worker" answer evicts in the
+--      same pass, a transport-level unknown must repeat SMG_WATCHER_PROBE_FAILURES
+--      rounds (default 2) before eviction, and reasons that say more about the
+--      gateway than about the service never count at all; a per-pass fuse
+--      (SMG_WATCHER_PROBE_FUSE) keeps one bad interval from emptying the pool.
 --
 -- Two layers, so the semantics are testable without nginx (same split as
 -- mesh.lua): the pure functions below take an injected `fetch`/`getenv`/store,
@@ -586,6 +592,10 @@ function _M.new_config(getenv, self_ports, metrics_port)
         remove_grace_secs = num_from(getenv, "SMG_WATCHER_REMOVE_GRACE_SECS", 300),
         keep_last_grace_secs = num_from(getenv, "SMG_WATCHER_KEEP_LAST_GRACE_SECS", 1800),
         allow_remove = bool_from(getenv, "SMG_WATCHER_ALLOW_REMOVE", true),
+        -- 探针摘除的滞回与保险丝，见 reconcile 的 removal 段与 probe_verdict。
+        -- 阈值写 0 或负数 = 退回"首次传输层失败即摘"（测试与显式要求立即摘除）。
+        probe_failures = num_from(getenv, "SMG_WATCHER_PROBE_FAILURES", 2),
+        probe_fuse = bool_from(getenv, "SMG_WATCHER_PROBE_FUSE", true),
         max_models = num_from(getenv, "SMG_WATCHER_MAX_MODELS", 8),
         require_health = bool_from(getenv, "SMG_WATCHER_REQUIRE_HEALTH", false),
         allow_models_only = bool_from(getenv, "SMG_WATCHER_ALLOW_MODELS_ONLY", false),
@@ -730,6 +740,47 @@ function _M.classify(url, opts)
     end
 
     return { url = url, models = ids, engine = engine, has_health = has_health }
+end
+
+---探针拒绝原因 -> 本轮该怎么处置（"reject" / "count" / nil）。
+---
+---分档依据只有一条：网关有没有亲眼看见对方给出一个否定的答案。
+---  * reject（确定性否定）：对方确实答了 HTTP，只是内容不合要求——有 2xx 却读不出
+---    data[].id（node_exporter、Web UI、404 页）、advertises 几十个模型（聚合器/另一层
+---    代理，路由过去等于多一跳甚至绕圈）、命中 router 自指纹（对端是 router，接进池会
+---    成环）。这种行留在池里只会回 5xx 并广告一个它服务不了的模型，所以当轮摘除，
+---    不等 remove_grace、也不受 keep-last 豁免。
+---  * count（传输层未知）：连不上、超时、TLS 失败、keepalive 池里被对端半关闭的旧连接、
+---    /v1/models 答非 2xx，以及 "/health 与 /metrics 双 5xx" 那条。前面几种在
+---    hb.http_request 里都落成 "no /v1/models answer"，网关分不清是引擎在忙大 prefill
+---    没在 probe_timeout 内答完，还是它真死了；双 5xx 那条同样不能算否定——vLLM 的身份
+---    标签恰恰来自 /metrics 文本，一次 /metrics 抖动 5xx 就让引擎判定退回 openai 进而
+---    触发它，它是"证据不完整"。摘除的真实代价：registry.add 把 K_HEALTH 归零并清掉两条
+---    外部负载读数，配合 health_success_threshold=2 与巡检间隔折算约 60s 才恢复接流，
+---    policy.on_remove 还会顺带摘掉该 URL 在所有 cache_aware 树里的租户、丢掉学到的前缀
+---    分布。引擎忙时很容易连续几轮都读不到，一次抖动就换来几十秒 503 空窗，比忍一轮
+---    僵尸行贵得多，所以必须先累计到阈值。
+---  * nil（完全不判定）："no probe transport" 说的是网关自己的装配（fetch 没注入）或
+---    cosocket 被限流，"no usable /health endpoint" 是注册准入开关 require_health 的产物，
+---    两者都不描述对方此刻能不能服务。拿它们当摘除理由的话，打开 require_health 的操作员
+---    会让所有 /health 404 的引擎陷入摘-加循环，所以这类条目本轮既不置计数也不走宽限。
+---@param reason string|nil @ classify() 的第二返回值
+---@return string|nil @ "reject" | "count" | nil（nil = 本轮不判定）
+function _M.probe_verdict(reason)
+    if type(reason) ~= "string" or reason == "" then
+        -- 老夹具或以后新增的文案：按最保守的传输层计一次，最终仍会摘，只是要先累计。
+        return "count"
+    end
+    if reason == "no probe transport" or reason == "no usable /health endpoint" then
+        return nil
+    end
+    if reason == "/v1/models answers without data[].id"
+        or reason == "it is a router, not a worker"
+        or string.find(reason, "advertises ", 1, true) == 1 then
+        return "reject"
+    end
+    -- "no /v1/models answer" 与 "/v1/models answers but /health and /metrics both 5xx ..."
+    return "count"
 end
 
 -- ------------------------------------------------------------------ discovery
@@ -980,7 +1031,8 @@ end
 ---
 ---Key layout (all in lr_watch):
 ---   p|<url>   protected marker
----   o|<url>   owned entry   {model_id, worker_id, engine, source, label, added_at, missing_since}
+---   o|<url>   owned entry   {model_id, worker_id, engine, source, label, added_at,
+---                            missing_since, probe_fails}
 ---   q|<url>   pending add   {queued_at, worker_id}
 ---   f|<url>   add back-off  {n, until}
 ---   map       the whole rename map as one JSON object
@@ -1254,7 +1306,9 @@ end
 _M.note_config_skip = note_config_skip
 
 ---One reconcile pass. Everything outside this function is plumbing, which makes
----the eight guards above auditable in one place and testable with fakes.
+---the guards above auditable in one place and testable with fakes -- including the
+---probe-verdict pre-pass below, which deliberately stays inside this function so
+---"why did that worker leave" has exactly one answer site.
 ---
 ---@param state table @ {cfg, ledger, actual, candidates, probe, register,
 ---                       unregister, now, stats, log}
@@ -1287,16 +1341,35 @@ function _M.reconcile(state)
 
     -- Discovery + strict probe.
     local discovered = {}
+    -- A URL we looked at and could not confirm is not "absent from discovery": the
+    -- strict probe wants a real /v1/models answer with data[].id, and without that
+    -- the service cannot answer a request. What we must NOT do is treat every
+    -- rejection as the same evidence, so the set carries classify()'s reason and the
+    -- verdict derived from it (see probe_verdict): a deterministic "this is not a
+    -- worker" answer evicts in the same pass, a transport-level unknown accumulates
+    -- entry.probe_fails and only evicts once it repeats.
+    local probe_failed = {}
+    -- Reasons that say more about the gateway than about the service (no transport,
+    -- require_health admission): this pass says nothing about the URL, so the entry
+    -- keeps its missing_since clock and its counter untouched.
+    local probe_ignore = {}
     for i = 1, #state.candidates do
         local cand = state.candidates[i]
         if cand and cand.url and not _M.is_self_url(cand.url, cfg.self_ports)
             and not _M.is_excluded(cand.url, cfg.exclude_patterns) then
-            local info = state.probe(cand.url)
+            local info, reason = state.probe(cand.url)
             if info then
                 info.label = cand.label or info.engine
                 info.source = cand.source
                 info.gpu = cand.gpu
                 discovered[#discovered + 1] = info
+            else
+                local verdict = _M.probe_verdict(reason)
+                if verdict then
+                    probe_failed[cand.url] = { reason = reason, verdict = verdict }
+                else
+                    probe_ignore[cand.url] = true
+                end
             end
         end
     end
@@ -1400,7 +1473,127 @@ function _M.reconcile(state)
     end
 
     -- Removals: only from our own ledger (guard 4).
-    for _, url in ipairs(sorted_keys(ledger.owned_urls())) do
+    --
+    -- Probe verdicts are decided for the whole pass *before* the first delete. Two
+    -- reasons: the fuse compares "how many rows the probes want gone" against the
+    -- owned total, and that denominator cannot be read after deletions started
+    -- shrinking it; and the hysteresis arithmetic belongs in one place so the loop
+    -- below stays the audit of the eight guards rather than a second decision tree.
+    -- probe_verdict_of maps url -> {verdict="release"|"bump", reason=, fails=};
+    -- anything absent from it is not a probe eviction candidate this pass.
+    local owned = ledger.owned_urls()
+    -- math.floor so a fractional env value cannot silently shorten the wait, and
+    -- 0/negative collapses to 1: that is the operator's explicit "evict at once".
+    local fail_threshold = math.floor(tonumber(cfg.probe_failures) or 2)
+    if fail_threshold < 1 then
+        fail_threshold = 1
+    end
+    local probe_verdict_of, probe_evicting = {}, 0
+    for _, url in ipairs(sorted_keys(owned)) do
+        local entry = owned[url]
+        local failed = entry and not desired[url] and state.actual[url]
+            and probe_failed[url]
+        -- Config members belong to config_store and a URL absent from probe_failed
+        -- was never dialled this pass (the undiscovered grace owns it); both stay out
+        -- of the tally, so a verdict can neither feed the fuse that would spare it nor
+        -- get blamed for the delete that could not remove it.
+        if failed and not _M.is_config_member(state, url) then
+            if failed.verdict == "reject" then
+                probe_verdict_of[url] = { verdict = "release", reason = failed.reason }
+                probe_evicting = probe_evicting + 1
+            else
+                local fails = (tonumber(entry.probe_fails) or 0) + 1
+                if fails >= fail_threshold then
+                    probe_verdict_of[url] = {
+                        verdict = "release", reason = failed.reason, fails = fails }
+                    probe_evicting = probe_evicting + 1
+                else
+                    probe_verdict_of[url] = {
+                        verdict = "bump", reason = failed.reason, fails = fails }
+                end
+            end
+        end
+    end
+
+    -- Single-pass fuse (guard 10). A gateway-wide failure -- cosocket exhaustion,
+    -- DNS, a kernel or timer problem that starves every probe of its budget -- makes
+    -- every service on the box look dead at once, and the strict probe would
+    -- obediently empty the pool in one interval. Losing more than half of owned
+    -- workers to a probe verdict in a single pass is far more likely to be the
+    -- gateway than the fleet, so the pass degrades to warn-only and waits for a
+    -- second opinion; the counters keep climbing, so a real fleet-wide outage still
+    -- evicts as soon as the premise (a transient gateway fault) stops holding.
+    --
+    -- The >= 2 floor is what keeps a one-worker deployment honest: a single row that
+    -- fails a *deterministic* probe really is a zombie, and sparing it would mean the
+    -- strict probe could never evict anything on a one-worker box.
+    local owned_total = 0
+    for _, entry in pairs(owned) do
+        if entry then
+            owned_total = owned_total + 1
+        end
+    end
+    -- allow_remove=false means nothing was ever going to be deleted, so claiming the
+    -- fuse "kept" them would describe a rescue that never happened.
+    local fuse_on = cfg.allow_remove and cfg.probe_fuse ~= false
+        and probe_evicting >= 2 and probe_evicting * 2 > owned_total
+    if fuse_on then
+        stats.probe_fuse_skips = (stats.probe_fuse_skips or 0) + probe_evicting
+        warn(state.log, string.format(
+            "watcher: probe fuse kept %d/%d owned workers this pass (the probes condemned more than half the pool; suspect a gateway-wide probe failure, SMG_WATCHER_PROBE_FUSE=0 disables the fuse)",
+            probe_evicting, owned_total))
+    end
+
+    ---Carry out this pass's probe decision for one owned entry.
+    ---@param url string
+    ---@param entry table
+    local function probe_evict(url, entry)
+        local decided = probe_verdict_of[url]
+            or { verdict = "release", reason = (probe_failed[url] or {}).reason }
+        -- A transport-level unknown is one observation per pass whether or not this
+        -- pass acts on it: the counter is what the hysteresis decides with, and the
+        -- metrics series is what tells an operator "the probes are unhappy" before any
+        -- worker is gone. It is written back in the keep-it branches too, so a pass
+        -- spared by the fuse still climbs toward the threshold and the survivors
+        -- evict the moment the fuse's premise (a transient gateway fault) lapses --
+        -- without the run ever having to restart from zero.
+        if decided.fails then
+            stats.probe_failures = (stats.probe_failures or 0) + 1
+            entry.probe_fails = decided.fails
+        end
+        if decided.verdict == "bump" then
+            ledger.set_owned(url, entry, state.entry_ttl)
+            -- Unlike the other keep-it branches this one may log every round: the
+            -- wait is bounded by the threshold, and an engine that starts timing out
+            -- should leave a trace the moment it starts, one pass before it costs the
+            -- pool a worker.
+            warn(state.log, string.format(
+                "watcher: %s failed the strict /v1/models probe (%d/%d): %s; keeping it",
+                url, tonumber(decided.fails) or 0, fail_threshold,
+                tostring(decided.reason or "unknown")))
+        elseif fuse_on then
+            -- The pass-level warn already named the count; per-entry silence rides on
+            -- entry.warned, the same mute every other keep-it branch uses, and it is
+            -- cleared as soon as the service answers a probe again.
+            if not entry.warned then
+                warn(state.log, string.format(
+                    "watcher: %s fails the strict /v1/models probe but the pass fuse is on; keeping it",
+                    url))
+                entry.warned = true
+                ledger.set_owned(url, entry, state.entry_ttl)
+            end
+        else
+            stats.probe_removes = (stats.probe_removes or 0) + 1
+            -- The classify() reason travels verbatim into the log line, because "the
+            -- probe said no" is only actionable when an operator can tell *which* no
+            -- it said: the strict probe's "it answered the wrong thing" versus the
+            -- undiscovered branch's "it stopped answering at all".
+            _M.release(state, url, entry, 0,
+                "probe failed (no /v1/models): " .. tostring(decided.reason or "unknown"))
+        end
+    end
+
+    for _, url in ipairs(sorted_keys(owned)) do
         local entry = ledger.get_owned(url)
         if entry then
             if desired[url] then
@@ -1413,6 +1606,11 @@ function _M.reconcile(state)
                 -- good, which is precisely the zombie the daemon exists to prevent.
                 entry.missing_since = nil
                 entry.warned = nil
+                -- The hysteresis clock resets at the same place as the warn mute: a
+                -- service that answers the probe again is no longer in a failure run,
+                -- so "up-down-up-down" cannot accumulate toward a threshold it would
+                -- never reach if each flap started from zero.
+                entry.probe_fails = nil
                 ledger.set_owned(url, entry, state.entry_ttl)
                 -- Guard 8: a router restart/reload re-creates workers with fresh
                 -- ids, so keep the recorded id in step with the pool.
@@ -1435,6 +1633,41 @@ function _M.reconcile(state)
                 ledger.drop_owned(url)
                 ledger.drop_pending(url)
                 ledger.drop_backoff(url)
+            elseif probe_ignore[url] then
+                -- 本轮对这条 URL 什么都没说出口：探针压根没拨通（no probe transport，
+                -- 网关侧的装配或 cosocket 限流），或它给的理由是注册准入开关
+                -- require_health 的产物（/health 404 的引擎有一大半）。这类结论既不能
+                -- 计入滞回也不能走 missing_since 宽限——否则打开 SMG_WATCHER_REQUIRE_HEALTH
+                -- 的操作员会让每个不实现 /health 的引擎陷入摘-加循环，网关自己的 socket
+                -- 抖动也会被记成"这个 worker 死了"。条目原样留着，等下一轮的真结论。
+            elseif probe_failed[url] then
+                -- Confirmed unavailable, not merely undiscovered: the strict probe
+                -- reached the service and could not read a usable model list from it.
+                -- Such a row answers 5xx while advertising a model it cannot serve, so
+                -- it does not get the undiscovered grace or the keep-last exemption --
+                -- how soon it leaves is decided by probe_evict above, which is where
+                -- the reject/count split, the hysteresis threshold and the fuse all
+                -- live. Recovery stays the normal path: the first round that reads a
+                -- real /v1/models re-adds it through the same add gates.
+                --
+                -- 摘除开关仍然排在探针结论前面：SMG_WATCHER_ALLOW_REMOVE=0 是操作员
+                -- "只许加不许删"的明确约定，探针结论再确定也不能替他们做删除的决定，
+                -- 否则严格探针就成了绕过这道保险的后门（首次实现就是直接 release，
+                -- 于是关掉摘除的服务仍然被删）。这里沿用下方 undiscovered 分支的
+                -- 形态：保留 pool 行、只警告一次，靠 entry.warned 静音后续轮次，
+                -- 避免每个 interval 刷一条同样的 warn。warned 会在服务重新被探到
+                -- 时（desired 分支）清掉，所以"恢复后再坏"仍会再提醒一次。
+                if not cfg.allow_remove then
+                    if not entry.warned then
+                        warn(state.log, string.format(
+                            "watcher: %s fails the strict /v1/models probe but removal is disabled; keeping it",
+                            url))
+                        entry.warned = true
+                        ledger.set_owned(url, entry, state.entry_ttl)
+                    end
+                else
+                    probe_evict(url, entry)
+                end
             else
                 local first_missing = tonumber(entry.missing_since)
                 if not first_missing then
@@ -1558,17 +1791,19 @@ end
 ---@param opts table @ classify options (fetch injected here)
 ---@param fanout number|nil
 ---@return table @ url -> info|nil
+---@return table @ url -> classify() rejection reason (nil when the probe itself raised)
 local function probe_pool(urls, opts, fanout)
-    local results, next_index = {}, 0
+    local results, reasons, next_index = {}, {}, 0
     local function one(url)
-        local info = _M.classify(url, opts)
+        local info, reason = _M.classify(url, opts)
         results[url] = info
+        reasons[url] = reason
     end
     if not has_ngx or type(ngx.thread) ~= "table" or #urls == 0 then
         for i = 1, #urls do
             one(urls[i])
         end
-        return results
+        return results, reasons
     end
     local width = math.max(1, math.min(fanout or 8, #urls))
     local threads = {}
@@ -1582,6 +1817,10 @@ local function probe_pool(urls, opts, fanout)
                 end
                 local ok, err = pcall(one, urls[index])
                 if not ok then
+                    -- A cosocket that raises mid-probe is a transport unknown, not a
+                    -- verdict about the service: the reason is what reconcile's split
+                    -- reads, so leaving it nil (=> unknown) is the honest answer.
+                    reasons[urls[index]] = "probe raised: " .. tostring(err)
                     ngx.log(ngx.WARN, "luarouter: watcher probe of ", urls[index],
                         " failed: ", tostring(err))
                 end
@@ -1591,7 +1830,7 @@ local function probe_pool(urls, opts, fanout)
     for i = 1, #threads do
         pcall(ngx.thread.wait, threads[i])
     end
-    return results
+    return results, reasons
 end
 
 -- ------------------------------------------------------------ docker discovery
@@ -1914,7 +2153,7 @@ function _M.run_pass(cfg, opts)
         end
     end
     local fetch = make_fetch(math.floor((cfg.probe_timeout_secs or 4) * 1000))
-    local probed = probe_pool(urls, {
+    local probed, reasons = probe_pool(urls, {
         fetch = fetch,
         require_health = cfg.require_health,
         max_models = cfg.max_models,
@@ -1931,13 +2170,16 @@ function _M.run_pass(cfg, opts)
         entry_ttl = math.max(3600, (cfg.remove_grace_secs or 300) * 10
             + (cfg.keep_last_grace_secs or 1800)),
         probe = function(url)
-            return probed[url]
+            -- Second return value is the classify() rejection reason: reconcile
+            -- cannot decide what to do with a "no" unless it knows which "no" it was.
+            return probed[url], reasons[url]
         end,
         register = make_register(conf),
         unregister = make_unregister(),
         stats = {
             reconciles = 0, adds = 0, add_fails = 0, removes = 0,
             discovered = 0, adds_stuck_released = 0,
+            probe_failures = 0, probe_removes = 0, probe_fuse_skips = 0,
         },
         log = function(level, message)
             if level == "warn" then

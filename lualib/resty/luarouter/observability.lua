@@ -758,7 +758,8 @@ end
 -- calls this once per reconcile pass, and nothing here reads or reorganises the
 -- existing logic.
 ---@param stats table @ the {reconciles, adds, add_fails, removes, discovered,
----                     adds_stuck_released} a pass produced
+---                     adds_stuck_released, probe_failures, probe_removes,
+---                     probe_fuse_skips} a pass produced
 ---@param owned number @ ledger-owned worker URLs
 ---@param protected number @ first-contact protected worker URLs
 ---@param map_entries number @ active model-map renames
@@ -769,6 +770,17 @@ function _M.record_watch_pass(stats, owned, protected, map_entries)
     _M.counter("lr_watch_removes_total", {}, stats.removes or 0)
     _M.counter("lr_watch_adds_stuck_released_total", {},
         stats.adds_stuck_released or 0)
+    -- The three probe-eviction families exist because lr_watch_removes_total alone
+    -- cannot answer the question an operator actually asks when the pool drains: was
+    -- it a service that really stopped being a worker, or the gateway's own probes
+    -- failing? probe_removes is the subset of removes the strict probe caused, and
+    -- probe_failures counts the transport-level unknowns that were *not* acted on
+    -- yet - a rising probe_failures with flat probe_removes is a flapping upstream
+    -- being correctly held by the hysteresis, while probe_removes climbing with it
+    -- is the flapping winning.
+    _M.counter("lr_watch_probe_failures_total", {}, stats.probe_failures or 0)
+    _M.counter("lr_watch_probe_removes_total", {}, stats.probe_removes or 0)
+    _M.counter("lr_watch_probe_fuse_skips_total", {}, stats.probe_fuse_skips or 0)
     _M.gauge("lr_watch_discovered_workers", {}, stats.discovered or 0)
     _M.gauge("lr_watch_owned_workers", {}, owned or 0)
     _M.gauge("lr_watch_protected_workers", {}, protected or 0)
@@ -1114,6 +1126,15 @@ local HELP = {
     lr_watch_add_fails_total = "Worker registrations the in-process watcher rejected",
     lr_watch_removes_total = "Workers removed by the in-process watcher",
     lr_watch_adds_stuck_released_total = "Stuck watcher registrations released",
+    -- Subsets of the two families above, split out so a dashboard can tell "a worker
+    -- really stopped being a worker" from "the router's probes could not read it":
+    -- probe_failures is the hysteresis holding a transport-level unknown below the
+    -- eviction threshold, probe_removes is the part of removes the strict probe
+    -- caused, probe_fuse_skips is what one pass refused to delete when the probes
+    -- condemned more than half the owned pool at once.
+    lr_watch_probe_failures_total = "Probe rejections held by the watcher hysteresis instead of evicting",
+    lr_watch_probe_removes_total = "Workers removed by the in-process watcher because their probe refused them",
+    lr_watch_probe_fuse_skips_total = "Probe-driven removals a watcher pass skipped because its fuse tripped",
     lr_watch_discovered_workers = "Workers discovered by the last watcher pass",
     lr_watch_owned_workers = "Workers the in-process watcher currently owns",
     lr_watch_protected_workers = "Pre-existing workers the in-process watcher will never delete",

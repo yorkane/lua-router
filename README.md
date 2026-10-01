@@ -18,7 +18,7 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 ## 当前基线
 
 全量门禁权威日志：`/data/tmp/lr-gates/gates-20261001-145420.log`（串行独占，**20 passed /
-0 failed / 0 skipped**）。代码基线：Lua 22 057 行 / 15 个模块 + policies/ 6 文件、单测 9 文件。
+0 failed / 0 skipped**）。代码基线：Lua 22 319 行 / 15 个模块 + policies/ 6 文件、单测 9 文件。
 
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
@@ -33,7 +33,7 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | head_routes | 108 / 0 | HEAD 镜像每个 GET 路由 |
 | mesh_http / mesh_two | 47 / 37 | mesh 真实 HTTP（对端 apply/sync、worker 镜像、/ha/policies）；双真容器互 seed 收敛、docker stop 分区恢复、retire 广播 |
 | e2e_policy_parity | 47 / 0 | prefix_hash / bucket / power_of_two / random 与 Rust 的量化对拍 |
-| e2e_watcher | 65 / 0 | 内建 watcher：targets/proc/docker 三源发现、九条守卫逐条断言、model-map 改名、容器重启重发现 |
+| e2e_watcher | 108 / 0 | 内建 watcher：三源发现、九条原守卫逐条断言 + 第 10 条守卫（探针确认不可用即摘除，含滞回与单轮保险丝）、model-map 改名、容器重启重发现 |
 | e2e_profiles | 97 / 0 | 虚拟 model profile 与 upstreams：白名单 / per-alias policy / api_key 三态与脱敏 / 30s 自愈 / apply 原子性 |
 | e2e_token_accounting | 62 / 0 | 流式 include_usage 透明注入+剥帧、四类 token 指标、400 兜底 sticky |
 | e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry |
@@ -238,7 +238,9 @@ docker run -d --name lua-router --network host \
 开启后 worker 0 定时器每 `SMG_WATCHER_INTERVAL_SECS`（15）做一轮 discover→probe→reconcile：
 发现源三选可独立开关 `SMG_WATCHER_TARGETS`（逗号分隔 URL，可远程）/ `SMG_WATCHER_DOCKER`=1
 （cosocket 读 /var/run/docker.sock）/ `SMG_WATCHER_PROC_SCAN`=1（纯 Lua 读 /proc/net/tcp）；
-探针要求 `GET /v1/models` 回 OpenAI JSON 才注册。九条守卫与原 Python 版逐条等价，对照表与
+探针要求 `GET /v1/models` 回带 `data[].id` 的 OpenAI JSON 才注册。前九条守卫与原 Python 版逐条
+等价，第 10 条是本地新增的摘除策略（按探针失败原因分档：确定性否定当轮摘、传输层未知连续失败
+`SMG_WATCHER_PROBE_FAILURES`（缺省 2）次才摘），对照表与
 偏差在 [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md)。`POST /model-map` 兼容原版四种
 body 形态做注册时改名。其余旋钮：`SMG_WATCHER_PROBE_TIMEOUT_SECS`(4)、
 `SMG_WATCHER_REMOVE_GRACE_SECS`(300)、`SMG_WATCHER_MAX_MODELS`(8)、
@@ -359,7 +361,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/todo-deferred.md](doc/todo-deferred.md) | TODO 档（MCP、wasm）的唯一口径与启用时的最小方案 |
 | [doc/gap-mesh.md](doc/gap-mesh.md) | mesh / HA 的 CRDT 设计、带宽代价与围栏 |
 | [doc/gap-mesh-final.md](doc/gap-mesh-final.md) | `/ha/status` 幻影键根因与真修 + 双真节点 e2e |
-| [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md) | watcher 合并入进程：三源发现、九条守卫对照、env 映射与偏差 |
+| [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md) | watcher 合并入进程：三源发现、九条原守卫对照 + 第 10 条摘除守卫、env 映射与偏差 |
 | [doc/gap-gpu-load.md](doc/gap-gpu-load.md) | GPU 负载源：metrics 抓取与远程 Prom 查询两路、优先级与 TTL |
 | [doc/gap-routing-dyn.md](doc/gap-routing-dyn.md) | 路由动态变更：policy/model_policies 热配置与优先级链 |
 | [doc/gap-token-accounting.md](doc/gap-token-accounting.md) | 流式 token 核算：include_usage 注入/剥帧、四类 token 指标 |

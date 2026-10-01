@@ -21,7 +21,10 @@ Scenarios, in order:
      until a POST /model-map rename adopts one of them -- the one case where the
      watcher takes ownership over, which is then subject to the remove grace.
   3  remove-grace: a stopped worker survives the grace window and is deleted after it
-     (guards 5 + 4, with keep-last switched off so nothing else holds it back).
+     (guards 5 + 4, with keep-last switched off so nothing else holds it back). The
+     worker is a container with a published port and it is stopped by removing the
+     container, because only that takes the URL out of discovery -- see the comment
+     above scenario 3 for why stop_mock() no longer reaches these guards.
   4  keep-last: the same stop, this time the worker is kept, warned about, and only
      removed once keep-last-grace itself expires (guard 6).
   5  docker discovery over the unix socket: a published container port becomes a
@@ -29,6 +32,11 @@ Scenarios, in order:
      removed, and survives a router restart -- the ledger and the pool are both
      shared dicts, so a restart clears them together and rediscovery re-registers
      from scratch (guard 8 in its merged form). Those checks share the [5] tag.
+  6  strict-probe eviction (guard 10): a worker that stays listed and keeps answering
+     /health but can no longer name a model on /v1/models leaves the pool on that same
+     pass, with no remove grace and no keep-last exemption, then re-registers through
+     the ordinary add gates once /v1/models answers again. Scenario 7 is the same
+     shape with a 500 instead of an id-less 200.
 """
 import json
 import os
@@ -406,8 +414,13 @@ def scenario_proc_scan_protection():
         # and only the scanned worker can be deleted for vanishing. Stopping it has
         # to remove exactly it: the adopted worker still answers /v1/models, and the
         # protected worker is off-limits whatever it does.
+        # The scanned URL stays in the candidate set (SMG_WATCHER_ALLOW_PORT is
+        # reported whatever /proc says, see the block comment before scenario 3), so
+        # after the kill the strict probe fails and guard 10 evicts it on that pass.
+        # What this asserts is guard 4 -- only the watcher's own ledger is deleted
+        # from -- on the fast branch; the grace itself is scenario [3]'s subject.
         stop_mock(found)
-        check("[2] an owned worker is deleted once its service is gone (guards 4+5)",
+        check("[2] an owned worker is deleted once its service is gone (guards 4+10)",
               wait_until(lambda: found_url not in by_url(port), 30), logs(name))
         check("[2] neither the adopted nor the protected worker went with it",
               seed_url in by_url(port) and keep_url in by_url(port),
@@ -423,24 +436,115 @@ def scenario_proc_scan_protection():
 
 
 # --------------------------------------------------------------------------
+# Helpers for the two discovery shapes the removal guards distinguish.
+#
+# Guard 5 (remove-grace) and guard 6 (keep-last) apply only to a worker that
+# discovery *stopped reporting*: the restart-shaped case a grace exists to ride
+# out. Guard 10 (doc/gap-watcher-merge.md 1.1) is the opposite finding -- the
+# service is still reported and still answers /health, but the strict probe
+# cannot read a model id out of /v1/models -- and it evicts on that same pass.
+# The two states have to be manufactured differently, which is why the scenarios
+# below use two different discovery sources:
+#
+#   * "no longer reported": the worker is a container with a *published* port, so
+#     the docker scanner lists it and removing the container removes the URL from
+#     discovery (and from /proc). A host-process mock cannot produce this state:
+#     SMG_WATCHER_TARGETS keeps reporting its list whatever the process does, and
+#     collect() turns every SMG_WATCHER_ALLOW_PORT into a candidate regardless of
+#     /proc/net/tcp (checked against watcher.collect() under luajit), so after
+#     stop_mock() the probe would keep running against the dead URL and the row
+#     would leave as a failed probe rather than as undiscovered.
+#   * "reported but unreadable": a host mock plus a static TARGET, with the fault
+#     flipped inside the running process over POST /fault. Same url, same process,
+#     /health and /metrics untouched -- so the eviction can only be attributed to
+#     the strict probe, and the recovery half re-adds the very same row.
+
+
+def start_mock_container(name, port, model):
+    """Run the mock as a container that publishes its port; wait until it answers.
+
+    The published mapping is what the docker scanner lists, so removing the
+    container is what makes discovery forget the URL.
+    """
+    subprocess.run(["docker", "run", "-d", "--name", name,
+                    "-p", "127.0.0.1:%d:8000" % port,
+                    "-v", "%s:/repo:ro" % REPO, "-e", "MODEL=%s" % model,
+                    "--entrypoint", "python3", "python:3.12-alpine",
+                    "/repo/test/mock_llm_worker.py", "--host", "0.0.0.0",
+                    "--port", "8000", "--model", model],
+                   check=True, capture_output=True)
+    CONTAINERS.append(name)
+    url = "http://127.0.0.1:%d" % port
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        status, _, _ = http("GET", url + "/health", timeout=2)
+        if status == 200:
+            return url
+        time.sleep(0.5)
+    raise RuntimeError("mock container %s never came up:\n%s" % (name, logs(name)))
+
+
+def remove_container(name):
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def docker_watch_env(keep_port, extra=None):
+    """Watcher env for one docker-discovered worker on a box full of real services.
+
+    Every published port but ours is excluded explicitly, as in scenario 5: a test
+    whose worker count depends on what else happens to be listening is a flaky
+    test. Container-internal IPs are switched off because the worker is reached
+    through its published mapping, and leaving them on would add unreachable bridge
+    candidates to every pass.
+    """
+    others = []
+    listed = subprocess.run(["docker", "ps", "--format", "{{.Ports}}"],
+                            capture_output=True).stdout.decode()
+    for match in __import__("re").finditer(r"(\d+)->", listed):
+        published = int(match.group(1))
+        if published != keep_port:
+            # Lua patterns: the port needs no escaping and the host half stays a
+            # wildcard, so the exclude never names an address literal.
+            others.append("^http://[^:]+:%d$" % published)
+    env = {"SMG_WATCHER_DOCKER": "1", "SMG_WATCHER_CONTAINER_IPS": "0"}
+    if others:
+        env["SMG_WATCHER_EXCLUDE"] = ",".join(others)
+    env.update(extra or {})
+    return env
+
+
+# --------------------------------------------------------------------------
 def scenario_grace_and_keep_last():
-    """One stopped worker, two ledgers: keep-last off deletes, keep-last on holds."""
+    """Undiscovered grace (guard 5) and keep-last (guard 6), on the undiscovered path.
+
+    Both stop the worker by removing the container the docker scanner had been
+    listing; see the block comment above for why that, and not stop_mock(), is the
+    state these two guards cover.
+    """
     name_grace = "lr-watch-3-%s" % RUN
     name_keep = "lr-watch-4-%s" % RUN
+    ctr_a = "lr-watch-3-ctr-%s" % RUN
+    ctr_b = "lr-watch-4-ctr-%s" % RUN
     port_a = free_port()
-    mock_a = start_mock(port_a, "gone-model")
-    watcher_a = start_watcher({
-        "SMG_WATCHER_TARGETS": "http://127.0.0.1:%d" % port_a,
-        # SMG_WATCHER_KEEP_LAST=false is the daemon's --no-keep-last: guard 6 off so
-        # this scenario measures the remove grace alone.
-        "SMG_WATCHER_KEEP_LAST": "false",
-    }, name_grace)
-    url_a = "http://127.0.0.1:%d" % port_a
+    url_a = start_mock_container(ctr_a, port_a, "gone-model")
+    watcher_a = start_watcher(
+        docker_watch_env(port_a, {
+            # SMG_WATCHER_KEEP_LAST=false is the daemon's --no-keep-last: guard 6 off
+            # so this scenario measures the remove grace alone.
+            "SMG_WATCHER_KEEP_LAST": "false",
+        }), name_grace, mounts_docker=True, wait_secs=60)
     if not check("[3] worker registered before the stop",
-                 wait_workers(watcher_a, 1, timeout=30), logs(name_grace)):
-        stop_mock(mock_a)
+                 wait_workers(watcher_a, 1, timeout=45), logs(name_grace)):
+        remove_container(ctr_a)
         return
-    stop_mock(mock_a)
+    check("[3] the worker is owned before the stop",
+          wait_metric(watcher_a, "lr_watch_owned_workers", 1),
+          watch_metrics(metrics(watcher_a)))
+    check("[3] nothing was removed while discovery still listed it",
+          watch_counter(watcher_a, "lr_watch_removes_total") == 0,
+          watch_metrics(metrics(watcher_a)))
+    # The stop: the container, and with it the published port discovery read, is gone.
+    remove_container(ctr_a)
     # First pass after the stop stamps missing_since; the worker must stay.
     time.sleep(3)
     rows = by_url(watcher_a)
@@ -460,31 +564,34 @@ def scenario_grace_and_keep_last():
           gone, logs(name_grace))
     check("[3] the deletion is counted once (guard 4: from its own ledger)",
           metric(metrics(watcher_a), "lr_watch_removes_total") == 1,
-          "\n".join(l for l in metrics(watcher_a).splitlines() if l.startswith("lr_watch")))
+          watch_metrics(metrics(watcher_a)))
+    # Attribution: this is the undiscovered branch, not the strict probe's.
+    check("[3] and it went as undiscovered, not as a failed probe",
+          "(undiscovered, gone" in logs(name_grace), logs(name_grace)[-600:])
     subprocess.run(["docker", "rm", "-f", name_grace], capture_output=True)
 
     # Same stop, keep-last on: the last worker of a model is held and warned about,
     # then released when its own grace expires.
     port_b = free_port()
-    mock_b = start_mock(port_b, "solo-model")
-    watcher_b = start_watcher({
-        "SMG_WATCHER_TARGETS": "http://127.0.0.1:%d" % port_b,
+    url_b = start_mock_container(ctr_b, port_b, "solo-model")
+    watcher_b = start_watcher(docker_watch_env(port_b, {
         "SMG_WATCHER_REMOVE_GRACE_SECS": "2",
         "SMG_WATCHER_KEEP_LAST_GRACE_SECS": "12",
-    }, name_keep)
-    url_b = "http://127.0.0.1:%d" % port_b
+    }), name_keep, mounts_docker=True, wait_secs=60)
     if check("[4] worker registered before the stop",
-             wait_workers(watcher_b, 1, timeout=30), logs(name_keep)):
-        stop_mock(mock_b)
+             wait_workers(watcher_b, 1, timeout=45), logs(name_keep)):
+        remove_container(ctr_b)
         time.sleep(9)          # grace (2 s) long elapsed, keep-last (12 s) not yet
         rows = by_url(watcher_b)
         check("[4] the last worker of a model survives remove-grace (guard 6)",
               url_b in rows, json.dumps(sorted(rows)))
         check("[4] nothing removed while keep-last holds",
               not metric(metrics(watcher_b), "lr_watch_removes_total"),
-              "\n".join(l for l in metrics(watcher_b).splitlines() if l.startswith("lr_watch")))
+              watch_metrics(metrics(watcher_b)))
         check("[4] the keep-last decision is logged",
               "last worker" in logs(name_keep), logs(name_keep)[-400:])
+        check("[4] and not the strict-probe branch",
+              "probe failed" not in logs(name_keep), logs(name_keep)[-600:])
         deadline = time.time() + 30
         released = False
         while time.time() < deadline:
@@ -494,8 +601,100 @@ def scenario_grace_and_keep_last():
             time.sleep(0.5)
         check("[4] keep-last expires and the dead worker finally goes",
               released, logs(name_keep))
+        check("[4] the log names the keep-last grace as what released it",
+              "keep-last expired" in logs(name_keep), logs(name_keep)[-600:])
     subprocess.run(["docker", "rm", "-f", name_keep], capture_output=True)
-    stop_mock(mock_b)
+    remove_container(ctr_b)
+
+
+# --------------------------------------------------------------------------
+def scenario_probe_failure_eviction(tag, mode):
+    """Guard 10: a service that cannot answer /v1/models leaves the pool at once.
+
+    The URL stays in the discovery source (a static TARGET) and keeps answering
+    /health and /metrics throughout, which is what separates this from scenarios
+    3/4. Only the strict probe's answer changes, flipped inside the same mock
+    process on the same url -- a restart or a new port would be a different
+    discovery situation, not the same row going bad and coming back.
+    """
+    t = "[%s]" % tag
+    name = "lr-watch-%s-%s" % (tag, RUN)
+    mock_port = free_port()
+    mock = start_mock(mock_port, "flaky-model")
+    url = "http://127.0.0.1:%d" % mock_port
+    port = start_watcher({"SMG_WATCHER_TARGETS": url}, name)
+    if not check(t + " the worker registers from a real /v1/models",
+                 wait_workers(port, 1, timeout=30), logs(name)):
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        stop_mock(mock)
+        return
+    row = by_url(port).get(url, {})
+    check(t + " the row is watcher-owned",
+          row.get("metadata", {}).get("managed-by") == "router-watch"
+          and wait_metric(port, "lr_watch_owned_workers", 1),
+          json.dumps(row.get("metadata")) + "\n" + watch_metrics(metrics(port)))
+    check(t + " and healthy while it can still name its model",
+          wait_healthy(port, url), logs(name))
+    # Let reap_pending confirm the queued add: a URL with a live pending entry is
+    # claimed and skips the removal loop for the whole add-confirm window (180 s).
+    time.sleep(3)
+    before = watch_counter(port, "lr_watch_removes_total") or 0
+
+    st, body, _ = http("POST", url + "/fault", {"models_mode": mode})
+    check(t + " the mock accepts the /v1/models fault " + repr(mode),
+          st == 200 and json.loads(body).get("models_mode") == mode,
+          "%s %s" % (st, body[:160]))
+    t0 = time.time()
+    gone = wait_until(lambda: url not in by_url(port), timeout=20)
+    elapsed = time.time() - t0
+    lg = logs(name)
+    check(t + " a confirmed-unavailable service leaves the pool", gone, lg[-600:])
+    # remove-grace is 4 s on a 2 s interval, so the grace branch could not evict
+    # before ~6 s: 5 separates "at once" from "after the grace" without being tight.
+    check(t + " it left at once, without waiting for remove-grace (%.1fs)" % elapsed,
+          elapsed < 5, "%.1fs" % elapsed)
+    check(t + " the log names the strict probe as the reason",
+          "probe failed (no /v1/models)" in lg, lg[-600:])
+    check(t + " and not the undiscovered/keep-last branch",
+          "(undiscovered, gone" not in lg and "last worker of model" not in lg,
+          lg[-600:])
+    check(t + " the removal is counted once (guard 4: its own ledger)",
+          wait_metric(port, "lr_watch_removes_total", before + 1),
+          watch_metrics(metrics(port)))
+    check(t + " the ledger stops owning it",
+          wait_metric(port, "lr_watch_owned_workers", 0), watch_metrics(metrics(port)))
+    st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                       {"model": "flaky-model",
+                        "messages": [{"role": "user", "content": "x"}]})
+    check(t + " a request naming it is refused, not routed", st in (404, 503),
+          "%s %s" % (st, body[:160]))
+    st, body, _ = http("GET", "http://127.0.0.1:%d/v1/models" % port)
+    check(t + " the advertised model list stops offering it",
+          st == 503 or "flaky-model" not in body, "%s %s" % (st, body[:160]))
+    st, body, _ = http("GET", url + "/health")
+    check(t + " the health surface never stopped answering", st == 200,
+          "%s %s" % (st, body[:80]))
+
+    # Recovery half: the same url, back through the ordinary add and health gates.
+    st, body, _ = http("POST", url + "/fault", {"models_mode": "normal"})
+    check(t + " the fault is cleared", st == 200, "%s %s" % (st, body[:120]))
+    check(t + " recovery re-registers through the same add gate",
+          wait_model(port, url, "flaky-model", timeout=30), logs(name))
+    check(t + " the recovered worker turns healthy again",
+          wait_healthy(port, url), logs(name))
+    check(t + " the ledger owns it once more",
+          wait_metric(port, "lr_watch_owned_workers", 1), watch_metrics(metrics(port)))
+    st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                       {"model": "flaky-model",
+                        "messages": [{"role": "user", "content": "y"}]})
+    echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
+    check(t + " traffic flows again",
+          st == 200 and echo.get("model") == "flaky-model", "%s %s" % (st, body[:200]))
+    check(t + " and nothing else was removed on the way back",
+          watch_counter(port, "lr_watch_removes_total") == before + 1,
+          watch_metrics(metrics(port)))
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    stop_mock(mock)
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +802,8 @@ def main():
     scenario_target_and_map()
     scenario_proc_scan_protection()
     scenario_grace_and_keep_last()
+    scenario_probe_failure_eviction("6", "no_ids")
+    scenario_probe_failure_eviction("7", "error500")
     scenario_docker_and_restart()
     failed = [r for r in RESULTS if not r[0]]
     print("\n=== %d checks, %d failed ===" % (len(RESULTS), len(failed)))

@@ -14,6 +14,25 @@ Environment knobs:
   FAIL_MODE  no_retry_4xx | retryable_500 | retry_once_500
   FAIL_KEEP  for retry_once_500: keep failing after the 1st failure (default 0)
 
+Discovery/strict-probe knob (doc/gap-watcher-merge.md 1.1 guard 10). It dirties
+ONLY the model list, never the health surface, so a watcher can blame the strict
+/v1/models probe and not the health sweep:
+  MODELS_MODE           normal | no_ids | empty_data | error500 | not_json
+                        (default normal, which is byte-identical to what every
+                        pre-existing suite saw)
+                        no_ids:     200 with data[] entries that carry no id
+                        empty_data: 200 with {"object":"list","data":[]}
+                        error500:   500 on /v1/models
+                        not_json:   200 with an HTML body (a web UI, not an API)
+  POST /fault {"models_mode":"..."} flips it at runtime on the SAME url and the
+  SAME process, which is what a "goes away, then comes back" test needs: a new
+  port would be a new url, and discovery would treat the recovery as a brand new
+  service instead of the same row returning. /health and /metrics answer 200 in
+  every mode, deliberately -- see the watcher's gateway guard and the health
+  sweep thresholds in config.lua. GET /state reports the live value; GET /reset
+  deliberately does NOT clear it, so a shared reset helper cannot silently undo
+  an injected fault.
+
 Streaming usage knobs (doc/gap-token-accounting.md). These exist so a test can
 reproduce what the real engines actually do — an OpenAI-compatible backend sends
 a usage frame only when the request asked for one — instead of always sending it:
@@ -53,6 +72,9 @@ STATE = {
     "chunk_ms": float(os.environ.get("CHUNK_MS", 0) or 0),
     "latency_ms": float(os.environ.get("LATENCY_MS", 0) or 0),
     "fail_mode": os.environ.get("FAIL_MODE", "") or "",
+    # Strict-probe fault shape for GET /v1/models; see MODELS_MODE in the module
+    # docstring. normal keeps the pre-existing byte shape untouched.
+    "models_mode": (os.environ.get("MODELS_MODE", "normal") or "normal").lower(),
     "started": time.time(),
     "requests": 0,
     "fail_once_used": False,
@@ -72,6 +94,9 @@ STATE = {
 LOCK = threading.Lock()
 
 CONTENT_TYPE_JSON = "application/json"
+
+# Accepted values for the MODELS_MODE fault (see the module docstring).
+MODELS_MODES = ("normal", "no_ids", "empty_data", "error500", "not_json")
 
 
 def env_float(name, default=0.0):
@@ -186,6 +211,30 @@ class Handler(BaseHTTPRequestHandler):
                 extra={"WWW-Authenticate": "Bearer"})
         return not denied
 
+    # ------------------------------------------------------------------ models
+    def _handle_models(self):
+        # GET /v1/models under the MODELS_MODE fault (see the module docstring).
+        # normal is the untouched pre-existing byte shape; every other mode is a
+        # way for a live service to stop answering the one question the strict probe
+        # asks (which model id do you serve) while /health and /metrics stay 200,
+        # which is what lets a test attribute a pool eviction to that probe alone.
+        with LOCK:
+            mode = STATE["models_mode"]
+        if mode == "error500":
+            self._send(500, {"error": {"message": "mock: models unavailable",
+                                       "type": "server_error", "code": "MOCK_500"}})
+        elif mode == "not_json":
+            self._send_text(200, "<html><body>mock web ui</body></html>",
+                            ctype="text/html; charset=utf-8")
+        elif mode == "empty_data":
+            self._send(200, {"object": "list", "data": []})
+        elif mode == "no_ids":
+            self._send(200, {"object": "list", "data": [{"object": "model"}]})
+        else:
+            self._send(200, {"object": "list", "data": [
+                {"id": STATE["model"], "object": "model", "created": int(STATE["started"]),
+                 "owned_by": "local"}]})
+
     # --------------------------------------------------------------------- GET
     def do_GET(self):
         self._handle_get()
@@ -211,9 +260,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "type": "method_not_allowed",
                                        "code": "METHOD_NOT_ALLOWED"}})
         elif path == "/v1/models":
-            self._send(200, {"object": "list", "data": [
-                {"id": STATE["model"], "object": "model", "created": int(STATE["started"]),
-                 "owned_by": "local"}]})
+            self._handle_models()
         elif path in ("/server_info", "/get_server_info"):
             self._send(200, {
                 "app_name": "mock-llm-worker",
@@ -328,6 +375,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(body, dict):
             body = {}
+        if path == "/fault":
+            # Runtime flip of the strict-probe fault, on the same url and process
+            # (see MODELS_MODE in the module docstring for why a restart is wrong).
+            # Ahead of the latency and FAIL_MODE hops on purpose: this is mock
+            # control, and a test must be able to change or clear an armed fault
+            # while another fault is already in effect.
+            mode = str(body.get("models_mode", "normal")).lower()
+            if mode not in MODELS_MODES:
+                self._send(400, {"error": {
+                    "message": "mock: bad models_mode %r (want one of %s)"
+                               % (mode, ",".join(sorted(MODELS_MODES))),
+                    "type": "invalid_request_error", "code": "BAD_MODELS_MODE"}})
+            else:
+                with LOCK:
+                    STATE["models_mode"] = mode
+                self._send(200, {"models_mode": mode})
+            return
         if STATE["latency_ms"] > 0:
             time.sleep(STATE["latency_ms"] / 1000.0)
         if self._failure():
@@ -718,6 +782,9 @@ def main():
     parser.add_argument("--latency-ms", type=float, default=None)
     parser.add_argument("--fail-mode", default=None,
                         choices=[None, "no_retry_4xx", "retryable_500", "retry_once_500"])
+    parser.add_argument("--models-mode", default=None, choices=list(MODELS_MODES),
+                        help="dirty GET /v1/models (the strict-probe fault); /health"
+                             " and /metrics stay 200 in every mode")
     parser.add_argument("--require-auth", action="store_true",
                         help="401 /v1* requests that carry no Authorization header")
     args = parser.parse_args()
@@ -728,13 +795,17 @@ def main():
                            else env_float("LATENCY_MS"))
     if args.fail_mode:
         STATE["fail_mode"] = args.fail_mode
+    if args.models_mode:
+        STATE["models_mode"] = args.models_mode
     if args.require_auth:
         STATE["require_auth"] = True
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
-    sys.stderr.write("[mock] model=%s listening on %s:%s fail_mode=%s chunk_ms=%s\n" % (
-        STATE["model"], args.host, args.port, STATE["fail_mode"] or "-", STATE["chunk_ms"]))
+    sys.stderr.write("[mock] model=%s listening on %s:%s fail_mode=%s chunk_ms=%s "
+                     "models_mode=%s\n" % (
+        STATE["model"], args.host, args.port, STATE["fail_mode"] or "-",
+        STATE["chunk_ms"], STATE["models_mode"]))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
