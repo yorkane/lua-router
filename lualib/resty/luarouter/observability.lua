@@ -1327,7 +1327,7 @@ function _M.query(filter, cursor, limit)
         -- 不后退（后退会让无脑循环把同一段重读一遍）。
         doc.earliest_seq = head
         doc.next_cursor = cursor
-        doc.requests = cjson.empty_array
+        doc.requests = {}
         return doc
     end
 
@@ -1455,7 +1455,7 @@ function _M.handle_logs()
     end
     if filter then
         local doc = _M.query(filter, query.cursor, query.limit)
-        if #doc.requests == 0 then
+        if type(doc.requests) ~= "table" or #doc.requests == 0 then
             doc.requests = cjson.empty_array
         end
         return respond_json(ngx.HTTP_OK, doc)
