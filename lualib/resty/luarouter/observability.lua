@@ -1447,6 +1447,19 @@ function _M.handle_logs()
         return log_disabled()
     end
     local query = ngx.req.get_uri_args()
+    local filter, bad_param, bad_msg = _M.parse_query(query)
+    if bad_param then
+        return respond_json(ngx.HTTP_BAD_REQUEST, {
+            error = bad_param .. ": " .. tostring(bad_msg),
+        })
+    end
+    if filter then
+        local doc = _M.query(filter, query.cursor, query.limit)
+        if #doc.requests == 0 then
+            doc.requests = cjson.empty_array
+        end
+        return respond_json(ngx.HTTP_OK, doc)
+    end
     local cursor = tonumber(query.cursor) or 0
     local limit = tonumber(query.limit) or 500
     local head, requests = _M.snapshot(cursor, limit)
