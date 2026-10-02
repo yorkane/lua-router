@@ -40,6 +40,7 @@ local K_CBF = "cbf:"     -- consecutive breaker failures
 local K_CBS = "cbu:"     -- consecutive breaker successes
 local K_CBO = "cbo:"     -- ms timestamp when the breaker opened
 local K_LOAD = "lo:"     -- in-flight requests
+local K_ACTIVE = "act:"  -- ms timestamp of the last completed request
 local K_URL2ID = "url:"  -- url -> id
 local K_IDURL  = "u:"    -- id -> url (cheap label lookup for metrics)
 local K_JOB = "job:"     -- url -> JobStatus JSON
@@ -944,6 +945,7 @@ function _M.add(req, cfg)
         d:set(K_CBF .. id, 0)
         d:set(K_CBS .. id, 0)
         d:set(K_LOAD .. id, 0)
+        d:set(K_ACTIVE .. id, 0)  -- 从未活跃过，让第一次巡检会探它
         -- A re-registration is a new engine behind the url: whatever the previous
         -- owner's GPU was doing has no right to describe this one, so both
         -- external channels start empty (the load source refills them on its tick).
@@ -1692,6 +1694,22 @@ end
 ---nil-safe: a worker with no key reads 0, exactly as load_with treats it.
 ---@param id string
 ---@return number inflight
+---Touch the worker's activity clock (call on every completed request).
+---The health sweep uses this to skip workers that just saw traffic.
+---@param id string
+function _M.touch_active(id)
+    shdict():set(K_ACTIVE .. id, ngx.now() * 1000)
+end
+
+---How long since the worker last saw traffic, in ms. nil = never seen.
+---@param id string
+---@return number|nil
+function _M.last_active_ms(id)
+    local ts = shdict():get(K_ACTIVE .. id)
+    if not ts or ts == 0 then return nil end
+    return ngx.now() * 1000 - ts
+end
+
 function _M.inflight_requests(id)
     return shdict():get(K_LOAD .. id) or 0
 end

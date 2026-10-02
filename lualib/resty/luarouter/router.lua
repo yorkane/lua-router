@@ -2997,6 +2997,10 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
             local status = response.status
             observability.record_router_upstream_response(status,
                 response.headers["x-smg-error-code"] or "")
+            -- 流量就是健康的证明：touch 一下，健康巡检会跳过它
+            if registry.touch_active then
+                registry.touch_active(worker.id)
+            end
 
             if hb.is_retryable_status(status) and attempt >= max_attempts then
                 -- Rust calls on_exhausted() when the last allowed attempt still

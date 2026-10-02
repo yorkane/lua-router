@@ -231,12 +231,29 @@ function _M.check_all()
     local timeout_ms = conf.health_check_timeout_secs * 1000
     local records = registry.records()
     local probed = 0
+    local skipped_idle = 0
+    -- 空闲阈值：缺省 300s。有流量的 worker 不需要探活——流量本身就是健康的证明。
+    -- 设为 0 或负数 = 不跳过（兼容旧行为）。
+    local idle_ms = (tonumber(os.getenv("SMG_HEALTH_CHECK_IDLE_SECS")) or 300) * 1000
+    local now_ms = ngx.now() * 1000
 
     for i = 1, #records do
         local record = records[i]
         if not record.disable_health_check then
-            local url = record.url .. conf.health_check_endpoint
-            local status, _, err = _M.http_get(url, timeout_ms)
+            local skip = false
+            if idle_ms > 0 and registry.last_active_ms then
+                local idle_ago = registry.last_active_ms(record.id)
+                if idle_ago and idle_ago < idle_ms then
+                    skip = true
+                    skipped_idle = skipped_idle + 1
+                end
+            end
+            if skip then
+                -- 有流量：跳过探活，不翻转健康位（流量已经证明它活着）
+                observability.record_health_check(record.id, true, true)
+            else
+                local url = record.url .. conf.health_check_endpoint
+                local status, _, err = _M.http_get(url, timeout_ms)
             local ok = status ~= nil and status >= 200 and status < 300
             local hc = {
                 failure_threshold = record.health_failure_threshold,
@@ -253,8 +270,12 @@ function _M.check_all()
                 observability.log_debug("health probe " .. url .. " failed: "
                     .. (err or ("status " .. tostring(status))))
             end
-            probed = probed + 1
+                probed = probed + 1
+            end
         end
+    end
+    if skipped_idle > 0 then
+        observability.log_debug("health sweep skipped " .. skipped_idle .. " idle workers")
     end
     return probed
 end
