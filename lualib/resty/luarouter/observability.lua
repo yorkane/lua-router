@@ -1039,6 +1039,319 @@ function _M.log_buffered()
     return math.min(head, cfg().request_log_capacity)
 end
 
+
+
+-- ------------------------------------------------------------------ query
+
+-- 合法的状态类前缀只认这四档；其余（6xx/1xx…）是拼写错误，必须 400 而不是
+-- 悄悄返回空表——「没有匹配」和「参数写错了」要在 HTTP 层就能区分开。
+local STATUS_CLASSES = { ["2xx"] = 2, ["3xx"] = 3, ["4xx"] = 4, ["5xx"] = 5 }
+-- 布尔过滤的取值集合，全部小写比较。
+local TRUTHY = { ["true"] = true, ["1"] = true, ["yes"] = true }
+local FALSY = { ["false"] = false, ["0"] = false, ["no"] = false }
+
+---Normalize one raw query value: single non-empty string, or nil, or an error.
+---nginx 的 get_args 对重复键会给数组，空串会匹配不上任何记录；两种情况都当参数
+---写错处理，而不是静默忽略。
+---@param value any
+---@param name string @ 报错文案里的参数名
+---@return string|nil, string|nil err
+local function query_text(value, name)
+    if value == nil then
+        return nil
+    end
+    if type(value) == "table" then
+        value = value[1]
+    end
+    if type(value) ~= "string" then
+        return nil, name .. " must be a string"
+    end
+    if value == "" then
+        return nil, name .. " must not be empty"
+    end
+    return value
+end
+
+---Strict non-negative integer (rejects "1.5", "10x" and negatives).
+---@param value any
+---@param name string
+---@return integer|nil, string|nil err
+local function query_int(value, name)
+    if value == nil then
+        return nil
+    end
+    if type(value) == "table" then
+        value = value[1]
+    end
+    if type(value) == "number" then
+        if value ~= math.floor(value) or value < 0 then
+            return nil, name .. " must be a non-negative integer"
+        end
+        return value
+    end
+    if type(value) ~= "string" or not string.match(value, "^%d+$") then
+        return nil, name .. " must be a non-negative integer"
+    end
+    return tonumber(value)
+end
+
+local function truthy(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local key = value:lower()
+    if TRUTHY[key] ~= nil then
+        return TRUTHY[key]
+    end
+    if FALSY[key] ~= nil then
+        return FALSY[key]
+    end
+    return nil
+end
+
+---Parse and validate the /_ui/logs query into a reusable filter.
+---
+--- 过滤语义全部是**精确相等**，刻意不做子串匹配：入口名之间有包含关系
+--- （glm 是 zai/glm-5.3 的子串），子串匹配会让用户以为过滤坏了。多个条件之间 AND。
+---
+--- 未知参数一律忽略而不是 400：前端会在同一 URL 上带自己的状态位（自动刷新、
+--- 分页控件），网关不认识它们不代表用户写错了。
+---
+---@param query table|nil @ req.get_query() 的原始值
+---@return table|false, string|nil err
+---  filter 为 false 表示「没有任何过滤参数」，调用方应当走 snapshot 老路径，
+---  这样不带过滤的返回体才能逐字节维持原契约。
+function _M.parse_query(query)
+    query = query or {}
+    local filter = {}
+    local found = false
+
+    -- 约定：返回 (true) 继续，返回 (false, err) 中止并向上抛 400 文案。写成
+    -- 「返回 err 字符串」会被 if ok then 当成真值继续往下跑，所以显式带 succeed 位。
+    local function text_field(name, dest)
+        if query[name] == nil then
+            return true
+        end
+        local value, err = query_text(query[name], name)
+        if err then
+            return false, err
+        end
+        filter[dest] = value
+        found = true
+        return true
+    end
+
+    -- model 匹配 requested_model 或 model：1 对多之后入口名与实际模型名不同是
+    -- 常态，按入口查的人和按实际模型查的人都期望命中。
+    local ok, res = text_field("model", "model")
+    if ok then
+        ok, res = text_field("forwarded_model", "forwarded_model")
+    end
+    if ok then
+        ok, res = text_field("route_type", "route_type")
+    end
+    if ok then
+        ok, res = text_field("session", "session")
+    end
+    if ok then
+        -- worker 的规范化（去 scheme / id 换成 url）由调用方做，这里只保证非空。
+        ok, res = text_field("worker", "worker")
+    end
+    if ok and query.status ~= nil then
+        local raw, err = query_text(query.status, "status")
+        if err then
+            ok, res = false, err
+        else
+            local cls = STATUS_CLASSES[raw:lower()]
+            local exact = tonumber(raw)
+            if cls then
+                -- 状态类只与记录里的数字状态码比较；与字符串 "4" 比会误命中。
+                filter.status_class = cls
+            elseif exact and exact == math.floor(exact) and exact >= 100 and exact <= 599 then
+                filter.status_exact = exact
+            else
+                ok, res = false,
+                    "status must be an HTTP code (100-599) or one of 2xx/3xx/4xx/5xx"
+            end
+            found = true
+        end
+    end
+    if ok and query.stream ~= nil then
+        local raw, err = query_text(query.stream, "stream")
+        if err then
+            ok, res = false, err
+        else
+            local bool = truthy(raw)
+            if bool == nil then
+                ok, res = false, "stream must be one of true/false/1/0/yes/no"
+            else
+                filter.stream = bool
+            end
+            found = true
+        end
+    end
+    if ok and (query.since_ms ~= nil or query.until_ms ~= nil) then
+        local since, serr = query_int(query.since_ms, "since_ms")
+        local until_ms, uerr = query_int(query.until_ms, "until_ms")
+        if serr then
+            ok, res = false, serr
+        elseif uerr then
+            ok, res = false, uerr
+        elseif since and until_ms and since > until_ms then
+            -- 区间反过来一定是手误：返回空数组会让人以为那段时间没有流量。
+            ok, res = false, "since_ms must not be greater than until_ms"
+        else
+            filter.since_ms = since
+            filter.until_ms = until_ms
+        end
+        found = true
+    end
+
+    if not ok then
+        return false, res
+    end
+    if not found then
+        return false
+    end
+    return filter
+end
+
+---One record passes only if it satisfies every field present in the filter.
+---@param record table
+---@param filter table @ as produced by parse_query (worker already normalized)
+---@return boolean
+local function matches(record, filter)
+    if filter.model then
+        -- 缺字段解码后是 nil 或 cjson.null（lightuserdata），都不等于字符串，
+        -- 所以缺字段的记录天然被过滤掉，不必特判。
+        if record.requested_model ~= filter.model and record.model ~= filter.model then
+            return false
+        end
+    end
+    if filter.forwarded_model and record.forwarded_model ~= filter.forwarded_model then
+        return false
+    end
+    if filter.worker then
+        local url = record.worker or record.selected
+        if type(url) ~= "string" then
+            return false
+        end
+        local stripped = string.gsub(url, "^https?://", "")
+        if stripped ~= filter.worker then
+            return false
+        end
+    end
+    if filter.route_type and record.route_type ~= filter.route_type then
+        return false
+    end
+    if filter.session and record.session ~= filter.session then
+        return false
+    end
+    if filter.stream == true and record.stream ~= true then
+        return false
+    end
+    if filter.stream == false and record.stream == true then
+        return false
+    end
+    local status = tonumber(record.status)
+    if filter.status_exact and status ~= filter.status_exact then
+        return false
+    end
+    if filter.status_class
+        and (not status or math.floor(status / 100) ~= filter.status_class) then
+        return false
+    end
+    local ts = tonumber(record.ts_ms)
+    if filter.since_ms and (not ts or ts < filter.since_ms) then
+        return false
+    end
+    if filter.until_ms and (not ts or ts > filter.until_ms) then
+        return false
+    end
+    return true
+end
+
+---Filtered, paginated read of the ring buffer: filter **before** the limit.
+---
+--- 与 snapshot 的关键差别是顺序：先扫完整个游标区间、把命中计数做全，再按 limit
+--- 截取。先截断再过滤的话，一页 500 条里过滤掉 490 条，页面就缩成一排空行，而计
+--- 数还会谎报「还有下一页」。所以 total_matched 必须是整段扫描的结论。
+---
+--- 游标语义与 snapshot 一致：从 cursor+1 起向 head 取，最旧优先；被环形缓冲覆盖的
+--- 部分直接当作不存在，earliest_seq 反映真实保留范围。
+---
+---@param filter table @ as produced by parse_query
+---@param cursor number
+---@param limit number
+---@return table doc
+function _M.query(filter, cursor, limit)
+    local d = logdict()
+    local head = d:get("head") or 0
+    local capacity = cfg().request_log_capacity
+    cursor = tonumber(cursor) or 0
+    if cursor < 0 then
+        cursor = 0
+    end
+    limit = tonumber(limit) or 500
+    if limit < 1 then
+        limit = 1
+    elseif limit > 2000 then
+        limit = 2000
+    end
+
+    local earliest = math.max(1, head - capacity + 1)
+    local start = cursor + 1
+    if start < earliest then
+        start = earliest
+    end
+
+    local doc = {
+        cursor = head,
+        capacity = capacity,
+        requests = {},
+        returned = 0,
+        total_matched = 0,
+        earliest_seq = earliest,
+        latest_seq = head,
+        -- 写入量超过容量 = 有比 earliest_seq 更早的行被覆盖掉过。
+        truncated_buffer = head > capacity,
+        truncated_page = false,
+    }
+    if start > head then
+        -- 游标越过保留区（缓冲被覆盖，或 head 仍是 0）：保留区塌成空，避免 UI 画出
+        -- earliest > latest 这种反着的区间。
+        doc.earliest_seq = head
+        doc.requests = cjson.empty_array
+        return doc
+    end
+
+    -- 扫描区间 = min(游标之后, 环形缓冲保留量)，上界就是 LMR_REQUEST_LOG_CAPACITY
+    -- （缺省 1000，config.lua clamp 到 >=0），所以成本与峰值内存按容量线性，而不是
+    -- 按匹配数。每行只 get + decode 一次并把解码结果复用给响应体，因此峰值内存
+    -- 约为「区间内全部匹配行的 Lua 表」+「一次整体 JSON 编码出的响应字符串」。
+    for seq = start, head do
+        local raw = d:get("q:" .. seq)
+        if raw then
+            local record = json_decode(raw)
+            if type(record) == "table" and matches(record, filter) then
+                doc.total_matched = doc.total_matched + 1
+                if doc.returned < limit then
+                    doc.returned = doc.returned + 1
+                    doc.requests[doc.returned] = record
+                else
+                    doc.truncated_page = true
+                end
+            end
+        end
+    end
+    if doc.returned == 0 then
+        doc.requests = cjson.empty_array
+    end
+    return doc
+end
+
+
+
 -- ------------------------------------------------------------------ _ui/stats
 
 ---Sliding-window counters for the logs page summary strip.
