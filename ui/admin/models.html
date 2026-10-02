@@ -191,8 +191,8 @@
                 <q-td :props="props">
                   <q-badge outline :color="props.row.registered ? 'teal-4' : 'grey-6'" class="chip-soft"
                          :label="props.row.registered ? t.registeredYes : t.registeredNo"></q-badge>
-                  <div v-if="(props.row.sources || []).length" class="muted mono" style="font-size:11px">
-                    {{ props.row.sources.join(', ') }}
+                  <div v-if="(props.row.sources || []).length" class="served-models" style="margin-top:4px">
+                    <span class="model-tag" v-for="src in props.row.sources" :key="src">{{ src }}</span>
                   </div>
                 </q-td>
               </template>
