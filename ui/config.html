@@ -9,9 +9,14 @@
           POST ./config/model-map   名称映射，转发 llm-watcher（旧接口，保留）
           POST ./config/model       每模型配置卡保存（字段缺省=不动；null=清除；remove:true=删除整条）
           POST ./config/apply       JSON 视图整体替换（缺省字段=清空；model_map 转发 watcher 落地）
-          POST ./config/virtual     虚拟模型 profile 整表替换（body {entries:[{model,target,workers,policy,effort}]}，
-                                    workers=规范化 url 白名单，policy/effort 可选覆盖；空数组=清空；兼容旧 {model,target}；
-                                    candidates=[{worker,model?}] 逐候选绑定，JSON 视图无损读写（表单页不编辑它）
+          POST ./config/virtual     虚拟模型 profile 整表替换（body {entries:[{model,targets,target,workers,policy,
+                                    effort,context_window}]}）：虚拟模型是对外主入口，targets=它映射的一组实际模型名
+                                    （1 对多的主字段），target 是旧形状的代表值（写了 targets 可省）；workers=规范化
+                                    url 白名单；context_window 是唯一允许的按条目覆盖（网关对下游统一钳制
+                                    max_tokens / max_completion_tokens；留空=不覆盖）；空数组=清空；兼容旧 {model,target}；
+                                    candidates=[{worker,model?}] 逐候选绑定（表单页不编辑它）。
+                                    本页对 virtual_models 是无损链路：表单没有编辑器的字段（candidates、policy、effort
+                                    以及后端新增的任意未知键）也必须原样回写——整表替换语义下，漏一个字段=清空它。
           POST ./config/upstreams   远程服务接入池整表替换（body {entries:[{url,model_id,priority,cost,labels,
                                     disable_health_check,max_concurrency,max_power_w,api_key}]}；api_key 缺失/null=不动，
                                     ""=清除；填值=设置；上限缺失/null/<=0/非数=不限；响应含 reconcile 摘要）
@@ -26,7 +31,10 @@
       4) 环境默认值（只读）。
     JSON 视图：可编辑子集（default_effort / effort_map / model_ctx / model_effort /
       model_configs / virtual_models / upstreams / model_map）的源码编辑，「校验并应用」走 ./config/apply 整体替换。
-      这份 JSON 等价于容器环境变量，可导出后粘进 compose 固化。
+      这份 JSON 等价于容器环境变量，可导出后粘进 compose 固化。virtual_models 是无损链路：
+      虚拟模型是对外主入口，1 对多地用 targets 映射一组实际模型名，只允许配 context_window 覆盖
+      （策略在路由策略页、强度在模型卡片）；读到的 targets / context_window / candidates 与未识别的键
+      必须原样写回，缺省的可选字段整体缺席（绝不写 null、绝不写空数组）。
       upstreams 的 api_key 回显恒 null（脱敏）：提交时保持 null/缺省=不动已存密钥，填 ""=清除，填值=设置。
 
   每模型卡的后端语义（POST ./config/model）：
@@ -270,17 +278,23 @@ details.env .body{margin-top:10px}
     <!-- B2. 虚拟模型映射 -->
     <section class="card">
       <h2>虚拟模型映射</h2>
-      <p class="desc">虚拟模型是对外别名，与真实模型并存、一起出现在 <code>/v1/models</code>；
-        请求用别名会被路由到 <code>target</code> 指向的上游模型。target 不存在时，请求会得到「无可用 worker」。
-        每行还可选：候选实例白名单（只把该别名限定到勾选的实例）、policy 与 effort 覆盖（留空=跟随全局/默认）。</p>
+      <p class="desc">虚拟模型是对外<b>主入口</b>，与真实模型并存、一起出现在 <code>/v1/models</code>；
+        一个别名 1 对多地映射<b>一组实际模型</b>（<code>targets</code>），由路由策略在这一组里选落点。
+        组里的模型都不在线时，请求会得到「无可用 worker」。旧形状的单值 <code>target</code> 仍是合法的
+        代表值（只配一个模型时填它即可，两者都缺省时由候选绑定推断）。每行还可选候选实例白名单
+        （只把该别名限定到勾选的实例）与 <code>context_window</code> 覆盖（留空=不覆盖）。
+        <b>虚拟模型这一层只允许配 context-window 覆盖</b>：调度策略请在「路由策略」页配，
+        思考强度请在对应的模型卡片上配。</p>
       <div class="rows" id="vm-rows" hidden></div>
+      <datalist id="vm-target-ids"></datalist>
       <div class="field" id="vm-actions" hidden>
         <button class="btn mini ghost" id="vm-add" type="button">+ 添加映射</button>
         <button class="btn" id="vm-save" type="button">保存映射</button>
       </div>
       <div class="hint" id="vm-hint" hidden>保存提交的是完整列表：删除一行后直接「保存映射」即可移除该别名。
-        别名与目标都留空的行提交时忽略；别名留空、目标留空、别名等于目标、target 指向另一个别名等非法行由后端整体拒绝并给出原因。
-        候选实例一个都不勾 = 全池可选；policy/effort 留「跟随」= 不覆盖。旧后端只认 {model,target}，多出的字段会被忽略。</div>
+        整行留空的行提交时忽略；别名留空、模型组与代表值都缺省、别名等于自身任一 target、别名指向另一个
+        别名、候选绑定的模型不在模型组里等非法行由后端整体拒绝并给出原因（本页会先给一遍中文提示）。
+        候选实例一个都不勾 = 全池可选；上下文留空 = 不覆盖。旧后端只认 {model,target}，多出的字段会被忽略。</div>
       <div class="legacy-note" id="vm-legacy-note" hidden>后端不支持虚拟模型映射（GET ./config 无 virtual_models 字段），请升级 llm-router。</div>
     </section>
 
@@ -314,8 +328,14 @@ details.env .body{margin-top:10px}
         LMR_MODEL_EFFORT / LMR_MODEL_EFFORT_MAP / LMR_MODEL_MODALITIES / LMR_VIRTUAL_MODELS），可以先导出再粘进 compose 固化。
         「校验并应用」走 <code>POST ./config/apply</code> <b>整体替换</b>：缺省字段视为清空；
         model_map 会转发 llm-watcher 落地改名。任一字段非法整体拒绝，不产生半提交。</p>
-      <p class="desc"><code>virtual_models</code> 可带 <code>workers</code>（规范化 url 白名单）、<code>policy</code>、
-        <code>effort</code> 覆盖。<code>upstreams</code> 的 <code>api_key</code> 回显恒 <code>null</code>（脱敏）：
+      <p class="desc"><code>virtual_models</code> 是对外主入口：一行 <code>model</code>（别名）用
+        <code>targets</code> 映射<b>一组实际模型名</b>，可带 <code>workers</code>（规范化 url 白名单）与
+        <code>context_window</code>（正整数，该入口唯一允许的覆盖，网关据此钳制下游的
+        max_tokens / max_completion_tokens；不想要覆盖就<b>整个键删掉</b>，写 <code>null</code> 或空数组会被
+        旧 build 误判）。<code>target</code> 是旧形状的代表值，写了 <code>targets</code> 时可省；两者都缺省时
+        由 <code>candidates</code> 的模型名推断。调度策略与思考强度不在这里配（分别在路由策略页、模型卡片）。
+        本视图<b>无损读写</b>：读到的 <code>candidates</code> 与任何未识别的键都会原样写回，缺省的可选字段则
+        整体缺席。<code>upstreams</code> 的 <code>api_key</code> 回显恒 <code>null</code>（脱敏）：
         提交时保持 <code>null</code> 或删掉该键 = 不动已存密钥，填 <code>""</code> = 清除，填值 = 设置。</p>
       <textarea id="json-ta" class="json-ta" spellcheck="false" placeholder="加载配置后此处显示可编辑 JSON 子集"></textarea>
       <div id="json-err"></div>
@@ -353,8 +373,6 @@ var MOD_LABELS = { image: '图片', video: '视频', audio: '音频' };
 var state = null;
 var modelIds = [];
 var poolWorkers = [];             // GET /workers 缓存：虚拟模型行的候选实例与 upstreams 状态对齐用
-var POLICY_NAMES = ['random', 'round_robin', 'cache_aware', 'power_of_two',
-  'prefix_hash', 'manual', 'bucket', 'consistent_hashing'];
 function normU(u){ return String(u || '').trim().replace(/\/+$/, ''); }
 function poolLabelFor(u){
   var want = normU(u);
@@ -951,26 +969,120 @@ function jumpToRename(name){
 }
 
 /* ---------- C. 模型名映射 ---------- */
-/* ---------- B2. 虚拟模型映射（别名 → 真实上游模型 + 可选 profile） ----------
-   后端契约（doc/gap-virtual-models.md 3.5）：
-     GET  document.virtual_models = [{model,target,workers?,policy?,effort?},...]（旧后端只有 model+target）；
-     POST ./config/virtual {entries:[{model,target,workers?,policy?,effort?}]} 整表替换（空数组=清空）。
-   workers 存规范化 url（或 worker id）；空/缺省 = 全池。policy/effort 缺省 = 不覆盖。
-   字段缺失（更旧后端无 virtual_models 字段）时只显示升级提示，不提供编辑区。 */
+/* ---------- B2. 虚拟模型映射（别名 → 一组实际模型 + 可选 context-window 覆盖） ----------
+   后端契约（doc/gap-virtual-models.md 3.5 + 用户裁定 2026-10-02「虚拟模型语义反转」）：
+     GET  document.virtual_models = [{model,targets?,target?,workers?,policy?,effort?,candidates?,context_window?},...]
+          （旧后端只有 {model,target}；更旧后端无此字段 → 只显示升级提示）；
+     POST ./config/virtual {entries:[...同上形状]} 整表替换（空数组=清空）。
+   语义：虚拟模型是对外主入口，1 对多地映射一组实际模型名（targets 是主字段）；target 只是
+   旧形状遗留的代表值，写了 targets 时可省。context_window 是唯一允许的按条目覆盖。
+   policy/effort 是遗留字段（调度策略归属路由策略页、强度归属模型卡片）：本页不再提供编辑
+   入口，但 vmRow/序列化仍然无损保留——编辑面没有入口不等于后台可以丢配置。
+   无损是这页的硬要求（candidates 曾被白名单丢过一次）：vmRow 把未知键原样收进 row.extra，
+   vmEntryJson 提交时并回去，「打开 JSON 视图 → 校验并应用」必须逐字段等价。 */
 function vmRow(r){
-  var workers = Array.isArray(r && r.workers)
-    ? r.workers.filter(function(u){ return typeof u === 'string' && u.trim(); }).map(normU)
-    : [];
-  return {
-    model: (r && r.model) || '',
-    target: (r && r.target) || '',
-    workers: workers,
+  var row = {
+    model: (r && typeof r.model === 'string') ? r.model : '',
+    target: (r && typeof r.target === 'string') ? r.target : '',
+    targets: vmTargets(r && r.targets),        // null = 未声明（缺席），非 null = 操作员写过的组
+    workers: vmWorkers(r && r.workers),         // 形状非法 → null，整字段按缺席走 extra 兜底
     policy: (r && typeof r.policy === 'string') ? r.policy : '',
     effort: (r && typeof r.effort === 'string') ? r.effort : '',
     // 逐候选绑定（后端 {worker, model}）。这一页没有它的编辑器，但草稿必须带着它，
     // 否则任何一次提交都会把已配的 candidates 抹掉——后端把整表替换当成事实来源。
-    candidates: vmCandidates(r && r.candidates)
+    candidates: vmCandidates(r && r.candidates),
+    contextWindow: vmContextWindow(r && r.context_window),   // 0 = 不覆盖
+    extra: {},                                 // 未知键 / 形状非法的原值，序列化时原样并回
+    raw: r && typeof r === 'object' ? r : null,
+    isVmRow: true
   };
+  collectVmExtra(row);
+  return row;
+}
+/* 后端认识的顶层键。除此之外的一切（含后端还没上线的新字段）都进 extra 无损带回去；
+   targets/workers/context_window 形状非法时也落进 extra 而不是悄悄丢掉：apply 是整表
+   替换，悄悄丢=清空，而宁可让后端按原文拒绝、操作员看到中文原因，也不能替他做决定。 */
+var VM_KNOWN_KEYS = ['model', 'target', 'targets', 'workers', 'policy', 'effort',
+  'candidates', 'context_window'];
+/* 「等价于缺席」的判定：后端把 null（cjson.null）、缺键、空串、空数组一律读成"未声明"
+   （build_target_group / build_candidates / build_candidate_bindings 的 #out==0 → nil），
+   所以这几种写法之间来回不算改动，不需要被 extra 保留 —— 这也正是"绝不写 null、绝不
+   写空数组"这条约束的实现处：本页只会让可选字段整体缺席。*/
+function vmAbsentish(v){
+  if (v === null || v === undefined) return true;
+  if (typeof v === 'string' && v.trim() === '') return true;
+  if (Array.isArray(v) && v.length === 0) return true;
+  return false;
+}
+function collectVmExtra(row){
+  var raw = row.raw;
+  if (!raw) return;
+  Object.keys(raw).forEach(function(k){
+    // 未知键（含后端还没上线的新字段）一律原样带回去。
+    if (VM_KNOWN_KEYS.indexOf(k) === -1) { row.extra[k] = raw[k]; return; }
+    // 已知键：本页能原样（等价）写回时交给结构化字段；读不下（形状非法）而原值又不是
+    // 「等价于缺席」的写法时，把原文塞进 extra 兜底。apply 是整表替换，悄悄丢=清空，
+    // 宁可让后端按原文拒绝、操作员看到中文原因，也不能替他做这个决定。
+    if (!vmFieldRead(row, k) && !vmAbsentish(raw[k])) row.extra[k] = raw[k];
+  });
+}
+/* 结构化字段是否「读下了」这个已知键——即回写它不会改变这个字段的语义。
+   trim / 去重 / url 规范化不算改变：那是后端自己也会做的规范化（build_target_group、
+   build_candidates 同口径），所以完全合法的输入允许被写成规范形。
+   candidates 单独放宽：逐条容错（丢掉非对象/无 worker 的条目）是既有契约，也是后端的
+   拒绝条件，被丢的条目本来就不可能是活的绑定；整字段是数组就按读下处理，
+   否则一份全脏的 candidates 会被原样交回、把整个文档卡成无法保存。*/
+function vmFieldRead(row, k){
+  if (k === 'targets') return row.targets !== null;
+  if (k === 'workers') return row.workers !== null;
+  if (k === 'context_window') return row.contextWindow > 0;
+  if (k === 'candidates') return Array.isArray(row.raw ? row.raw.candidates : null);
+  if (k === 'model' || k === 'target') {
+    // 别名与代表值只做 trim：非字符串（42、false、{}）会被读成「没写」，而这样的一行在
+    // 表单提交时又被整行过滤掉，等于把别人写过的配置静默清空。所以非字符串一律按「没读
+    // 下」处理，原文进 extra 交回后端，由它给出自己的类型拒绝原因（target must be a
+    // string or null），本页不替操作员做决定。
+    var mv = row.raw ? row.raw[k] : null;
+    return typeof mv === 'string' || vmAbsentish(mv);
+  }
+  return typeof (row.raw ? row.raw[k] : null) === 'string';   // policy / effort
+}
+/* targets 的容错读法（照 vmCandidates 的风格）：形状不对整字段丢——但「丢」只意味着
+   表单不再编辑它，原值仍经 extra 无损回写（见 collectVmExtra）。去重保序与后端
+   build_target_group 一致，避免一次往返给磁盘长出一个操作员没写过的字段。 */
+function vmTargets(list){
+  if (!Array.isArray(list)) return null;
+  var out = [], seen = {};
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i];
+    if (typeof item !== 'string' || !item.trim()) return null;   // 一条脏 = 整字段按未声明走
+    var m = item.trim();
+    if (!seen[m]) { seen[m] = true; out.push(m); }
+  }
+  return out.length ? out : null;   // 空数组等同未声明（后端口径相同），缺席而不是写 []
+}
+/* workers 保持既有形状（字符串数组，规范化 url）。任一元素不是非空字符串就整字段
+   按未声明走：后端对 workers 是整体拒绝，本地悄悄丢会让「清理脏配置」变成静默清空。 */
+function vmWorkers(list){
+  if (!Array.isArray(list)) return null;
+  var out = [], seen = {};
+  for (var i = 0; i < list.length; i++) {
+    var u = list[i];
+    if (typeof u !== 'string' || !u.trim()) return null;
+    u = normU(u);
+    if (!seen[u]) { seen[u] = true; out.push(u); }
+  }
+  return out.length ? out : null;
+}
+/* context_window：后端只认正整数（数字或纯数字字符串）。非法值返回 0=不覆盖并落进
+   extra 原样回写，让后端用它的中文原因拒绝，而不是本页替他抹掉。 */
+function vmContextWindow(v){
+  if (typeof v === 'number' && isFinite(v) && v >= 1 && Math.floor(v) === v) return v;
+  if (typeof v === 'string' && /^\d+$/.test(v.trim())) {
+    var n = parseInt(v.trim(), 10);
+    if (n >= 1) return n;
+  }
+  return 0;
 }
 /* candidates 的容错读法：形状不对就整条丢，绝不让一行脏数据掀翻整个视图。
    worker 是唯一必填（规范化 url 或 worker id），model 可选、缺省继承 target，
@@ -1005,6 +1117,44 @@ function vmCandidatesJson(row){
   });
   return out;
 }
+/* 一行草稿 → 后端 entry。规则：值缺席就整个键不写（绝不写 null、绝不写空数组）——
+   后端把「字段缺席」与「显式 null」区分对待，写出 null 会让旧 build 误判。
+   extra 最后并入；只有本页确实没写出该键时才补，避免与规范化的同名字键重复。 */
+function vmEntryJson(row){
+  var e = {};
+  // 空串与缺席等价（后端 trim 成未声明），所以两者都不写键：JSON 视图里写 target:""
+  // 会让 candidates-only 的行凭空多出一个键，与后端快照（profiles_list 对这种行根本不
+  // 写 target）不再逐字段相等 —— 那是这个视图唯一的无损判据。操作员要加字段就自己写。
+  var model = (row.model || '').trim();
+  var target = (row.target || '').trim();
+  if (model) e.model = model;
+  if (target) e.target = target;
+  if (row.targets && row.targets.length) e.targets = row.targets.slice();
+  if (row.workers && row.workers.length) e.workers = row.workers.slice();
+  if (row.policy) e.policy = row.policy;
+  if (row.effort) e.effort = row.effort;
+  var cands = vmCandidatesJson(row);
+  if (cands.length) e.candidates = cands;
+  if (row.contextWindow > 0) e.context_window = row.contextWindow;
+  // extra 覆盖结构化值：能被记进 extra 的键说明本页无法原样改写它（形状非法、或规范化
+  // 会改动操作员写的字节），此时交回原文，由后端决定接受还是给出它的拒绝原因。
+  // UI 编辑某字段时会顺手删掉它的 extra 影子（见 vmClearExtra），所以不会吃掉编辑。
+  var ex = row.extra || {};
+  Object.keys(ex).forEach(function(k){ e[k] = ex[k]; });
+  return e;
+}
+/* 擦掉某个键的「原文影子」：操作员在表单里动过这个字段，就以结构化值为准，不再回写原文。 */
+function vmClearExtra(row, k){
+  if (row && row.extra) delete row.extra[k];
+}
+/* 草稿行本身已经是 vmRow 形状（带 contextWindow / extra / raw 这些页面内部字段）。
+   对这种行再走一遍 vmRow，会把这些内部字段当成操作员新加的未知键抄进 entry，
+   JSON 视图就长出后端看不懂的键。所以先认身份：已是行就直接用，
+   只有服务端数组（没有本地草稿时）才需要解析。 */
+function vmRowOf(r){
+  return (r && r.isVmRow) ? r : vmRow(r);
+}
+
 function vmRows(){
   if (vmDraft) return vmDraft;
   var src = state && Array.isArray(state.virtual_models) ? state.virtual_models : [];
@@ -1012,52 +1162,51 @@ function vmRows(){
   if (!rows.length) rows.push(vmRow(null));
   return rows;
 }
-function vmEdit(){
-  if (!vmDraft) vmDraft = vmRows().map(function(r){
-    // candidates 逐个拷成新对象：草稿与 state 共享同一张表的话，一次表单编辑会就地
-    // 改掉服务端快照，normStr 的 dirty 比较就永远比不出差异。
-    return { model: r.model, target: r.target, workers: r.workers.slice(),
-      policy: r.policy, effort: r.effort,
-      candidates: vmCandidatesJson(r).map(function(c){
-        var copy = { worker: c.worker };
-        if (c.model) copy.model = c.model;
-        return copy;
-      }) };
-  });
-  return vmDraft;
+/* 深拷贝一份行给草稿用：绝不与 state 共享数组/对象，否则一次表单编辑会就地改掉服务端
+   快照，normStr 的 dirty 比较就永远比不出差异（candidates 的教训对 targets/extra 同样成立）。 */
+function vmRowCopy(r){
+  var copy = {
+    model: r.model, target: r.target,
+    targets: r.targets ? r.targets.slice() : null,
+    workers: r.workers ? r.workers.slice() : null,
+    policy: r.policy, effort: r.effort,
+    candidates: vmCandidatesJson(r).map(function(c){
+      var one = { worker: c.worker };
+      if (c.model) one.model = c.model;
+      return one;
+    }),
+    contextWindow: r.contextWindow,
+    extra: deepCopyPlain(r.extra || {}),
+    raw: null,
+    isVmRow: true
+  };
+  return copy;
 }
-function selectWith(options, withEmpty, emptyLabel, value){
-  var sel = document.createElement('select');
-  sel.className = 'select';
-  if (withEmpty) {
-    var o0 = document.createElement('option');
-    o0.value = ''; o0.textContent = emptyLabel;
-    sel.appendChild(o0);
+function deepCopyPlain(v){
+  if (Array.isArray(v)) return v.map(deepCopyPlain);
+  if (v && typeof v === 'object') {
+    var out = {};
+    Object.keys(v).forEach(function(k){ out[k] = deepCopyPlain(v[k]); });
+    return out;
   }
-  options.forEach(function(name){
-    var o = document.createElement('option');
-    o.value = name; o.textContent = name;
-    sel.appendChild(o);
-  });
-  var want = value === null || value === undefined ? '' : String(value);
-  var known = want === '' || options.indexOf(want) !== -1;
-  if (!known) {
-    var ou = document.createElement('option');
-    ou.value = want; ou.textContent = want + '（未知）';
-    sel.appendChild(ou);
-  }
-  sel.value = want;
-  return sel;
+  return v;
+}
+function vmEdit(){
+  if (!vmDraft) vmDraft = vmRows().map(vmRowCopy);
+  return vmDraft;
 }
 function renderWchips(box, row, idx){
   var d = vmEdit();
   box.innerHTML = '';
-  if (!row.workers.length) {
+  // workers 现在是「可缺席」的 null（与后端「缺席=全池」同形），编辑时再就地升成数组。
+  if (!Array.isArray(row.workers)) row.workers = null;
+  var ws = row.workers || [];
+  if (!ws.length) {
     var none = document.createElement('span');
     none.className = 'none'; none.textContent = '全池（未限定实例）';
     box.appendChild(none);
   }
-  row.workers.forEach(function(u, wi){
+  ws.forEach(function(u, wi){
     var chip = document.createElement('span');
     chip.className = 'wchip';
     var label = document.createElement('span');
@@ -1068,7 +1217,10 @@ function renderWchips(box, row, idx){
     x.type = 'button'; x.textContent = '\u00d7';
     x.addEventListener('click', function(){
       var dd = vmEdit();
+      if (!dd[idx].workers) return;
       dd[idx].workers.splice(wi, 1);
+      if (!dd[idx].workers.length) dd[idx].workers = null;   // 清空=整体缺席，不写 []
+      vmClearExtra(dd[idx], 'workers');
       renderVirtualModels();
     });
     chip.appendChild(x);
@@ -1082,7 +1234,7 @@ function renderWchips(box, row, idx){
   sel.appendChild(o0);
   poolWorkers.forEach(function(w){
     var u = normU(w.url);
-    if (!u || row.workers.indexOf(u) !== -1) return;
+    if (!u || ws.indexOf(u) !== -1) return;
     var o = document.createElement('option');
     o.value = u; o.textContent = u + ' \u00b7 ' + (w.model_id || 'unknown');
     sel.appendChild(o);
@@ -1090,7 +1242,9 @@ function renderWchips(box, row, idx){
   sel.addEventListener('change', function(){
     if (!sel.value) return;
     var dd = vmEdit();
+    if (!dd[idx].workers) dd[idx].workers = [];
     if (dd[idx].workers.indexOf(sel.value) === -1) dd[idx].workers.push(sel.value);
+    vmClearExtra(dd[idx], 'workers');
     renderVirtualModels();
   });
   box.appendChild(sel);
@@ -1105,7 +1259,9 @@ function renderWchips(box, row, idx){
     var u = normU(custom.value);
     if (!u) return;
     var dd = vmEdit();
+    if (!dd[idx].workers) dd[idx].workers = [];
     if (dd[idx].workers.indexOf(u) === -1) dd[idx].workers.push(u);
+    vmClearExtra(dd[idx], 'workers');
     renderVirtualModels();
   });
   box.appendChild(custom);
@@ -1133,32 +1289,65 @@ function renderVirtualModels(){
     alias.setAttribute('list', 'model-ids');
     alias.value = row.model;
     alias.disabled = loading;
-    alias.addEventListener('input', function(){ vmEdit()[idx].model = alias.value; });
+    alias.addEventListener('input', function(){
+      vmEdit()[idx].model = alias.value;
+      // 操作员亲手改过别名 → 以结构化值为准，不能再回写后端给的原文影子。
+      vmClearExtra(vmEdit()[idx], 'model');
+    });
     var arrow = document.createElement('span');
     arrow.className = 'arrow'; arrow.textContent = '\u2192';
+    /* targets：1 对多的主字段，可增删的一组实际模型名。下拉候选来自池内模型名
+       （renderDatalist 里的 vm-target-ids），也允许自由输入未注册的名称。 */
+    var tLbl = document.createElement('span');
+    tLbl.className = 'vm-lbl'; tLbl.textContent = '模型组';
+    var tchips = document.createElement('div');
+    tchips.className = 'wchips';
+    renderTchips(tchips, row, idx);
+    /* 旧形状的代表值：单值 target。写了模型组时后端仍以它作为「这个别名对应的那一个
+       名字」给 pre-feature reader 用，所以保留编辑口（留空=由模型组首项代表）。 */
+    var tgtLbl = document.createElement('span');
+    tgtLbl.className = 'vm-lbl'; tgtLbl.textContent = '代表';
     var target = document.createElement('input');
     target.className = 'input model';
     target.autocomplete = 'off'; target.spellcheck = false;
-    target.placeholder = 'target（真实上游模型 id）';
-    target.setAttribute('list', 'model-ids');
+    target.placeholder = '代表模型（可留空，取模型组首项）';
+    target.setAttribute('list', 'vm-target-ids');
     target.value = row.target;
     target.disabled = loading;
-    target.addEventListener('input', function(){ vmEdit()[idx].target = target.value; });
+    target.style.flex = '0 1 200px'; target.style.minWidth = '140px';
+    target.addEventListener('input', function(){
+      vmEdit()[idx].target = target.value;
+      vmClearExtra(vmEdit()[idx], 'target');
+    });
     var wLbl = document.createElement('span');
     wLbl.className = 'vm-lbl'; wLbl.textContent = '候选';
     var chips = document.createElement('div');
     chips.className = 'wchips';
     renderWchips(chips, row, idx);
-    var polLbl = document.createElement('span');
-    polLbl.className = 'vm-lbl'; polLbl.textContent = '策略';
-    var pol = selectWith(POLICY_NAMES, true, '跟随全局', row.policy);
-    pol.disabled = loading;
-    pol.addEventListener('change', function(){ vmEdit()[idx].policy = pol.value; });
-    var effLbl = document.createElement('span');
-    effLbl.className = 'vm-lbl'; effLbl.textContent = '强度';
-    var eff = selectWith(EFForts, true, '跟随默认', row.effort);
-    eff.disabled = loading;
-    eff.addEventListener('change', function(){ vmEdit()[idx].effort = eff.value; });
+    /* 调度策略与思考强度不再在这里编辑（用户裁定 2026-10-02）：策略归属路由策略页，
+       effort 归属模型卡片。草稿里的既有值仍由 vmEntryJson 原样回写，编辑面收起入口
+       不等于后台丢配置。 */
+    var cwLbl = document.createElement('span');
+    cwLbl.className = 'vm-lbl'; cwLbl.textContent = '上下文';
+    var cw = document.createElement('input');
+    cw.type = 'number'; cw.className = 'input num';
+    cw.min = '1'; cw.step = '1';
+    cw.placeholder = '不覆盖';
+    cw.value = row.contextWindow > 0 ? String(row.contextWindow) : '';
+    cw.disabled = loading;
+    cw.title = '该入口唯一允许的覆盖：网关对下游统一钳制 max_tokens / max_completion_tokens';
+    cw.addEventListener('input', function(){
+      var d = vmEdit();
+      var v = cw.value.trim();
+      var n = /^\d+$/.test(v) ? parseInt(v, 10) : 0;
+      d[idx].contextWindow = n > 0 ? n : 0;
+      // 三种输入分开看：合法正整数 → 写数字并擦掉原文影子；空 → 就是"不覆盖"，键缺席；
+      // 非法文本（负数/小数/乱填）→ 记进 extra 交回后端，让它给出中文拒绝原因，
+      // 而不是本页悄悄当成"没填"（那等于替操作员把覆盖删了）。
+      if (n > 0) vmClearExtra(d[idx], 'context_window');
+      else if (v !== '') d[idx].extra.context_window = v;
+      else vmClearExtra(d[idx], 'context_window');
+    });
     var del = document.createElement('button');
     del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
     del.disabled = loading;
@@ -1168,13 +1357,66 @@ function renderVirtualModels(){
       if (!d.length) d.push(vmRow(null));
       renderVirtualModels();
     });
-    line.appendChild(alias); line.appendChild(arrow); line.appendChild(target);
+    line.appendChild(alias); line.appendChild(arrow);
+    line.appendChild(tLbl); line.appendChild(tchips);
+    line.appendChild(tgtLbl); line.appendChild(target);
     line.appendChild(wLbl); line.appendChild(chips);
-    line.appendChild(polLbl); line.appendChild(pol);
-    line.appendChild(effLbl); line.appendChild(eff);
+    line.appendChild(cwLbl); line.appendChild(cw);
     line.appendChild(del);
     rows.appendChild(line);
   });
+}
+/* 模型组编辑器：chip 列表 + 「下拉选/自由输入」的新增框，形状照 renderWchips，
+   区别只是值是模型名而不是实例 url。 */
+function renderTchips(box, row, idx){
+  var d = vmEdit();
+  var list = d[idx].targets;
+  box.innerHTML = '';
+  if (!list || !list.length) {
+    var none = document.createElement('span');
+    none.className = 'none';
+    none.textContent = row.workers && row.workers.length
+      ? '未声明（由候选绑定推断）' : '未声明（用代表模型）';
+    box.appendChild(none);
+  }
+  (list || []).forEach(function(m, mi){
+    var chip = document.createElement('span');
+    chip.className = 'wchip';
+    var label = document.createElement('span');
+    label.className = 'u'; label.textContent = m; label.title = m;
+    chip.appendChild(label);
+    var x = document.createElement('button');
+    x.type = 'button'; x.textContent = '\u00d7';
+    x.addEventListener('click', function(){
+      var dd = vmEdit();
+      if (!dd[idx].targets) return;
+      dd[idx].targets.splice(mi, 1);
+      if (!dd[idx].targets.length) dd[idx].targets = null;   // 空组=未声明（后端同口径）
+      vmClearExtra(dd[idx], 'targets');
+      renderVirtualModels();
+    });
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
+  var add = document.createElement('input');
+  add.className = 'input';
+  add.style.width = '190px'; add.style.maxWidth = '190px'; add.style.fontSize = '11px';
+  add.placeholder = '模型名 回车添加';
+  add.autocomplete = 'off'; add.spellcheck = false;
+  add.disabled = loading;
+  add.setAttribute('list', 'vm-target-ids');
+  add.addEventListener('keydown', function(ev){
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    var name = add.value.trim();
+    if (!name) return;
+    var dd = vmEdit();
+    if (!dd[idx].targets) dd[idx].targets = [];
+    if (dd[idx].targets.indexOf(name) === -1) dd[idx].targets.push(name);
+    vmClearExtra(dd[idx], 'targets');
+    renderVirtualModels();
+  });
+  box.appendChild(add);
 }
 function mmRows(){
   if (mmDraft) return mmDraft;
@@ -1275,8 +1517,11 @@ function renderEnv(){
   var vm = Array.isArray(e.virtual_models) ? e.virtual_models : [];
   kvLine(host, 'virtual_models(env)', vm.length
     ? vm.map(function(r){
-        var s = (r && r.model ? String(r.model) : '?') + ' → ' + (r && r.target ? String(r.target) : '?');
+        var g = r && Array.isArray(r.targets) && r.targets.length
+          ? r.targets.join('/') : (r && r.target ? String(r.target) : '?');
+        var s = (r && r.model ? String(r.model) : '?') + ' → ' + g;
         if (r && Array.isArray(r.workers) && r.workers.length) s += ' [' + r.workers.length + ' 实例]';
+        if (r && r.context_window) s += ' ctx=' + r.context_window;
         if (r && r.policy) s += ' ' + r.policy;
         if (r && r.effort) s += ' ' + r.effort;
         return s;
@@ -1298,6 +1543,20 @@ function renderDatalist(){
     o.value = id;
     dl.appendChild(o);
   });
+  // 模型组/代表模型的下拉候选：注册模型名 + 池内实例上报的 model_id 并集。
+  // 只是候选不是白名单——输入框允许自由输入未注册名（对齐上游改名尚未入池的场景）。
+  var dl2 = document.getElementById('vm-target-ids');
+  if (!dl2) return;
+  dl2.innerHTML = '';
+  var seen = {};
+  modelIds.concat(poolWorkers.map(function(w){ return w && w.model_id; }))
+    .forEach(function(name){
+      if (typeof name !== 'string' || !name.trim() || seen[name]) return;
+      seen[name] = true;
+      var o = document.createElement('option');
+      o.value = name;
+      dl2.appendChild(o);
+    });
 }
 
 /* ===================== JSON 视图 =====================
@@ -1326,22 +1585,13 @@ function modelConfigsArray(){
   }
   return arr;
 }
-/* 虚拟模型的可编辑形状：统一为新形状（workers/policy/effort 空则省略），
-   旧后端返回的 {model,target} 会被无损保留；用户加的 profile 字段随草稿走。 */
+/* 虚拟模型的可编辑形状：一行草稿 → 后端 entry，走共用的 vmEntryJson（序列化只有一条
+   路径，无损契约才只有一份实现）。targets / context_window 缺省即整体缺席 —— 绝不写
+   null、绝不写空数组：后端把「字段缺席」与「显式 null」区分对待，写出 null 会让旧
+   build 误判。candidates 与未知键的无损保证也同在 vmEntryJson 里。 */
 function vmJsonArray(){
   var src = vmDraft || (state && Array.isArray(state.virtual_models) ? state.virtual_models : []);
-  return src.map(function(r){
-    var row = vmRow(r);
-    var e = { model: row.model, target: row.target };
-    if (row.workers.length) e.workers = row.workers.slice();
-    if (row.policy) e.policy = row.policy;
-    if (row.effort) e.effort = row.effort;
-    // candidates 是这个视图唯一的无损保证：JSON 里读到的绑定必须原样写回，
-    // 否则「打开 JSON 视图 → 校验并应用」这一串无损操作会把池里已配的多绑定清空。
-    var cands = vmCandidatesJson(row);
-    if (cands.length) e.candidates = cands;
-    return e;
-  });
+  return src.map(function(r){ return vmEntryJson(vmRowOf(r)); });
 }
 function buildEditableJson(){
   var s = state || {};
@@ -1469,6 +1719,16 @@ document.getElementById('json-apply').addEventListener('click', function(){
   };
   if ('model_map' in obj) body.model_map = obj.model_map;   // 对象或 "orig:new,..." 字符串
   if ('upstreams' in obj) body.upstreams = obj.upstreams;   // api_key:null=不动密钥，""=清除（契约 3.4）
+  // 虚拟模型先在本地跑一遍与表单同款的中文体检：这里的数组是
+  // 操作员手改过的，错往往是抄错行、把候选的模型名打错字，先给原因
+  // 比让后端整体拒绝更省事。只报错不改数据，后端仍是权威。
+  if (Array.isArray(body.virtual_models)) {
+    var vmErr = vmLocalError(body.virtual_models.map(vmRow).map(vmEntryJson));
+    if (vmErr) {
+      showJsonErr('虚拟模型无法应用：' + vmErr);
+      return;
+    }
+  }
   submit('./config/apply', body, '配置已整体应用', function(){
     jsonDraft = null;                                    // 以响应重建
   });
@@ -1589,24 +1849,95 @@ document.getElementById('vm-add').addEventListener('click', function(){
   vmEdit().push(vmRow(null));
   renderVirtualModels();
 });
-/* 整表提交：别名/目标都留空的行忽略，其余原样交给后端校验（别名空/目标空/别名等于目标/
-   target 指向别名 → 400 error 原文 toast）。可选字段空则整体省略（workers:[] 等同全池，
-   不如省掉，保持旧后端可读）。删到一行不剩提交空数组 = 清空全部别名。 */
+/* 表单保存前的本地体检：只拦「后端一定会拒、操作员却看不出为什么」的形状，提示写成可
+   操作的中文（哪一行、哪个字段、怎么改）。权威校验仍在后端，它的 400 原文照旧 toast。
+   后端规则在本页的口径：candidate 的 model 必须出现在 targets 里；别名不得等于自身任一
+   target；context_window 必须正整数；targets 为空时回退旧 target/candidates 仍然合法。*/
+function vmLocalError(entries){
+  var aliases = {};
+  entries.forEach(function(e){ if (e.model) aliases[e.model] = true; });
+  for (var i = 0; i < entries.length; i++) {
+    var e = entries[i];
+    var who = '第 ' + (i + 1) + ' 行';
+    var model = e.model || '';
+    var group = Array.isArray(e.targets) ? e.targets : null;
+    var hasTarget = typeof e.target === 'string' && e.target.trim();
+    var nCands = (e.candidates || []).length;
+    if (!model && !group && !hasTarget && !nCands) continue;   // 整行留空 = 提交时忽略
+    if (!model) return who + '：别名（对外模型名）为空，请填写。';
+    if (!group && !hasTarget && !nCands)
+      return model + '：模型组为空。请在「模型组」里至少填一个实际模型名，'
+        + '或改用候选实例绑定（每个候选各带自己的模型名）。';
+    if (group) {
+      var inGroup = {};
+      group.forEach(function(m){ inGroup[m] = true; });
+      for (var c = 0; c < nCands; c++) {
+        var cand = e.candidates[c];
+        if (cand.model && !inGroup[cand.model])
+          return model + '：候选 ' + cand.worker + ' 绑定了 ' + cand.model
+            + '，但它不在模型组 targets（' + group.join('、') + '）里。'
+            + '请把这个模型名加进模型组，或删掉这条候选绑定。';
+      }
+      for (var g = 0; g < group.length; g++) {
+        if (group[g] === model)
+          return model + '：别名不能出现在自己的模型组里（targets 含 ' + model
+            + '），否则请求会被转回这个别名本身。请改成上游真实模型名。';
+      }
+    }
+    if (hasTarget && e.target.trim() === model)
+      return model + '：别名不能等于代表模型 target，请填写一个上游真实模型名。';
+    if ('context_window' in e && !vmPositiveIntOk(e.context_window))
+      return model + '：上下文覆盖（context_window）必须是大于 0 的整数，例如 131072；'
+        + '留空表示不覆盖。当前值「' + String(e.context_window) + '」无效。';
+  }
+  var dup = {};
+  for (var k = 0; k < entries.length; k++) {
+    var m = entries[k].model;
+    if (m && dup[m]) return '别名 ' + m + ' 出现了两行，请合并成一行或删除其中一行。';
+    dup[m] = true;
+  }
+  // 别名指向另一个别名（后端同规则）：本批内先拦，跨批由后端兜底。
+  for (var a = 0; a < entries.length; a++) {
+    var ea = entries[a];
+    var ga = Array.isArray(ea.targets) ? ea.targets
+      : (typeof ea.target === 'string' && ea.target.trim() ? [ea.target] : []);
+    for (var b = 0; b < ga.length; b++) {
+      if (ga[b] !== ea.model && aliases[ga[b]])
+        return ea.model + '：模型组里的 ' + ga[b] + ' 本身也是一个虚拟模型别名。'
+          + '别名不能指向别名，请填写上游真实模型名。';
+    }
+  }
+  return '';
+}
+/* 与后端 build_context_window 同口径：正整数（数字或纯数字字符串）。字符串走 Number()
+   并要求回写一致，于是 '1e3'、' 12 '、'1.5'、'+8' 一律按非法处理，与后端的 ^\\d+$ 判定一致。*/
+function vmPositiveIntOk(v){
+  if (typeof v === 'number') return isFinite(v) && v >= 1 && Math.floor(v) === v;
+  if (typeof v !== 'string') return false;
+  var t = v.trim();
+  if (!t) return false;
+  var n = Number(t);
+  return isFinite(n) && String(n) === t && n >= 1 && Math.floor(n) === n;
+}
+/* 整表提交的行筛选 + 序列化。表单页没有 candidates/policy/effort 编辑器，但提交是整表
+   替换：草稿里从服务端读来的这些值必须原样交回去，否则改一次上下文就把它们全清了。
+   可选字段空则整体省略（workers:[] 等同全池，不如省掉，保持旧后端可读）。删到一行不
+   剩提交空数组 = 清空全部别名。 */
+function vmFormEntries(){
+  return vmRows()
+    .filter(function(r){
+      // extra 非空 = 本页带回了操作员写过的原文（含形状非法的 model/target），这种行不
+      // 能按「整行留空」过滤掉，否则一次保存就把别人的配置静默清空。
+      return (r.model || '').trim() || (r.target || '').trim()
+        || (r.targets && r.targets.length) || (r.candidates || []).length
+        || Object.keys(r.extra || {}).length > 0;
+    })
+    .map(function(r){ return vmEntryJson(r); });
+}
 document.getElementById('vm-save').addEventListener('click', function(){
-  var entries = vmRows()
-    .filter(function(r){ return (r.model || '').trim() || (r.target || '').trim(); })
-    .map(function(r){
-      var e = { model: (r.model || '').trim(), target: (r.target || '').trim() };
-      var ws = (r.workers || []).filter(function(u){ return typeof u === 'string' && u.trim(); }).map(normU);
-      if (ws.length) e.workers = ws;
-      if (r.policy) e.policy = r.policy;
-      if (r.effort) e.effort = r.effort;
-      // 表单页没有 candidates 编辑器，但提交是整表替换：草稿里从服务端读来的绑定必须
-      // 一起交回去，否则在表单里改一个 policy 就把该别名的逐候选绑定全清了。
-      var cands = vmCandidatesJson(r);
-      if (cands.length) e.candidates = cands;
-      return e;
-    });
+  var entries = vmFormEntries();
+  var msg = vmLocalError(entries);
+  if (msg) { toast('err', msg); return; }
   submit('./config/virtual', { entries: entries },
     entries.length ? '已保存 ' + entries.length + ' 条虚拟模型映射' : '已清空全部虚拟模型映射');
 });

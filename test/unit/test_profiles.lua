@@ -1446,7 +1446,19 @@ unlink(CONFIG_PATH)
 reset_env()
 
 --------------------------------------------------------------------------
--- 11. 热路径 readers：profile_for / profile_policy / profile_effort
+-- 11. 保留 readers（**不再驱动转发**）：profile_for / profile_policy / profile_effort
+--
+-- root ruling 2026-10-02 把 per-alias 的 policy / effort 从热路径上摘掉了：虚拟模型是
+-- 对下游的服务主入口、一对多映射一组实际模型，而 policy/effort 描述的是**某一个引擎**，
+-- 挂在入口名上对组里任何一个模型都不诚实。字段的现在的地位是：
+--   * 仍被接受、仍落盘、仍从磁盘读回（本节钉住"没被人删的东西不会凭空消失"）；
+--   * 这两个 store reader 仍原样答题（保留 API，不是热路径入口）；
+--   * 转发路径**一个字都不读**它们 —— 那是下面 11b 节的事，断言打在 router.lua 的
+--     真源码上。
+-- 所以本节刻意**不再**用 "applies" / "wins" / "restores the profile" 这类词：那是在
+-- 说这些字段驱动了行为，而它们不驱动。改名之前已核实全仓除本文件外无调用者
+-- （rg profile_policy|profile_effort 只命中 config_store 的两处定义；router 用的是
+--  profile_policy_name / profile_effort_value 这两个自己的 seam）。
 --------------------------------------------------------------------------
 reset_env()
 eq(store.profile_for("nope"), nil, "profile_for is nil for a real model")
@@ -1464,11 +1476,15 @@ store.apply_profiles({
     { model = "vm-a", target = "target-model", policy = "prefix_hash", effort = "low" },
     { model = "vm-b", target = "shared-target" },
 })
-eq(store.profile_policy("vm-a"), "prefix_hash", "profile_policy reads the alias override")
-eq(store.profile_policy("vm-b"), nil, "profile_policy is nil when unset")
-eq(store.profile_policy(store.profile_for("vm-a")), "prefix_hash", "profile_policy accepts a profile table")
-eq(store.profile_policy({ policy = "bogus" }), nil, "profile_policy drops an unknown stored name")
-eq(store.profile_policy({ policy = 12 }), nil, "profile_policy drops a non-string stored name")
+eq(store.profile_policy("vm-a"), "prefix_hash",
+    "the retained policy reader answers for the alias (round-trip only, see 11b)")
+eq(store.profile_policy("vm-b"), nil, "the retained policy reader is nil when unset")
+eq(store.profile_policy(store.profile_for("vm-a")), "prefix_hash",
+    "the retained policy reader accepts a profile table")
+eq(store.profile_policy({ policy = "bogus" }), nil,
+    "the retained policy reader drops an unknown stored name")
+eq(store.profile_policy({ policy = 12 }), nil,
+    "the retained policy reader drops a non-string stored name")
 
 -- 返回的是副本：调用方改不坏活动快照
 local p1 = store.profile_for("vm-a")
@@ -1478,12 +1494,17 @@ local p2 = store.profile_for("vm-a")
 eq(p2.target, "target-model", "the live snapshot is immune to caller writes")
 eq(store.profiles_list()[1].target, "target-model", "profiles_list is immune too")
 
--- effort 优先级（契约 3.3）：强制 model_effort > alias profile > resolved profile
-eq(store.profile_effort("vm-a", "target-model"), "low", "the alias profile effort applies")
+-- 保留 reader 内部的优先级（契约 3.3 的形状）：强制 model_effort > alias profile >
+-- resolved profile。这条链路现在是**孤立**的：热路径的 effort 走落点模型自己的卡
+-- （11b(d) 用真源码钉住），所以这里钉的是"若将来恢复一个 per-entry 旋钮，它接哪"。
+eq(store.profile_effort("vm-a", "target-model"), "low",
+    "the retained effort reader answers the alias profile value")
 store.apply_effort({ model_effort = { { model = "vm-a", effort = "ultra" } } })
-eq(store.profile_effort("vm-a", "target-model"), "ultra", "a forced model_effort on the alias wins")
+eq(store.profile_effort("vm-a", "target-model"), "ultra",
+    "a forced model_effort row outranks the alias value inside the reader")
 store.apply_effort({ model_effort = {} })
-eq(store.profile_effort("vm-a", "target-model"), "low", "clearing the forced row restores the profile")
+eq(store.profile_effort("vm-a", "target-model"), "low",
+    "clearing the forced row returns the reader to the stored alias value")
 
 store.apply_profiles({
     { model = "vm-a", target = "target-model", policy = "prefix_hash", effort = "low" },
@@ -1508,8 +1529,617 @@ store.apply_effort({ model_effort = {} })
 -- readers 只读 current() 快照：连读同值，且不因上一批写入而漂移
 eq(store.profile_policy("vm-a"), "prefix_hash", "the policy reader repeats")
 eq(store.profile_policy("vm-a"), "prefix_hash", "and is stable across calls")
-eq(store.profile_effort("vm-c", "target-model"), "minimal", "the profile effort reader still works")
+eq(store.profile_effort("vm-c", "target-model"), "minimal",
+    "the retained effort reader still answers from the stored field")
 reset_env()
+
+
+--------------------------------------------------------------------------
+-- 11b. 热路径 seams：per-alias policy / effort 已停用（root ruling 2026-10-02）
+--
+-- 上一节钉的是**磁盘与 reader 层**：字段还在、还往返、两个保留 reader 仍答题。
+-- 这一节钉的是**转发层**：router 一个字都不读那两个字段。手法同
+-- test/unit/test_caps_routing.lua —— 按导出语句把 router.lua 的**真实现**切出来配桩
+-- 加载，所以断言跑在盘上那份代码上：把 profile_policy_name 改回 return profile.policy
+-- 就会让这里变红（变异验证见 /data/tmp/lr-vm/mutate_seams.py 的输出）。
+--
+-- 为什么不能只断言 seam 返回 nil：它现在就是一行 return nil，照抄一份断言等于自我
+-- 实现。真正有判别力的是 policy_for 的**分支形状** —— 停用之前 profile.policy 会让它
+-- 走 forced 分支（第二次 policy_mod.new 带上 name）而根本不问 for_model；停用之后它
+-- 必须问 for_model。stub 分别记下"建过哪些实例"和"问过哪些 key"，两件事实同时钉住。
+--------------------------------------------------------------------------
+local function verify_hot_path_seams()
+    local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
+    local rf = io.open(lib .. "/resty/luarouter/router.lua")
+    local rsrc = rf and rf:read("*a")
+    if rf then rf:close() end
+    if type(rsrc) ~= "string" then
+        failed[#failed + 1] = "cannot read router.lua for the hot-path slice"
+        return
+    end
+    local function slice(from_pat, to_pat, name)
+        local blk = rsrc:match("(" .. from_pat .. ".-)" .. to_pat)
+        if type(blk) ~= "string" then
+            failed[#failed + 1] = "router source slice missing: " .. name
+            return "local _missing_" .. name .. " = nil"
+        end
+        return blk
+    end
+
+    local asked, built
+    local policy_stub = {
+        instances = {},
+        new = function(_conf, opts)
+            built[#built + 1] = (type(opts) == "table" and opts.name) or "-"
+            return { policy_name = function() return "stub" end,
+                     restore_snapshot = function() end }
+        end,
+        generation = function() return 1 end,
+        start_eviction = function() end,
+        for_model = function(_conf, key, hint, has_workers)
+            asked[#asked + 1] = { key = key, hint = hint, hw = has_workers }
+            return { policy_name = function() return "stub" end,
+                     restore_snapshot = function() end }
+        end,
+    }
+    local hint_by_model = {}
+    local records_fn
+    local reg_stub = {
+        records = function() return records_fn() end,
+        policy_hint_for_model = function(m) return hint_by_model[m], 1 end,
+        candidate_allows_model = function() return true end,
+    }
+    records_fn = function() return {} end
+    -- is_array_table 不写替身。它是 profile_model_group 判"这是不是一组模型"的依据，
+    -- 用替身等于把判定换成我自己的理解 —— 替身写 n>0、真实现写 n==#v，稀疏表在两者下
+    -- 结果不同，而这种差异正是守卫要挡的东西。区间 [is_array_table, _M.profile_worker_list)
+    -- 恰好只含 is_array_table / profile_model_group / profile_worker_list 三个函数，
+    -- 整块切真实现（锚点用导出语句：在两函数间插新函数不会把块切坏）。
+    local chunk_src = table.concat({
+        "local _M = {}",
+        "local _unused_is_array_table, registry, policy_mod, cfg = ...",
+        "local profile_policy_name, profile_effort_value, profile_model_group",
+        "local group_key_name, group_policy_hint, default_policy",
+        slice("local function card_key_for", "_M%.card_key_for", "card_key_for"),
+        slice("profile_policy_name = function", "_M%.profile_policy_name", "policy_name"),
+        slice("profile_effort_value = function", "local function field_pattern", "effort_value"),
+        slice("local function is_array_table", "_M%.profile_worker_list", "is_array_and_group"),
+        slice("group_key_name = function", "%-%-%-The labels%.policy hint", "key_name"),
+        slice("group_policy_hint = function", "_M%.group_policy_hint", "hint"),
+        slice("local function policy_for", "_M%.policy_for", "policy_for"),
+        "return { card_key_for = card_key_for," ..
+        " profile_policy_name = profile_policy_name," ..
+        " profile_effort_value = profile_effort_value," ..
+        " profile_model_group = profile_model_group," ..
+        " group_key_name = group_key_name, group_policy_hint = group_policy_hint," ..
+        " policy_for = policy_for }",
+    }, "\n")
+    local compiled, load_err = load(chunk_src, "profiles_hot_seams", "t", _G)
+    if not compiled then
+        failed[#failed + 1] = "hot-path slice did not compile: " .. tostring(load_err)
+        return
+    end
+    local HN = compiled(nil, reg_stub, policy_stub,
+        function() return { policy = "round_robin" } end)
+    if type(HN) ~= "table" then
+        failed[#failed + 1] = "hot-path slice returned no table"
+        return
+    end
+    -- 把切出来的真实现交给组语义一节复用（同一次切片，两处断言）。
+    local seams = HN
+
+    -- (a) 同一个 profile 上，保留 reader 答题、热路径 seam 答 nil：两行**同时**绿才叫
+    --     "字段还在但不再驱动转发"，一起坏掉只会证明模块没加载。
+    reset_env()
+    store.apply_profiles({
+        { model = "vm-dead", target = "target-model", policy = "prefix_hash", effort = "ultra" },
+    })
+    local dead = store.profile_for("vm-dead")
+    ok(dead ~= nil, "11b(a) the row with retired fields stored")
+    eq(dead and dead.policy, "prefix_hash", "11b(a) the field is really there to be ignored")
+    eq(store.profile_policy("vm-dead"), "prefix_hash",
+        "11b(a) the retained store reader still answers for it")
+    eq(store.profile_effort("vm-dead", "target-model"), "ultra",
+        "11b(a) and so does the retained effort reader")
+    eq(HN.profile_policy_name(dead), nil, "11b(a) the router seam ignores the stored policy")
+    eq(HN.profile_effort_value(dead, "vm-dead", "target-model"), nil,
+        "11b(a) the router seam ignores the stored effort")
+    -- 组入口（1 对多的主用法）同样接不回来：这里是将来最容易被"顺手恢复"的地方。
+    store.apply_profiles({
+        { model = "vm-dead", targets = { "target-model", "other-model" },
+          policy = "prefix_hash", effort = "ultra" },
+    })
+    local gdead = store.profile_for("vm-dead")
+    ok(HN.profile_model_group(gdead) ~= nil, "11b(a) the same row really is a group entry")
+    eq(gdead and gdead.policy, "prefix_hash", "11b(a) a group row keeps its stored policy field")
+    eq(HN.profile_policy_name(gdead), nil, "11b(a) a group entry cannot re-enable the alias policy")
+    eq(HN.profile_effort_value(gdead, "vm-dead", "target-model"), nil,
+        "11b(a) a group entry cannot re-enable the alias effort")
+
+    -- (b) policy_for 的分支形状：legacy 行带 policy 字段也必须走 for_model。
+    reset_env()
+    -- 必须让模型**有** hint，否则 policy_for 按既有语义直接返回共享的 default 实例、
+    -- 根本不问 for_model，那条分支就什么都没测到（第一版如此，被自己的断言照了出来）。
+    hint_by_model = { ["target-model"] = "cache_aware" }
+    store.apply_profiles({ { model = "vm-seam", target = "target-model", policy = "bucket" } })
+    local seam = store.profile_for("vm-seam")
+    asked, built = {}, {}
+    local inst = HN.policy_for("target-model", seam)
+    ok(inst ~= nil, "11b(b) policy_for still answers")
+    eq(#built, 1, "11b(b) only the global default instance was built")
+    eq(built[1], "-", "11b(b) that build carried no alias-level policy name")
+    -- asked[1] 要先判空再取字段：若哪天 alias 的 policy 被重新接回热路径，policy_for 会
+    -- 走 forced 分支**根本不调** for_model，那时 asked 是空的 —— 直接索引会让整个文件
+    -- 崩在这里（崩溃也红，但没有 FAIL 行，变异验证就没法说"是哪条断言抓到的"）。
+    eq(asked[1] and asked[1].key, "target-model",
+        "11b(b) the retired field does not short-circuit the for_model chain")
+    eq(asked[1] and asked[1].hint, "cache_aware",
+        "11b(b) it reaches for_model with the per-model hint, not an alias-level name")
+
+    -- (c) 组模式一棵亲和树：key 是**入口名**。两个入口映射同一组模型时必须各自一棵树 ——
+    --     这是 1 对多最常见的形状，也最容易因"key 退化成组头/落点名"而静默串台。
+    reset_env()
+    store.apply_profiles({
+        { model = "svc-one", targets = { "grp-a", "grp-b" } },
+        { model = "svc-two", targets = { "grp-a", "grp-b" } },
+    })
+    local one = store.profile_for("svc-one")
+    local two = store.profile_for("svc-two")
+    ok(HN.profile_model_group(one) ~= nil, "11b(c) entry one is in group mode")
+    asked, built = {}, {}
+    HN.policy_for("grp-a", one)
+    HN.policy_for("grp-b", one)
+    HN.policy_for("grp-a", two)
+    eq(#asked, 3, "11b(c) three passes each asked for an instance")
+    eq(asked[1] and asked[1].key, "svc-one", "11b(c) the group keys by the entry name")
+    eq(asked[2] and asked[2].key, "svc-one",
+        "11b(c) the landing model does not move the tree within an entry")
+    eq(asked[3] and asked[3].key, "svc-two",
+        "11b(c) a second entry over the SAME group gets its own tree")
+    ok(asked[1] ~= nil and asked[3] ~= nil and asked[1].key ~= asked[3].key,
+        "11b(c) two entries never share an affinity tree")
+    eq(asked[1] and type(asked[1].hw), "boolean",
+        "11b(c) has_workers is a boolean (for_model compares == false)")
+    -- hint 取自**整组**第一个活着的 record：入口名不出现在任何 record 里，按名字问恒 nil。
+    records_fn = function()
+        return { { id = "w1", url = A, model_id = "grp-a", labels = { policy = "cache_aware" } } }
+    end
+    asked = {}
+    HN.policy_for("grp-a", store.profile_for("svc-one"))
+    eq(asked[1] and asked[1].hint, "cache_aware", "11b(c) the hint comes from the group's workers")
+    eq(asked[1] and asked[1].hw, true, "11b(c) a group with a live worker reports true")
+    records_fn = function() return {} end
+    asked = {}
+    HN.policy_for("grp-a", store.profile_for("svc-one"))
+    eq(asked[1] and asked[1].hw, false,
+        "11b(c) an emptied group reports false so the eviction rule can fire")
+
+    -- (d) effort / ctx 卡的**查找键跟着落点模型走**（裁定"effort 属于模型卡"的落点）。
+    --     绑定的模型名优先于 profile.target 与 resolved，所以给入口写 effort 既不生效、
+    --     也不会盖住落点模型自己的卡。断言打在真 card_key_for 上。
+    local bound_prof = { model = "svc-k", target = "grp-head",
+        candidates = { { worker = A, model = "m-one" }, { worker = B, model = "m-two" } } }
+    eq(HN.card_key_for(bound_prof, "svc-k", nil, "m-two"), "m-two",
+        "11b(d) the selected binding names the card")
+    eq(HN.card_key_for(bound_prof, "svc-k", { lr_bound_model = "m-one" }, nil), "m-one",
+        "11b(d) a binding carried by the record names the card")
+    eq(HN.card_key_for(bound_prof, "svc-k", nil, nil), "grp-head",
+        "11b(d) before selection a bindings row falls back to the declared target")
+    eq(HN.card_key_for({ model = "svc-p", target = "real" }, "real", nil, nil), "real",
+        "11b(d) an unbound row keeps the pre-feature key (zero behaviour change)")
+    reset_env()
+    return seams
+end
+
+--------------------------------------------------------------------------
+-- 11c. 虚拟模型 = 服务主入口（1 对多）的契约（root ruling 2026-10-02）
+--
+-- 语义反转后一个条目说的是"这个入口对外提供**哪一组**实际模型"，选路在组内做；条目上
+-- 唯一允许的覆盖是 context_window（对下游统一的 max_tokens 钳制）。本节按六组钉住：
+--   (1) 新形状解析：targets 多值 + context_window；target 单值是"长度为 1 的组"，
+--       只在读侧归一，磁盘上不许凭空长出 targets；
+--   (2) 向后兼容：纯 {model,target}、candidates-only、LMR_VIRTUAL_MODELS env 种子三条
+--       旧路径的 profile_model_group 一律 nil（组门不触发 = 既有部署逐字节不变）；
+--   (3) 校验拒绝：空/非数组/非字符串/空白成员、非正整数 context_window、组内出现另一个
+--       入口名、绑定名不在组内、同一实例绑两个不同模型；
+--   (4) 快照往返：apply -> list -> apply -> document -> cfg_from_document 两轮不丢字段
+--       也不长幻影字段（explicit_targets / explicit_target 决定回写与否）；
+--   (5) 派生组优先级：显式 targets > target 与各候选绑定名的并集（target 恒首位）> nil，
+--       以及"候选缺省 model 只能继承操作员写过的名字"这条顺序无关性；
+--   (6) virtual_models 降级为**派生只读视图**：virtual_profiles 是唯一事实来源。
+--
+-- 判组开关（explicit_targets）与转发名的推导都在 router.lua 里，所以 (2)(5) 的断言复用
+-- 11b 那一次真源码切片：桩化的判定函数永远不会红，真实现才会。
+--------------------------------------------------------------------------
+local function verify_group_semantics(HN)
+    local function rg(t, k)
+        if type(t) ~= "table" then return nil end
+        return rawget(t, k)
+    end
+    local function row_of(rows, m)
+        for _, row in ipairs(rows or {}) do
+            if row.model == m then return row end
+        end
+        return nil
+    end
+    local function cnd(worker, model) return { worker = worker, model = model } end
+
+    ---------------------------------------------------------------- (1) 新形状解析
+    reset_env()
+    local _, s1 = store.apply_profiles({
+        { model = "svc-main", targets = { "glm-4", "qwen3-30b" }, context_window = 32768 },
+    })
+    eq(s1, nil, "(1) an explicit group is accepted")
+    local p1 = store.profile_for("svc-main")
+    ok(p1 ~= nil, "(1) profile_for answers for the entry")
+    eq(p1 and p1.model, "svc-main", "(1) the profile carries its own entry name")
+    eq(rg(p1, "explicit_targets"), true, "(1) explicit_targets records that the operator wrote it")
+    eq(rg(p1, "targets") and #p1.targets, 2, "(1) the group has both models")
+    eq(p1 and p1.targets[1], "glm-4", "(1) the declared order is kept")
+    eq(p1 and p1.target, "glm-4", "(1) the representative is the group head")
+    eq(p1 and p1.context_window, 32768, "(1) the only allowed per-entry override stored")
+    eq(store.virtual_targets("svc-main") and #store.virtual_targets("svc-main"), 2,
+        "(1) virtual_targets reports the group")
+    store.apply_model_config({ model = "glm-4", ctx = 131072 })
+    store.apply_model_config({ model = "qwen3-30b", ctx = 8192 })
+    -- 统一钳制：clamp 是**入口**的属性而不是"策略挑了哪台"的函数。不写 override 时取整组
+    -- 最小卡（更宽会让最窄的引擎拒收，而且值会随落点抖动）；写下的那个直接赢、忽略所有卡。
+    eq(store.virtual_ctx_cap(p1), 32768,
+        "(1) an explicit context_window wins outright over every card")
+    store.apply_profiles({ { model = "svc-main", targets = { "glm-4", "qwen3-30b" } } })
+    eq(store.virtual_ctx_cap(store.profile_for("svc-main")), 8192,
+        "(1) without an override the clamp is the group minimum (uniform, never per-pick)")
+    -- 组缩到一个名字时 clamp 交还给**落点模型自己的卡**：组里只有一个引擎，卡本身就是
+    -- 统一答案，入口层再插一层反而会让"删掉第二个模型"这种普通修改悄悄改掉钳制值。
+    store.apply_profiles({ { model = "svc-main", targets = { "glm-4" } } })
+    eq(store.virtual_ctx_cap(store.profile_for("svc-main")), nil,
+        "(1) a group of one defers to the landing model's own card")
+    eq(store.ctx_cap("glm-4"), 131072, "(1) and that card still answers its own name")
+    eq(store.virtual_ctx_cap({ model = "svc-x", explicit_targets = true,
+        targets = { "glm-4", "qwen3-30b" }, context_window = 4096 }), 4096,
+        "(1) an explicit context_window wins outright over every card")
+
+    -- target 单值 = 长度为 1 的组：读侧归一，写侧**绝不**回写。
+    reset_env()
+    local _, s1b = store.apply_profiles({ { model = "svc-one", target = "solo-model" } })
+    eq(s1b, nil, "(1) a lone target still parses (it is the group of one it always was)")
+    local p1b = store.profile_for("svc-one")
+    eq(p1b and #p1b.targets, 1, "(1) the reader normalizes a lone target into a group of one")
+    eq(p1b and p1b.targets[1], "solo-model", "(1) the derived group carries the target")
+    eq(rg(p1b, "explicit_targets"), nil, "(1) a derived group is NOT group mode")
+    local r1b = store.profiles_list()[1]
+    eq(rg(r1b or {}, "targets"), nil, "(1) the emitted row grows no targets key nobody wrote")
+    check(cjson.encode(r1b):find('"targets"', 1, true) == nil,
+        "(1) the encoded legacy row never mentions targets")
+
+    ---------------------------------------------------------------- (2) 向后兼容旗标
+    -- 这三行是整个改动的安全旗标：旧形状一旦被误判成组模式，policy 树的 key 与引擎模型门
+    -- 会同时挪位，等于给没提过要求的既有部署改了行为（设计红线）。
+    reset_env()
+    store.apply_profiles({ { model = "vm-legacy", target = "real-legacy" } })
+    eq(HN.profile_model_group(store.profile_for("vm-legacy")), nil,
+        "(2) a pure {model,target} row never enters group mode")
+    reset_env()
+    store.apply_profiles({
+        { model = "vm-bound", target = "real-legacy",
+          candidates = { cnd(A, "real-legacy"), cnd(B, "other-real") } },
+    })
+    eq(HN.profile_model_group(store.profile_for("vm-bound")), nil,
+        "(2) a candidates-only row never enters group mode (last round's shape still routes)")
+    reset_env()
+    _G.LMR_ENV_CACHE.LMR_VIRTUAL_MODELS = "env-a:real-a,env-b:real-b"
+    reset_state(true)
+    eq(store.resolve_model("env-a"), "real-a", "(2) the env seed still maps the alias")
+    local envp = store.profile_for("env-a")
+    eq(envp and envp.target, "real-a", "(2) the env profile keeps its target")
+    eq(rg(envp, "explicit_targets"), nil, "(2) an env pair is not group mode")
+    eq(HN.profile_model_group(envp), nil, "(2) the env seed never enters group mode")
+    eq(store.virtual_ctx_cap(envp), nil, "(2) the env entry takes no clamp")
+    local erow = row_of(store.env_defaults().virtual_models, "env-a")
+    eq(rg(erow or {}, "targets"), nil, "(2) the env snapshot grows no targets key")
+    reset_env()
+
+    ---------------------------------------------------------------- (3) 校验拒绝
+    -- 每条都要求 err 是 string（拒绝），且措辞落在被钉住的家族里；拒绝后不得留半行配置。
+    local rejects = {
+        { { model = "vc-1", targets = "not-an-array" }, "must be an array of strings" },
+        { { model = "vc-2", targets = cjson.decode("[123]") }, "must be strings" },
+        { { model = "vc-3", targets = { "ok", 42 } }, "must be strings" },
+        { { model = "vc-4", targets = { "ok", "  " } }, "must not be blank" },
+        { { model = "vc-5", targets = { "ok" }, context_window = 0 }, "positive integer" },
+        { { model = "vc-6", targets = { "ok" }, context_window = -8 }, "positive integer" },
+        { { model = "vc-7", targets = { "ok" }, context_window = 1.5 }, "positive integer" },
+        { { model = "vc-8", targets = { "ok" }, context_window = "many" }, "positive integer" },
+        { { model = "vc-9", targets = { "ok" }, context_window = false }, "positive integer" },
+    }
+    for _, case in ipairs(rejects) do
+        reset_env()
+        local _, err = store.apply_profiles({ case[1] })
+        check(type(err) == "string", "(3) rejected " .. case[1].model, err)
+        check(type(err) == "string" and err:find(case[2], 1, true) ~= nil,
+            "(3) wording mentions " .. case[2] .. " for " .. case[1].model, err)
+        eq(#store.profiles_list(), 0, "(3) the rejected batch wrote nothing (" .. case[1].model .. ")")
+    end
+    -- 链守卫：组里任何一名都不得是另一个入口（防虚拟名链式转发）。
+    reset_env()
+    local _, chain1 = store.apply_profiles({
+        { model = "vc-base", target = "real-base" },
+        { model = "vc-top", targets = { "vc-base", "real-base" } },
+    })
+    check(type(chain1) == "string"
+        and chain1:find("another virtual model", 1, true) ~= nil,
+        "(3) a group member naming another entry is rejected", chain1)
+    reset_env()
+    local _, chain2 = store.apply_profiles({ { model = "vc-self", targets = { "vc-self", "x" } } })
+    check(type(chain2) == "string", "(3) a group that names itself is rejected", chain2)
+    -- 跨批（引用**存量**入口）也要挡住：只查本批的话，分两次保存就能拼出一条虚拟名链，
+    -- 转发体里就会出现一个上游根本不认识的模型名。
+    reset_env()
+    store.apply_profiles({ { model = "vc-live", target = "real-live" } })
+    local _, chain3 = store.apply_profiles({ { model = "vc-top2", targets = { "vc-live", "real-live" } } })
+    check(type(chain3) == "string" and chain3:find("another virtual model", 1, true) ~= nil,
+        "(3) a group member naming a live entry from an earlier batch is rejected", chain3)
+    eq(#store.profiles_list(), 1, "(3) the rejected cross-batch row left nothing behind")
+    -- 空数组：按"未声明"处理而不是"声明了零个模型"。当后者会得到一个永远 503 的入口，
+    -- 当前者继续走 target 路径 —— 一个可用的入口胜过一份看起来合法的坏配置。
+    reset_env()
+    local _, ea_err = store.apply_profiles({ { model = "vc-empty", targets = {} } })
+    check(type(ea_err) == "string" and ea_err:find("needs a target model", 1, true) ~= nil,
+        "(3) an empty targets array with nothing else is refused", ea_err)
+    reset_env()
+    local _, eb_err = store.apply_profiles({ { model = "vc-empty2", targets = {}, target = "real-x" } })
+    eq(eb_err, nil, "(3) an empty targets array alongside a target degrades to the target path")
+    local ep = store.profile_for("vc-empty2")
+    eq(rg(ep, "explicit_targets"), nil, "(3) and the empty array does not claim group mode")
+    eq(HN.profile_model_group(ep), nil, "(3) so the hot path still sees no group")
+    -- 内部标记还得能在**磁盘形状**上被看到：空数组若被当成"写过 targets"，发射器会因
+    -- explicit_targets 为真而**不写** target、只写一个空数组 —— 那行下次读回就没有落点了。
+    -- （这条断言是变异 empty-array-is-a-group 第一次存活时补的：当时只断言了行为、
+    --  没断言形状，那个缺陷在公开 API 上确实无从观测。）
+    local erow = store.profiles_list()[1]
+    eq(rg(erow or {}, "targets"), nil, "(3) the empty array is not emitted as a written group")
+    eq(erow and erow.target, "real-x", "(3) and the row keeps the target it will read back as")
+    local _, ereapply = store.apply_profiles({ erow })
+    eq(ereapply, nil, "(3) the emitted row re-applies cleanly (no self-poisoned round-trip)")
+
+    -- 手改磁盘的文档必须**降级**而不是打挂热路径：写侧校验只在 apply 时起作用，磁盘上
+    -- 一份坏形状不能让选路崩。profile_model_group 返回 nil 的含义就是"这不是组条目"，
+    -- 请求于是照旧路径转发 —— 半份声明好过一个 500。
+    -- 这组也是真 is_array_table 唯一能被观测的地方：替身写成 n>0 时，稀疏表
+    -- targets[1]="a", targets[3]="b" 在替身下是数组、在真实现下不是（n==#v 不成立）。
+    local dirty_cases = {
+        { model = "d1", explicit_targets = true, targets = "not-an-array" },
+        { model = "d2", explicit_targets = true, targets = {} },
+        { model = "d3", explicit_targets = true, targets = { "a", 42 } },
+        { model = "d4", explicit_targets = true, targets = { "a", "" } },
+        { model = "d5", explicit_targets = true, targets = { [1] = "a", [3] = "b" } },
+        { model = "d6", explicit_targets = true, targets = { a = "x" } },
+        { model = "d7", explicit_targets = true },
+        { model = "d8" },
+        { model = "d9", targets = { "ok1", "ok2" }, explicit_targets = true },
+    }
+    for _, dirty in ipairs(dirty_cases) do
+        local name = dirty.model
+        if name == "d9" then
+            ok(HN.profile_model_group(dirty) ~= nil,
+                "(3) a well-formed hand-edited row still selects as a group: " .. name)
+            eq(#HN.profile_model_group(dirty), 2, "(3) and hands both names to selection: " .. name)
+        else
+            eq(HN.profile_model_group(dirty), nil,
+                "(3) a hand-edited row degrades to not-a-group instead of crashing: " .. name)
+        end
+    end
+    -- 同一份脏行的重复名要在**选路层**再去重（写侧去重管不到手改的磁盘）：两个同名模型
+    -- 会造出两个候选、两遍亲和记账。
+    eq(#HN.profile_model_group({ model = "d10", explicit_targets = true,
+        targets = { "dup", "dup", "keep" } }), 2,
+        "(3) selection-level dedup still applies to a hand-edited row")
+
+    -- 入口名与模型卡重名：裁定"只能配 context_window 以便对下游保持统一"的**唯一**绕过
+    -- 途径，就是有人给入口那个名字写了张卡 —— ctx_cap 按落点名查卡的话，同一个请求落在
+    -- A 与落在 B 会拿到两个 max_tokens，正是裁定要消除的抖动。所以入口名必须对卡片查找
+    -- **隐身**。两种写入顺序都要测：只查一张表的守卫会漏掉另一种。
+    reset_env()
+    store.apply_profiles({ { model = "svc-clash", targets = { "cl-a", "cl-b" } } })
+    store.apply_model_config({ model = "svc-clash", ctx = 4096 })
+    ok(store.current().virtual_profiles["svc-clash"] ~= nil,
+        "(1) precondition: the clashing name really is an entry")
+    eq(store.ctx_cap("svc-clash"), nil,
+        "(1) entry written first: the entry name never answers a card lookup")
+    eq(store.virtual_ctx_cap(store.profile_for("svc-clash")), nil,
+        "(1) a card under the entry name cannot become the entry clamp")
+    reset_env()
+    store.apply_model_config({ model = "svc-later", ctx = 2048 })
+    eq(store.ctx_cap("svc-later"), 2048, "(1) precondition: a plain name does answer")
+    store.apply_profiles({ { model = "svc-later", targets = { "la", "lb" } } })
+    eq(store.ctx_cap("svc-later"), nil,
+        "(1) card written first: once the name is an entry it stops answering")
+    reset_env()
+    store.apply_profiles({ { model = "svc-keep", target = "real-k" } })
+    store.apply_model_config({ model = "real-k", ctx = 9216 })
+    eq(store.ctx_cap("real-k"), 9216,
+        "(1) a real model name still answers its own card (the guard is entry-name only)")
+    eq(store.virtual_ctx_cap(store.profile_for("svc-keep")), nil,
+        "(1) a legacy single-target entry leaves clamping to the per-pick card")
+    -- 绑定名必须在组内：写错一个字母会把流量钉到一个必然 404 的实例上，必须当场报错。
+    reset_env()
+    local _, bind_out = store.apply_profiles({
+        { model = "vc-bo", targets = { "in-a", "in-b" },
+          candidates = { cnd(A, "typo-model") } },
+    })
+    check(type(bind_out) == "string" and bind_out:find("not one of its targets", 1, true) ~= nil,
+        "(3) a binding outside the group is rejected by name", bind_out)
+    -- 同一实例绑两个不同模型 = 必须报错（"最后一条说了算"会悄悄改变路由）；
+    -- 同一条重复提交则静默去重。
+    reset_env()
+    local _, dup_two = store.apply_profiles({
+        { model = "vc-dup", targets = { "p", "q" },
+          candidates = { cnd(A, "p"), cnd(A, "q") } },
+    })
+    check(type(dup_two) == "string" and dup_two:find("two models", 1, true) ~= nil,
+        "(3) one worker bound to two models is refused", dup_two)
+    reset_env()
+    local _, dup_same = store.apply_profiles({
+        { model = "vc-dup2", targets = { "p" },
+          candidates = { cnd(A, "p"), cnd(A, "p") } },
+    })
+    eq(dup_same, nil, "(3) an identical repeated binding dedupes instead of refusing")
+    eq(store.profile_for("vc-dup2") and #store.profile_for("vc-dup2").candidates, 1,
+        "(3) the duplicate collapsed to one binding")
+
+    ---------------------------------------------------------------- (4) 快照往返两轮
+    reset_env()
+    store.apply_model_config({ model = "mm-a", ctx = 131072 })
+    store.apply_profiles({
+        { model = "svc-rt", targets = { "mm-a", "mm-b" }, context_window = 20000,
+          candidates = { cnd(A, "mm-a"), cnd(B, "mm-b") } },
+        { model = "svc-rt-legacy", target = "mm-a" },
+    })
+    local emitted = store.profiles_list()
+    local rt = row_of(emitted, "svc-rt")
+    ok(rt ~= nil, "(4) the group row is emitted")
+    eq(type(rt.targets) == "table" and #rt.targets, 2, "(4) targets round-trip through the list")
+    eq(rt and rt.context_window, 20000, "(4) context_window round-trips")
+    eq(rt and rt.candidates and #rt.candidates, 2, "(4) candidates round-trip")
+    eq(rt and rawget(rt, "target"), nil, "(4) a written-targets row emits no derived target")
+    local _, rt2_err = store.apply_profiles(emitted)
+    eq(rt2_err, nil, "(4) re-applying the emitted list is accepted")
+    local after2 = store.profile_for("svc-rt")
+    eq(after2 and #after2.targets, 2, "(4) still 1-to-N after the second write")
+    eq(after2 and after2.context_window, 20000, "(4) the override survives the second write")
+    eq(rg(after2, "explicit_targets"), true, "(4) group mode survives the second write")
+    local doc = store.document()
+    local drow = row_of(doc.virtual_models, "svc-rt")
+    ok(drow ~= nil, "(4) document() carries the row")
+    eq(type(drow.targets) == "table" and #drow.targets, 2, "(4) the authoritative JSON view keeps the group")
+    eq(drow and drow.context_window, 20000, "(4) and the override")
+    local dleg = row_of(doc.virtual_models, "svc-rt-legacy")
+    eq(rg(dleg or {}, "targets"), nil, "(4) the legacy row's JSON view grows no phantom group")
+    eq(dleg and dleg.target, "mm-a", "(4) the legacy row keeps its written target")
+    -- 已停用的 per-alias 字段必须**留在**权威 JSON 视图里：操作员没删过的东西不能在
+    -- 一次查看/保存后凭空消失（那是"配了却丢"，比不显示更糟）。它同时是"字段还在但
+    -- 不再驱动转发"这半句话的另一只脚 —— 只断言 reader 答题而视图不保留，就等于字段
+    -- 实际上已经丢了。
+    store.apply_profiles({ { model = "svc-rt-legacy", target = "mm-a",
+        policy = "prefix_hash", effort = "low" } })
+    local dret = row_of(store.document().virtual_models, "svc-rt-legacy")
+    eq(dret and dret.policy, "prefix_hash",
+        "(4) the authoritative JSON view keeps a retired policy field")
+    eq(dret and dret.effort, "low", "(4) and the retired effort field")
+    eq(store.profile_policy("svc-rt-legacy"), "prefix_hash",
+        "(4) the retained reader still answers for it after a document round-trip")
+    eq(HN.profile_policy_name(store.profile_for("svc-rt-legacy")), nil,
+        "(4) while the hot path still ignores the same stored value")
+    local rebuilt, rb_err = store.cfg_from_document({ virtual_models = doc.virtual_models })
+    eq(rb_err, nil, "(4) the document re-reads cleanly")
+    local rp = rebuilt and rebuilt.virtual_profiles and rebuilt.virtual_profiles["svc-rt"]
+    eq(rp and #rp.targets, 2, "(4) the re-read row is still a group")
+    eq(rg(rp, "explicit_targets"), true, "(4) the re-read row keeps group mode")
+    eq(rebuilt and rebuilt.virtual_models["svc-rt"], "mm-a",
+        "(4) the derived alias view matches the group head")
+    -- 删掉 targets 是"退回 legacy"，不是留一份幻影组。
+    reset_env()
+    store.apply_profiles({ { model = "svc-dl", targets = { "d1", "d2" }, context_window = 1024 } })
+    local _, dl_err = store.apply_profiles({ { model = "svc-dl", target = "d-only" } })
+    eq(dl_err, nil, "(4) rewriting without targets is accepted")
+    local p10 = store.profile_for("svc-dl")
+    eq(p10 and p10.target, "d-only", "(4) the new target is explicit")
+    eq(rg(p10, "explicit_targets"), nil, "(4) group mode is gone once targets are not written")
+    eq(rg(p10, "context_window"), nil, "(4) a deleted context_window does not resurrect")
+    eq(store.current().virtual_models["svc-dl"], "d-only",
+        "(4) the derived view follows the rewrite (no stale representative)")
+
+    ---------------------------------------------------------------- (5) 派生组优先级
+    -- 显式 targets 决定组的**内容与顺序**，候选声明顺序改不了它。为什么这样测而不是
+    -- "绑一个组外模型看它会不会被并进来"：组外绑定在 (3) 就被硬拒了，根本走不到派生组，
+    -- 所以"显式组不被加宽"在公开 API 上是**不可观测**的（第一版正是这样，被变异验证照成
+    -- 只有 (3) 变红）。真正能被观测、也真正会坏的是"显式顺序被候选顺序覆盖"。
+    reset_env()
+    store.apply_profiles({
+        { model = "svc-prio", targets = { "t2", "t1" }, target = "stale-name",
+          candidates = { cnd(A, "t1"), cnd(B, "t2") } },
+    })
+    local prio = store.profile_for("svc-prio")
+    eq(prio and type(prio.targets) == "table" and #prio.targets, 2,
+        "(5) a written targets array is not widened by the union path")
+    eq(prio and prio.targets[1], "t2", "(5) the written order leads, not the candidate order")
+    eq(prio and prio.targets[2], "t1", "(5) and both written names survive in written order")
+    eq(prio and prio.target, "stale-name",
+        "(5) the stale written target stays on the row untouched (disk bytes are the operator's)")
+    eq(store.current().virtual_models["svc-prio"], "t2",
+        "(5) but the derived view self-heals to the group head instead of chasing it")
+    eq(store.resolve_model("svc-prio"), "t2", "(5) so resolve_model never forwards the stale name")
+    eq(store.profiles_list()[1].targets[1], "t2", "(5) the emitted row keeps the written order")
+    local names = {}
+    for _, n in ipairs((prio and prio.targets) or {}) do names[n] = true end
+    eq(names["stale-name"], nil, "(5) a target outside the written group never joins the group")
+    -- 没写 targets 时：并集 = target + 各候选绑定名，target 恒首位（凡"必须挑一个代表名"
+    -- 的旧读者读到的还是组头，与上一轮逐字节一致）。
+    reset_env()
+    store.apply_profiles({
+        { model = "svc-union", target = "t0",
+          candidates = { cnd(A, "c1"), cnd(B, "c2"), cnd("http://c:8000", "c1") } },
+    })
+    local uni = store.profile_for("svc-union")
+    eq(uni and #uni.targets, 3, "(5) the derived union is target + distinct binding names")
+    eq(uni and uni.targets[1], "t0", "(5) the written target leads the union")
+    eq(rg(uni, "explicit_targets"), nil, "(5) a derived union never claims group mode")
+    eq(HN.profile_model_group(uni), nil, "(5) and the hot path agrees it is not a group")
+    -- 候选缺省 model 的继承源只能是"操作员亲口写过的名字"，不能是兄弟候选的名字：
+    -- 否则同一份配置换个顺序就得到不同落点。两种顺序都要测。
+    reset_env()
+    local _, inh_err = store.apply_profiles({
+        { model = "svc-inh", candidates = { cnd(A, "sib"), cnd(B) } },
+    })
+    check(type(inh_err) == "string" and inh_err:find("needs a model", 1, true) ~= nil,
+        "(5) a model-less binding does not inherit a sibling's model", inh_err)
+    reset_env()
+    local _, inh_err2 = store.apply_profiles({
+        { model = "svc-inh", candidates = { cnd(B), cnd(A, "sib") } },
+    })
+    check(type(inh_err2) == "string" and inh_err2:find("needs a model", 1, true) ~= nil,
+        "(5) the same refusal regardless of candidate order", inh_err2)
+    reset_env()
+    store.apply_profiles({ { model = "svc-head", targets = { "h1", "h2" },
+        candidates = { cnd(A), cnd(B, "h2") } } })
+    local headp = store.profile_for("svc-head")
+    eq(headp and headp.candidates and headp.candidates[1].model, "h1",
+        "(5) a model-less binding inherits the group head the operator wrote")
+    reset_env()
+    store.apply_profiles({ { model = "svc-wt", target = "written",
+        candidates = { cnd(A), cnd(B, "second") } } })
+    local wtp = store.profile_for("svc-wt")
+    eq(wtp and wtp.candidates and wtp.candidates[1].model, "written",
+        "(5) with no written targets it inherits the written target instead")
+
+    ---------------------------------------------------------------- (6) 派生只读视图
+    -- virtual_models 不再是第二份可写状态：它必须永远由 virtual_profiles 派生，否则
+    -- resolve_model / /v1/models / 模型文档三处会各自读到不同的一张（幻影别名）。
+    reset_env()
+    store.apply_profiles({ { model = "svc-view", targets = { "v1", "v2" } } })
+    eq(store.current().virtual_models["svc-view"], "v1",
+        "(6) the derived view carries the group head, not a second stored value")
+    local vlist = store.virtual_models_list()
+    local vrow
+    for _, row in ipairs(vlist) do
+        if row[1] == "svc-view" then vrow = row end
+    end
+    ok(vrow ~= nil, "(6) the entry is listed for the /v1/models advertiser")
+    eq(vrow and #vrow, 3, "(6) the row is alias + the whole group (variadic, not a pair)")
+    eq(vrow and vrow[2], "v1", "(6) the advertised group starts at the head")
+    store.apply_profiles({})
+    eq(#store.profiles_list(), 0, "(6) the profile table cleared")
+    eq(store.current().virtual_models["svc-view"], nil,
+        "(6) the derived view clears with it (no phantom alias survives)")
+    eq(store.resolve_model("svc-view"), "svc-view",
+        "(6) resolve_model stops mapping a removed entry")
+    eq(store.virtual_targets("svc-view"), nil,
+        "(6) virtual_targets reports no entry rather than an empty group")
+    reset_env()
+end
+
+local vm_seams = verify_hot_path_seams()
+verify_group_semantics(vm_seams)
 
 --------------------------------------------------------------------------
 -- 12. 端点语义：ui 桥 -> handle_config_virtual / handle_config_upstreams /

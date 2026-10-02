@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <title>Model overrides · llm-router</title>
+  <title>Model management · llm-router</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
   <link rel="stylesheet" href="./app.css?v=5">
@@ -18,7 +18,9 @@
         <q-page class="workspace-page">
           <header class="page-heading">
             <div>
-              <h1>{{ t.title }}</h1>
+              <!-- 页面主标题按用户裁定改为「模型管理」：i18n.js 由他人并行维护，
+                   这里用本地字典覆盖，等键进 i18n.js 后可以删掉这一段 -->
+              <h1>{{ pageTitle }}</h1>
               <p>{{ t.description }}</p>
             </div>
             <div class="heading-actions">
@@ -39,6 +41,81 @@
 
           <q-spinner v-if="loading && !doc" color="purple-3" size="30px"></q-spinner>
 
+          <!-- 虚拟模型：本页的主入口（root ruling 2026-10-02 语义反转）。
+               一个虚拟名 = 日常服务入口，一对多映射一组实际模型，由调度策略在组内选路；
+               条目只允许 context_window 一个覆盖字段。policy 归路由策略页、effort 归模型卡片，
+               所以这里刻意不提供 per-alias 的档位/策略编辑器。 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading">
+              <div>
+                <div class="surface-title">{{ tv('virtualSection') }}</div>
+                <div class="surface-subtitle">{{ tv('virtualCopy') }}</div>
+              </div>
+              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="tv('virtualSave')" @click="saveVirtual"></q-btn>
+            </q-card-section>
+            <q-separator dark></q-separator>
+            <q-card-section class="surface-body">
+              <div class="rows-list" style="gap:10px">
+                <div v-for="(row, index) in virtualRows" :key="'va' + index" style="display:grid;gap:6px;padding:10px 0;border-bottom:1px dashed rgba(139, 145, 184, .18)">
+                  <!-- 展示面：虚拟名 → 它映射的每个实际模型（含绑定实例）与统一的上下文口径 -->
+                  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-left:2px">
+                    <strong class="code-pill" style="font-size:13px">{{ row.model || tv('virtualNameUnset') }}</strong>
+                    <span class="muted">→</span>
+                    <template v-if="groupOfRow(row).length">
+                      <span v-for="(tg, ti) in displayTargets(row)" :key="'vs' + index + '-' + ti"
+                            style="display:inline-flex;align-items:center;gap:4px;border:1px solid rgba(139,145,184,.16);border-radius:8px;padding:2px 6px">
+                        <span class="code-pill">{{ tg.model || tv('virtualTargetUnset') }}</span>
+                        <span v-if="tg.worker" class="muted mono" style="font-size:11px">@ {{ tg.worker }}</span>
+                        <span v-else class="muted" style="font-size:11px">{{ tv('virtualAnyWorker') }}</span>
+                      </span>
+                    </template>
+                    <span v-else class="muted">{{ tv('virtualNoTargets') }}</span>
+                    <q-badge outline :color="row.context_window ? 'teal-4' : 'grey-6'" class="chip-soft">
+                      {{ row.context_window ? tv('virtualCtxCovered') + ' ' + row.context_window : tv('virtualCtxFollow') }}</q-badge>
+                    <q-badge v-for="chip in legacyChips(row)" :key="'vl' + index + '-' + chip" outline color="orange-4" class="chip-soft">{{ chip }}</q-badge>
+                    <span style="flex:1 1 auto"></span>
+                    <span class="muted" style="font-size:11px">{{ tv('virtualDeleteHint') }}</span>
+                    <q-btn flat round dense icon="mdi-close" color="red-4" @click="virtualRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                  </div>
+                  <!-- 编辑面：虚拟名 + 唯一的覆盖字段 -->
+                  <div class="row-edit" style="grid-template-columns:minmax(0,1.1fr) minmax(0,1fr) minmax(0,.9fr)">
+                    <q-input v-model="row.model" dense outlined dark class="mono" :label="tv('virtualAlias')"
+                             :placeholder="tv('virtualAliasPlaceholder')" @update:model-value="touchRow(row)"></q-input>
+                    <q-input v-model="row.context_window" dense outlined dark type="number" :label="tv('virtualCtxField')"
+                             :hint="tv('virtualCtxHint')" @update:model-value="touchRow(row)"></q-input>
+                    <span class="muted" style="font-size:11px">{{ tv('virtualCtxCopy') }}</span>
+                  </div>
+                  <!-- 实际模型组：每行一个模型名，可选把该行绑到某个实例 -->
+                  <div style="padding:2px 0 4px 14px">
+                    <div class="rows-head q-mb-xs">{{ tv('virtualTargetsTitle') }} · {{ tv('virtualTargetsCopy') }}</div>
+                    <div class="rows-list">
+                      <div v-for="(tg, ti) in row.targets" :key="'vt' + index + '-' + ti" class="row-edit"
+                           style="grid-template-columns:minmax(0,1.4fr) minmax(0,1.2fr) auto">
+                        <q-select v-model="tg.model" dense outlined dark use-input fill-input hide-selected
+                                  :options="targetModelOptions(tg)" :option-label="modelOptionLabel" map-options emit-value clearable
+                                  :label="tv('virtualTargetModel')" :placeholder="tv('virtualTargetModelPlaceholder')" input-debounce="120"
+                                  @update:model-value="touchRow(row)">
+                          <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
+                        </q-select>
+                        <q-select v-model="tg.worker" dense outlined dark use-input fill-input hide-selected
+                                  :options="workerOptionsFor(tg)" map-options emit-value clearable
+                                  :label="tv('virtualTargetWorker')" :placeholder="t.virtualWorkerPlaceholder" input-debounce="120"
+                                  @update:model-value="touchRow(row)">
+                          <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
+                        </q-select>
+                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="removeTarget(row, ti)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                      </div>
+                      <div v-if="!row.targets.length" class="muted">{{ tv('virtualNoTargets') }}</div>
+                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualTargetAdd')" @click="addTarget(row)"></q-btn></div>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="!virtualRows.length" class="muted">{{ t.rowsEmpty }}</div>
+                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualAdd')" @click="addVirtualRow"></q-btn></div>
+              </div>
+            </q-card-section>
+          </q-card>
+
           <!-- 生效预览：本地静态推算，不发请求 -->
           <q-card flat class="surface-card preview-card">
             <q-card-section class="surface-heading">
@@ -51,7 +128,7 @@
             <q-card-section class="preview-box">
               <div class="preview-fields">
                 <q-select v-model="preview.model" dense outlined dark use-input
-                          :label="t.previewModel" :options="modelOptions" :option-label="modelOptionLabel"
+                          :label="t.previewModel" :options="filteredModelOptions" :option-label="modelOptionLabel"
                           @filter="filterModelOptions" map-options emit-value input-debounce="120">
                   <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
                 </q-select>
@@ -59,12 +136,19 @@
                           :options="effortOptions" map-options emit-value clearable></q-select>
               </div>
               <div class="preview-out">
-                <div><span class="k">{{ t.previewResultModel }}</span><span class="code-pill">{{ previewResult.model }}</span>
-                  <q-badge v-if="previewResult.alias" outline color="teal-4" class="chip-soft q-ml-sm">{{ t.previewAliasNote }}: {{ preview.model }} → {{ previewResult.resolved }}</q-badge></div>
+                <div><span class="k">{{ t.previewResultModel }}</span>
+                  <!-- 一对多：虚拟名解析成整组模型，落点由调度策略决定，预览只能把候选组全列出来 -->
+                  <template v-if="previewResult.group.length > 1">
+                    <span v-for="(one, oi) in previewResult.group" :key="'pg' + oi" class="code-pill q-mr-xs">{{ one }}</span>
+                    <span class="muted" style="font-size:11.5px">{{ tv('previewGroupNote') }}</span>
+                  </template>
+                  <span v-else class="code-pill">{{ previewResult.model }}</span>
+                  <q-badge v-if="previewResult.alias" outline color="teal-4" class="chip-soft q-ml-sm">{{ t.previewAliasNote }}: {{ preview.model }} → {{ previewResult.groupText }}</q-badge></div>
                 <div><span class="k">{{ t.previewResultEffort }}</span><span class="code-pill">{{ previewResult.effortText }}</span>
                   <span class="muted q-ml-sm">({{ previewResult.effortChain }})</span></div>
                 <div><span class="k">{{ t.previewResultCtx }}</span><span class="code-pill">{{ previewResult.ctxText }}</span>
-                  <span v-if="previewResult.ctx" class="muted q-ml-sm">{{ t.previewCtxNote }}</span></div>
+                  <span v-if="previewResult.ctx" class="muted q-ml-sm">{{ previewResult.ctxSourceNote || t.previewCtxNote }}</span>
+                  <span v-else-if="previewResult.group.length > 1" class="muted q-ml-sm">{{ tv('previewCtxGroupNone') }}</span></div>
                 <div><span class="k">{{ t.previewServing }}</span><span class="code-pill">{{ previewServing.text }}</span></div>
                 <div v-if="mapNote" class="preview-note">{{ mapNote }}</div>
               </div>
@@ -90,10 +174,16 @@
                 <q-td :props="props">
                   <div class="identity-cell">
                     <div><strong>{{ props.row.model }}</strong>
-                      <span v-if="props.row.target">{{ t.virtualTarget }} → {{ props.row.target }}</span>
-                      <q-badge v-if="(props.row.candidates || []).length" outline color="purple-4" class="chip-soft">
-                        {{ t.virtualCandidates }} · {{ props.row.candidates.length }}</q-badge>
-                      <span v-else-if="props.row.virtual" class="muted" style="font-size:11px">{{ t.virtualBadge }}</span></div>
+                      <span v-if="props.row.virtual" class="muted">{{ tv('virtualBadge') }}</span>
+                      <!-- 一对多：卡片表里把整组实际模型都列出来，绑到实例的标 @url -->
+                      <template v-if="(props.row.group || []).length">
+                        <span>{{ tv("virtualGroupArrow") }}</span>
+                        <!-- key 带上实例：同一模型绑多台时模型名会重复，只用模型名就是重复 key -->
+                        <q-chip v-for="one in props.row.group" :key="one.model + '@' + (one.worker || '*')" dense size="12px" class="chip-soft">
+                          {{ one.model }}<span v-if="one.worker" class="muted"> @ {{ one.worker }}</span></q-chip>
+                      </template>
+                      <q-badge v-if="props.row.contextWindow" outline color="teal-4" class="chip-soft">
+                        {{ tv('virtualCtxCovered') }} {{ props.row.contextWindow }}</q-badge></div>
                   </div>
                 </q-td>
               </template>
@@ -197,57 +287,6 @@
             </q-card-section>
           </q-card>
 
-          <!-- 虚拟模型别名 -->
-          <q-card flat class="surface-card">
-            <q-card-section class="surface-heading">
-              <div>
-                <div class="surface-title">{{ t.virtualSection }}</div>
-                <div class="surface-subtitle">{{ t.virtualCopy }}</div>
-              </div>
-              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="t.virtualSave" @click="saveVirtual"></q-btn>
-            </q-card-section>
-            <q-separator dark></q-separator>
-            <q-card-section class="surface-body">
-              <div class="rows-list">
-                <div v-for="(row, index) in virtualRows" :key="'va' + index" style="display:grid;gap:4px;padding:6px 0">
-                  <div class="row-edit">
-                    <q-input v-model="row.model" dense outlined dark class="mono" :label="t.virtualAlias" :rules="[virtualAliasRule]"></q-input>
-                    <!-- target 仍是单值入口（多数别名只绑一个模型）；有候选时它同时充当候选缺省继承的模型名 -->
-                    <q-select v-model="row.target" dense outlined dark use-input :options="modelOptions" :option-label="modelOptionLabel"
-                              map-options emit-value clearable :label="t.virtualTarget" input-debounce="120"></q-select>
-                    <div class="route-cell" style="gap:4px;justify-content:flex-end">
-                      <q-badge v-if="(row.candidates || []).length" outline color="purple-4" class="chip-soft"
-                               :label="t.virtualCandidates + ' · ' + row.candidates.length"></q-badge>
-                      <q-btn flat dense round size="sm" :icon="row.expanded ? 'mdi-chevron-up' : 'mdi-call-split'"
-                             @click="row.expanded = !row.expanded"><q-tooltip>{{ t.virtualCandidates }}</q-tooltip></q-btn>
-                      <span class="muted" style="font-size:11px">{{ t.virtualDeleteHint }}</span>
-                    </div>
-                    <q-btn flat round dense icon="mdi-close" color="red-4" @click="virtualRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
-                  </div>
-                  <!-- 逐实例绑定：同一别名可以把不同实例绑到不同模型，target 因此可以整体省略 -->
-                  <div v-if="row.expanded || (row.candidates || []).length" style="padding:2px 0 6px 16px">
-                    <div class="rows-list">
-                      <div v-for="(cand, ci) in row.candidates" :key="'vc' + index + '-' + ci"
-                           class="row-edit" style="grid-template-columns: minmax(0,1.4fr) minmax(0,1.2fr) minmax(0,1fr) auto">
-                        <q-select v-model="cand.worker" dense outlined dark use-input :options="workerOptionsFor(cand)"
-                                  map-options emit-value :label="t.virtualWorkerField" input-debounce="120"
-                                  :placeholder="t.virtualWorkerPlaceholder"></q-select>
-                        <q-select v-model="cand.model" dense outlined dark use-input :options="candidateModelOptions(cand.worker)"
-                                  map-options emit-value clearable :label="t.virtualCandidateModel"
-                                  :placeholder="t.virtualInherit" input-debounce="120"></q-select>
-                        <span class="muted" style="font-size:11px">{{ candidateNote(cand, row) }}</span>
-                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="row.candidates.splice(ci, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
-                      </div>
-                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.virtualCandidateAdd" @click="addCandidate(row)"></q-btn></div>
-                    </div>
-                  </div>
-                </div>
-                <div v-if="!virtualRows.length" class="muted">{{ t.rowsEmpty }}</div>
-                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.virtualAdd" @click="addVirtualRow"></q-btn></div>
-              </div>
-            </q-card-section>
-          </q-card>
-
           <!-- 改名映射（watcher） -->
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading">
@@ -347,6 +386,12 @@
         let unsubscribeLocale
 
         const c = computed(() => window.lmrI18n.messages[locale.value].common)
+        // 文案一律取自 i18n.js 的 models 块（translate 内部会回退 zh-CN 块），
+        // 缺失的键原样回显键名，便于在页面上直接发现漏翻。
+        function tv (key, values) {
+          return window.lmrI18n.translate(locale.value, 'models', key, values)
+        }
+        const pageTitle = computed(() => tv('pageTitle'))
         const t = computed(() => window.lmrI18n.messages[locale.value].models)
         const pagination = reactive({ rowsPerPage: 15 })
 
@@ -358,24 +403,35 @@
           const names = new Set(models.value.map(row => row.model))
           ;(doc.value && doc.value.model_ctx ? doc.value.model_ctx : []).forEach(row => names.add(row.model))
           ;(doc.value && doc.value.model_effort ? doc.value.model_effort : []).forEach(row => names.add(row.model))
-          virtualRows.value.forEach(row => {
-            if (row.target) names.add(row.target)
-            ;(row.candidates || []).forEach(cand => { if (cand.model) names.add(cand.model) })
-          })
-          // 逐实例绑定的模型名也进可引用集合：candidates-only 的别名否则在档位/ctx 的
-          // 下拉里彻底选不到，而那些卡片本来就是按落点模型名配的
+          // 每个虚拟入口映射的整组实际模型都要能被引用：档位卡与 ctx 卡是按落点模型名配的，
+          // 组里的名字选不到的话操作员只能去 JSON 视图里配（这条链路的可发现性就是本页的职责）
+          virtualRows.value.forEach(row => groupOfRow(row).forEach(model => names.add(model)))
           ;((doc.value && doc.value.virtual_models) || []).forEach(entry => {
-            ;(entry && Array.isArray(entry.candidates) ? entry.candidates : []).forEach(cand => {
-              if (cand && cand.model) names.add(cand.model)
-            })
+            groupOfEntry(entry).forEach(model => names.add(model))
           })
           return [...names].filter(Boolean).sort()
         })
         function modelOptionLabel (option) { return option }
+        // 预览的模型下拉：池内/已配置的真实模型，外加每个虚拟名。少了虚拟名的话操作员根本
+        // 没法在预览里选自己的服务入口，而「入口 → 一组模型」正是新语义下最想让人看见的一行。
+        // :options 必须绑到 filter 真正改写的那个数组，否则输入过滤只是摆设（选单永远是全量）
+        const previewModelOptions = computed(() => {
+          const names = new Set(modelOptions.value)
+          ;((doc.value && doc.value.virtual_models) || []).forEach(entry => {
+            const alias = cleanModelName(entry && entry.model)
+            if (alias) names.add(alias)
+          })
+          virtualRows.value.forEach(row => {
+            const alias = cleanModelName(row.model)
+            if (alias) names.add(alias)
+          })
+          return [...names].filter(Boolean).sort()
+        })
         function filterModelOptions (value, update) {
           update(() => {
             const needle = String(value || '').toLowerCase()
-            filteredModelOptions.value = needle ? modelOptions.value.filter(name => name.toLowerCase().includes(needle)) : modelOptions.value
+            const all = previewModelOptions.value
+            filteredModelOptions.value = needle ? all.filter(name => name.toLowerCase().includes(needle)) : all
           })
         }
 
@@ -420,18 +476,20 @@
           const aliases = (doc.value && doc.value.virtual_models) || []
           aliases.forEach(entry => {
             if (!entry || !entry.model) return
-            const candidates = Array.isArray(entry.candidates) ? entry.candidates : []
-            const first = candidates.find(cand => cand && cand.model)
-            const target = typeof entry.target === 'string' && entry.target
-              ? entry.target : (first ? first.model : '')
+            // 展示口径直接借用编辑面的行构造（同一个 (模型,实例) 一条）：两处一旦各写一遍
+            // 「怎么解析这一条」，就会有一处漂移，而漂移的表现是操作员看见的组与实际生效的组不一致
+            const view = virtualRowFromEntry(entry)
+            const group = displayTargets(view)
+            const cw = Number(entry.context_window)
             const existing = rows.find(row => row.model === entry.model)
             if (existing) {
               existing.virtual = true
-              existing.target = target
-              existing.candidates = candidates
+              existing.group = group
+              existing.contextWindow = Number.isFinite(cw) && cw >= 1 ? cw : null
               return
             }
-            rows.push({ model: entry.model, registered: false, sources: [], virtual: true, target, candidates })
+            rows.push({ model: entry.model, registered: false, sources: [], virtual: true, group,
+              contextWindow: Number.isFinite(cw) && cw >= 1 ? cw : null })
           })
           return rows
         })
@@ -451,17 +509,20 @@
           if (!text || text === 'null' || text === 'default') return null
           return EFFORTS.includes(text) ? text : null
         }
-        function pairList (rows, key) {
-          const map = {}
-          ;(rows || []).forEach(row => {
-            if (!row || !row.model) return
-            map[row.model] = key === 'ctx' ? Number(row[key]) : row[key]
-          })
-          return map
+        // 请求名对应的虚拟条目（按客户端名命中，与后端 profile_for_alias 同口径）
+        function previewEntry (requested) {
+          if (!requested) return null
+          const list = (doc.value && doc.value.virtual_models) || []
+          return list.find(entry => entry && cleanModelName(entry.model) === requested) || null
         }
-        function previewResolve (requested) {
-          const virtual = pairList((doc.value && doc.value.virtual_models) || [], 'target')
-          return virtual[requested] || requested
+        // 代表模型：config_store 里 pre-feature reader 都按它找卡（显式 target 优先，
+        // 否则组内第一个）。预览的档位链按它推算；ctx/组展示另有自己的口径。
+        function previewRepresentative (entry, requested) {
+          if (!entry) return requested
+          const target = cleanModelName(entry.target)
+          if (target) return target
+          const group = groupOfEntry(entry)
+          return group[0] || requested
         }
         function previewEffort (model, requested) {
           const cfg = doc.value || {}
@@ -499,17 +560,38 @@
         }
         const previewResult = computed(() => {
           const requested = preview.model || ''
-          const resolved = requested ? previewResolve(requested) : requested
+          const entry = previewEntry(requested)
+          const group = entry ? groupOfEntry(entry) : (requested ? [requested] : [])
+          const resolved = previewRepresentative(entry, requested)
           const effort = previewEffort(resolved, preview.effort)
-          const cap = resolved ? previewCtx(resolved) : null
+          // 条目级钳制优先且与落点无关（这正是条目级覆盖存在的理由：一个服务名一个预算）；
+          // 没有条目级值时退回该模型自己的卡片，与 router.apply_ctx_cap 的 entry 参数同语义
+          const entryCap = requested ? virtualCtxCap(entry) : null
+          const explicit = entry && Number.isFinite(Number(entry.context_window)) && Number(entry.context_window) >= 1
+          const cap = requested ? (entryCap !== null ? entryCap : previewCtx(resolved)) : null
+          // 档位卡是按落点模型配的（router 的 card_key_for 在选中实例之后才取名字），所以整组
+          // 有多个模型时预览必须逐个模型各推一次：一致就显示一个值，不一致就把每个落点写清楚，
+          // 否则操作员会以为整组吃同一档位
+          const effortPerModel = group.length > 1
+            ? group.map(model => ({ model, effort: previewEffort(model, preview.effort) })) : null
+          const effortSame = effortPerModel
+            ? effortPerModel.every(item => (item.effort.effort || '') === (effortPerModel[0].effort.effort || '')) : true
           return {
             model: resolved || '—',
             resolved,
-            alias: resolved !== requested && requested !== '',
-            effortText: effort.effort || c.value.unset,
-            effortChain: effort.chain || '',
+            group,
+            groupText: group.join(', ') || '—',
+            alias: Boolean(entry),
+            effortText: effortSame
+              ? (effort.effort || c.value.unset)
+              : effortPerModel.map(item => item.model + ' → ' + (item.effort.effort || c.value.unset)).join(' · '),
+            effortChain: effortSame ? (effort.chain || '') : tv('previewEffortGroupNote'),
+            effortPerModel,
             ctx: cap,
-            ctxText: cap ? String(cap) : t.value.previewNoCtx
+            ctxText: cap ? String(cap) : t.value.previewNoCtx,
+            ctxSourceNote: cap && entryCap !== null
+              ? (explicit ? tv('previewCtxFromEntry') : tv('previewCtxFromGroupMin'))
+              : (tv('previewCtxFromCard') || '')
           }
         })
 
@@ -518,16 +600,32 @@
         // registry 的三档同口径：已验证且不含 -> 明确不可路由；一台已验证的都没有 ->
         // 「没人证明过」，保持可路由而不是假装健康。
         const previewServing = computed(() => {
-          const model = previewResult.value.resolved || preview.model
-          if (!model || model === '—') return { text: c.value.empty, ok: null }
+          // 组入口的可服务判定要问整组：任何一台已验证实例提供组内任一模型，请求就能落地
+          const group = previewResult.value.group && previewResult.value.group.length
+            ? previewResult.value.group : [previewResult.value.resolved || preview.model]
+          const names = group.filter(model => model && model !== '—')
+          if (!names.length) return { text: c.value.empty, ok: null }
           const verified = poolWorkers.value.filter(row => row.models_verified === true)
-          const serving = verified.filter(row => (row.models || []).indexOf(model) !== -1)
+          const serving = verified.filter(row => names.some(model => (row.models || []).indexOf(model) !== -1))
           if (verified.length && serving.length === 0) return { text: t.value.previewServingNo, ok: false }
           if (!verified.length) {
-            const legacy = poolWorkers.value.filter(row => row.model_id === model).length
+            const legacy = poolWorkers.value.filter(row => names.indexOf(row.model_id) !== -1).length
             return { text: legacy ? t.value.previewServingUnverified : t.value.previewServingNone, ok: null }
           }
-          return { text: t.value.previewServingYes.replace('{n}', String(serving.length)), ok: true }
+          // 整组入口只报「有几台能服务这个入口」会藏住真正的坑：组里某个模型一台都没有，
+          // 请求到它就 503，而总数看着还挺健康。所以组内逐个模型点名，缺人的直接标出来。
+          const base = t.value.previewServingYes.replace('{n}', String(serving.length))
+          if (names.length < 2) return { text: base, ok: true }
+          const perModel = names.map(model => ({
+            model,
+            n: verified.filter(row => (row.models || []).indexOf(model) !== -1).length
+          }))
+          const dead = perModel.filter(item => item.n === 0).map(item => item.model)
+          const detail = perModel.map(item => item.model + ':' + item.n).join(' · ')
+          if (dead.length) {
+            return { text: base + ' · ' + tv('previewServingGroupGap', { models: dead.join(', ') }), ok: false }
+          }
+          return { text: base + ' (' + detail + ')', ok: true }
         })
 
         // ── 载入 ──
@@ -538,20 +636,15 @@
           globalForm.effort_map = (document_.effort_map || []).map(row => ({ from: row.from, to: row.to }))
           globalForm.model_effort = (document_.model_effort || []).map(row => ({ model: row.model, effort: row.effort }))
           legacyCtx.value = (document_.model_ctx || []).map(row => ({ model: row.model, ctx: row.ctx }))
-          // raw 保存服务端原样条目：workers/policy/effort 这些表单画不出的字段靠它在保存时
-          // 原样带回，编辑 target 或 candidates 不会顺手抹掉它们（JSON 才是权威面）
-          virtualRows.value = (document_.virtual_models || []).map(row => ({
-            model: row.model || '',
-            target: typeof row.target === 'string' ? row.target : '',
-            candidates: Array.isArray(row.candidates)
-              ? row.candidates.map(cand => ({ worker: cand && cand.worker ? String(cand.worker) : '', model: cand && cand.model ? String(cand.model) : '' }))
-              : [],
-            raw: { ...row }
-          }))
+          // raw 是服务端原样条目：target/workers/policy/effort 以及任何未知键靠它在保存时
+          // 原样带回（JSON 视图才是权威面，表单只是它之外的快捷方式）。dirty 记录
+          // 「操作员是否真的编辑过这一行」：没编辑过的行提交时连 targets 都不写，
+          // 于是 legacy {model,target} 条目在磁盘上保持字节不变，不会长出新字段。
+          virtualRows.value = (document_.virtual_models || []).map(row => virtualRowFromEntry(row))
           const map = (document_.watcher && document_.watcher.model_map) || {}
           mapRows.value = Object.entries(map).map(([original, value]) => ({ original, value }))
-          if (!preview.model) preview.model = models.value.length ? models.value[0].model : (modelOptions.value[0] || '')
-          filteredModelOptions.value = modelOptions.value
+          if (!preview.model) preview.model = models.value.length ? models.value[0].model : (previewModelOptions.value[0] || '')
+          filteredModelOptions.value = previewModelOptions.value
         }
 
         async function load () {
@@ -581,9 +674,8 @@
           try {
             await action()
             Quasar.Notify.create({
-              message: values
-                ? window.lmrI18n.translate(locale.value, 'models', messageKey, values)
-                : window.lmrI18n.translate(locale.value, 'models', messageKey),
+              // 走 tv()：键名与 i18n.js 的 models 块一致，缺失时 translate 自己回退 zh-CN 块
+              message: tv(messageKey, values),
               type: 'positive', position: 'top-right', timeout: 2400
             })
             warningMessage.value = ''
@@ -625,118 +717,292 @@
           }
         }
 
-        function virtualAliasRule (value) { return Boolean(String(value || '').trim()) || t.value.virtualRuleAlias }
+        // ── 虚拟模型：服务入口 → 一组实际模型（root ruling 2026-10-02 语义反转）──
+        //
+        // 条目形状以 config_store.profile_from_entry 为唯一口径：
+        //   model（虚拟名，必填）、targets（一组实际模型名，新主字段）、
+        //   candidates（[{worker, model}]，可选的逐实例绑定）、context_window（唯一覆盖字段）。
+        // 旧的单值 target / workers 白名单 / policy / effort 仍被后端接受，UI 不再提供编辑器，
+        // 只靠 row.raw 原样带回：画不出 ≠ 不存在，删掉它们必须是操作员在 JSON 视图里的动作。
+        function cleanModelName (value) { return String(value === null || value === undefined ? '' : value).trim() }
 
-        // ── 虚拟模型：别名 →（单值 target 或逐实例 candidates）──
-        // 后端约定：target 与 candidates 至少一个；候选的 model 缺省继承 target，所以
-        // 「所有实例绑同一模型」只写 target 就够，「各绑各的模型」才需要 candidates。
-        // worker 用规范化 url（去掉末尾斜杠），与 config_store 的 norm_candidate 同口径。
-        function normWorker (value) {
-          return String(value || '').trim().replace(/\/+$/, '')
+        // 与后端 target_group_of 同口径的三档回退：显式 targets > 单值 target >
+        // 各条 candidates 的去重模型名（保持首次声明顺序）。UI 读入时用它把任意历史
+        // 形状折成同一张编辑表，提交时才按 dirty 决定是否改写。
+        function groupOfEntry (entry) {
+          const declared = Array.isArray(entry && entry.targets)
+            ? entry.targets.map(cleanModelName).filter(Boolean) : []
+          if (declared.length) return dedupe(declared)
+          const target = cleanModelName(entry && entry.target)
+          if (target) return [target]
+          const fromBindings = []
+          ;(Array.isArray(entry && entry.candidates) ? entry.candidates : []).forEach(cand => {
+            const model = cleanModelName(cand && cand.model)
+            if (model) fromBindings.push(model)
+          })
+          return dedupe(fromBindings)
         }
+        function dedupe (list) {
+          // 键表一律 Object.create(null)：模型名/实例地址是操作员手填的，
+          // "__proto__"、"constructor" 这类名字在裸 {} 上会被当成「已存在」
+          const seen = Object.create(null)
+          const out = []
+          list.forEach(item => { if (!seen[item]) { seen[item] = true; out.push(item) } })
+          return out
+        }
+
+        // 条目里的全部绑定，按声明顺序原样取出（同一条 worker+model 重复出现才去重）。
+        // 这里绝不能按模型名收敛成「一个模型一个实例」：同一模型绑多台实例是常见拓扑
+        // （一个入口下两台机器跑同一个模型做负载均衡），收敛会让多出来的绑定在下次保存时
+        // 静默消失——正是上一轮「JSON 视图丢 candidates」的同源事故。
+        function bindingsOfEntry (entry) {
+          const out = []
+          const seen = Object.create(null)
+          ;(Array.isArray(entry && entry.candidates) ? entry.candidates : []).forEach(cand => {
+            if (!cand || typeof cand !== 'object') return
+            const worker = normWorker(cand.worker || cand.url)
+            const model = cleanModelName(cand.model)
+            const key = worker + '\u0000' + model
+            if (!worker && !model) return
+            if (seen[key]) return
+            seen[key] = true
+            out.push({ worker, model })
+          })
+          return out
+        }
+
+        function virtualRowFromEntry (row) {
+          const entry = row && typeof row === 'object' ? row : {}
+          const bindings = bindingsOfEntry(entry)
+          const group = groupOfEntry(entry)
+          const targets = []
+          const placed = new Set()
+          // 一行 = 一个 (模型, 实例) 绑定；组里没有任何绑定的模型单独成一行（worker 留空 =
+          // 任意能提供它的实例）。顺序：先按组的声明顺序，再补组外的绑定
+          group.forEach(model => {
+            const mine = bindings.filter(cand => cand.model === model)
+            if (mine.length) {
+              mine.forEach(cand => {
+                const key = cand.model + '\u0000' + cand.worker
+                if (placed.has(key)) return
+                placed.add(key)
+                targets.push({ model: cand.model, worker: cand.worker })
+              })
+              return
+            }
+            targets.push({ model, worker: '' })
+          })
+          // 组里没有、但确实被绑定过的名字（历史脏配置、只写了 candidates 的写法、甚至只写了
+          // 实例没写模型名的绑定）也摊成行：编辑这一行时它们会跟着进组，比「编辑后静默丢掉
+          // 一条绑定」安全得多 —— 不可见却仍生效的配置正是上一轮事故的形状
+          bindings.forEach(cand => {
+            const key = cand.model + '\u0000' + cand.worker
+            if (placed.has(key)) return
+            placed.add(key)
+            targets.push({ model: cand.model, worker: cand.worker })
+          })
+          const cw = entry.context_window
+          return {
+            model: cleanModelName(entry.model),
+            targets,
+            context_window: (typeof cw === 'number' && cw >= 1) || (typeof cw === 'string' && /^\d+$/.test(cw.trim()) && Number(cw) >= 1)
+              ? String(cw) : '',
+            raw: { ...entry },
+            // 只有真被编辑过的行才允许改写 targets/candidates/context_window（见 virtualEntryFromRow）
+            dirty: false
+          }
+        }
+
+        function touchRow (row) { row.dirty = true }
+
         function addVirtualRow () {
-          virtualRows.value.push({ model: '', target: '', candidates: [], raw: null, expanded: false })
+          virtualRows.value.push({ model: '', targets: [{ model: '', worker: '' }], context_window: '', raw: null, dirty: true })
         }
-        function addCandidate (row) {
-          if (!Array.isArray(row.candidates)) row.candidates = []
-          row.candidates.push({ worker: '', model: '' })
-          row.expanded = true
+        function addTarget (row) {
+          if (!Array.isArray(row.targets)) row.targets = []
+          row.targets.push({ model: '', worker: '' })
+          row.dirty = true
         }
-        // 候选实例的下拉：整个池，外加该行已写的 worker（历史配置不会被「选项里没有」吃掉）
-        function workerOptionsFor (cand) {
+        function removeTarget (row, index) {
+          row.targets.splice(index, 1)
+          row.dirty = true
+        }
+
+        // 展示面：组内每个模型 + 它绑到的实例（没绑就是「任意能提供它的实例」）。
+        // 匿名绑定行（model 空、worker 有值）也要显示，否则操作员以为它不存在。
+        function displayTargets (row) {
+          return (row.targets || []).map(tg => ({ model: cleanModelName(tg.model), worker: normWorker(tg.worker) }))
+        }
+        function groupOfRow (row) {
+          return dedupe((row.targets || []).map(tg => cleanModelName(tg.model)).filter(Boolean))
+        }
+        // 被 UI 隐藏但仍留在配置里的旧字段：必须显式打出来，不能让它们成为看不见的设置。
+        // 两类要分开标，因为它们的行为完全不同（口径见 router.lua）：
+        //   workers  —— 仍在候选收窄上生效（candidates_for 的 legacy_allow），操作员必须知道它还在限流；
+        //   policy / effort —— 热路径已经不读（profile_policy_name / profile_effort_value 恒返回 nil），
+        //              只是磁盘上还留着，标成「停用」而不是「保留」，否则等于暗示它还在调度。
+        // target 单独一条：它是 /v1/models 注入与档位/ctx 找卡用的代表值，编辑过组以后可能已经
+        // 不在组里 —— 「改了 A 却还生效着 B」的典型形状，等保存时才报就太晚了。
+        function legacyChips (row) {
+          const raw = row.raw || {}
+          const chips = []
+          if (Array.isArray(raw.workers) && raw.workers.length) chips.push(tv('virtualLegacyWorkers') + ' · ' + raw.workers.length)
+          if (cleanModelName(raw.policy)) chips.push(tv('virtualLegacyPolicy') + ' · ' + raw.policy)
+          if (cleanModelName(raw.effort)) chips.push(tv('virtualLegacyEffort') + ' · ' + raw.effort)
+          const legacyTarget = cleanModelName(raw.target)
+          const group = groupOfRow(row)
+          if (legacyTarget && group.length && !group.includes(legacyTarget)) {
+            chips.push(tv('virtualStaleTargetChip') + ' · ' + legacyTarget)
+          }
+          return chips
+        }
+
+        // 目标模型的下拉：池内模型 + 已配置卡片 + 本行已写的名字（历史配置不能被
+        // 「选项里没有」吃掉）；自由输入允许，因为上游可以在探针之前就先配好名字。
+        function targetModelOptions (tg) {
+          const names = new Set(modelOptions.value)
+          const current = cleanModelName(tg && tg.model)
+          if (current) names.add(current)
+          return [...names].filter(Boolean).sort()
+        }
+        // worker 用规范化 url（去尾斜杠）或 worker id，与 config_store.norm_candidate 同口径。
+        function normWorker (value) {
+          return String(value === null || value === undefined ? '' : value).trim().replace(/\/+$/, '')
+        }
+        // 绑定实例的下拉：整个池，外加该行已写的 worker（历史配置不会被「选项里没有」吃掉）
+        function workerOptionsFor (tg) {
           const names = new Set(poolWorkers.value.map(row => normWorker(row.url)).filter(Boolean))
-          const current = normWorker(cand && cand.worker)
+          const current = normWorker(tg && tg.worker)
           if (current) names.add(current)
           return [...names].sort()
         }
-        // 候选模型的下拉：该实例真实覆盖的模型优先，无覆盖信息时退回全量模型名
-        function candidateModelOptions (worker) {
-          const url = normWorker(worker)
-          const hit = poolWorkers.value.find(row => normWorker(row.url) === url)
-          const names = new Set(hit && Array.isArray(hit.models) && hit.models.length ? hit.models : modelOptions.value)
-          modelOptions.value.forEach(name => names.add(name))
-          return [...names].filter(Boolean).sort()
-        }
-        function workerNote (url) {
-          if (!normWorker(url)) return t.value.virtualWorkerPick
-          const hit = poolWorkers.value.find(row => normWorker(row.url) === normWorker(url))
-          if (!hit) return t.value.virtualWorkerOffline
-          if (hit.models_verified === false) return t.value.virtualWorkerUnverified
-          return t.value.virtualWorkerPool
-        }
-        function candidateNote (cand, row) {
-          const model = String(cand.model || '').trim()
-          const target = String(row.target || '').trim()
-          const base = workerNote(cand.worker)
-          if (!model) return target ? base + ' · ' + t.value.virtualInheritTo + ' ' + target : base + ' · ' + t.value.virtualNeedsModel
-          return base
-        }
 
-        // 校验口径与 config_store.profile_from_entry 对齐：target/candidates 至少一个、候选要么
-        // 自带 model 要么有 target 可继承、同一 worker 不得绑两个不同模型、别名不等于自己的模型。
-        // 服务端仍是最终裁判，这里只是把 400 提前到点保存之前，并给出可操作的中文说明。
+        // 校验口径与 config_store 的 build_target_group / profile_from_entry 对齐：组非空、
+        // 别名不等于组内任何模型、每条绑定要么有 worker、绑定模型必须落在组里（否则后端 400）、
+        // 同一实例不得绑两个不同模型、context_window 要么是空要么是 >0 整数。
+        // 服务端仍是最终裁判，这里只把 400 提前到点保存之前，并给可操作的中文说明。
         function validateVirtualRow (row) {
-          const alias = String(row.model || '').trim()
-          if (!alias) return t.value.virtualRuleAlias
-          const target = String(row.target || '').trim()
-          const bindings = (row.candidates || [])
-            .map(cand => ({ worker: normWorker(cand.worker), model: String(cand.model || '').trim() }))
-            .filter(cand => cand.worker || cand.model)
-          if (!target && !bindings.length) return t.value.virtualNeedEither
-          const seen = {}
-          for (const cand of bindings) {
-            if (!cand.worker) return t.value.virtualCandidateNeedsWorker
-            if (!cand.model && !target) return t.value.virtualNeedsModel
-            const model = cand.model || target
-            if (seen[cand.worker] && seen[cand.worker] !== model) {
-              return window.lmrI18n.translate(locale.value, 'models', 'virtualDupWorker',
-                { worker: cand.worker, a: seen[cand.worker], b: model })
+          const alias = cleanModelName(row.model)
+          if (!alias) return tv('virtualRuleAlias')
+          const group = groupOfRow(row)
+          if (!group.length) return tv('virtualNeedTargets')
+          const inGroup = Object.create(null)
+          group.forEach(model => { inGroup[model] = true })
+          if (inGroup[alias]) return alias + ' · ' + tv('virtualSame')
+          const seen = Object.create(null)
+          for (const tg of (row.targets || [])) {
+            const model = cleanModelName(tg.model)
+            const worker = normWorker(tg.worker)
+            if (!model && !worker) continue
+            if (!model) return tv('virtualTargetNeedsModel')
+            if (!inGroup[model]) return model + ' · ' + tv('virtualTargetNotInGroup')
+            if (worker) {
+              if (seen[worker] && seen[worker] !== model) {
+                return tv('virtualDupWorker', { worker: worker, a: seen[worker], b: model })
+              }
+              seen[worker] = model
             }
-            seen[cand.worker] = model
-            if (model === alias) return alias + ' · ' + t.value.virtualSame
           }
-          if (target && target === alias) return alias + ' · ' + t.value.virtualSame
+          const raw = row.raw || {}
+          if (cleanModelName(raw.target) === alias) return alias + ' · ' + tv('virtualSame')
+          const cw = String(row.context_window || '').trim()
+          if (cw && (!/^\d+$/.test(cw) || Number(cw) < 1)) return tv('virtualCtxRule')
+          // 重复的虚拟名在后端是「后者覆盖前者」而不是报错：不提前拦住就等于悄悄丢一份配置
+          if (virtualRows.value.some(other => other !== row && cleanModelName(other.model) === alias)) {
+            return tv('virtualDupAlias', { alias })
+          }
+          // 组里的名字如果本身是另一个虚拟名，转发出去就是一个没人认识的别名（root ruling 4）
+          const aliases = new Set(virtualRows.value.map(other => cleanModelName(other.model)).filter(Boolean))
+          for (const model of group) {
+            if (aliases.has(model)) return tv('virtualChainTarget', { alias, model })
+          }
           return ''
         }
 
-        // 表单 → 后端条目：从服务端原样带回的 raw 出发，只改写表单画得出的字段。
-        // raw 里的未知字段（workers/policy/effort 以及将来新增的任何键）一律保留：
-        // 画不出不等于不存在，表单只是 JSON 权威面之外的快捷方式。
+        // 表单 → 后端条目：从服务端原样带回的 raw 出发，只改写新语义的四个字段。
+        // 未编辑过的行原样回传（连 targets 都不补），这是 legacy 条目字节不变的关键；
+        // 编辑过的行也一律保留 raw.target/workers/policy/effort 与未知键，只覆盖 UI 画得出的部分。
         function virtualEntryFromRow (row) {
           const entry = { ...(row.raw || {}) }
-          entry.model = String(row.model || '').trim()
-          const target = String(row.target || '').trim()
-          if (target) entry.target = target
-          else delete entry.target
-          const bindings = (row.candidates || [])
-            .map(cand => ({ worker: normWorker(cand.worker), model: String(cand.model || '').trim() }))
-            .filter(cand => cand.worker)
-            .map(cand => (cand.model ? { worker: cand.worker, model: cand.model } : { worker: cand.worker }))
+          entry.model = cleanModelName(row.model)
+          if (!row.dirty) return entry
+          const group = groupOfRow(row)
+          // 一台实例只能代表一个模型（后端 build_candidate_bindings 会拒绝一 worker 两 model），
+          // 所以按 worker 去重、保留首次声明；同一模型绑多台则各自成条，一条都不能少
+          const bindings = []
+          const seenWorker = Object.create(null)
+          ;(row.targets || []).forEach(tg => {
+            const model = cleanModelName(tg.model)
+            const worker = normWorker(tg.worker)
+            if (!model || !worker || !group.includes(model)) return
+            if (seenWorker[worker]) return
+            seenWorker[worker] = true
+            bindings.push({ worker, model })
+          })
+          if (group.length) entry.targets = group
+          else delete entry.targets
           if (bindings.length) entry.candidates = bindings
           else delete entry.candidates
+          const cw = String(row.context_window || '').trim()
+          if (cw && /^\d+$/.test(cw) && Number(cw) >= 1) entry.context_window = Number(cw)
+          else delete entry.context_window
           return entry
         }
 
         async function saveVirtual () {
-          // 整表替换语义：空行（既没写别名也没写目标）静默丢弃，其余一律提交。
-          // 校验放在发请求之前，报错点名到具体别名，避免服务端 400 只回一行文案。
-          const kept = virtualRows.value.filter(row => {
-            const alias = String(row.model || '').trim()
-            const target = String(row.target || '').trim()
-            const bindings = (row.candidates || []).some(cand => normWorker(cand.worker) || String(cand.model || '').trim())
-            return Boolean(alias || target || bindings)
-          })
+          // 整表替换语义：什么都没填的行（包括手滑多点一次「添加服务入口」）静默丢弃。
+          // 这里刻意不看 dirty：新行的 dirty 是天生的，把它算进「有内容」会让一次误点
+          // 卡住整张表的保存，而操作员真正想删的东西另有删除按钮。
+          const kept = virtualRows.value.filter(row =>
+            Boolean(cleanModelName(row.model)
+              || (row.targets || []).some(tg => cleanModelName(tg.model) || normWorker(tg.worker))
+              || String(row.context_window || '').trim()))
+          const warnings = []
           for (const row of kept) {
             const error = validateVirtualRow(row)
             if (error) {
-              Quasar.Notify.create({ message: (String(row.model || '').trim() || '(<no alias>)') + ' — ' + error, type: 'negative', position: 'top-right', timeout: 5200 })
+              Quasar.Notify.create({ message: (cleanModelName(row.model) || '(<no name>)') + ' — ' + error, type: 'negative', position: 'top-right', timeout: 6200 })
               return
             }
+            // 隐藏的 legacy target 已经不在组里：后端会把它当代表值，转发的名字与组的
+            // 口径不一致，这属于「UI 画不出但会影响路由」的状态，必须在保存前说清楚。
+            const legacyTarget = cleanModelName((row.raw || {}).target)
+            if (row.dirty && legacyTarget && !groupOfRow(row).includes(legacyTarget)) {
+              warnings.push(tv('virtualStaleTarget', { alias: cleanModelName(row.model), target: legacyTarget }))
+            }
+          }
+          // 一张都填不出来而且磁盘上本来就没有条目时不发请求：整表替换的空表对空表是
+          // 无意义的往返。「本来有」才需要发（那才是删除操作，见用例：删光行必须提交空表）
+          const hadEntries = (((doc.value && doc.value.virtual_models) || []).length) > 0
+          if (!kept.length && !hadEntries) {
+            Quasar.Notify.create({ message: tv('virtualNothingToSave'), type: 'info', position: 'top-right', timeout: 2600 })
+            return
           }
           const entries = kept.map(virtualEntryFromRow)
-          await mutate(() => window.lmrApi.configVirtual(entries), 'virtualSaved')
+          const ok = await mutate(() => window.lmrApi.configVirtual(entries), 'virtualSaved')
+          if (ok && warnings.length) {
+            warningMessage.value = warnings.join(' / ')
+          }
         }
 
+        // 每别名统一的上下文钳制：复刻 config_store.virtual_ctx_cap。
+        // 显式 context_window 优先；否则整组（>=2 个模型）取各模型 ctx 卡的最小值；
+        // 组内只有一个模型时返回 null，即「没有条目级钳制」，走该模型自己的卡片。
+        function virtualCtxCap (entry) {
+          const explicit = Number(entry && entry.context_window)
+          if (Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit)
+          // 与 config_store.virtual_ctx_cap 同口径：后端的组最小值只看 profile.targets，
+          // 而 profile.targets 对任意形状（显式 targets / 单值 target / candidates 去重）都成立，
+          // 所以这里不做「必须显式写过 targets」的额外收窄——多绑的老配置同样吃组最小值
+          const group = groupOfEntry(entry)
+          if (group.length < 2) return null
+          let cap = null
+          group.forEach(model => {
+            const one = previewCtx(model)
+            if (typeof one === 'number' && one >= 1 && (cap === null || one < cap)) cap = one
+          })
+          return cap
+        }
         async function saveModelMap () {
           const rows = mapRows.value.filter(row => row.original && row.value)
           if (!rows.length) { Quasar.Notify.create({ message: c.value.required, type: 'negative', position: 'top-right' }); return }
@@ -802,7 +1068,7 @@
         function applyLocale (nextLocale) {
           locale.value = nextLocale
           document.documentElement.lang = nextLocale
-          document.title = window.lmrI18n.messages[nextLocale].models.title + ' · llm-router'
+          document.title = tv('pageTitle') + ' · llm-router'
           window.lmrI18n.applyQuasarLang(nextLocale)
         }
 
@@ -817,9 +1083,13 @@
           c, cardColumns, cardCopyText, cardFilter, cardForm, cardOpen, cardRows, clearCard, ctxRule,
           deleteMapRow, doc, effortOptions, effortText, filterModelOptions, globalForm, legacyCtx, load,
           loading, loadError, mapNote, mapRows, modelOptionLabel, modelOptions, modalityOptions,
+          // 预览下拉的 :options 绑到它自己：模板用 with(_ctx) 解析，漏一项就是运行期 undefined，
+          // 编译期不会报错（之前就是这个原因让过滤形同虚设）
+          filteredModelOptions,
           modalitiesText, mutate, openCard, pagination, persistNote, preview, previewResult, saving, saveCard, saveGlobal,
-          saveLegacyCtx, saveModelMap, saveVirtual, t, virtualAliasRule, virtualRows,
-          addCandidate, addVirtualRow, candidateModelOptions, candidateNote, normWorker, poolWorkers, workerOptionsFor,
+          saveLegacyCtx, saveModelMap, saveVirtual, t, tv, pageTitle, virtualRows,
+          addTarget, removeTarget, addVirtualRow, displayTargets, groupOfRow, legacyChips, touchRow,
+          targetModelOptions, normWorker, poolWorkers, workerOptionsFor,
           previewServing,
           watcherColor, watcherLabel, warningMessage
         }

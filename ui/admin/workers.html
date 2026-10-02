@@ -9,7 +9,7 @@
   <title>Service pool · llm-router</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
-  <link rel="stylesheet" href="./app.css?v=5">
+  <link rel="stylesheet" href="./app.css?v=6">
 </head>
 <body>
   <div id="q-app">
@@ -24,6 +24,7 @@
             <div class="heading-actions">
               <q-toggle v-model="autoRefresh" dense color="teal-4" :label="t.autoRefreshOn"></q-toggle>
               <q-btn outline no-caps icon="mdi-refresh" :label="t.probeNow" class="secondary-button" :loading="loading" @click="load"></q-btn>
+              <q-btn outline no-caps icon="mdi-code-json" :label="t.jsonButton" class="secondary-button" :disable="unsupported" @click="openJson"></q-btn>
               <q-btn unelevated no-caps icon="mdi-server-plus-outline" :label="t.addWorker" class="primary-button" @click="openAdd"></q-btn>
             </div>
           </header>
@@ -37,13 +38,17 @@
             <template v-slot:avatar><q-icon name="mdi-progress-clock"></q-icon></template>
             {{ waitingNotice }}
           </q-banner>
+          <q-banner v-if="unsupported" rounded dense class="info-banner q-mb-md">
+            <template v-slot:avatar><q-icon name="mdi-information-outline"></q-icon></template>
+            {{ t.unsupportedNotice }}
+          </q-banner>
 
-          <section class="stat-grid">
+          <section class="stat-grid cols-4">
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-server-network" class="stat-icon purple"></q-icon>
               <div class="stat-label">{{ t.statWorkers }}</div>
-              <div class="stat-value">{{ workers.length }}</div>
-              <div class="stat-note">{{ healthyCount }} / {{ workers.length }}</div>
+              <div class="stat-value">{{ rows.length }}</div>
+              <div class="stat-note">{{ healthyCount }} / {{ rows.length }}</div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-heart-pulse" class="stat-icon teal"></q-icon>
@@ -57,13 +62,19 @@
               <div class="stat-value">{{ groups.length }}</div>
               <div class="stat-note">{{ t.statModelsNote }}</div>
             </q-card-section></q-card>
+            <q-card flat class="stat-card"><q-card-section>
+              <q-icon name="mdi-file-document-outline" class="stat-icon orange"></q-icon>
+              <div class="stat-label">{{ t.statDeclared }}</div>
+              <div class="stat-value">{{ decls.length }}</div>
+              <div class="stat-note">{{ declaredNote }}</div>
+            </q-card-section></q-card>
           </section>
 
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading">
               <div>
                 <div class="surface-title">{{ t.poolTitle }}</div>
-                <div class="surface-subtitle">{{ t.groupNote }}</div>
+                <div class="surface-subtitle">{{ t.poolNote }}</div>
               </div>
               <q-input v-model="filter" dense outlined dark debounce="200" :placeholder="t.searchPlaceholder" class="search-input">
                 <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
@@ -71,16 +82,17 @@
             </q-card-section>
             <q-separator dark></q-separator>
 
-            <q-inner-loading :showing="loading && workers.length === 0" dark>
+            <q-inner-loading :showing="loading && rows.length === 0" dark>
               <q-spinner-gears size="34px" color="purple-3"></q-spinner-gears>
               <div class="q-mt-sm muted">{{ c.loading }}</div>
             </q-inner-loading>
 
             <div v-if="!loading && groups.length === 0" class="empty-state">
               <q-icon name="mdi-server-off" size="18px"></q-icon>
-              <span>{{ workers.length === 0 ? t.emptyPool : t.emptyFilter }}</span>
+              <span>{{ rows.length === 0 ? t.emptyPool : t.emptyFilter }}</span>
             </div>
 
+            <!-- 统一服务视图：一行 = 一个上游地址，运行态池行与声明态条目按规范化 URL 合并 -->
             <section v-for="group in groups" :key="group.model" class="model-group">
               <div class="group-bar">
                 <q-icon name="mdi-cube-outline" size="15px"></q-icon>
@@ -96,23 +108,34 @@
                 :columns="columns"
                 :pagination="pagination"
                 :rows-per-page-options="[10, 20, 0]"
-                row-key="id"
+                row-key="key"
                 class="linear-table"
               >
                 <template v-slot:body-cell-url="props">
                   <q-td :props="props">
                     <div class="identity-cell">
-                      <q-icon v-if="props.row.is_healthy" name="mdi-check-decagram" color="teal-4" size="18px"></q-icon>
-                      <q-icon v-else name="mdi-alert-octagon" color="red-4" size="18px"></q-icon>
+                      <q-icon v-if="props.row.inPool && props.row.is_healthy" name="mdi-check-decagram" color="teal-4" size="18px"></q-icon>
+                      <q-icon v-else-if="props.row.inPool" name="mdi-alert-octagon" color="red-4" size="18px"></q-icon>
+                      <q-icon v-else name="mdi-help-circle-outline" color="grey-6" size="18px"></q-icon>
                       <div>
                         <strong>{{ props.row.url }}</strong>
-                        <span>{{ props.row.id }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span></span>
-                        <!-- 该实例真实覆盖的模型：只有引擎自己 /v1/models 答过的才算已验证 -->
-                        <span v-if="(props.row.models || []).length" class="mono" style="font-size:11px">{{ t.servedModels }} {{ props.row.models.join(', ') }}</span>
+                        <span>{{ props.row.id || props.row.url }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span></span>
+                        <span v-if="coveredModels(props.row).length" class="mono" style="font-size:11px">{{ t.servedModels }} {{ coveredModels(props.row).join(', ') }}</span>
                         <q-badge v-if="modelsVerifiedOf(props.row) !== null" outline
                                  :color="modelsVerifiedOf(props.row) ? 'teal-4' : 'grey-6'" class="chip-soft"
                                  :label="modelsVerifiedOf(props.row) ? t.modelsVerified : t.modelsDeclared"></q-badge>
                       </div>
+                    </div>
+                  </q-td>
+                </template>
+                <template v-slot:body-cell-origin="props">
+                  <q-td :props="props">
+                    <div class="route-cell">
+                      <q-badge :color="originColor(props.row)" :label="originLabel(props.row)" text-color="white"></q-badge>
+                      <q-badge v-if="props.row.decl_url && props.row.discovery !== 'config'" outline color="grey-6" class="chip-soft">
+                        {{ t.badgeAlso }}
+                        <q-tooltip>{{ t.alsoHint }}</q-tooltip>
+                      </q-badge>
                     </div>
                   </q-td>
                 </template>
@@ -126,12 +149,12 @@
                     </div>
                   </q-td>
                 </template>
-                <template v-slot:body-cell-load="props"><q-td :props="props" class="mono">{{ props.row.load }}</q-td></template>
+                <template v-slot:body-cell-load="props"><q-td :props="props" class="mono">{{ props.row.inPool ? props.row.load : '—' }}</q-td></template>
                 <template v-slot:body-cell-priority="props"><q-td :props="props" class="mono">{{ props.row.priority }}</q-td></template>
                 <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
                 <template v-slot:body-cell-capacity="props">
                   <q-td :props="props">
-                    <!-- 配置值与实测值分行读：瓦数是采样读数，不是操作员写的配置 -->
+                    <!-- 三行读法：阈值（谁的口径）/ 实测（只读，绝不回写）/ 归属与漂移 -->
                     <div style="display:flex;flex-direction:column;gap:2px">
                       <div class="route-cell" style="gap:6px">
                         <q-icon name="mdi-buffer" size="13px" :color="capExceeded(props.row, 'max_concurrency', 'concurrency') ? 'red-4' : 'grey-6'"></q-icon>
@@ -143,13 +166,40 @@
                         <span class="mono" :class="{'text-red-4': capExceeded(props.row, 'max_power_w', 'power')}">{{ capConfigText(props.row, 'max_power_w') }}</span>
                         <span class="muted mono" style="font-size:11px">{{ capMeasuredText(props.row, 'power') }}</span>
                       </div>
+                      <!-- 归属：声明层是上限的事实来源（自愈按声明写回池行）；未声明/被
+                           watcher 抢先认领的行才由运行态 PUT 说了算。两种情况必须看得见面，
+                           否则「改了却被 30 秒后撤销」就成了查不出原因的怪现象。 -->
+                      <q-badge
+                        v-if="props.row.cap_owner === 'declared' && props.row.inPool"
+                        outline :color="props.row.cap_drift[0] || props.row.cap_drift[1] ? 'amber-9' : 'teal-4'"
+                        class="chip-soft" :label="props.row.cap_drift[0] || props.row.cap_drift[1] ? t.capDrift : t.capFromDecl"
+                      ><q-tooltip>{{ t.capDriftHint }}</q-tooltip></q-badge>
+                      <q-badge v-else-if="props.row.cap_shadowed" outline color="red-4" class="chip-soft" :label="t.capShadowed">
+                        <q-tooltip>{{ t.capShadowedHint }}</q-tooltip>
+                      </q-badge>
                     </div>
+                  </q-td>
+                </template>
+                <template v-slot:body-cell-key="props">
+                  <q-td :props="props">
+                    <!-- 池行没有 has_api_key，存在位只能来自声明条目；但只有声明层真正拥有
+                         这一行时才算 has_key（见 mergeRows）。同地址被 watcher 抢先持有时
+                         改打灰徽章 key_inert：密钥确实写在声明里，此刻却没有下发。 -->
+                    <q-badge v-if="props.row.has_key" outline color="teal-4" class="chip-soft">
+                      <q-icon name="mdi-key-variant" size="12px"></q-icon>&nbsp;{{ t.keySet }}
+                      <q-tooltip>{{ t.keySetHint }}</q-tooltip>
+                    </q-badge>
+                    <q-badge v-else-if="props.row.key_inert" outline color="orange-4" class="chip-soft">
+                      <q-icon name="mdi-key-alert-outline" size="12px"></q-icon>&nbsp;{{ t.keySetInert }}
+                      <q-tooltip>{{ t.keySetInertHint }}</q-tooltip>
+                    </q-badge>
+                    <span v-else class="muted">{{ t.keyNone }}</span>
                   </q-td>
                 </template>
                 <template v-slot:body-cell-metadata="props">
                   <q-td :props="props">
                     <div v-if="labelKeys(props.row).length" class="label-cell">
-                      <q-chip v-for="key in labelKeys(props.row)" :key="key" dense size="12px" class="chip-soft">{{ key }}={{ props.row.metadata[key] }}</q-chip>
+                      <q-chip v-for="key in labelKeys(props.row)" :key="key" dense size="12px" class="chip-soft">{{ key }}={{ props.row.labels[key] }}</q-chip>
                     </div>
                     <span v-else class="muted">—</span>
                   </q-td>
@@ -157,9 +207,26 @@
                 <template v-slot:body-cell-actions="props">
                   <q-td :props="props">
                     <div class="row-actions">
-                      <q-btn flat round dense icon="mdi-open-in-new" @click="openWorker(props.row)"><q-tooltip>{{ t.openWorker }}</q-tooltip></q-btn>
-                      <q-btn flat round dense icon="mdi-pencil-outline" @click="openEdit(props.row)"><q-tooltip>{{ c.edit }}</q-tooltip></q-btn>
-                      <q-btn flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removeWorker(props.row)"><q-tooltip>{{ t.deleteTitle }}</q-tooltip></q-btn>
+                      <q-btn flat round dense icon="mdi-open-in-new" :disable="!props.row.inPool" @click="openWorker(props.row)"><q-tooltip>{{ t.openWorker }}</q-tooltip></q-btn>
+                      <!-- 两种编辑分开且不互斥：声明层按钮改配置文档，运行态按钮改池记录。
+                           同一地址可能既有声明又有被 watcher 抢先认领的池行，两个都要够得着。 -->
+                      <q-btn v-if="props.row.decl" flat round dense icon="mdi-file-document-edit-outline" :disable="unsupported" @click="openDeclEdit(props.row)">
+                        <q-tooltip>{{ t.editDeclared }}</q-tooltip>
+                      </q-btn>
+                      <!-- 运行态入口只对「运行态是事实来源」的行开放：声明拥有的行连 priority/cost
+                           /labels 都由自愈按声明写回（upstream_drifts 比较这些字段），给它一个 PUT
+                           编辑框就是制造"改了但 30 秒后作废"的困惑，所以干脆只留声明层入口。 -->
+                      <q-btn v-if="props.row.inPool && props.row.cap_owner !== 'declared'" flat round dense icon="mdi-pencil-outline" @click="openEdit(props.row)">
+                        <q-tooltip>{{ t.editRuntime }}</q-tooltip>
+                      </q-btn>
+                      <q-btn v-if="props.row.decl_url" flat round dense icon="mdi-close-circle-outline" color="orange-9" @click="removeDeclaration(props.row)">
+                        <q-tooltip>{{ t.deleteDeclTitle }}</q-tooltip>
+                      </q-btn>
+                      <q-btn v-if="props.row.inPool" flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removeWorker(props.row)">
+                        <!-- 与确认框同一个键：t.deleteTitle 会被 upstreams 段的「移除接入条目」
+                             盖掉，那是删声明的说法，挂在摘池行的按钮上会说反动作。 -->
+                        <q-tooltip>{{ t.deletePoolTitle }}</q-tooltip>
+                      </q-btn>
                     </div>
                   </q-td>
                 </template>
@@ -168,55 +235,107 @@
             </section>
           </q-card>
 
-          <!-- 添加远程服务 -->
+          <!-- 添加服务：声明层（持久化）或运行态（立即入池） -->
           <q-dialog v-model="addOpen" persistent>
             <q-card class="dialog-card">
-              <q-card-section><div class="dialog-title">{{ t.addTitle }}</div><div class="dialog-copy">{{ t.addCopy }}</div></q-card-section>
+              <q-card-section><div class="dialog-title">{{ t.addTitle }}</div><div class="dialog-copy">{{ addCopyText }}</div></q-card-section>
               <q-card-section>
                 <q-form class="dialog-fields" @submit.prevent="submitAdd">
+                  <q-option-group
+                    v-model="addMode"
+                    inline
+                    dense
+                    color="primary"
+                    :options="addModeOptions"
+                  ></q-option-group>
                   <q-input v-model="addForm.url" dense outlined dark autofocus :rules="[urlRule]" :label="t.urlField" :placeholder="t.urlPlaceholder" class="mono">
                     <template v-slot:append><q-icon name="mdi-link-variant"></q-icon></template>
                   </q-input>
                   <div class="form-grid-2">
-                    <q-input v-model="addForm.model_id" dense outlined dark :label="t.modelField"></q-input>
-                    <q-input v-model="addForm.api_key" dense outlined dark type="password" :label="t.apiKeyField"></q-input>
+                    <q-input v-model="addForm.model_id" dense outlined dark :label="t.modelField" :hint="t.modelHint"></q-input>
+                    <q-input v-model="addForm.api_key" dense outlined dark type="password" :label="t.apiKeyField" :hint="t.apiKeyHint"></q-input>
                   </div>
                   <div class="form-grid-2">
-                    <q-input v-model="addForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint"></q-input>
-                    <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint"></q-input>
+                    <q-input v-model="addForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
                   </div>
                   <div class="form-grid-2">
-                    <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]"></q-input>
-                    <q-input v-model="addForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]"></q-input>
+                    <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="addForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
                   </div>
-                  <q-input v-model="addForm.labels" dense outlined dark :label="t.labelsField" :placeholder="'gpu=0,engine=sglang'" :hint="t.labelsHint" :rules="[labelsRule]"></q-input>
+                  <q-input
+                    v-model="addForm.modelsText"
+                    dense outlined dark :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"
+                    :disable="addMode === 'runtime'"
+                  ></q-input>
+                  <q-input v-model="addForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :placeholder="t.labelsJsonPlaceholder" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
                   <q-toggle v-model="addForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
                   <div class="muted">{{ t.disableHealthHint }}</div>
                 </q-form>
               </q-card-section>
               <q-card-actions align="right">
                 <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="addOpen = false"></q-btn>
-                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.addSubmit" type="submit" @click="submitAdd"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="addSubmitText" type="submit" @click="submitAdd"></q-btn>
               </q-card-actions>
             </q-card>
           </q-dialog>
 
-          <!-- 编辑实例（PUT /workers/{id}） -->
+          <!-- 编辑声明条目（写 upstreams 段，经 POST /_ui/config/upstreams 整表替换） -->
+          <q-dialog v-model="declOpen" persistent>
+            <q-card class="dialog-card">
+              <q-card-section><div class="dialog-title">{{ t.declTitle }}</div><div class="dialog-copy">{{ t.declCopy }}</div></q-card-section>
+              <q-card-section>
+                <q-form class="dialog-fields" @submit.prevent="submitDecl">
+                  <q-input v-model="declForm.url" dense outlined dark :rules="[declUrlRule]" :label="t.urlField" class="mono">
+                    <template v-slot:append><q-icon name="mdi-link-variant"></q-icon></template>
+                  </q-input>
+                  <div class="form-grid-2">
+                    <q-input v-model="declForm.model_id" dense outlined dark :label="t.modelField" :hint="t.modelHint"></q-input>
+                    <q-input v-model="declForm.api_key" dense outlined dark type="password" :label="t.apiKeyField" :hint="t.apiKeyHint" :disable="declForm.clearKey"></q-input>
+                  </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="declForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="declForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
+                  </div>
+                  <div class="form-grid-2">
+                    <q-input v-model="declForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="declForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
+                  </div>
+                  <q-input v-model="declForm.modelsText" dense outlined dark :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"></q-input>
+                  <q-input v-model="declForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
+                  <q-toggle v-model="declForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
+                  <div class="muted">{{ t.disableHealthHint }}</div>
+                  <q-toggle v-model="declForm.clearKey" dense color="orange-9" :label="t.clearKey"></q-toggle>
+                  <div class="muted">{{ t.clearKeyHint }} · {{ t.apiKeyKeep }}</div>
+                </q-form>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="declOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.declSubmit" type="submit" @click="submitDecl"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+
+          <!-- 编辑运行态属性（PUT /workers/{id}） -->
           <q-dialog v-model="editOpen">
             <q-card class="dialog-card">
               <q-card-section><div class="dialog-title">{{ t.updateTitle }}</div><div class="dialog-copy">{{ selected.url }} · {{ t.editFieldsHint }}</div></q-card-section>
               <q-card-section>
                 <div class="dialog-fields">
+                  <q-banner v-if="selected.cap_owner === 'declared'" rounded dense class="warning-banner">
+                    <template v-slot:avatar><q-icon name="mdi-lock-check-outline"></q-icon></template>
+                    {{ t.capLockedHint }}
+                  </q-banner>
                   <div class="form-grid-2">
-                    <q-input v-model="editForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint"></q-input>
-                    <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint"></q-input>
+                    <q-input v-model="editForm.priority" dense outlined dark type="number" :label="t.priorityField" :hint="t.priorityHint" :disable="selected.cap_owner === 'declared'"></q-input>
+                    <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :disable="selected.cap_owner === 'declared'"></q-input>
                   </div>
                   <div class="form-grid-2">
-                    <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]"></q-input>
-                    <q-input v-model="editForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]"></q-input>
+                    <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]" :disable="selected.cap_owner === 'declared'"></q-input>
+                    <q-input v-model="editForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]" :disable="selected.cap_owner === 'declared'"></q-input>
                   </div>
-                  <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]"></q-input>
-                  <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
+                  <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" :disable="selected.cap_owner === 'declared'"></q-input>
+                  <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth" :disable="selected.cap_owner === 'declared'"></q-toggle>
                 </div>
               </q-card-section>
               <q-card-actions align="right">
@@ -225,95 +344,247 @@
               </q-card-actions>
             </q-card>
           </q-dialog>
+
+          <!-- 声明层 JSON 面：upstreams 段的原文查看/编辑，保存走整段替换（其余段由服务端保留） -->
+          <q-dialog v-model="jsonOpen" persistent>
+            <q-card class="dialog-card json-card">
+              <q-card-section><div class="dialog-title">{{ t.jsonTitle }}</div><div class="dialog-copy">{{ t.jsonCopy }}</div></q-card-section>
+              <q-card-section>
+                <textarea
+                  v-model="jsonText"
+                  class="json-ta mono"
+                  rows="18"
+                  spellcheck="false"
+                  :placeholder="t.jsonPlaceholder"
+                ></textarea>
+                <div v-if="jsonError" class="text-red-4" style="font-size:12px;margin-top:6px">{{ jsonError }}</div>
+              </q-card-section>
+              <q-card-actions align="right">
+                <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="jsonOpen = false"></q-btn>
+                <q-btn flat no-caps icon="mdi-content-copy" :label="t.jsonReset" :disable="submitting" @click="resetJson"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.jsonSave" @click="saveJson"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
         </q-page>
       </q-page-container>
     </q-layout>
   </div>
-
   <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
-  <script src="./i18n.js?v=3"></script>
-  <script src="./api.js?v=2"></script>
+  <script src="./i18n.js?v=6"></script>
+  <script src="./api.js?v=5"></script>
   <script>
-    const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+    const { computed, onBeforeUnmount, onMounted, reactive, ref, watch } = Vue
     const HEALTH_WAIT_MS = 150000       // 生产健康探测 30s 一轮 × 成功阈值 2 → 需要约 60-90s
     const HEALTH_POLL_MS = 3000
+    const POOL_POLL_MS = 3000
+    const DECL_POLL_MS = 20000           // 声明层走 GET /_ui/config（会顺带探 watcher），比池慢一档
+
+    // 两种数据源按规范化 URL 对齐：尾斜杠与大小写差异必须折叠掉，否则声明与池行判成两条
+    function normUrl (value) {
+      return String(value || '').trim().replace(/\/+$/, '')
+    }
+    function normKey (value) {
+      return normUrl(value).toLowerCase()
+    }
+    function clone (value) {
+      return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+    }
 
     const app = Vue.createApp({
       setup () {
         const workers = ref([])
+        const decls = ref([])            // 声明层 upstreams 原始条目（含未知字段，写回时保真）
         const locale = ref(window.lmrI18n.getLocale())
         const loading = ref(false)
         const loadError = ref('')
+        const unsupported = ref(false)
         const filter = ref('')
         const autoRefresh = ref(true)
         const submitting = ref(false)
         const addOpen = ref(false)
+        const addMode = ref('declared')
+        const declOpen = ref(false)
         const editOpen = ref(false)
+        const jsonOpen = ref(false)
+        const jsonText = ref('')
+        const jsonError = ref('')
         const selected = ref({})
+        const selectedKey = ref('')
+        const declSelfKey = ref('')
         const waitingUrl = ref('')
         const waitingNotice = ref('')
         const healthInterval = ref(30)
         let unsubscribeLocale
-        let refreshTimer
+        // 组件还活着吗：iframe 在壳里切换页面时 setup 的实例会被销毁，但此刻可能已经有一个
+        // 越过 await 的轮询 tick 在飞。它回来后若无条件重建定时器，就再没人清 —— 3 秒轮询
+        // 永久泄漏。所有 start* 一律先问 alive。
+        let alive = true
+        let poolTimer
+        let declTimer
         let waitTimer
 
-        // 容量上限两个字段：空串 = 「没说话」，提交时整个字段省略；0 = 明确「不限」。
-        // 后端 cap_limit 把 <=0/非数归一为不限，所以这里不能把空串当 0 发出去。
-        const addForm = reactive({ url: '', model_id: '', api_key: '', priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false })
+        const blankAdd = () => ({ url: '', model_id: '', api_key: '', priority: '', cost: '', max_concurrency: '', max_power_w: '', modelsText: '', labelsText: '', disable_health_check: false })
+        const blankDecl = () => ({ url: '', model_id: '', api_key: '', clearKey: false, priority: '', cost: '', max_concurrency: '', max_power_w: '', modelsText: '', labelsText: '', disable_health_check: false })
+        const addForm = reactive(blankAdd())
+        const declForm = reactive(blankDecl())
         const editForm = reactive({ priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false })
         const pagination = reactive({ rowsPerPage: 20 })
 
         const c = computed(() => window.lmrI18n.messages[locale.value].common)
-
-        // 带插值的键在这里补齐，模板里不写死文案
         const t = computed(() => {
           const dict = window.lmrI18n.messages[locale.value].workers
+          const ups = window.lmrI18n.messages[locale.value].upstreams
+          const pool = window.lmrI18n.messages[locale.value].pool
           return {
             ...dict,
-            groupManagementTitle: dict.title,
+            // 声明态字段沿用 upstreams 段（合并页面而不重写词典）；pool 排最后，
+            // 因为同名的 title/description/labelsField 要以合并页的口径为准。
+            ...ups,
+            ...pool,
             statHealthyNote: dict.statHealthyNote.replace('{n}', healthInterval.value)
           }
+        })
+        const addCopyText = computed(() => (addMode.value === 'declared' ? t.value.addCopyDeclared : t.value.addCopyRuntime))
+        const addSubmitText = computed(() => (addMode.value === 'declared' ? t.value.addSubmitDeclared : t.value.addSubmitRuntime))
+        const addModeOptions = computed(() => [
+          // 声明层不可用（后端无 upstreams 段）时直接把该档置灰，而不是让人选了之后被拒
+          { label: t.value.modeDeclared, value: 'declared', disable: unsupported.value },
+          { label: t.value.modeRuntime, value: 'runtime' }
+        ])
+        const declaredNote = computed(() => {
+          const pending = rows.value.filter(row => row.decl_url && !row.inPool).length
+          return pending ? t.value.statDeclaredPending.replace('{n}', pending) : t.value.statDeclaredOk
         })
 
         const columns = computed(() => [
           { name: 'url', label: t.value.colUrl, field: 'url', align: 'left', sortable: true },
-          { name: 'status', label: t.value.colHealth, field: 'is_healthy', align: 'left', sortable: true, sort: row => (row.is_healthy ? 1 : 0) },
-          { name: 'load', label: t.value.colLoad, field: 'load', align: 'left', sortable: true, style: 'width:70px' },
+          { name: 'origin', label: t.value.colOrigin, field: 'origin', align: 'left', sortable: true, style: 'width:130px' },
+          { name: 'status', label: t.value.colHealth, field: 'is_healthy', align: 'left', sortable: true, sort: row => (row.inPool ? (row.is_healthy ? 1 : 0) : -1) },
+          { name: 'load', label: t.value.colLoad, field: 'load', align: 'left', sortable: true, style: 'width:70px', sort: row => (Number.isFinite(Number(row.load)) ? Number(row.load) : -1) },
           { name: 'priority', label: t.value.colPriority, field: 'priority', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'cost', label: t.value.colCost, field: 'cost', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'capacity', label: t.value.colCapacity, field: 'max_concurrency', align: 'left', sortable: true, style: 'width:150px', sort: row => capacitySortValue(row) },
-          { name: 'metadata', label: t.value.colLabels, field: 'metadata', align: 'left' },
-          { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:130px' }
+          { name: 'key', label: t.value.colKey, field: 'has_key', align: 'left', style: 'width:88px' },
+          { name: 'metadata', label: t.value.colLabels, field: 'labels', align: 'left' },
+          { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:160px' }
         ])
 
-        const healthyCount = computed(() => workers.value.filter(worker => worker.is_healthy).length)
+        // 合并算法是纯函数（workers, decls → rows）：页面里 rows 只是它的 computed 包装。
+        // 抽出来是为了能在 node 里用真实形状的数据钉住归属判定，而不是只靠肉眼读模板。
+        function mergeRows (workerRows, declRows) {
+          const byKey = new Map()
+          ;(workerRows || []).forEach(worker => {
+            if (!worker || !worker.url) return
+            const key = normKey(worker.url)
+            if (!key) return
+            byKey.set(key, { key, url: normUrl(worker.url), inPool: true, id: worker.id || '', worker_type: worker.worker_type || 'regular',
+              model_id: worker.model_id || '', models: Array.isArray(worker.models) ? worker.models : [],
+              models_verified: worker.models_verified, is_healthy: Boolean(worker.is_healthy), load: worker.load,
+              priority: worker.priority, cost: worker.cost,
+              // 两份上限分开留：pool_* 是池记录此刻真实的值，decl_* 是配置文档写的期望值。
+              // 合并后的 max_* 只是「显示值」，归属见下面的 capOwnership。
+              pool_max_concurrency: worker.max_concurrency, pool_max_power_w: worker.max_power_w,
+              decl_max_concurrency: undefined, decl_max_power_w: undefined,
+              max_concurrency: worker.max_concurrency, max_power_w: worker.max_power_w,
+              inflight_requests: worker.inflight_requests, power_w: worker.power_w, labels: worker.metadata || {},
+              job_status: worker.job_status, disable_health_check: Boolean(worker.disable_health_check),
+              discovery: worker.discovery || 'dynamic', decl: null, decl_url: '' })
+          })
+          ;(declRows || []).forEach(decl => {
+            if (!decl || !decl.url) return
+            const key = normKey(decl.url)
+            if (!key) return
+            const row = byKey.get(key)
+            const declaredPriority = Number.isFinite(Number(decl.priority)) ? Number(decl.priority) : 50
+            const declaredCost = Number.isFinite(Number(decl.cost)) ? Number(decl.cost) : 1
+            if (row) {
+              row.decl = decl
+              row.decl_url = normUrl(decl.url)
+              row.decl_max_concurrency = decl.max_concurrency
+              row.decl_max_power_w = decl.max_power_w
+              // 上限的显示值绝不在这里定：只有声明层真正拥有这一行时才用声明值，
+              // 否则必须保持池里的真实值 —— 见下面 out.forEach 里的 cap_owner 判定。
+              // 这里过早覆盖会让「watcher 抢先持有池行」的服务显示出根本没用上的声明值。
+              if (row.model_id === '' || row.model_id === 'unknown') row.model_id = decl.model_id || row.model_id
+              if ((row.models || []).length === 0 && Array.isArray(decl.models)) row.models = decl.models.slice()
+              if (row.priority === undefined) row.priority = declaredPriority
+              if (row.cost === undefined) row.cost = declaredCost
+              if (!row.disable_health_check && decl.disable_health_check) row.disable_health_check = true
+              if (!row.labels || Object.keys(row.labels).length === 0) row.labels = decl.labels || {}
+            } else {
+              byKey.set(key, { key, url: normUrl(decl.url), inPool: false, id: '', worker_type: 'regular',
+                model_id: decl.model_id || '', models: Array.isArray(decl.models) ? decl.models.slice() : [],
+                models_verified: null, is_healthy: false, load: null,
+                priority: declaredPriority, cost: declaredCost,
+                pool_max_concurrency: undefined, pool_max_power_w: undefined,
+                decl_max_concurrency: decl.max_concurrency, decl_max_power_w: decl.max_power_w,
+                max_concurrency: decl.max_concurrency, max_power_w: decl.max_power_w,
+                inflight_requests: null, power_w: null, labels: decl.labels || {}, job_status: null,
+                disable_health_check: Boolean(decl.disable_health_check), discovery: 'config', decl, decl_url: normUrl(decl.url) })
+            }
+          })
+          const out = Array.from(byKey.values())
+          out.forEach(row => {
+            row.origin = row.decl_url ? 'config' : (row.discovery === 'config' ? 'config' : 'dynamic')
+            // 密钥存在位同样只有「声明层真正拥有这一行」时才算数。同地址池行被 watcher
+            // 抢先持有时，声明条目里的密钥根本没下发到转发路径上：这时显示「已设置」
+            // 是在替一个不生效的配置背书，和旁边的「声明管不到这行」自相矛盾。
+            // 它改由 key_inert 单独标记（灰徽章 + 说明），不计入「这一行有密钥」。
+            row.decl_has_key = Boolean(row.decl) && hasKey(row.decl)
+            row.has_key = false
+            row.key_inert = false
+            // 上限的事实来源（root 风险 6）：只有 config_store 的自愈会把声明值写进池记录，
+            // 而它只 patch discovery == "config" 的行（config_store.lua 的 reconcile：同地址被
+            // watcher/bootstrap/手工持有时整条 else 分支跳过）。所以：
+            //   declared —— 池行由声明层拥有：显示并编辑声明值，与池行的差异是「待自愈」；
+            //   runtime  —— 池行不归声明层管（未声明，或同地址被 watcher 抢先认领）：
+            //              显示并编辑池值；此时若还有声明，必须显式标出「声明覆盖不到这一行」。
+            const ownedByDecl = Boolean(row.decl_url) && (!row.inPool || row.discovery === 'config')
+            row.cap_owner = ownedByDecl ? 'declared' : 'runtime'
+            if (ownedByDecl) row.has_key = row.decl_has_key
+            else if (row.decl_has_key) row.key_inert = true
+            if (ownedByDecl) {
+              row.max_concurrency = row.decl_max_concurrency
+              row.max_power_w = row.decl_max_power_w
+            }
+            row.cap_drift = ownedByDecl && row.inPool ? [
+              capNumber(row.decl_max_concurrency) !== capNumber(row.pool_max_concurrency),
+              capNumber(row.decl_max_power_w) !== capNumber(row.pool_max_power_w)
+            ] : [false, false]
+            row.cap_shadowed = Boolean(row.decl_url) && !ownedByDecl
+          })
+          out.sort((a, b) => String(a.url).localeCompare(String(b.url)))
+          return out
+        }
 
-        // 过滤：地址 / 模型 / 标签值，忽略大小写
+        const rows = computed(() => mergeRows(workers.value, decls.value))
+
         const filtered = computed(() => {
           const needle = filter.value.trim().toLowerCase()
-          if (!needle) return workers.value
-          return workers.value.filter(worker => {
-            const labels = Object.entries(worker.metadata || {}).map(([key, value]) => key + '=' + value).join(' ')
-            return [worker.url, worker.model_id, worker.id, labels].join(' ').toLowerCase().includes(needle)
+          if (!needle) return rows.value
+          return rows.value.filter(row => {
+            const labels = Object.entries(row.labels || {}).map(entry => entry[0] + '=' + entry[1]).join(' ')
+            return [row.url, row.model_id, (row.models || []).join(' '), labels].join(' ').toLowerCase().includes(needle)
           })
         })
 
-        // 按 model_id 分组（unknown 排最后，其余按名称）
         const groups = computed(() => {
           const byModel = new Map()
-          filtered.value.forEach(worker => {
-            const model = worker.model_id || 'unknown'
+          filtered.value.forEach(row => {
+            const model = row.model_id && row.model_id !== 'unknown' ? row.model_id : 'unknown'
             if (!byModel.has(model)) byModel.set(model, [])
-            byModel.get(model).push(worker)
+            byModel.get(model).push(row)
           })
           const out = []
-          for (const [model, rows] of byModel) {
-            rows.sort((a, b) => String(a.url).localeCompare(String(b.url)))
-            out.push({ model, rows, healthy: rows.filter(row => row.is_healthy).length })
+          for (const [model, list] of byModel) {
+            out.push({ model, rows: list, healthy: list.filter(row => row.inPool && (row.is_healthy || row.disable_health_check)).length })
           }
           out.sort((a, b) => (a.model === 'unknown') - (b.model === 'unknown') || a.model.localeCompare(b.model))
           return out
         })
+
+        const healthyCount = computed(() => rows.value.filter(row => row.inPool && (row.is_healthy || row.disable_health_check)).length)
 
         function notify (message, type = 'positive') {
           Quasar.Notify.create({ message, type, position: 'top-right', timeout: type === 'negative' ? 5200 : 2400 })
@@ -324,26 +595,78 @@
           if (!Number.isFinite(number)) return '—'
           return Number.isInteger(number) ? String(number) : number.toFixed(2)
         }
-
         function labelKeys (row) {
-          return Object.keys(row.metadata || {}).sort()
+          return Object.keys((row && row.labels) || {}).sort()
         }
-
-        // 该实例覆盖哪些模型的凭证来源：true = 引擎自己的 /v1/models 答过，
-        // false = 手填或 config 声明写进去的（只是备注，不构成"这台确实服务该模型"），
-        // null = 后端还没给出这个字段（旧版本），此时不显示徽章而不是猜一个。
+        function coveredModels (row) {
+          const list = (row && row.models) || []
+          if (list.length) return list
+          return row && row.model_id && row.model_id !== 'unknown' ? [row.model_id] : []
+        }
+        // true = 引擎自己的 /v1/models 答过；false = 手填或声明写进去的备注；null = 后端无此字段（不显示徽章）
         function modelsVerifiedOf (row) {
           const value = row && row.models_verified
           if (value === true) return true
           if (value === false) return false
           return null
         }
+        // 声明条目只可能带服务端脱敏后的存在位；绝不明文回显（契约 3.4）
+        function hasKey (decl) {
+          if (!decl) return false
+          if (decl.has_api_key !== undefined) return Boolean(decl.has_api_key)
+          if (decl.api_key_set !== undefined) return Boolean(decl.api_key_set)
+          return Boolean(decl.api_key)
+        }
+        function originLabel (row) {
+          if (row.decl_url && row.inPool) return t.value.originDeclared
+          if (row.decl_url) return t.value.originDeclOnly
+          if (row.discovery === 'watcher') return t.value.originWatcher
+          return t.value.originDynamic
+        }
+        function originColor (row) {
+          if (row.decl_url && row.inPool) return 'teal-8'
+          if (row.decl_url) return 'amber-9'
+          return 'grey-7'
+        }
+        function healthLabel (row) {
+          if (!row.inPool) return t.value.healthNotInPool
+          if (row.disable_health_check) return t.value.healthDisabled
+          if (row.is_healthy) return t.value.healthHealthy
+          if (isPending(row)) return t.value.healthPending
+          return t.value.healthUnhealthy
+        }
+        function healthColor (row) {
+          if (!row.inPool) return 'grey-8'
+          if (row.disable_health_check) return 'grey-7'
+          if (row.is_healthy) return 'teal-6'
+          if (isPending(row)) return 'amber-8'
+          return 'red-8'
+        }
+        function isPending (row) {
+          if (row.is_healthy) return false
+          const status = row.job_status && row.job_status.status
+          if (status === 'pending' || status === 'processing') return true
+          return waitingUrl.value !== '' && row.url === waitingUrl.value
+        }
+        function jobLabel (job) {
+          const key = job.job_type === 'remove_worker' ? 'jobRemoveWorker' : 'jobAddWorker'
+          const statusKey = { pending: 'jobPending', processing: 'jobProcessing', completed: 'jobCompleted', failed: 'jobFailed' }[job.status] || 'jobPending'
+          const dict = window.lmrI18n.messages[locale.value].workers
+          const label = dict[key] + ' · ' + dict[statusKey]
+          return job.message ? label + ' — ' + job.message : label
+        }
+        function jobColor (status) {
+          if (status === 'completed') return 'teal-4'
+          if (status === 'failed') return 'red-4'
+          return 'amber-4'
+        }
 
         // ── 容量上限（配置）与实时读数 ──
         // max_concurrency / max_power_w 是操作员写的阈值；inflight_requests 与 power_w
         // 是网关自己的在飞计数和监控采到的瓦特。两者必须分行且视觉区分：实测值是只读的，
         // 一旦被当成配置回写，就等于让监控采样替操作员改了选路规则。
-        // 读数缺席 = 未知（power_w 在没有新鲜采样时压根不出现），未知一律显示「—」而非 0。
+        // 读数缺席 = 未知（power_w 在没有新鲜采样时压根不出现），未知一律显示「—」而非 0，
+        // 与后端 capacity_exclusion 的「未知不排除」同口径。
         function capNumber (value) {
           const number = Number(value)
           if (!Number.isFinite(number) || number <= 0) return null
@@ -351,10 +674,11 @@
         }
         function inflightOf (row) {
           const number = Number(row && row.inflight_requests)
-          return Number.isFinite(number) ? number : null
+          return Number.isFinite(number) && row.inPool ? number : null
         }
         function powerOf (row) {
-          const value = row && row.power_w
+          if (!row || !row.inPool) return null
+          const value = row.power_w
           if (value === null || value === undefined || value === '') return null
           const number = Number(value)
           return Number.isFinite(number) ? number : null
@@ -380,7 +704,7 @@
           return t.value.capMeasured + ' ' + (inflight === null ? '—' : formatCapNumber(inflight))
         }
         // 达到上限 = 这条实例此刻被选路硬排除（即使 cache_aware 想留在本地）。
-        // 未知读数永不判超限，与后端 capacity_exclusion 的「未知不排除」同口径。
+        // 未知读数永不判超限；未入池的行没有读数，也永不判超限。
         function capExceeded (row, field, kind) {
           const cap = capNumber(row && row[field])
           if (cap === null) return false
@@ -391,9 +715,8 @@
           const cap = capNumber(row && row.max_concurrency)
           return cap === null ? -1 : cap
         }
-        // 表单值 → 下发值：空串 = 不下发该字段（新增即「不限」，编辑即「保持不变」）；
-        // 0 与负数归一为 0，后端 cap_limit 把 <=0 读成「不限」，所以填 0 就是清除上限。
-        // 非数字返回 null，由 capRule 拦下提交。
+        // 运行态 PUT 的三态：空串 = 不下发该字段（保持不变）；0/负数 = 0（撤上限）；>0 = 设定。
+        // 后端 cap_limit 把 <=0/非数归一为不限，所以这里不能把空串当 0 发出去。
         function capFormValue (value, integer) {
           const text = String(value === null || value === undefined ? '' : value).trim()
           if (text === '') return undefined
@@ -407,78 +730,18 @@
           if (!text) return true
           return Number.isFinite(Number(text)) || t.value.capRule
         }
-
-        function healthLabel (row) {
-          if (row.disable_health_check) return t.value.healthDisabled
-          if (row.is_healthy) return t.value.healthHealthy
-          if (isPending(row)) return t.value.healthPending
-          return t.value.healthUnhealthy
-        }
-        function healthColor (row) {
-          if (row.disable_health_check) return 'grey-7'
-          if (row.is_healthy) return 'teal-6'
-          if (isPending(row)) return 'amber-8'
-          return 'red-8'
-        }
-        // 刚提交注册、还没跑过第一轮探测：job 排队中或是新增且无 job
-        function isPending (row) {
-          if (row.is_healthy) return false
-          const status = row.job_status && row.job_status.status
-          if (status === 'pending' || status === 'processing') return true
-          return waitingUrl.value !== '' && row.url === waitingUrl.value
-        }
-
-        function jobLabel (job) {
-          const key = job.job_type === 'remove_worker' ? 'jobRemoveWorker' : 'jobAddWorker'
-          const statusKey = { pending: 'jobPending', processing: 'jobProcessing', completed: 'jobCompleted', failed: 'jobFailed' }[job.status] || 'jobPending'
-          const dict = window.lmrI18n.messages[locale.value].workers
-          const label = `${dict[key]} · ${dict[statusKey]}`
-          return job.message ? label + ' — ' + job.message : label
-        }
-        function jobColor (status) {
-          if (status === 'completed') return 'teal-4'
-          if (status === 'failed') return 'red-4'
-          return 'amber-4'
-        }
-
-        function urlRule (value) {
-          const text = String(value || '').trim()
-          if (!text) return c.value.required
-          return /^https?:\/\/[^/]+$/i.test(text.replace(/\/+$/, '')) || t.value.urlRule
-        }
-        function labelsRule (value) {
-          const text = String(value || '').trim()
+        function numberRule (value) {
+          const text = String(value === null || value === undefined ? '' : value).trim()
           if (!text) return true
-          return text.split(/[,;]/).every(part => /^[^=,\s]+=.*$/.test(part.trim()) || part.trim() === '') || t.value.labelsRule
+          return Number.isFinite(Number(text)) || t.value.numberRule
         }
-
-        function parseLabels (text) {
-          const labels = {}
-          String(text || '').split(/[,;]/).forEach(part => {
-            const trimmed = part.trim()
-            if (!trimmed) return
-            const index = trimmed.indexOf('=')
-            if (index < 1) return
-            labels[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1).trim()
-          })
-          return Object.keys(labels).length ? labels : undefined
+        function capsValid (form) {
+          return capRule(form.max_concurrency) === true && capRule(form.max_power_w) === true
         }
-
-        function buildSpec (form) {
-          const spec = { url: String(form.url || '').trim().replace(/\/+$/, '') }
-          if (String(form.model_id || '').trim()) spec.model_id = String(form.model_id).trim()
-          if (String(form.api_key || '').trim()) spec.api_key = String(form.api_key).trim()
-          if (String(form.priority || '').trim() !== '') spec.priority = Number(form.priority)
-          if (String(form.cost || '').trim() !== '') spec.cost = Number(form.cost)
-          appendCaps(spec, form)
-          if (form.disable_health_check) spec.disable_health_check = true
-          const labels = parseLabels(form.labels)
-          if (labels) spec.labels = labels
-          return spec
+        function numberFieldsValid (form) {
+          return numberRule(form.priority) === true && numberRule(form.cost) === true
+            && numberRule(form.max_concurrency) === true && numberRule(form.max_power_w) === true
         }
-
-        // 两个上限共用一段读写：POST 与 PUT 走的是同一批字段名（registry 的 add 与
-        // UPDATE_NUMBER_FIELDS），三态都由 capFormValue 决定（undefined=省略 / 0=清除 / >0=设定）。
         function appendCaps (target, form) {
           const concurrency = capFormValue(form.max_concurrency, true)
           if (concurrency !== undefined) target.max_concurrency = concurrency
@@ -490,22 +753,172 @@
           const number = value => (value === undefined || value === null || value === false) ? '' : String(value)
           return { max_concurrency: number(row && row.max_concurrency), max_power_w: number(row && row.max_power_w) }
         }
-        function capsValid (form) {
-          return capRule(form.max_concurrency) === true && capRule(form.max_power_w) === true
+
+        // ── 校验规则 ──
+        function urlRuleFor (selfKey) {
+          return value => {
+            const text = normUrl(value)
+            if (!text) return c.value.required
+            if (!/^https?:\/\/[^/]+$/i.test(text)) return t.value.urlRule
+            if (selfKey !== null && normKey(text) !== selfKey && rows.value.some(row => row.key === normKey(text))) {
+              return t.value.dupUrlNotice
+            }
+            return true
+          }
+        }
+        const urlRule = value => urlRuleFor(null)(value)
+        // 自身排除项用「打开对话框那一刻」的地址（declSelfKey），绝不能用 declForm.url：
+        // 后者跟着输入实时变化，操作员改成别的已存在地址时自身判定也跟着变，重复检测失效。
+        const declUrlRule = value => urlRuleFor(declSelfKey.value)(value)
+        function labelsKv (text) {
+          const labels = {}
+          String(text || '').split(/[,;]/).forEach(part => {
+            const trimmed = part.trim()
+            if (!trimmed) return
+            const index = trimmed.indexOf('=')
+            if (index < 1) return
+            labels[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1).trim()
+          })
+          return labels
+        }
+        function labelsRule (value) {
+          const text = String(value || '').trim()
+          if (!text) return true
+          return text.split(/[,;]/).every(part => /^[^=,\s]+=.*$/.test(part.trim()) || part.trim() === '') || t.value.labelsRule
         }
 
-        async function loadQuiet () {
+        // ── 声明层条目构造（整表替换语义的关键）──
+        // base 是 GET /_ui/config 拿到的**原始**条目（含 api_key:null 与未知字段），
+        // 表单只改写它画出来的字段、绝不重建整条：未知字段与脱敏位原样带回，
+        // 已存密钥在「没填、也没勾清除」时保持不动（契约 3.4 三态）。
+        function buildEntry (form, base) {
+          const entry = clone(base || {})
+          delete entry.id
+          // 服务端存在位与持久化字段绝不回写：它们不属于操作员写的条目
+          // （契约 3.4 的三态只由 api_key 表达）。
+          delete entry.has_api_key
+          delete entry.api_key_state
+          delete entry.api_key_stored
+          entry.url = normUrl(form.url)
+          const model = String(form.model_id || '').trim()
+          if (model) entry.model_id = model
+          else delete entry.model_id
+          const key = String(form.api_key || '')
+          if (form.clearKey) entry.api_key = ''
+          else if (key) entry.api_key = key
+          else delete entry.api_key
+          const priority = String(form.priority === null || form.priority === undefined ? '' : form.priority).trim()
+          if (priority !== '') entry.priority = Number(priority)
+          else delete entry.priority
+          const cost = String(form.cost === null || form.cost === undefined ? '' : form.cost).trim()
+          if (cost !== '') entry.cost = Number(cost)
+          else delete entry.cost
+          // 上限两字段：空串在声明层就是「不限」——整表替换语义下缺省字段等于未声明，
+          // 所以清空输入框是操作员有意的「撤掉上限」，不是「保持原值」。
+          // 并发上限只能是整数：与后端 cap_limit(value, integer=true) 的 math.floor 同口径，
+          // 免得 UI 显示 2.7 而池里落 2（自愈下一轮就会显示成不一致）。
+          const concurrency = capNumber(form.max_concurrency)
+          const concurrencyText = String(form.max_concurrency === null || form.max_concurrency === undefined ? '' : form.max_concurrency).trim()
+          if (concurrencyText !== '' && concurrency !== null) entry.max_concurrency = Math.floor(concurrency)
+          else delete entry.max_concurrency
+          const power = capNumber(form.max_power_w)
+          const powerText = String(form.max_power_w === null || form.max_power_w === undefined ? '' : form.max_power_w).trim()
+          if (powerText !== '' && power !== null) entry.max_power_w = power
+          else delete entry.max_power_w
+          const models = modelsList(form.modelsText)
+          if (models.length) entry.models = models
+          else delete entry.models
+          const labels = labelsKv(form.labelsText)
+          if (Object.keys(labels).length) entry.labels = labels
+          else delete entry.labels
+          if (form.disable_health_check) entry.disable_health_check = true
+          else delete entry.disable_health_check
+          return entry
+        }
+        function modelsList (text) {
+          const seen = []
+          String(text || '').split(/[,;\s]+/).forEach(part => {
+            const name = part.trim()
+            if (name && seen.indexOf(name) === -1) seen.push(name)
+          })
+          return seen
+        }
+        function declToForm (decl) {
+          return {
+            url: decl.url || '',
+            model_id: decl.model_id || '',
+            api_key: '',
+            clearKey: false,
+            priority: decl.priority === undefined || decl.priority === null ? '' : String(decl.priority),
+            cost: decl.cost === undefined || decl.cost === null ? '' : String(decl.cost),
+            max_concurrency: decl.max_concurrency === undefined || decl.max_concurrency === null ? '' : String(decl.max_concurrency),
+            max_power_w: decl.max_power_w === undefined || decl.max_power_w === null ? '' : String(decl.max_power_w),
+            modelsText: Array.isArray(decl.models) ? decl.models.join(',') : '',
+            labelsText: Object.entries(decl.labels || {}).map(entry => entry[0] + '=' + entry[1]).join(','),
+            disable_health_check: Boolean(decl.disable_health_check)
+          }
+        }
+        function rowToDeclForm (row) {
+          return {
+            url: row.url,
+            model_id: row.model_id === 'unknown' ? '' : (row.model_id || ''),
+            api_key: '',
+            clearKey: false,
+            priority: row.priority === undefined ? '' : String(row.priority),
+            cost: row.cost === undefined ? '' : String(row.cost),
+            max_concurrency: capsFromRow(row).max_concurrency,
+            max_power_w: capsFromRow(row).max_power_w,
+            modelsText: (row.models || []).join(','),
+            labelsText: labelKeys(row).map(key => key + '=' + row.labels[key]).join(','),
+            disable_health_check: Boolean(row.disable_health_check)
+          }
+        }
+
+        function reconcileSummary (res) {
+          const rec = res && (res.reconcile || (res.summary && res.summary.reconcile) || res.summary)
+          if (!rec || typeof rec !== 'object') return ''
+          const count = value => {
+            if (Array.isArray(value)) return value.length
+            const number = Number(value)
+            return Number.isFinite(number) ? number : 0
+          }
+          return window.lmrI18n.translate(locale.value, 'pool', 'reconcileNotice', {
+            added: count(rec.added), updated: count(rec.updated), removed: count(rec.removed), skipped: count(rec.skipped)
+          })
+        }
+
+        // ── 读取：池 3s 一轮，声明层 20s 一轮（两份数据独立刷新，任一失败不阻塞另一个）──
+        async function loadPoolQuiet () {
           try {
             const result = await window.lmrApi.workers()
             workers.value = (result && result.workers) || []
-            loadError.value = ''
             return true
           } catch (error) {
             loadError.value = error.message
             return false
           }
         }
-
+        async function loadDeclsQuiet () {
+          try {
+            const doc = await window.lmrApi.config()
+            // 必须在替换 decls 之前判脏：jsonBaseline() 读的是当前 decls，先赋值就永远
+            // 判成"没编辑过"，操作员在 JSON 面板里写了一半的草稿会被下一轮刷新抹掉。
+            const wasDirty = jsonDirty()
+            decls.value = (doc && Array.isArray(doc.upstreams)) ? doc.upstreams : []
+            unsupported.value = !(doc && Array.isArray(doc.upstreams))
+            // 面板开着时一律不覆盖文本（用户可能正在改），只在关闭时静默跟随服务端
+            if (!wasDirty && !jsonOpen.value) jsonText.value = prettyUpstreams(doc)
+            return true
+          } catch (error) {
+            loadError.value = error.message
+            return false
+          }
+        }
+        async function loadQuiet () {
+          const [pool, decl] = await Promise.all([loadPoolQuiet(), loadDeclsQuiet()])
+          if (pool && decl) loadError.value = ''
+          return pool && decl
+        }
         async function load () {
           loading.value = true
           await loadQuiet()
@@ -513,19 +926,49 @@
         }
 
         function openWorker (row) {
-          window.open(row.url + '/', '_blank', 'noopener')
+          window.open(normUrl(row.url) + '/', '_blank', 'noopener')
         }
 
-        // 提交注册 → 202 → 每 3s 轮询，等该行变绿；超时给负面提示
+        // ── 添加 ──
+        function openAdd () {
+          Object.assign(addForm, blankAdd())
+          // 后端没有 upstreams 段（老版本网关）时，默认档必须落到真正能用的那一侧：
+          // 声明层此时整表被 saveDecls 的守卫拒绝，让人停在"保存不了"的困惑里。
+          addMode.value = unsupported.value ? 'runtime' : 'declared'
+          addOpen.value = true
+        }
         async function submitAdd () {
-          if (!urlRule(addForm.url) || !labelsRule(addForm.labels) || !capsValid(addForm)) return
+          if (urlRule(addForm.url) !== true || labelsRule(addForm.labelsText) !== true) return
+          if (addMode.value === 'declared') {
+            if (!numberFieldsValid(addForm)) return
+            const entry = buildEntry(addForm, null)
+            await saveDecls(list => {
+              const entries = list.slice()
+              entries.push(entry)
+              return entries
+            }, () => {
+              addOpen.value = false
+              Object.assign(addForm, blankAdd())
+              watchHealth(entry.url)
+            })
+            return
+          }
+          if (!capsValid(addForm) || !numberRule(addForm.priority) || !numberRule(addForm.cost)) return
           submitting.value = true
-          const spec = buildSpec(addForm)
           try {
+            const spec = { url: normUrl(addForm.url) }
+            if (String(addForm.model_id || '').trim()) spec.model_id = String(addForm.model_id).trim()
+            if (String(addForm.api_key || '').trim()) spec.api_key = String(addForm.api_key).trim()
+            if (String(addForm.priority || '').trim() !== '') spec.priority = Number(addForm.priority)
+            if (String(addForm.cost || '').trim() !== '') spec.cost = Number(addForm.cost)
+            appendCaps(spec, addForm)
+            if (addForm.disable_health_check) spec.disable_health_check = true
+            const labels = labelsKv(addForm.labelsText)
+            if (Object.keys(labels).length) spec.labels = labels
             await window.lmrApi.addWorker(spec)
             notify(window.lmrI18n.translate(locale.value, 'workers', 'addedNotice', { url: spec.url }))
             addOpen.value = false
-            Object.assign(addForm, blankAddForm())
+            Object.assign(addForm, blankAdd())
             watchHealth(spec.url)
             await load()
           } catch (error) {
@@ -535,15 +978,187 @@
           }
         }
 
+        // ── 编辑：有声明走声明层，纯动态行走 PUT /workers/{id} ──
+        function openEdit (row) {
+          selected.value = row
+          selectedKey.value = row.key
+          // 运行态编辑：改池记录（PUT /workers/{id}）。有声明的行上限被锁死（见对话框横幅），
+          // 因为那是声明层的字段，自愈会按声明写回。
+          if (!row.inPool) {
+            // 未入池的行没有池记录可改，退回声明层编辑（行必然是声明条目）
+            if (row.decl) {
+              declSelfKey.value = normKey(row.decl.url)
+              Object.assign(declForm, declToForm(row.decl))
+              declOpen.value = true
+            } else {
+              declSelfKey.value = ''
+              Object.assign(declForm, rowToDeclForm(row))
+              declOpen.value = true
+            }
+            return
+          }
+          Object.assign(editForm, {
+            priority: row.priority === undefined ? '' : String(row.priority),
+            cost: row.cost === undefined ? '' : String(row.cost),
+            ...capsFromRow(row),
+            labels: labelKeys(row).map(key => key + '=' + row.labels[key]).join(','),
+            disable_health_check: Boolean(row.disable_health_check)
+          })
+          editOpen.value = true
+        }
+
+        // 声明层编辑（只在行确实有声明时可达）
+        function openDeclEdit (row) {
+          selected.value = row
+          selectedKey.value = row.key
+          if (!row.decl) {
+            notify(t.value.unsupportedNotice, 'negative')
+            return
+          }
+          declSelfKey.value = normKey(row.decl.url)
+          Object.assign(declForm, declToForm(row.decl))
+          declOpen.value = true
+        }
+
+        // 声明层写入的唯一出口：任何一次改动都基于**最近一次 GET 的整份 upstreams**，
+        // 只替换目标条目，其余条目原样带回（整表替换语义下漏一条就等于删一条）。
+        async function saveDecls (mutate, onDone) {
+          submitting.value = true
+          try {
+            // 安全闸：整表替换的前提是「手里的整表是真的」。刷新失败时 decls 可能停在
+            // 上一轮的旧快照，甚至是首次 GET 就失败留下的空数组 —— 那时提交等于用残缺
+            // 列表覆盖声明层，漏掉的条目会被 apply_upstreams 连池行一起 reclaim 掉。
+            // 与其冒这个风险，不如明确拒绝这一次保存。
+            if (!await loadDeclsQuiet()) {
+              notify(t.value.saveNeedsFreshList, 'negative')
+              return
+            }
+            if (unsupported.value) {
+              notify(t.value.unsupportedNotice, 'negative')
+              return
+            }
+            const entries = mutate(decls.value.slice())
+            const res = await window.lmrApi.configUpstreams(entries)
+            await loadQuiet()
+            const summary = reconcileSummary(res)
+            if (summary) notify(summary, 'info')
+            if (onDone) onDone()
+            startAutoRefresh()
+          } catch (error) {
+            notify(error.message, 'negative')
+          } finally {
+            submitting.value = false
+          }
+        }
+
+        async function submitDecl () {
+          if (declUrlRule(declForm.url) !== true || !numberFieldsValid(declForm) || labelsRule(declForm.labelsText) !== true) return
+          // base 条目与"是否已存在"必须在 saveDecls 重新拉取**之后**决定：
+          // 用刷新前的旧快照建条目，会让并发编辑（另一个标签刚改过这条）被静默回写掉。
+          let existed = false
+          let savedUrl = declForm.url
+          await saveDecls(list => {
+            // 定位键用「打开对话框那一刻」的原地址（declSelfKey），不能用输入框里的当前值：
+            // 操作员改 URL（换端口/换主机名）时，输入值是**新**地址，按它查会查不到原条目，
+            // 于是这条编辑变成"新增一条 + 旧条目留在表里继续被自愈投影进池"（含它的上限与密钥），
+            // 而且新条目是凭空重建的 —— 表单没画的字段全部丢失。改名必须先按原地址找到 base，
+            // 克隆后再把新地址写进 entry.url，并把原条目从表里剔除。
+            const target = declSelfKey.value || normKey(declForm.url)
+            const original = list.find(item => normKey(item.url) === target)
+            existed = Boolean(original)
+            const entry = buildEntry(declForm, original || null)
+            savedUrl = entry.url
+            const entries = list.filter(item => normKey(item.url) !== target)
+            // 改名时新地址撞上另一条已存在的条目（并发新增，重复检测漏网）：把改动并进那一条，
+            // 而不是让表里出现同址两行 —— 两行的话服务端只认一条，另一条成为删不掉的幽灵。
+            const clash = entries.findIndex(item => normKey(item.url) === normKey(entry.url))
+            if (clash >= 0) entries[clash] = buildEntry(declForm, entries[clash])
+            else entries.push(entry)
+            return entries
+          }, () => {
+            notify(window.lmrI18n.translate(locale.value, 'pool', existed ? 'declUpdatedNotice' : 'declAddedNotice', { url: savedUrl }))
+            declOpen.value = false
+            watchHealth(savedUrl)
+          })
+        }
+
+        async function submitEdit () {
+          if (!capsValid(editForm) || !labelsRule(editForm.labels)) return
+          // 防御性拒绝：入口已按归属收敛，但若仍给声明拥有的行提交 PUT，这些字段会在
+          // 30 秒内被自愈按声明覆盖 —— 与其静默发出去，不如挡下并指回声明层。
+          if (selected.value.cap_owner === 'declared') {
+            notify(t.value.capLockedHint, 'warning')
+            return
+          }
+          submitting.value = true
+          try {
+            const patch = {}
+            if (String(editForm.priority || '').trim() !== '') patch.priority = Number(editForm.priority)
+            if (String(editForm.cost || '').trim() !== '') patch.cost = Number(editForm.cost)
+            // 上限只在「运行态是事实来源」时下发。声明拥有的行由自愈按声明写回，
+            // 这里发出去的值 30 秒内会被覆盖，静默发出去比拒绝更容易让人误解成"改成功了"。
+            if (selected.value.cap_owner !== 'declared') appendCaps(patch, editForm)
+            if (labelsRule(editForm.labels)) {
+              const labels = labelsKv(editForm.labels)
+              if (Object.keys(labels).length) patch.labels = labels
+            }
+            patch.disable_health_check = Boolean(editForm.disable_health_check)
+            await window.lmrApi.updateWorker(selected.value.id, patch)
+            notify(window.lmrI18n.translate(locale.value, 'workers', 'updatedNotice', { url: selected.value.url }))
+            editOpen.value = false
+            await load()
+          } catch (error) {
+            notify(error.message, 'negative')
+          } finally {
+            submitting.value = false
+          }
+        }
+
+        // ── 删除：两种语义分开，且都只删自己那一层 ──
+        function removeDeclaration (row) {
+          Quasar.Dialog.create({
+            title: t.value.deleteDeclTitle,
+            message: row.url + ' · ' + t.value.deleteDeclConfirm,
+            cancel: true,
+            persistent: true,
+            ok: { label: c.value.del, color: 'negative', flat: true }
+          }).onOk(async () => {
+            await saveDecls(list => list.filter(item => normKey(item.url) !== row.key),
+              () => notify(window.lmrI18n.translate(locale.value, 'pool', 'declDeletedNotice', { url: row.url })))
+          })
+        }
+
+        function removeWorker (row) {
+          Quasar.Dialog.create({
+            // 合并页同时有「移除声明」和「摘除池行」两种删除，词典里 upstreams 段也有一对
+            // 同名的 deleteTitle/deleteConfirm（说的是删声明）。这里必须用合并页自己的键，
+            // 否则弹的是删声明的文案，把「摘池行」这个动作说反。
+            title: t.value.deletePoolTitle,
+            message: row.url + ' · ' + (row.decl_url ? t.value.deletePoolWithDecl : t.value.deletePoolConfirm),
+            cancel: true,
+            persistent: true,
+            ok: { label: c.value.del, color: 'negative', flat: true }
+          }).onOk(async () => {
+            try {
+              await window.lmrApi.removeWorker(row.id)
+              notify(window.lmrI18n.translate(locale.value, 'workers', 'deletedNotice', { url: row.url }))
+              await load()
+            } catch (error) {
+              notify(error.message, 'negative')
+            }
+          })
+        }
+
+        // ── 提交注册后等健康：每 3s 轮询池，变绿或超时后交还自动刷新 ──
         function watchHealth (url) {
           waitingUrl.value = url
           const deadline = Date.now() + HEALTH_WAIT_MS
           clearWait()
-          refreshTimer && window.clearInterval(refreshTimer)
+          poolTimer && window.clearInterval(poolTimer)
           waitTimer = window.setInterval(async () => {
-            await loadQuiet()
-            const row = workers.value.find(worker => worker.url === url)
-            if (row && row.is_healthy) {
+            await loadPoolQuiet()
+            const row = rows.value.find(item => item.key === normKey(url))
+            if (row && row.inPool && row.is_healthy) {
               notify(window.lmrI18n.translate(locale.value, 'workers', 'healthGreenNotice', { url }))
               clearWait()
               startAutoRefresh()
@@ -551,7 +1166,7 @@
             }
             const job = row && row.job_status
             if (job && job.status === 'failed') {
-              notify(`${url} — ${job.message || ''}`.trim(), 'negative')
+              notify((url + ' — ' + (job.message || '')).trim(), 'negative')
               clearWait()
               startAutoRefresh()
               return
@@ -571,84 +1186,140 @@
           waitingNotice.value = ''
         }
 
-        function openEdit (row) {
-          selected.value = row
-          Object.assign(editForm, {
-            priority: row.priority === undefined ? '' : String(row.priority),
-            cost: row.cost === undefined ? '' : String(row.cost),
-            ...capsFromRow(row),
-            labels: labelKeys(row).map(key => key + '=' + row.metadata[key]).join(','),
-            disable_health_check: Boolean(row.disable_health_check)
+        // ── JSON 权威面：upstreams 段的原文往返 ──
+        // 服务端回显的是脱敏行（api_key 恒 null + has_api_key 存在位）。这里只把
+        // 「操作员看得懂的字段」放进视图，但视图→保存这条路必须无损：任何表单没画的
+        // 字段（candidates 之外的未知键、models、声明顺序）都以服务端原值为基准。
+        function prettyUpstreams (doc) {
+          const list = (doc && Array.isArray(doc.upstreams)) ? doc.upstreams : decls.value
+          return JSON.stringify(list.map(displayUpstreamRow), null, 2)
+        }
+        function displayUpstreamRow (row) {
+          const out = {}
+          Object.keys(row || {}).forEach(key => {
+            if (key === 'has_api_key' || key === 'api_key_state' || key === 'api_key_stored') return
+            out[key] = row[key]
           })
-          editOpen.value = true
+          return out
         }
-
-        function buildPatch (form) {
-          const patch = {}
-          if (String(form.priority || '').trim() !== '') patch.priority = Number(form.priority)
-          if (String(form.cost || '').trim() !== '') patch.cost = Number(form.cost)
-          appendCaps(patch, form)
-          if (labelsRule(form.labels)) {
-            const labels = parseLabels(form.labels)
-            if (labels) patch.labels = labels
-          }
-          patch.disable_health_check = Boolean(form.disable_health_check)
-          return patch
+        function jsonBaseline () {
+          return prettyUpstreams(null)
         }
-
-        async function submitEdit () {
-          if (!capsValid(editForm) || !labelsRule(editForm.labels)) return
-          submitting.value = true
+        function normJson (value) {
+          if (value === null || typeof value !== 'object') return JSON.stringify(value)
+          if (Array.isArray(value)) return '[' + value.map(normJson).join(',') + ']'
+          return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + normJson(value[key])).join(',') + '}'
+        }
+        function jsonDirty () {
+          if (!jsonText.value) return false
           try {
-            await window.lmrApi.updateWorker(selected.value.id, buildPatch(editForm))
-            notify(window.lmrI18n.translate(locale.value, 'workers', 'updatedNotice', { url: selected.value.url }))
-            editOpen.value = false
-            await load()
+            return normJson(JSON.parse(jsonText.value)) !== normJson(JSON.parse(jsonBaseline()))
           } catch (error) {
-            notify(error.message, 'negative')
-          } finally {
-            submitting.value = false
+            return true
           }
         }
-
-        function removeWorker (row) {
-          Quasar.Dialog.create({
-            title: t.value.deleteTitle,
-            message: `${row.url} · ${row.model_id} · ${t.value.deleteConfirm}`,
-            cancel: true,
-            persistent: true,
-            ok: { label: c.value.del, color: 'negative', flat: true }
-          }).onOk(async () => {
-            try {
-              await window.lmrApi.removeWorker(row.id)
-              notify(window.lmrI18n.translate(locale.value, 'workers', 'deletedNotice', { url: row.url }))
-              await load()
-            } catch (error) {
-              notify(error.message, 'negative')
+        function openJson () {
+          jsonText.value = jsonDirty() ? jsonText.value : jsonBaseline()
+          jsonError.value = ''
+          jsonOpen.value = true
+        }
+        function resetJson () {
+          jsonText.value = jsonBaseline()
+          jsonError.value = ''
+        }
+        async function saveJson () {
+          let parsed
+          try {
+            parsed = JSON.parse(jsonText.value)
+          } catch (error) {
+            jsonError.value = window.lmrI18n.translate(locale.value, 'pool', 'jsonBadParse', { message: error.message })
+            return
+          }
+          if (!Array.isArray(parsed)) {
+            jsonError.value = t.value.jsonMustBeArray
+            return
+          }
+          for (let i = 0; i < parsed.length; i++) {
+            const row = parsed[i]
+            if (!row || typeof row !== 'object' || Array.isArray(row)) {
+              jsonError.value = window.lmrI18n.translate(locale.value, 'pool', 'jsonRowBad', { index: i + 1 })
+              return
             }
+            if (typeof row.url !== 'string' || !normUrl(row.url)) {
+              jsonError.value = window.lmrI18n.translate(locale.value, 'pool', 'jsonRowUrl', { index: i + 1 })
+              return
+            }
+            const key = normKey(row.url)
+            if (parsed.findIndex(item => normKey(item && item.url) === key) !== i) {
+              jsonError.value = window.lmrI18n.translate(locale.value, 'pool', 'jsonDupUrl', { index: i + 1, url: normUrl(row.url) })
+              return
+            }
+          }
+          // 三态守卫：操作员手写了 api_key_state / api_key_stored 就等于替网关决定密钥去留，
+          // 这两个字段只允许来自服务端回显（而回显里它们已被剔除），所以直接拒绝而不是静默删除。
+          const stray = parsed.some(row => 'api_key_state' in row || 'api_key_stored' in row)
+          if (stray) {
+            jsonError.value = t.value.jsonNoKeyFields
+            return
+          }
+          const entries = parsed.map(row => displayUpstreamRow(row))
+          // 整表替换最危险的入口就是这个面板：粘成 [] 或删掉几行，保存即落盘并 reclaim
+          // 掉对应 config 池行。表单路径每次只碰一条，无需确认；整段保存必须在缩表时问一次。
+          const shrinkNote = entries.length === 0
+            ? window.lmrI18n.translate(locale.value, 'pool', 'jsonConfirmEmpty', { n: decls.value.length })
+            : (entries.length < decls.value.length
+              ? window.lmrI18n.translate(locale.value, 'pool', 'jsonConfirmShrink', { before: decls.value.length, after: entries.length })
+              : '')
+          if (shrinkNote) {
+            Quasar.Dialog.create({
+              title: t.value.jsonConfirmTitle,
+              message: shrinkNote,
+              cancel: true,
+              persistent: true,
+              ok: { label: c.value.confirm, color: 'negative', flat: true }
+            }).onOk(async () => {
+              await commitJson(entries)
+            })
+            return
+          }
+          await commitJson(entries)
+        }
+        async function commitJson (entries) {
+          await saveDecls(() => entries, () => {
+            notify(t.value.jsonSavedNotice)
+            jsonOpen.value = false
           })
-        }
-
-        function openAdd () {
-          Object.assign(addForm, blankAddForm())
-          addOpen.value = true
-        }
-
-        function blankAddForm () {
-          return { url: '', model_id: '', api_key: '', priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false }
         }
 
         function startAutoRefresh () {
-          window.clearInterval(refreshTimer)
-          if (autoRefresh.value && !waitTimer) refreshTimer = window.setInterval(loadQuiet, 3000)
+          window.clearInterval(poolTimer)
+          poolTimer = null
+          if (!alive) return
+          if (autoRefresh.value && !waitTimer) poolTimer = window.setInterval(loadPoolQuiet, POOL_POLL_MS)
         }
         function stopAutoRefresh () {
-          window.clearInterval(refreshTimer)
-          refreshTimer = null
+          window.clearInterval(poolTimer)
+          poolTimer = null
+        }
+        function startDeclRefresh () {
+          window.clearInterval(declTimer)
+          declTimer = null
+          if (!alive) return
+          if (autoRefresh.value) declTimer = window.setInterval(() => { if (!jsonOpen.value) loadDeclsQuiet() }, DECL_POLL_MS)
+        }
+        function stopDeclRefresh () {
+          window.clearInterval(declTimer)
+          declTimer = null
         }
 
+        // 关掉自动刷新必须真的关掉：文案里写了「池 3 秒 / 声明 20 秒」，开关却只在建定时器时
+        // 读过一次，那就是说话不算话 —— 关掉之后两个定时器会一直跑到下次写入或重载。
+        watch(autoRefresh, enabled => {
+          if (enabled) { startAutoRefresh(); startDeclRefresh() }
+          else { stopAutoRefresh(); stopDeclRefresh() }
+        })
+
         async function loadHealthInterval () {
-          // 摘要里显示探测周期：读不到就保留默认 30s
           try {
             const props = await window.lmrApi.props()
             if (props && props.health_check_interval_secs) healthInterval.value = Number(props.health_check_interval_secs)
@@ -658,7 +1329,7 @@
         function applyLocale (nextLocale) {
           locale.value = nextLocale
           document.documentElement.lang = nextLocale
-          document.title = window.lmrI18n.messages[nextLocale].workers.title + ' · llm-router'
+          document.title = window.lmrI18n.messages[nextLocale].pool.title + ' · llm-router'
           window.lmrI18n.applyQuasarLang(nextLocale)
           if (waitingUrl.value) {
             waitingNotice.value = window.lmrI18n.translate(nextLocale, 'workers', 'waitingHealth')
@@ -666,25 +1337,31 @@
         }
 
         onMounted(() => {
+          alive = true
           applyLocale(locale.value)
           unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
           load()
           loadHealthInterval()
           startAutoRefresh()
+          startDeclRefresh()
         })
         onBeforeUnmount(() => {
+          alive = false
           stopAutoRefresh()
+          stopDeclRefresh()
           clearWait()
           if (unsubscribeLocale) unsubscribeLocale()
         })
 
         return {
-          addForm, addOpen, autoRefresh, c, clearWait, columns, editForm, editOpen, filter,
-          formatCost, healthInterval, healthyCount, healthColor, healthLabel, jobColor, jobLabel,
-          groups, labelKeys, load, loading, loadError, openAdd, openEdit, openWorker, pagination,
-          removeWorker, selected, labelsRule, submitting, submitAdd, submitEdit, t, urlRule,
-          capConfigText, capMeasuredText, capExceeded, capNumber, capRule, modelsVerifiedOf,
-          waitingNotice, workers
+          addCopyText, addForm, addMode, addModeOptions, addOpen, addSubmitText, autoRefresh, c, clearWait, columns,
+          coveredModels, declForm, declOpen, declUrlRule, decls, declaredNote, editForm, editOpen, filter,
+          formatCost, groups, hasKey, healthColor, healthLabel, healthyCount, jobColor, jobLabel, jsonError,
+          jsonOpen, jsonText, labelKeys, labelsKv, labelsRule, load, loading, loadError, modelsList, rows,
+          modelsVerifiedOf, numberRule, capRule, openAdd, openDeclEdit, openEdit, openJson, openWorker, originColor,
+          originLabel, pagination, prettyUpstreams, removeDeclaration, removeWorker, resetJson,
+          saveJson, selected, submitting, submitAdd, submitDecl, submitEdit, t, waitingNotice, unsupported, urlRule,
+          capConfigText, capMeasuredText, capExceeded, capNumber
         }
       }
     })

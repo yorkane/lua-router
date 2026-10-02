@@ -477,6 +477,93 @@ local function build_candidate_bindings(alias, raw)
     return out
 end
 
+--- Normalized, order-preserving, de-duplicated target group for one virtual model.
+---
+--- 为什么要有这一层（用户裁定 2026-10-02，虚拟模型语义反转）：虚拟模型不是"客户端别名 →
+--- 单一上游模型"，它是**日常服务的主入口**，一对多地映射**一组实际模型**，由调度策略在
+--- 这一组里选落点。旧形状只有单值 target，于是"一个入口同时对外提供 A 和 B 两个模型"
+--- 根本配不出来，只能建两个别名，各自的亲和树与容量口径互相不认识。
+---
+--- 空数组按"未声明"处理（返回 nil），交给调用方决定回退到 target/candidates：一个写了
+--- `targets: []` 的配置要么是手滑要么是 UI 序列化 bug，把它当"声明了零个模型"会在运行期
+--- 得到一个永远 503 的入口，而当"没声明"则继续走既有的 target 路径——后者是可用的。
+---@return string[]|nil targets, string|nil err
+local function build_target_group(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if not is_array(raw) then
+        return nil, string.format("virtual model %s targets must be an array of strings", alias)
+    end
+    local out, seen = {}, {}
+    for _, item in ipairs(raw) do
+        if type(item) ~= "string" then
+            return nil, string.format(
+                "virtual model %s targets entries must be strings", alias)
+        end
+        local model = trim(item)
+        if model == "" then
+            return nil, string.format("virtual model %s targets entries must not be blank", alias)
+        end
+        if not seen[model] then
+            seen[model] = true
+            out[#out + 1] = model
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+--- The one declared model group of a profile, whatever the entry spelled it as.
+--- Precedence is deliberate and is the whole compatibility story:
+---   1. an explicit `targets` array (the new primary field);
+---   2. a single `target` -> the group of one it always was;
+---   3. the per-candidate bindings -> their distinct model names, in first-declaration
+---      order, so a candidates-only config keeps routing exactly as it does today
+---      without the operator having to restate the group.
+--- Returns (group, explicit) where explicit says the operator wrote the `targets` key
+--- himself: the snapshot only re-emits that key when it is true, which is what keeps a
+--- legacy `{model, target}` row byte-identical on disk instead of growing a second,
+--- derived copy of the same name (the phantom-field mistake documented at
+--- profile_from_entry's explicit_target note).
+local function target_group_of(target, candidates, declared_targets)
+    if declared_targets then
+        local out = {}
+        for i = 1, #declared_targets do out[i] = declared_targets[i] end
+        return out, true
+    end
+    -- 未显式写 targets 时，组是「target 与各候选绑定模型名的并集」。上一轮的多绑定形状
+    -- (model + target + candidates 各带 model) 本来就用不同模型名绑不同实例；把它折成
+    -- 单元素 target 会让那些绑定被「绑定名必须在组内」判成非法 400。取并集既保住那批
+    -- 配置，也正是 1 对多的意思。target 恒在首位：凡是「必须挑一个代表名」的旧读者
+    -- 读到的还是组头，与上一轮逐字节一致。
+    local out, seen = {}, {}
+    local function note(model)
+        if type(model) == "string" and model ~= "" and not seen[model] then
+            seen[model] = true
+            out[#out + 1] = model
+        end
+    end
+    note(target)
+    for i = 1, #(candidates or {}) do
+        note(candidates[i].model)
+    end
+    if #out == 0 then return nil, false end
+    return out, false
+end
+
+--- Context-window override for one virtual model: the *only* per-entry override the
+--- new design allows (root ruling 2026-10-02). Absent/blank/null = no override.
+local function build_context_window(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if raw == false or raw == true then
+        return nil, string.format("virtual model %s context_window must be a positive integer", alias)
+    end
+    local n = parse_positive_int(raw)
+    if not n then
+        return nil, string.format("virtual model %s context_window must be a positive integer", alias)
+    end
+    return n
+end
+
 local function copy_bindings(candidates)
     -- Shallow copy of the binding list: the snapshot and profile_for must not hand out
     -- the live tables, or a caller that edits one row would rewrite the config in place.
@@ -508,6 +595,16 @@ end
 --- profile_from_entry; this guards only the wording family the contract pins for
 --- "neither half present". Declared next to the builders because cfg_from_document,
 --- which is much earlier in the file, has to see it as a local.
+--- Same shape test for the new primary field: a row carrying a non-empty `targets`
+--- array declares its model group and therefore needs no target of its own.
+local function has_target_group(entry)
+    if type(entry) ~= "table" then return false end
+    local raw = rawget(entry, "targets")
+    if raw == nil or raw == JSON_NULL then return false end
+    if not is_array(raw) then return true end   -- wrong type: let the builder word it
+    return #raw > 0
+end
+
 local function entry_has_bindings(entry)
     if type(entry) ~= "table" then return false end
     local raw = rawget(entry, "candidates")
@@ -528,6 +625,12 @@ local function profile_from_entry(alias, entry)
     if type(entry) ~= "table" then
         return nil, "virtual model entries must be objects"
     end
+    -- The new primary field (root ruling 2026-10-02): one entry maps the virtual name
+    -- to a *group* of real models. Read it before target/candidates because the group,
+    -- when written, is what the entry means; the two legacy spellings below only fill
+    -- in for rows that predate it.
+    local declared_group, gerr = build_target_group(alias, rawget(entry, "targets"))
+    if gerr then return nil, gerr end
     local declared_target = rawget(entry, "target")
     if declared_target ~= nil and declared_target ~= JSON_NULL and type(declared_target) ~= "string" then
         return nil, string.format("virtual model %s target must be a string or null", alias)
@@ -539,28 +642,69 @@ local function profile_from_entry(alias, entry)
     end
     local candidates, cerr = build_candidate_bindings(alias, rawget(entry, "candidates"))
     if cerr then return nil, cerr end
-    if target == nil and candidates == nil then
+    local group = target_group_of(target, candidates, declared_group)
+    -- 有候选但一个模型名都没给（既无 target 也无 candidate.model）时不能在这里报「两半都缺」：
+    -- 那条路径下面会精确点到「哪一个候选缺 model」，措辞对操作员有用得多，单测也钉的是它。
+    if group == nil and candidates == nil then
         return nil, string.format("virtual model %s needs a target model or candidates", alias)
     end
+    group = group or {}
     -- A binding without its own model inherits the profile target; with no target to
     -- inherit the forwarded name would be undefined for that one instance, so it is a
     -- config error rather than something to guess at request time.
     if candidates then
+        -- 继承源只能是「操作员亲口写过的名字」：写过的 target，或显式写过的 targets 组头。
+        -- 不能退到派生组的组头——派生组会把候选自己声明的模型名也排进去，于是某条没写
+        -- model 的绑定会去继承**兄弟候选**的模型名：同一份配置换个候选顺序就得到不同的
+        -- 落点模型，而且本该报「no target to inherit」的错会被静默吞掉。
+        local inherit = target
+        if inherit == nil and declared_group then inherit = declared_group[1] end
+        local in_group = {}
+        for i = 1, #group do in_group[group[i]] = true end
         for i = 1, #candidates do
             local model = candidates[i].model
-            if (model == nil or model == "") and target ~= nil then
-                candidates[i].model = target
-                model = target
+            if (model == nil or model == "") and inherit ~= nil then
+                candidates[i].model = inherit
+                model = inherit
             end
             if model == nil or model == "" then
                 return nil, string.format(
                     "virtual model %s candidate %s needs a model (no target to inherit)",
                     alias, candidates[i].worker)
             end
+            -- A binding to a name outside the group is a contradiction, not a detail:
+            -- selection would never reach that instance for any declared model, or
+            -- (worse) a typo'd name would silently pin traffic to a worker that 404s it.
+            -- Refuse it here, where the operator sees it, rather than at request time.
+            if not in_group[model] then
+                return nil, string.format(
+                    "virtual model %s candidate %s is bound to %s, which is not one of its targets",
+                    alias, candidates[i].worker, model)
+            end
+        end
+    end
+    -- 写过 targets 之后 target 只是「代表值」。它落在组外（操作员改了组却没同步改
+    -- target）会让 resolve_model / 模型文档去追一个该入口并不提供的名字，所以
+    -- sync_virtual_view 对组入口一律改用组头，这里只留一条 warn 把不一致说出来。
+    -- 不当场 400 是有意的：apply 是整表替换，一行的过期 target 会连带挡住操作员
+    -- 保存其它行；而它在读侧已经不驱动任何行为，剩下的只是磁盘上的历史字节。
+    -- 注意这与「绑定名必须在组内」不同——那条会决定转发名，所以必须硬拒。
+    if declared_group and target ~= nil then
+        local inside = false
+        for i = 1, #declared_group do
+            if declared_group[i] == target then inside = true break end
+        end
+        if not inside then
+            ngx_log_warn("luarouter: virtual model ", alias, " carries target ", target,
+                " outside its declared targets; using the group head as representative")
         end
     end
     local profile = {
-        target = target or representative_target(target, candidates),
+        -- The representative stays the single name every pre-feature reader keys off
+        -- (resolve_model, /v1/models, the effort/ctx lookups). Under the new semantics
+        -- it is only a representative: the group is authoritative.
+        target = target or representative_target(target, candidates) or group[1],
+        targets = group,
     }
     -- The derived representative is held to the same rule as a written target: without
     -- it a candidates-only entry that names itself gets rejected by the batch chain
@@ -573,6 +717,13 @@ local function profile_from_entry(alias, entry)
     -- candidates-only 配置如果被隐式补上 target，磁盘文档就长出一个没人声明的模型名，
     -- 之后所有 reader（effort 卡、policy hint、/v1/models）都会跟着这个幻影名字找配置。
     if target ~= nil then profile.explicit_target = true end
+    -- Same rule as explicit_target: the group is written back only when the operator
+    -- wrote the `targets` key. Everything else (a legacy pair, a candidates-only row)
+    -- re-derives it at read time, so the disk document never grows a field nobody typed.
+    if declared_group then profile.explicit_targets = true end
+    local context_window, cwerr = build_context_window(alias, rawget(entry, "context_window"))
+    if cwerr then return nil, cwerr end
+    if context_window then profile.context_window = context_window end
     if candidates then profile.candidates = candidates end
     local workers, werr = build_candidates(alias, rawget(entry, "workers"))
     if werr then return nil, werr end
@@ -590,7 +741,18 @@ local function profile_from_entry(alias, entry)
             return nil, string.format("unknown policy for virtual model %s: %s (want one of %s)",
                 alias, trimmed, POLICY_NAMES_JOIN)
         end
-        if name then profile.policy = name end
+        if name then
+            profile.policy = name
+            -- Root ruling 2026-10-02: scheduling policy belongs to the routing page
+            -- (global / model_policies), not to the virtual-model entry. The field is
+            -- still accepted and round-tripped so an exported-and-re-imported document
+            -- keeps validating, and it is *not* consulted on the hot path any more.
+            -- Saying nothing there would make the row silently stop doing what its
+            -- name promises, so the load answers once per parse.
+            ngx_log_warn("luarouter: virtual model ", alias,
+                " declares policy=", name,
+                ", which no longer applies there (configure it on the routing page)")
+        end
     end
     if rawget(entry, "effort") ~= nil and entry.effort ~= JSON_NULL then
         if type(entry.effort) ~= "string" then
@@ -602,12 +764,82 @@ local function profile_from_entry(alias, entry)
             return nil, string.format("unknown effort for virtual model %s: %s (want one of %s)",
                 alias, trimmed, EFFORT_LEVELS_JOIN)
         end
-        if level then profile.effort = level end
+        if level then
+            profile.effort = level
+            -- Same ruling and the same honesty rule as policy above: the effort ladder
+            -- is per *engine*, so it lives on the model card (model_effort /
+            -- model_configs), keyed by the real model a request lands on.
+            ngx_log_warn("luarouter: virtual model ", alias,
+                " declares effort=", level,
+                ", which no longer applies there (configure it on the model card)")
+        end
     end
     return profile, nil
 end
 
-local function assert_no_alias_chain(built, alias, target)
+--- One validated alias -> profile table from a decoded batch, chain-checked.
+--- Shared by cfg_from_document and apply_profiles so the two writers cannot drift.
+---@param entries table[] @ document-shape rows
+---@param existing table|nil @ live alias -> profile map for the cross-batch chain check
+---@return table|nil built, string|nil err
+-- 前向声明：下面两个链守卫是 local function，定义在本函数之后。Lua 里没有这行声明的话，
+-- build_profiles 里的同名标识符会退化成**全局读**（nil），任何一次写 virtual_models 都会
+-- 崩在 "attempt to call global 'assert_no_alias_chain'"。
+local assert_no_alias_chain, assert_bindings_no_alias
+local function build_profiles(entries, existing)
+    local built = {}
+    for _, entry in ipairs(entries or {}) do
+        if type(entry) ~= "table" then
+            return nil, "virtual model entries must be objects"
+        end
+        local alias = type(entry.model) == "string" and trim(entry.model) or ""
+        if alias == "" then
+            -- 文案回到被钉住的措辞家族：别名缺失与 target 缺失同属「这条 entry 两半没给全」，
+            -- 单测钉的是 model and target 这一族，不该因为重构而换话术。
+            return nil, "virtual model entries need both model and target"
+        end
+        -- Pre-validation only words the "declared nothing at all" case; element-level
+        -- errors stay with profile_from_entry (the contract pins this wording family).
+        if (type(entry.target) ~= "string" or trim(entry.target) == "")
+            and not entry_has_bindings(entry)
+            and not has_target_group(entry) then
+            -- 一句里同时含 needs a target model（契约家族）与 model and target（单测家族）：
+            -- 同一个错误在 document / apply 两条写入路径上必须同一种话术。
+            return nil, string.format(
+                "virtual model %s needs a target model (an entry needs both model and target)",
+                alias)
+        end
+        local profile, perr = profile_from_entry(alias, entry)
+        if not profile then return nil, perr end
+        built[alias] = profile
+    end
+    for _, alias in ipairs(sorted_keys(built)) do
+        local profile = built[alias]
+        local cerr = assert_no_alias_chain(built, alias, profile.target)
+        if not cerr then
+            cerr = assert_bindings_no_alias(built, existing, alias, profile)
+        end
+        if not cerr then
+            -- Every model in the group is a name the gateway will forward, so every one
+            -- of them is held to the no-chain rule (root ruling 4). Checking only the
+            -- representative would let `targets: [some-other-alias]` through, and the
+            -- forwarded body would then name a name no upstream knows.
+            for i = 1, #(profile.targets or {}) do
+                cerr = assert_no_alias_chain(built, alias, profile.targets[i])
+                if not cerr and existing and existing[profile.targets[i]] ~= nil then
+                    cerr = string.format(
+                        "virtual model %s target must not be another virtual model: %s",
+                        alias, profile.targets[i])
+                end
+                if cerr then break end
+            end
+        end
+        if cerr then return nil, cerr end
+    end
+    return built, nil
+end
+
+assert_no_alias_chain = function(built, alias, target)
     if built == nil then return nil end
     if built[target] ~= nil then
         return string.format("virtual model %s target must not be another virtual model: %s",
@@ -652,7 +884,7 @@ end
 ---@param built table|nil @ alias -> profile for the batch being validated
 ---@param existing table|nil @ live alias -> target map (checked when built does not know it)
 ---@return string|nil err
-local function assert_bindings_no_alias(built, existing, alias, profile)
+assert_bindings_no_alias = function(built, existing, alias, profile)
     if type(profile) ~= "table" or profile.candidates == nil then return nil end
     for i = 1, #profile.candidates do
         local model = profile.candidates[i].model
@@ -900,6 +1132,38 @@ local function new_cfg()
     }
 end
 
+--- Derive the legacy alias -> representative-target map from the profiles, which are
+--- the single source of truth (root ruling 2026-10-02).
+---
+--- 为什么派生而不是并行维护：这两张表各自被独立写入过（cfg_from_document 与
+--- apply_profiles 各写一次），于是任何一条只清一张表的路径都会留下"幻影别名"——
+--- resolve_model / /v1/models / 模型文档三处 reader 各自读到不同的一张。1 对多之后
+--- virtual_models 的单值语义本来也不成立了（一个入口对应一组模型，没有唯一的"它的
+--- target"），把它降级成派生视图既消除了双写，也让 reader 在"必须只有一个名字"的
+--- 地方继续读到代表值而不是 nil。
+local function sync_virtual_view(cfg)
+    local map = {}
+    for alias, profile in pairs(cfg.virtual_profiles or {}) do
+        if type(profile) == "table" then
+            -- 写过 targets 的入口，代表值取**组头**而不是 profile.target：操作员可以先写
+            -- target、再用 JSON 视图把那个名字从组里删掉，此时 profile.target 是一个已经
+            -- 不属于这个入口的名字。让它进派生视图，resolve_model / 模型文档就会把流量与
+            -- 卡片去找一个根本不在这个组里的模型名（选路本身不受影响：组候选的转发名一律
+            -- 取 lr_bound_model）。profile.target 本身保持写过的原值不动，磁盘上的字节仍
+            -- 由操作员说了算 —— 这里只保证派生视图与组口径一致。
+            local rep = profile.target
+            if profile.explicit_targets == true and type(profile.targets) == "table" then
+                local head = profile.targets[1]
+                if type(head) == "string" and head ~= "" then
+                    rep = head
+                end
+            end
+            map[alias] = rep
+        end
+    end
+    cfg.virtual_models = map
+end
+
 local function new_card()
     return { ctx = nil, default_effort = nil, effort_map = {}, modalities = nil }
 end
@@ -945,8 +1209,7 @@ local function cfg_from_env()
         if alias ~= "" and target ~= "" and alias ~= target then
             -- Old alias=target pairs are exactly the new shape with no candidates
             -- and no overrides, so both views get the same content.
-            cfg.virtual_models[alias] = target
-            cfg.virtual_profiles[alias] = { target = target }
+            cfg.virtual_profiles[alias] = { target = target, targets = { target } }
         end
     end
     for _, entry in ipairs(_M.env_upstreams()) do
@@ -961,6 +1224,10 @@ local function cfg_from_env()
             ngx_log_warn("luarouter config env upstream skipped: ", err)
         end
     end
+    -- virtual_models 是派生视图，env 层同样要同步：否则 LMR_VIRTUAL_MODELS 种子进来的别名
+    -- 只进了 virtual_profiles 一张表，resolve_model / snapshot_of / virtual_models_list 三个
+    -- 读者全都读不到它，行为等同于整条 env 配置被静默丢弃。
+    sync_virtual_view(cfg)
     return cfg
 end
 
@@ -1041,19 +1308,30 @@ local function snapshot_of(cfg)
         -- reader 当成真实模型去找 effort/policy 卡，也会让"删掉 target"这种编辑在下次
         -- reload 后悄悄复活。缺省字段（而不是 null）是这里既有的往返约定。
         local entry = { model = alias }
+        -- Same "only what the operator wrote" rule as target above: a legacy pair or a
+        -- candidates-only row re-derives its group at read time, so re-emitting it here
+        -- would put a derived list on disk and make "delete the targets" an edit that
+        -- silently resurrects itself on the next reload.
+        if profile.explicit_targets and profile.targets then
+            entry.targets = { table.unpack(profile.targets) }
+        end
         if profile.candidates then
             if profile.explicit_target then
                 entry.target = profile.target or cfg.virtual_models[alias]
             end
             entry.candidates = copy_bindings(profile.candidates)
-        else
+        elseif not profile.explicit_targets then
             entry.target = profile.target or cfg.virtual_models[alias]
         end
         -- Optional fields are absent rather than null so a snapshot written by an
         -- older build round-trips unchanged and the JSON editor stays readable.
         if profile.workers then entry.workers = profile.workers end
+        -- policy/effort are legacy-carried only (root ruling 2026-10-02): the hot path
+        -- ignores them, but a row that still has them keeps them on disk so nothing an
+        -- operator never deleted can vanish from the authoritative JSON view.
         if profile.policy then entry.policy = profile.policy end
         if profile.effort then entry.effort = profile.effort end
+        if profile.context_window then entry.context_window = profile.context_window end
         virtual_models[#virtual_models + 1] = entry
     end
     local upstreams = {}
@@ -1294,32 +1572,12 @@ local function cfg_from_document(doc, previous)
 
     if doc.virtual_models ~= nil then
         if not is_array(doc.virtual_models) then return nil, "virtual_models must be an array" end
-        local built_profiles = {}
-        for _, entry in ipairs(doc.virtual_models) do
-            local alias = type(entry.model) == "string" and trim(entry.model) or ""
-            if alias == "" then return nil, "virtual_models entries need a model (the alias)" end
-            -- target is optional whenever the row carries its own bindings (see
-            -- profile_from_entry); a blank row with neither half keeps the old wording.
-            if (type(entry.target) ~= "string" or trim(entry.target) == "")
-                and not entry_has_bindings(entry) then
-                return nil, string.format("virtual model %s needs a target model", alias)
-            end
-            local profile, perr = profile_from_entry(alias, entry)
-            if not profile then return nil, perr end
-            built_profiles[alias] = profile
-        end
-        -- Chain rejection over the merged batch (root ruling 4): no target may
-        -- name an alias that exists in this table, whoever declared it.
-        for alias, profile in pairs(built_profiles) do
-            local cerr = assert_no_alias_chain(built_profiles, alias, profile.target)
-            if cerr then return nil, cerr end
-            cerr = assert_bindings_no_alias(built_profiles, nil, alias, profile)
-            if cerr then return nil, cerr end
-        end
-        for alias, profile in pairs(built_profiles) do
+        local built, berr = build_profiles(doc.virtual_models, nil)
+        if not built then return nil, berr end
+        for alias, profile in pairs(built) do
             cfg.virtual_profiles[alias] = profile
-            cfg.virtual_models[alias] = profile.target
         end
+        sync_virtual_view(cfg)
     end
 
     if doc.upstreams ~= nil then
@@ -1529,12 +1787,72 @@ end
 
 -- ------------------------------------------------------------- readers
 
+--- Context cap of a *real* model, from its card or the legacy table. An entry's own name
+--- is deliberately excluded: which clamp a virtual request gets is
+--- virtual_ctx_cap's decision (uniform across the group, independent of the pick), and
+--- letting a card written under the entry name leak in here would re-open the per-pick
+--- variance the ruling closed.
 function _M.ctx_cap(model)
     if type(model) ~= "string" or model == "" then return nil end
     local cfg = _M.current()
+    if cfg.virtual_profiles[model] ~= nil or cfg.virtual_models[model] ~= nil then
+        return nil
+    end
     local card = cfg.model_configs[model]
     if card and card.ctx then return card.ctx end
     return cfg.model_ctx[model]
+end
+
+--- The one context clamp a virtual-model entry must present downstream.
+---
+--- Root ruling 2026-10-02 ("只能配置模型上下文长度覆盖，以便对下游保持统一"): the clamp
+--- of a virtual entry is a property of the *entry*, not of whichever instance the policy
+--- happened to pick, so it cannot be looked up per landing model -- the same request
+--- would get one max_tokens on worker A and another on worker B, which is precisely the
+--- non-uniformity the ruling exists to remove.
+---   1. an explicit `context_window` on the entry wins outright and ignores every card;
+---   2. otherwise the *minimum* of the cards of the models in its group. Minimum because
+---      a group is served by engines the entry does not control: clamping to the widest
+---      would send a body the narrowest of them can reject, and the value would still
+---      flicker with the pick. A conservative constant is the only reading that is both
+---      safe and uniform;
+---   3. nil when no card and no override exists -- which is byte-for-byte the
+---      pre-feature "nothing to clamp" answer.
+--- An empty/absent group falls back to the representative target's card so a legacy
+--- {model, target} pair keeps clamping exactly as it does today (the group of one *is*
+--- that target, so the minimum is the same number).
+---@param alias_or_profile table|string|nil
+---@return number|nil cap
+function _M.virtual_ctx_cap(alias_or_profile)
+    local profile
+    if type(alias_or_profile) == "table" then
+        profile = alias_or_profile
+    elseif type(alias_or_profile) == "string" and alias_or_profile ~= "" then
+        profile = _M.current().virtual_profiles[alias_or_profile]
+    end
+    if type(profile) ~= "table" then return nil end
+    local explicit = profile.context_window
+    if type(explicit) == "number" and explicit >= 1 then return math.floor(explicit) end
+    -- A group of one is not a group: with nothing declared but one model, the clamp the
+    -- engine's own card dictates *is* the uniform answer, and taking it here (rather than
+    -- at the card_key the router resolves per pick) keeps a legacy {model, target} pair
+    -- clamping byte-for-byte as it does today. Only a genuine multi-model entry needs a
+    -- decision that is independent of which instance the policy chose.
+    -- 只有操作员写过 targets 的入口才接管 clamp：legacy 行（只有 target
+    -- 和或 candidates）一律返回 nil，让 clamp 照旧的「按落点模型卡」路径逐字节不变。
+    -- 并集口径下一个多绑定的旧入口也许拟出 >=2 的组，所以这里只能看
+    -- explicit_targets 而不能只看组长度，否则普通修改会把它的 clamp 换掉。
+    if profile.explicit_targets ~= true then return nil end
+    local group = profile.targets
+    if type(group) ~= "table" or #group < 2 then return nil end
+    local cap
+    for i = 1, #group do
+        local one = _M.ctx_cap(group[i])
+        if type(one) == "number" and one >= 1 then
+            if cap == nil or one < cap then cap = one end
+        end
+    end
+    return cap
 end
 
 function _M.modalities_for(model)
@@ -1665,6 +1983,12 @@ function _M.policy_document()
     end
     for _, row in ipairs(registered_models()) do note(row.model) end
     for _, row in ipairs(_M.model_policies_list()) do note(row.model) end
+    -- 虚拟入口名也进这一张表。root ruling 2026-10-02 摘掉了 per-alias 的 policy 字段，
+    -- 于是「给这个入口换策略」只剩 model_policies 一条路；而 1 对多之后策略实例的 key
+    -- 恰恰就是入口名（一个入口一棵亲和树，见 router.group_key_name）。少了这一行，
+    -- 路由页就永远列不出入口那一行，操作员只能靠手打名字——最关键的调度开关反而没有入口。
+    -- registered 对入口名恒为 false（引擎不认识这个名字，本就不该被算作已注册）。
+    for alias in pairs(_M.current().virtual_profiles) do note(alias) end
     table.sort(order)
 
     local registry_mod
@@ -1716,12 +2040,40 @@ function _M.resolve_model(model)
     return _M.current().virtual_models[model] or model
 end
 
+--- One row per alias: { alias, model... } -- the alias followed by every real model it
+--- stands for. The row is deliberately variadic rather than {alias, target}: under the
+--- group semantics an entry covers N engines and an advertiser that reads only [2] would
+--- put the old single-owner shape back on the wire. Legacy rows carry the group of one
+--- they always had, so their consumers see exactly what they saw before.
 function _M.virtual_models_list()
     local cfg = _M.current()
     local out = {}
     for _, alias in ipairs(sorted_keys(cfg.virtual_models)) do
-        out[#out + 1] = { alias, cfg.virtual_models[alias] }
+        local profile = cfg.virtual_profiles[alias]
+        local group = (type(profile) == "table" and profile.targets) or nil
+        if type(group) ~= "table" or #group == 0 then
+            group = { cfg.virtual_models[alias] }
+        end
+        local row = { alias }
+        for i = 1, #group do
+            if type(group[i]) == "string" and group[i] ~= "" then
+                row[#row + 1] = group[i]
+            end
+        end
+        out[#out + 1] = row
     end
+    return out
+end
+
+--- The model group an entry stands for, for the UI and the config document. Nil for a
+--- name that is not an entry, so callers can tell "no entry" from "entry with nothing
+--- mapped" (the latter cannot be built: the validator requires a non-empty group).
+function _M.virtual_targets(model)
+    if type(model) ~= "string" or model == "" then return nil end
+    local profile = _M.current().virtual_profiles[model]
+    if type(profile) ~= "table" or type(profile.targets) ~= "table" then return nil end
+    local out = {}
+    for i = 1, #profile.targets do out[i] = profile.targets[i] end
     return out
 end
 
@@ -1885,44 +2237,13 @@ end
 --- Returns (snapshot, nil) or (nil, error).
 function _M.apply_profiles(entries)
     if not is_array(entries) then return nil, "virtual_models must be an array" end
-    local built = {}
-    for _, entry in ipairs(entries) do
-        if type(entry) ~= "table" then
-            return nil, "virtual model entries must be objects"
-        end
-        local alias = trim(type(entry.model) == "string" and entry.model or "")
-        local has_target = trim(type(entry.target) == "string" and entry.target or "") ~= ""
-        if alias == "" or (not has_target and not entry_has_bindings(entry)) then
-            return nil, "virtual model entries need both model and target"
-        end
-        local profile, perr = profile_from_entry(alias, entry)
-        if not profile then return nil, perr end
-        built[alias] = profile
-    end
-    -- Batch + existing-graph chain check (root ruling 4): an alias may never
-    -- point at another alias, whether declared in this batch or earlier.
-    for alias, profile in pairs(built) do
-        local cerr = assert_no_alias_chain(built, alias, profile.target)
-        if not cerr then
-            local existing = _M.current().virtual_models[profile.target]
-            if existing ~= nil then
-                cerr = string.format(
-                    "virtual model %s target must not be another virtual model: %s", alias, profile.target)
-            end
-        end
-        if not cerr then
-            cerr = assert_bindings_no_alias(built, _M.current().virtual_models, alias, profile)
-        end
-        if cerr then return nil, cerr end
-    end
+    -- The live graph participates in the chain check, so an entry cannot point at an
+    -- alias this batch does not declare (root ruling 4).
+    local built, berr = build_profiles(entries, _M.current().virtual_profiles)
+    if not built then return nil, berr end
     local cfg = _M.current()
-    local profiles, map = {}, {}
-    for alias, profile in pairs(built) do
-        profiles[alias] = profile
-        map[alias] = profile.target
-    end
-    cfg.virtual_profiles = profiles
-    cfg.virtual_models = map
+    cfg.virtual_profiles = built
+    sync_virtual_view(cfg)
     write_snapshot(snapshot_of(cfg))
     return snapshot_of(_M.current()), nil
 end
@@ -1945,6 +2266,20 @@ function _M.profile_for(model)
         return { target = target }
     end
     local out = { target = profile.target }
+    -- The entry carries its own client-facing name so the router can key policy state
+    -- by it (one entry, one affinity tree) without every call site threading the alias
+    -- through a second argument. The store is the only place that knows both.
+    out.model = model
+    -- explicit_targets rides along deliberately: the *derived* group exists for every
+    -- row (a legacy pair has the group of one it always was), and reading it as "this
+    -- entry is a group entry" would put the model gate and the single-tree policy key
+    -- onto configs that never asked for them. Only a row whose group the operator wrote
+    -- gets the new selection semantics; everything else keeps the old path verbatim.
+    out.explicit_targets = profile.explicit_targets or nil
+    -- The group rides the same fresh-copy rule as workers/candidates: the router reads
+    -- it per request and must not be able to write into the live snapshot through it.
+    if profile.targets then out.targets = { table.unpack(profile.targets) } end
+    out.context_window = profile.context_window
     if profile.workers then out.workers = { table.unpack(profile.workers) } end
     -- Bindings ride the same "fresh copy" rule as workers: the router reads them per
     -- request and must not be able to corrupt the live snapshot through the returned
@@ -1966,15 +2301,19 @@ function _M.profiles_list()
         -- the list handed to the UI / apply endpoint round-trips a candidates-only row
         -- without inventing a model name nobody configured.
         local entry = { model = alias }
+        if profile.explicit_targets and profile.targets then
+            entry.targets = { table.unpack(profile.targets) }
+        end
         if profile.candidates then
             if profile.explicit_target then entry.target = profile.target end
             entry.candidates = copy_bindings(profile.candidates)
-        else
+        elseif not profile.explicit_targets then
             entry.target = profile.target
         end
         if profile.workers then entry.workers = { table.unpack(profile.workers) } end
         entry.policy = profile.policy
         entry.effort = profile.effort
+        if profile.context_window then entry.context_window = profile.context_window end
         out[#out + 1] = entry
     end
     return out

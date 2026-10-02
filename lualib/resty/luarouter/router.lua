@@ -234,7 +234,12 @@ end
 -- Virtual-model profile hooks (doc/gap-virtual-models.md 3.3). The helpers
 -- call store(), so they are defined next to it further below; the names are
 -- forward declared here because policy_for already consults them.
-local profile_for_alias, profile_worker_list, profile_policy_name, profile_effort_value
+local profile_for_alias, profile_worker_list, profile_policy_name, profile_effort_value,
+    profile_model_group
+-- Called from policy_for, which sits a thousand lines above their definitions: without
+-- this forward declaration the reference compiles to a global read and the select path
+-- dies on a nil call at the first group request.
+local group_key_name, group_policy_hint
 
 local function policy_for(model, profile)
     local conf = cfg()
@@ -265,6 +270,27 @@ local function policy_for(model, profile)
             end
         end
         return inst
+    end
+    -- Group mode: the service entry, not any one of its models, owns the policy state
+    -- (one entry = one instance = one affinity tree). Two things have to be arranged for
+    -- that key to behave like a real model's:
+    --   * the hint has to come from the *group's* workers, since no worker advertises the
+    --     entry's name and policy_hint_for_model(entry) would always answer nil;
+    --   * has_workers is computed against the group rather than the entry name, so the
+    --     "last worker gone, forget the instance" rule still fires when the pool really
+    --     empties (a truthful signal) and does not fire merely because the entry name
+    --     never appears in a record (which would hand every entry the shared global
+    --     instance and silently pool two entries' affinity together).
+    local group = profile_model_group(profile)
+    if group then
+        local hint, live = group_policy_hint(group)
+        -- 第四个参数必须是布尔：policy.for_model 判定的是 has_workers == false，
+        -- 直接把 group_policy_hint 的**计数**递过去，数字永远不等于 false，「最后一个 worker
+        -- 走了就丢掉该实例」这条规则对组入口就永久失效——池子清空后入口仍抱着旧的策略实例
+        -- 与旧的亲和树，等 worker 带不同 labels.policy 回来时，新 hint 被旧实例盖住。
+        -- 组清空 → false（真的回收），组内有活 → true（不误收，因为入口名本身不在任何
+        -- record 里，按名字问会永远得到 0 而被误判成空池）。
+        return policy_mod.for_model(conf, group_key_name(profile, model), hint, live > 0)
     end
     local hint, count = registry.policy_hint_for_model(model)
     if not hint then
@@ -634,6 +660,55 @@ local function is_array_table(v)
     return n == #v
 end
 
+---The mapped model group of a profile (1 对多), or nil.
+---
+---Root ruling 2026-10-02 turns the virtual model into the *service entry point*: one
+---public name covers a group of real models and the policy picks among them. The store
+---normalizes every spelling (explicit targets, a lone legacy target, or the distinct
+---models of the per-candidate bindings) into this one array, so the router has exactly
+---one question to ask: which names does this entry stand for.
+---
+---Guards mirror profile_worker_list/profile_bindings: the store validated on write, so
+---this only keeps a hand-edited on-disk document from taking down the hot path. A row
+---whose shape is wrong yields nil, which means "not a group entry" and the request
+---routes on the pre-feature path rather than on half a declaration.
+---@param profile table|nil
+---@return string[]|nil group
+profile_model_group = function(profile)
+    if type(profile) ~= "table" then
+        return nil
+    end
+    -- Only a group the operator *wrote* selects like a group. The store derives a
+    -- one-element group for every legacy row (a lone target always had one), and reading
+    -- that as "group mode" would move the policy tree key and the engine model gate onto
+    -- configs that never asked for them -- a byte-for-byte behaviour change for existing
+    -- deployments, which the design red line forbids.
+    if profile.explicit_targets ~= true then
+        return nil
+    end
+    local raw = profile.targets
+    if not is_array_table(raw) or #raw == 0 then
+        return nil
+    end
+    local out, seen = {}, {}
+    for i = 1, #raw do
+        local model = raw[i]
+        if type(model) ~= "string" or model == "" then
+            return nil
+        end
+        if not seen[model] then
+            seen[model] = true
+            out[#out + 1] = model
+        end
+    end
+    if #out == 0 then
+        return nil
+    end
+    return out
+end
+
+_M.profile_model_group = profile_model_group
+
 ---Non-empty candidate whitelist of a profile, or nil (= full pool). The store
 ---validates the shape on write; the guards here only protect the hot path from
 ---a hand-edited document.
@@ -698,24 +773,21 @@ local function normalize_policy_name(value)
     return nil
 end
 
----Effective per-profile policy name, or nil (policy_for keeps its chain).
+---Effective per-profile policy name. Always nil since root ruling 2026-10-02 (see the
+---body): the routing page owns policy, so policy_for must not be handed an alias-level
+---override. The function stays because policy_for calls it on every request and unit
+---tests pin that the alias layer cannot come back through it.
 ---@param profile table|nil
----@return string|nil
+---@return nil
 profile_policy_name = function(profile)
     if type(profile) ~= "table" then
         return nil
     end
-    local named = normalize_policy_name(profile.policy)
-    if named then
-        return named
-    end
-    local store_mod = store()
-    if store_mod and type(store_mod.profile_policy) == "function" then
-        local ok, name = pcall(store_mod.profile_policy, profile)
-        if ok then
-            return normalize_policy_name(name)
-        end
-    end
+    -- Same ruling as profile_effort_value: scheduling policy is configured per model or
+    -- globally on the routing page (model_policies / policy), never on the service
+    -- entry. Ignoring both the field and the store reader is what makes the whole
+    -- mapped group route under *one* policy instance -- the prerequisite for affinity
+    -- and load-escape to hold across the group instead of inside each model.
     return nil
 end
 
@@ -745,28 +817,28 @@ local function normalize_effort_name(value)
     return nil
 end
 
----Effective per-profile effort. The store helper (when A ships one) gets both
----keys so it can prefer the alias spelling; the profile's own effort field is
----the fallback every path can take.
+---Effective per-profile effort. Always nil since root ruling 2026-10-02; kept as a
+---named seam because apply_effort_policy already threads the alias/resolved keys and a
+---future ruling that restores a *different* per-entry knob lands here rather than in
+---the ladder.
 ---@param profile table|nil
----@param alias string|nil @ client-facing name
----@param resolved string|nil @ upstream id the alias maps to
----@return string|nil
+---@param alias string|nil @ client-facing name (unused since the ruling)
+---@param resolved string|nil @ upstream id the alias maps to (unused since the ruling)
+---@return nil
 profile_effort_value = function(profile, alias, resolved)
     if type(profile) ~= "table" then
         return nil
     end
-    local store_mod = store()
-    if store_mod and type(store_mod.profile_effort) == "function" then
-        local ok, value = pcall(store_mod.profile_effort, alias, resolved)
-        if ok then
-            local named = normalize_effort_name(value)
-            if named then
-                return named
-            end
-        end
-    end
-    return normalize_effort_name(profile.effort)
+    -- Root ruling 2026-10-02 (虚拟模型语义反转): the effort ladder describes an
+    -- *engine*, and a virtual entry now spans several engines, so one per-entry effort
+    -- cannot be honest about any of them. It belongs on the model card, keyed by the
+    -- real model a request lands on (apply_effort_policy already looks it up there).
+    -- The stored field is still accepted and round-tripped so an old document keeps
+    -- validating -- and warns at parse time -- but nothing on this path consults it,
+    -- because a row nobody deleted must not keep enforcing a rule the design retired.
+    -- Both layers go: the profile field *and* the store reader below, which would
+    -- otherwise resolve the same alias from the live snapshot.
+    return nil
 end
 
 -- ------------------------------------------------------------------ raw JSON edits
@@ -1376,7 +1448,16 @@ _M.card_key_for = card_key_for
 ---@param profile table|nil
 ---@return string|nil
 local function profile_policy_model(profile)
-    if type(profile) ~= "table" or profile.candidates == nil then
+    if type(profile) ~= "table" then
+        return nil
+    end
+    -- A group entry has no single model to name (that is the whole point), and its
+    -- policy instance is keyed by the entry itself inside policy_for, so reporting a
+    -- model here would be both wrong and misleading to the caller.
+    if profile.explicit_targets == true then
+        return nil
+    end
+    if profile.candidates == nil then
         return nil
     end
     local allow, models = profile_bindings(profile)
@@ -1402,7 +1483,7 @@ _M.profile_policy_model = profile_policy_model
 -- here: a plain reference from forward() would compile to a *global* read and hand back
 -- nil at run time rather than failing at boot. Their definitions below assign to these
 -- names instead of declaring new locals.
-local apply_effort_policy, apply_ctx_cap
+local apply_effort_policy, apply_ctx_cap, entry_ctx_cap
 
 
 ---Model gate for one candidate: may this instance be handed a request for `want`?
@@ -1456,6 +1537,68 @@ local function candidate_may_serve(record, want)
     end
     return false
 end
+---What name the policy state of one selection pass is bucketed under.
+---
+---The entry's own client-facing name when this is a group pass (the callers hand the
+---requested name in), otherwise the resolved model id as before. Falls back to the
+---representative target when no client name is available (a direct callers such as the
+---/_ui chat path), so the bucket is still one stable string per entry.
+---@param profile table|nil
+---@param model string|nil
+---@return string
+group_key_name = function(profile, model)
+    -- The entry name first: it is one stable string per service entry, whereas the
+    -- resolved id is the group's *head*, which two entries could share by accident (and
+    -- then they would silently pool their affinity state).
+    if type(profile) == "table" and type(profile.model) == "string" and profile.model ~= "" then
+        return profile.model
+    end
+    if type(model) == "string" and model ~= "" then
+        return model
+    end
+    if type(profile) == "table" and type(profile.target) == "string" and profile.target ~= "" then
+        return profile.target
+    end
+    return "unknown"
+end
+
+---The labels.policy hint and live-worker count of a whole mapped group.
+---
+---Mirrors registry.policy_hint_for_model's rule ("the first worker of the model fixes
+---the policy"): the first *available* record that serves any model of the group wins, in
+---registry order, so the hint is stable while its workers are. Counting live members here
+---rather than passing a constant true keeps policy.for_model's eviction rule meaningful
+---for an entry name that no record carries.
+---@param group string[]
+---@return string|nil hint, number count
+group_policy_hint = function(group)
+    local records = registry.records()
+    local hint, count = nil, 0
+    for i = 1, #records do
+        local record = records[i]
+        local serves = false
+        for j = 1, #group do
+            if registry.candidate_allows_model(record, group[j]) then
+                serves = true
+                break
+            end
+        end
+        if serves then
+            count = count + 1
+            if hint == nil then
+                local labels = record.labels
+                if type(labels) == "table"
+                    and type(labels.policy) == "string" and labels.policy ~= "" then
+                    hint = labels.policy
+                end
+            end
+        end
+    end
+    return hint, count
+end
+
+_M.group_policy_hint = group_policy_hint
+
 ---Healthy, breaker-not-open workers that may take this request.
 ---
 ---One pass, three gates, ordered cheap-first:
@@ -1495,6 +1638,16 @@ local function candidates_for(model, profile, counted)
     local bound_allow, bound_models = profile_bindings(profile)
     local legacy_allow = profile_worker_list(profile)
     local allow = bound_allow or legacy_allow
+    -- Group mode (root ruling 2026-10-02): the entry stands for a set of real models,
+    -- and which one a candidate serves is a question for *that engine*, not a name the
+    -- operator wrote. Computed once per pass -- the group is a few strings and this loop
+    -- is the hot path, so the per-record membership test below stays a table lookup.
+    local group = profile_model_group(profile)
+    local in_group
+    if group then
+        in_group = {}
+        for i = 1, #group do in_group[group[i]] = true end
+    end
     -- Registry-side cap predicate (doc/gap-worker-caps.md). Read-only from here:
     -- the two numbers it compares are this gateway's own in-flight counter and
     -- gpu_load's watt samples, both maintained elsewhere. Absent (a stripped unit
@@ -1531,7 +1684,13 @@ local function candidates_for(model, profile, counted)
         -- cross-binding unconfigurable, which is the feature being asked for. The IGW
         -- narrowing, by contrast, is a guess about a client-supplied name, and a guess
         -- the engine has explicitly contradicted is worth 4xx-ing locally.
-        if keep and binding == nil and igw then
+        -- 组模式下这道门整个让位给下面的组门。客户端报的是入口名，而入口名不会
+        -- 出现在任何引擎的 /v1/models 里（引擎背书的是它所映射的实际模型名），照入口名
+        -- 去问引擎等于「凡是被引擎亲口答过的实例一律否掉」——enable_igw 一开就会
+        -- 把整组健康实例筛空，只剩从没被探过的那一行。组门问的才是正确的问题：这个候选
+        -- 能否提供组里的任一名（candidate_allows_model，未探过=可路由）。模型收窄没有被
+        -- 取消，只是换了问法：从「你叫这个名字吗」改成「这一组里有没有你能服务的」。
+        if keep and binding == nil and igw and not group then
             if not candidate_may_serve(record, model) then
                 keep = false
                 refused = refused + 1
@@ -1554,6 +1713,46 @@ local function candidates_for(model, profile, counted)
                 end
             end
         end
+        -- Group gate: ask the engine, never guess. A candidate stays if any model of
+        -- the group is one it will take; the *first* such name becomes the forwarding
+        -- binding. candidate_allows_model is deliberately the registry's fail-open
+        -- predicate -- false only when the engine answered /v1/models itself and its
+        -- list lacks the name -- so a worker nobody ever probed is not excluded for the
+        -- crime of being un-inspected (design red line: a probe failure may not cost
+        -- capacity).
+        if keep and group then
+            local serve, serving = nil, 0
+            for i = 1, #group do
+                if registry.candidate_allows_model(record, group[i]) then
+                    serving = serving + 1
+                    if serve == nil then
+                        serve = group[i]
+                    end
+                end
+            end
+            if serving == 0 then
+                keep = false
+                refused = refused + 1
+            else
+                -- An explicit binding is operator intent and outranks the engine's
+                -- answer, but only for a name inside the group (the store refuses the
+                -- others at write time, this guards a hand-edited document).
+                if binding ~= nil and not in_group[binding] then
+                    binding = serve
+                elseif binding == nil then
+                    -- Prefer the name the worker leads with: two candidates that both
+                    -- serve the whole group then disagree less often about which one is
+                    -- "their" model, and a worker serving the group through its primary
+                    -- name forwards the same id it advertises today.
+                    local primary = record.model_id
+                    if primary ~= nil and in_group[primary] and primary ~= "unknown" then
+                        binding = primary
+                    else
+                        binding = serve
+                    end
+                end
+            end
+        end
         if keep then
             -- The standalone policies read load and health off the worker itself
             -- (Rust reads them through Worker::load()/is_healthy()), so hand them a
@@ -1562,6 +1761,19 @@ local function candidates_for(model, profile, counted)
             record.load = registry.load(record.id)
             record.healthy = true
             record.lr_bound_model = binding
+            -- One entry, one affinity tree. The standalone policies bucket their state
+            -- by (pool, model) read off the *worker* (policies/cache_aware.lua
+            -- make_tree_key, prefix_hash/consistent_hashing ring keys, bucket keys), so
+            -- a group spanning two models would split into two trees whose tenant sets
+            -- never see each other -- affinity and load-escape would then hold *inside*
+            -- each model and fail across the group, which is exactly the thing this
+            -- feature is for. Stamping the entry name into the field they read makes the
+            -- whole group one pool. Forwarding is unaffected: it reads lr_bound_model,
+            -- which is always set for a group candidate (never the entry name), so no
+            -- request can be sent upstream under a name no engine knows.
+            if group then
+                record.model_id = group_key_name(profile, model)
+            end
             out[#out + 1] = record
         end
     end
@@ -1570,7 +1782,11 @@ local function candidates_for(model, profile, counted)
     -- cap", and how many the engine's own model answer refused. A second return is free
     -- for callers that ignore it (Lua truncates the tuple), which is why this is not
     -- module state that a retry or the request-log re-read would have to race with.
-    return out, { capped = capped, refused = refused }
+    -- group 旗标只服务 503 文案：组入口被引擎「答过、且都不服务这一组」时，沿用
+    -- 「全部熔断或不健康」是假的（它们健康，只是没有组里的名字）。legacy 路径不带
+    -- 这个旗标，所以旧文案一个字都不会变。
+    return out, { capped = capped, refused = refused,
+                  group = group ~= nil and true or nil }
 end
 
 local function compact_url(url)
@@ -2677,6 +2893,13 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
             if why ~= nil and why.capped > 0 and #candidates == 0 then
                 message = "No available workers (" .. tostring(why.capped)
                     .. " at their configured concurrency/power cap)"
+            elseif why ~= nil and why.group and why.refused > 0
+                and #candidates == 0 then
+                -- 组入口专属：这些实例是健康的，只是引擎答过「我不服务这一组里的任何
+                -- 模型」。沿用旧文案会把操作员支去查熔断与巡检，而真正该查的是 targets
+                -- 有没有写错名、或实例根本没加载那个模型。
+                message = "No available workers (" .. tostring(why.refused)
+                    .. " healthy engines serve none of the mapped models)"
             end
             return 503, error_body(503, "no_available_workers", message)
         end
@@ -2690,12 +2913,34 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
         -- this is the pre-feature expression verbatim -- worker.model_id, and no card
         -- rewrite at all on /generate.
         local bound = worker.lr_bound_model
+        -- rewrite_model takes the *forwarding* name, which must be a real engine model,
+        -- never the entry's own name: record.model_id was stamped with the entry name for
+        -- the policy tree (see candidates_for), so falling back to it here would send
+        -- `{"model":"<virtual-name>"}` upstream. lr_bound_model is set for every group
+        -- candidate, so a group request can never hit the fallback with a stamped record.
+        -- The forwarding name must be a real engine model, never the entry's own name:
+        -- record.model_id was stamped with the entry name for the policy tree, so a group
+        -- candidate must not fall back to it. It cannot: the group gate always resolves a
+        -- binding for a surviving candidate (either the operator's, or the first group
+        -- name the engine will take), so `bound` is set whenever the stamp is.
         local payload = rewrite_model(raw_body, bound or worker.model_id)
+        -- 组入口的日志必须说出「这一发到底落在哪个实际模型上」：行上的 model 是代表值
+        -- （组头），策略把它整组当一棵树，于是同一个入口的 N 发请求在日志里看起来一模一样。
+        -- 这个字段只记录、不参与任何转发决策（转发名就是上面 rewrite 用的那个）。
+        -- legacy 路径下它等于选中实例自己的 model_id，与旧行为一致，只是多了一个可查字段。
+        ngx.ctx.lr_forwarded_model = bound or worker.model_id
         if cards then
             local key = card_key_for(profile, model, worker, bound)
             local effort_raw, requested_effort, effective_effort =
                 apply_effort_policy(payload, body, key, profile, alias)
-            payload = (apply_ctx_cap(effort_raw, body, key))
+            -- Two clamp sources, one winner: the entry's own context_window (uniform for
+            -- the whole group, decided without looking at the pick) and, below it, the
+            -- card of the model this attempt lands on. The entry level exists because the
+            -- client must see one context budget for one service name whichever engine
+            -- answers; the card level stays because a plain request naming a real model
+            -- has no entry above it at all.
+            local entry_cap = entry_ctx_cap(profile)
+            payload = (apply_ctx_cap(effort_raw, body, key, entry_cap))
             -- The last attempt's numbers are the ones logged, because that is the
             -- exchange the client actually received.
             ngx.ctx.lr_requested_effort = requested_effort
@@ -2946,16 +3191,51 @@ apply_effort_policy = function(raw, body, model, profile, alias)
     return set_top_field(raw, "reasoning_effort", effective), requested, effective
 end
 
+---The entry-level context clamp for one virtual model, or nil.
+---
+---nil is not a missing value, it is the answer "this request has no service entry above
+---it": a plain request naming a real model, or a legacy row that declared nothing. The
+---store decides the precedence (explicit context_window wins, otherwise the minimum over
+---the mapped group) and returns nil for a group of one, which is what keeps every
+---pre-group config clamping off this path entirely.
+---@param profile table|nil
+---@return number|nil cap
+entry_ctx_cap = function(profile)
+    if type(profile) ~= "table" then
+        return nil
+    end
+    local store_mod = store()
+    if not store_mod or type(store_mod.virtual_ctx_cap) ~= "function" then
+        return nil
+    end
+    local ok, cap = pcall(store_mod.virtual_ctx_cap, profile)
+    if ok and type(cap) == "number" and cap >= 1 then
+        return cap
+    end
+    return nil
+end
+
 ---Rust apply_ctx_cap: clamp max_tokens and its alias to the model context cap.
 ---Absent fields are written too, matching `current.is_none_or(|v| v > cap)`.
+---
+---Two clamp sources with a fixed precedence: the virtual-model entry's own cap wins over
+---the card of the model this attempt lands on, and when the entry speaks it speaks alone
+---(no second, per-pick min/max afterwards) because the whole point of the entry-level
+---override is that the client sees one budget for one service name. With no entry cap the
+---`entry` argument is nil and the expression is the pre-feature one verbatim.
+---@param entry number|nil @ entry-level uniform cap, preferred over the model card
 ---@return string raw, number|nil cap
-apply_ctx_cap = function(raw, body, model)
+apply_ctx_cap = function(raw, body, model, entry)
     local store_mod = store()
     if not store_mod or type(store_mod.ctx_cap) ~= "function" then
         return raw, nil
     end
-    local ok, cap = pcall(store_mod.ctx_cap, model)
-    if not ok or type(cap) ~= "number" or cap < 1 then
+    local cap = entry
+    if cap == nil then
+        local ok, model_cap = pcall(store_mod.ctx_cap, model)
+        cap = ok and model_cap or nil
+    end
+    if type(cap) ~= "number" or cap < 1 then
         return raw, nil
     end
     for _, field in ipairs({ "max_tokens", "max_completion_tokens" }) do
@@ -3026,6 +3306,9 @@ local function route_inference(route, body, raw)
     -- here so a retried request cannot inherit a stale value from the attempt before.
     ngx.ctx.lr_requested_effort = nil
     ngx.ctx.lr_effort = nil
+    -- 落点模型与 effort 同理：由 forward() 在选中实例之后盖章，末次尝试说了算。
+    -- 不清零的话，一次重试落到别的模型上会留下上一次那一发的落点名。
+    ngx.ctx.lr_forwarded_model = nil
 
     -- Only extract routing text when the policy reads it: the flattening walks
     -- every message, which random / round_robin / the hash ring never look at.
@@ -3217,17 +3500,42 @@ local function inject_virtual_models(data)
         seen[data[i].id] = true
     end
     for i = 1, #aliases do
-        local alias, target = aliases[i][1], aliases[i][2]
+        -- aliases[i] is {alias, targets...}: a variable-length row, one entry per model
+        -- the service stands for. Reading only [2] (the old single target) would
+        -- advertise an entry as if it were one engine, which is the semantics that just
+        -- got retired.
+        local alias = aliases[i][1]
+        local tail = {}
+        for j = 2, #aliases[i] do
+            tail[#tail + 1] = tostring(aliases[i][j])
+        end
         if not seen[alias] then
             -- A real worker keeps the name; the alias is dropped rather than
-            -- duplicating the id, which would break clients that key on it.
+            -- duplicating the id, which would break clients that key on it. Under the
+            -- group semantics a worker can legitimately *be* one of the mapped models
+            -- while the entry name is still unique, so this rule stays as-is: it guards
+            -- the entry's own id, not the group members'.
             seen[alias] = true
-            data[#data + 1] = {
+            local entry = {
                 id = alias,
                 object = "model",
                 created = 0,
-                owned_by = "llm-router->" .. tostring(target),
             }
+            if #tail == 1 then
+                -- One model behind the entry: exactly the pre-group answer, byte for
+                -- byte, so clients (and the contract) that read owned_by as "which
+                -- engine this alias stands for" keep working for legacy rows.
+                entry.owned_by = "llm-router->" .. tail[1]
+            else
+                -- A real group: the gateway owns the entry and the models behind it
+                -- belong to whichever engines serve them. Naming one of them would
+                -- advertise the entry as that single model's alias again, which is the
+                -- semantics that just got retired; the full list rides a separate field
+                -- so the pinned OpenAI-shaped owned_by keeps its old meaning.
+                entry.owned_by = "llm-router"
+                entry.owned_by_models = tail
+            end
+            data[#data + 1] = entry
         end
     end
     table.sort(data, function(a, b)
@@ -4147,6 +4455,9 @@ local function log_inference_request(duration_s, ttft_s)
         model = model,
         requested_model = ngx.ctx.lr_requested_model or model,
         requested_effort = ngx.ctx.lr_requested_effort or cjson.null,
+        -- 转发给上游的实际模型名。1 对多之后它与 model 可以不同（model 是入口代表值），
+        -- 排查「这个入口的流量有没有跑到预期的那个模型上」全靠它；缺省场景两者相等。
+        forwarded_model = ngx.ctx.lr_forwarded_model or cjson.null,
         effort = ngx.ctx.lr_effort or cjson.null,
         provider = labels.engine or "sglang",
         worker = compact_url(worker.url),
@@ -4386,6 +4697,8 @@ _M.inference_handler = inference_handler
 _M.route_inference = route_inference
 _M.apply_effort_policy = apply_effort_policy
 _M.apply_ctx_cap = apply_ctx_cap
+_M.entry_ctx_cap = entry_ctx_cap
+_M.group_key_name = group_key_name
 _M.forward = forward
 _M.stream_response = stream_response
 _M.request_id = request_id

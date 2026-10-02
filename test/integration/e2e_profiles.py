@@ -15,11 +15,18 @@
                    vm-w  白名单=worker1 规范化 url → 20 发只落 worker1；转发 body 的
                          model 是 target 真名 alpha
                    vm-i  白名单=worker2 的 id      → 12 发只落 worker2（id 形态）
-                   vm-b  policy=prefix_hash        → SMG_PREFIX_TOKEN_COUNT 钉到共享
-                         前缀长度，20 发全砸一个 mock；对照 model=alpha（全局
-                         round_robin）同形状流量必须摊开——唯一变量是 profile.policy
-                   vm-c  effort=high               → 不带 reasoning_effort 的请求被
-                         改写注入 high；对照 alpha 的请求体没有这个键
+                   vm-b  policy=prefix_hash        → root ruling 2026-10-02 起
+                         per-alias policy 停用：字段仍被接受并在文档回显（后面那条
+                         断言钉住），但热路径不许再看它——同形状 20 发必须像对照
+                         模型一样摊开，route_type 全是当前生效策略，且解析期 warn
+                   vm-gp 组入口（显式 targets）+ model_policy[入口名]=prefix_hash
+                         → 停用字段的替代入口仍然生效：20 发全砸一个 mock、
+                         route_type 全 prefix_hash、GET /_ui/config/policy 列出
+                         入口那一行 source=model；同时 model=alpha 同形状流量必须
+                         仍摊开（入口级覆盖不得泄漏到真实模型上）
+                   vm-c  effort=high               → 同 ruling 停用：请求体不再被
+                         注入 reasoning_effort；按引擎配 model_effort（模型卡）才是
+                         注入的正确来源——配上则别名请求注入 high，清掉回到不注入
                    vm-g  target=remote-g           → POST /workers 带 api_key 的
                          gated worker 走白名单：200 + mock 的 /last_auth 记录
                          Authorization == "Bearer sk-G-123"
@@ -234,6 +241,36 @@ def post_apply(port, doc):
     return post_json(port, "/_ui/config/apply", doc)
 
 
+def post_effort(port, patch):
+    return post_json(port, "/_ui/config/effort", patch)
+
+
+def put_policy(port, patch):
+    """PUT /_ui/config/policy {policy?, model_policies?, model_policy?}.
+
+    The routing page is the *only* place a scheduling policy is configured since
+    root ruling 2026-10-02 removed the per-alias override, so the replacement-entry
+    case has to go through this endpoint rather than through virtual_models.
+    """
+    st, body, _ = http("PUT", "http://127.0.0.1:%d/_ui/config/policy" % port, patch)
+    try:
+        return st, json.loads(body)
+    except ValueError:
+        return st, body
+
+
+def policy_rows(port):
+    """GET /_ui/config/policy -> {model: row} of the per-model chain document."""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config/policy" % port)
+    if st != 200:
+        return {}
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return {}
+    return {r.get("model"): r for r in as_list(doc.get("models"))}
+
+
 def rc_count(resp, key):
     """reconcile.added/updated/removed/skipped -- number, or len of a name list."""
     rec = resp.get("reconcile") if isinstance(resp, dict) else None
@@ -307,6 +344,18 @@ def watch_metrics(port):
     return "\n".join(l for l in text.splitlines() if l.startswith("lr_watch"))
 
 
+def logs_all(name):
+    """Whole container log, undecorated.
+
+    _lib.logs() keeps the last 6000 characters, which is right for "did anything
+    abort" but useless for a one-shot line the operator sees once per config write:
+    every request also writes an access-log line, so a warn emitted at POST time is
+    pushed out of that window by the traffic the scenario fires afterwards. Parse
+    warnings are asserted against the full log for that reason."""
+    r = subprocess.run(["docker", "logs", name], capture_output=True)
+    return r.stderr.decode("utf-8", "replace") + "\n" + r.stdout.decode("utf-8", "replace")
+
+
 # ==================================================== S1 whitelist / policy / effort
 def scenario_whitelist():
     pa, pb, pg = free_port(), free_port(), free_port()
@@ -377,24 +426,92 @@ def scenario_whitelist():
     ca, cb = hits(pa, pb, ba, bb)
     check("[S1] control: global round_robin spreads identical prefixes (%d/%d)" % (ca, cb),
           ca > 0 and cb > 0, "a=%d b=%d" % (ca, cb))
+    # ---- per-alias policy is retired (root ruling 2026-10-02) ------------------
+    # vm-b still *declares* policy=prefix_hash. What the suite pins now is that the
+    # hot path ignores it: identical-prefix traffic must spread exactly like the
+    # round_robin control a few lines above, and every logged row must name the
+    # *effective* policy (the env default), never the retired per-alias one. The
+    # field's own survival is a separate check below (document echoes it), so the
+    # pair together say "accepted, remembered, not obeyed".
     ba, bb = mock_lines(pa, "/v1/chat/completions"), mock_lines(pb, "/v1/chat/completions")
     fire(port, "vm-b", 20)
     ha, hb = hits(pa, pb, ba, bb)
-    check("[S1] vm-b profile policy=prefix_hash sticks 20/20 (%d/%d)" % (ha, hb),
-          ha + hb == 20 and max(ha, hb) == 20, "a=%d b=%d" % (ha, hb))
+    check("[S1] retired per-alias policy does not steer: vm-b spreads (%d/%d)" % (ha, hb),
+          ha + hb == 20 and ha > 0 and hb > 0, "a=%d b=%d" % (ha, hb))
     types = route_types(port, "vm-b")
-    check("[S1] every logged vm-b row says route_type prefix_hash",
-          bool(types) and len(types) >= 15 and all(t == "prefix_hash" for t in types),
+    check("[S1] vm-b rows report the effective policy, not prefix_hash",
+          bool(types) and len(types) >= 15 and all(t == "round_robin" for t in types),
           json.dumps(types[:10]))
+    check("[S1] the retired policy warns at parse time instead of dying silently",
+          "declares policy=prefix_hash" in logs_all(name), logs_all(name)[-400:])
 
+    # ---- the replacement entry still works: model_policies on the *entry* name --
+    # Per-alias policy is gone, but "give this service entry its own policy" is a
+    # legitimate demand and the routing page answers it: policy instances are keyed
+    # by the entry name (router.group_key_name), so model_policies[entry] is what
+    # steers a virtual model. Without this case the *capability* would be untested
+    # the moment the old spelling stopped working.
+    st, resp = post_profiles(port, profiles5 + [
+        {"model": "vm-gp", "targets": ["alpha"], "workers": [url_a, url_b]}])
+    check("[S1] a group entry (explicit targets) is accepted", st == 200,
+          "%s %s" % (st, str(resp)[:250]))
+    st, resp = put_policy(port, {"model_policy": {"model": "vm-gp", "policy": "prefix_hash"}})
+    check("[S1] model_policies can pin the entry name to prefix_hash", st == 200,
+          "%s %s" % (st, str(resp)[:250]))
+    rows = policy_rows(port)
+    gp_row = rows.get("vm-gp") or {}
+    check("[S1] the routing page lists the entry row with source=model",
+          gp_row.get("effective") == "prefix_hash" and gp_row.get("source") == "model",
+          json.dumps(gp_row)[:250])
+    ba, bb = mock_lines(pa, "/v1/chat/completions"), mock_lines(pb, "/v1/chat/completions")
+    fire(port, "vm-gp", 20)
+    ha, hb = hits(pa, pb, ba, bb)
+    check("[S1] entry-level prefix_hash sticks 20/20 (%d/%d)" % (ha, hb),
+          ha + hb == 20 and max(ha, hb) == 20, "a=%d b=%d" % (ha, hb))
+    gp_types = route_types(port, "vm-gp")
+    check("[S1] every logged vm-gp row says route_type prefix_hash",
+          bool(gp_types) and len(gp_types) >= 15 and all(t == "prefix_hash" for t in gp_types),
+          json.dumps(gp_types[:10]))
+    # The override is scoped to the entry name: the real model under it must keep
+    # routing on the env default, otherwise "one knob for one entry" is a lie and a
+    # model-wide stickiness was smuggled in through the alias.
+    ba, bb = mock_lines(pa, "/v1/chat/completions"), mock_lines(pb, "/v1/chat/completions")
+    fire(port, "alpha", 24)
+    ca, cb = hits(pa, pb, ba, bb)
+    check("[S1] the entry override does not leak onto its own model (%d/%d)" % (ca, cb),
+          ca > 0 and cb > 0, "a=%d b=%d" % (ca, cb))
+    st, resp = put_policy(port, {"model_policy": {"model": "vm-gp", "policy": None}})
+    check("[S1] clearing the entry override is accepted", st == 200,
+          "%s %s" % (st, str(resp)[:200]))
+
+    # ---- per-alias effort is retired; the model card is the live source ---------
     st, body, _ = chat(port, "vm-c", "effort probe")
     echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
-    check("[S1] vm-c profile effort=high injects reasoning_effort",
-          st == 200 and echo.get("reasoning_effort") == "high", json.dumps(echo)[:250])
+    check("[S1] retired per-alias effort injects nothing",
+          st == 200 and echo.get("reasoning_effort") in (None, ""), json.dumps(echo)[:250])
+    check("[S1] the retired effort warns at parse time instead of dying silently",
+          "declares effort=high" in logs_all(name), logs_all(name)[-400:])
     st, body, _ = chat(port, "alpha", "effort control")
     plain = json.loads(body).get("echo_body", {}) if st == 200 else {}
     check("[S1] control model carries no reasoning_effort",
           st == 200 and plain.get("reasoning_effort") in (None, ""), json.dumps(plain)[:250])
+    # The ladder lives on the *engine* now (a virtual entry spans N engines, so one
+    # per-entry effort cannot be honest about any of them): key it on the model the
+    # request lands on and the same alias request must get the injection.
+    st, resp = post_effort(port, {"model_effort": [{"model": "alpha", "effort": "high"}]})
+    check("[S1] model_effort on the engine card is accepted", st == 200,
+          "%s %s" % (st, str(resp)[:200]))
+    st, body, _ = chat(port, "vm-c", "effort via card")
+    echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
+    check("[S1] the engine card injects reasoning_effort through the alias",
+          st == 200 and echo.get("reasoning_effort") == "high", json.dumps(echo)[:250])
+    st, resp = post_effort(port, {"model_effort": []})
+    check("[S1] clearing the card turns the injection off again", st == 200,
+          "%s %s" % (st, str(resp)[:200]))
+    st, body, _ = chat(port, "vm-c", "effort after clear")
+    echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
+    check("[S1] with no card configured the alias request stays clean",
+          st == 200 and echo.get("reasoning_effort") in (None, ""), json.dumps(echo)[:250])
 
     reset_mock(pg)
     st, body = chat_until(port, "vm-g", "remote key probe")

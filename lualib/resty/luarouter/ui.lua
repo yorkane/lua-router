@@ -215,17 +215,34 @@ function _M.models()
         end
     end
     if store_ok then
-        for _, pair in ipairs(store.virtual_models_list()) do
-            local alias, target = pair[1], pair[2]
+        -- virtual_models_list() 现在是「变长行」：{ alias, 实际模型... }。1 对多之后
+        -- 只读 [2] 会把整组入口重新标成「某一个模型的别名」——那正是本轮退役掉的旧语义。
+        -- 单模型行保持 "llm-router-><model>" 逐字节不变（picker 与契约钉的是 legacy 形状）；
+        -- 多模型行改标网关自己拥有，并把整组放进 owned_by_models 供 UI 展示。
+        for _, row in ipairs(store.virtual_models_list()) do
+            local alias = row[1]
+            local tail = {}
+            for j = 2, #row do
+                local m = row[j]
+                if type(m) == "string" and m ~= "" then tail[#tail + 1] = m end
+            end
             if not seen[alias] then
                 seen[alias] = true
-                data[#data + 1] = {
+                local entry = {
                     id = alias,
                     object = "model",
                     created = 0,
-                    owned_by = "llm-router->" .. target,
                     status = { value = "loaded" },
                 }
+                if #tail == 1 then
+                    entry.owned_by = "llm-router->" .. tail[1]
+                elseif #tail > 1 then
+                    entry.owned_by = "llm-router"
+                    entry.owned_by_models = tail
+                else
+                    entry.owned_by = "llm-router"
+                end
+                data[#data + 1] = entry
             end
         end
     end

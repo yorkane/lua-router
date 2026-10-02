@@ -3,7 +3,7 @@
 > 本文是架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略子系统、周边集成、
 > 部署形态与测试框架。计数对应 2026-10-01 当前 main 树：15 个 Lua 模块 + policies/ 6 文件 /
 > 24 417 行、单测 10 文件、契约 650 项 / 23 段、21 门禁全绿（日志
-> `/data/tmp/lr-gates/gates-20261001-214729.log`）。裁剪判定与执行记录见
+> `/data/tmp/lr-gates/gates-20261002-030544.log`）。裁剪判定与执行记录见
 > [scope-trim.md](scope-trim.md)；已删平面的描述在 git 历史，本文只描述现状。
 
 ## 0. 定位与全景
@@ -117,11 +117,11 @@ sequenceDiagram
 
 | 模块 | 行数 | 职责 | 被谁接线 |
 |---|---:|---|---|
-| router.lua | 4409 | 入口与总装：路由表、转发泵、重试、/_ui 处理、metrics handler、DP rank 注入；候选装配 `candidates_for` 的门序（健康→白名单/绑定→模型许可→容量硬排除）与 per-attempt 卡片解析 | init.lua / 各 conf 的 *_by_lua |
-| config_store.lua | 2864 | 热配置：别名/profile（含 `candidates` 多绑定与其校验）/upstreams（含每服务上限声明）/effort/ctx/policy（`LMR_CONFIG_FILE` 原子落盘 + shdict 快照） | router/init |
+| router.lua | 4722 | 入口与总装：路由表、转发泵、重试、/_ui 处理、metrics handler、DP rank 注入；候选装配 `candidates_for` 的门序（健康→白名单/绑定→模型许可→容量硬排除→**组门**：组条目改问「这一组里有没有你能服务的」并就地定下转发绑定）与 per-attempt 卡片解析 | init.lua / 各 conf 的 *_by_lua |
+| config_store.lua | 3203 | 热配置：虚拟模型 1 对多（`targets` 组 + 派生组三档回退 + `explicit_*` 旗标 + `virtual_models` 降级为派生只读视图）+ 条目级 `context_window` 覆盖与校验/upstreams（含每服务上限声明）/effort/ctx/policy（`LMR_CONFIG_FILE` 原子落盘 + shdict 快照） | router/init |
 | registry.lua | 2795 | worker 注册表（shdict 持久）、健康状态、`/model_info` 元数据发现、DP 展开 url@rank、负载字段折叠、**每服务上限判定 `capacity_exclusion`**、`models`/`models_verified` 覆盖度 | router/hb/mesh/watcher |
 | mesh.lua | 2525 | HA gossip：成员表、快照同步、/ha/* 端点、身份统一（sync_with 并键）、suspect/down 状态机 | init 定时器 |
-| watcher.lua | ~2.2k（描述性，非计数口径） | 进程内服务发现：targets/docker.sock/proc 三源、严格 /v1/models 探针、十条守卫（1-9 移植自 Python 守护进程，第 10 条=探针确认不可用即按分档摘除，见 gap-watcher-merge.md §1.1）、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
+| watcher.lua | 2362（描述性，非计数口径） | 进程内服务发现：targets/docker.sock/proc 三源、严格 /v1/models 探针、十条守卫（1-9 移植自 Python 守护进程，第 10 条=探针确认不可用即按分档摘除，见 gap-watcher-merge.md §1.1）、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
 | observability.lua | 1460 | Prometheus 家族渲染（HELP/TYPE 对齐 Rust）、请求日志环形缓冲、inflight 年龄槽表 | router/metrics handler |
 | gpu_load.lua | 1721 | GPU 负载源：worker /metrics 抓取 + 远程 Prometheus 查询，写 registry 负载字段；**第三条通道**顺带采回绝对瓦特（`pw:`，只服务 `max_power_w`，不参与 0..1 打分） | hb 定时器挂载 |
 | hash.lua | 964 | BLAKE3 环位（与 Rust 逐位兼容）、ketama 序、粘滞键 | consistent_hashing/prefix_hash |
@@ -130,7 +130,7 @@ sequenceDiagram
 | init.lua | 547 | fork 前接线：env 快照、hb/watcher/mesh/负载定时器（worker0 + lr_locks 单飞）、on_log 兜底 | nginx init_by_lua |
 | hb.lua | 396 | 健康巡检定时器 + 熔断计数 + /v1/loads 扇出 | init 定时器 |
 | config.lua | 394 | env→配置对象 | 全模块 |
-| ui.lua / props.lua | 331/225 | /_ui API 别名、/props 快照 | ui.conf include |
+| ui.lua / props.lua | 348/225 | /_ui API 别名、/props 快照 | ui.conf include |
 | limit.lua | 209 | 全局并发闸门 + 排队（shdict 计数） | router access |
 
 依赖方向自上而下单向：conf → init → router →（policy/registry/hb/limit/watcher/gpu_load/mesh/…）
@@ -153,7 +153,7 @@ sequenceDiagram
 
 | 字典 | 大小 | 内容 | 写者 |
 |---|---|---|---|
-| lr_workers | 2m | worker 记录（URL/模型/覆盖度 `models`+`models_verified`/健康/熔断/元数据/负载字段）与数值键 `lo:`（本网关在飞）/`xl:`/`sl:`（外部负载）/`pw:`（毫瓦功率样本，TTL）/`mp:`+`mpok:`（覆盖度探针预算），registry 每次读写整表 JSON | registry/hb/watcher/mesh/gpu_load |
+| lr_workers | 2m | worker 记录（URL/模型/覆盖度 `models`+`models_verified`/健康/熔断/元数据/负载字段/上限 `max_concurrency`+`max_power_w`/来源 `discovery`）与数值键 `lo:`（本网关在飞）/`xl:`/`sl:`（外部负载）/`pw:`（毫瓦功率样本，TTL）/`mp:`+`mpok:`（覆盖度探针预算），registry 每次读写整表 JSON。**本轮无新增 shdict 键**：虚拟模型的组与上限一律随记录 JSON 与 `luarouter_config` 快照走 | registry/hb/watcher/mesh/gpu_load |
 | lr_policy | 20m | 策略态：manual 粘滞键、routing key 计数、cache_aware 树快照 | policy |
 | lr_stats | 5m | 计数器/直方图/inflight 年龄槽表（1024 定长槽） | observability |
 | lr_request_log | 20m | 请求日志环形缓冲（/_ui/logs 与 SSE 源） | router log 阶段 |
@@ -172,10 +172,13 @@ P1+P2 ≈45–65%）。
 挑目标；`hb` 先过滤不健康/熔断中的 worker；失败回退序在 router 层（重试换 worker）。策略可经
 `/_ui/config` 热切换（全局 + per-model，免重启，见 [gap-routing-dyn.md](gap-routing-dyn.md)）。
 
-候选集层面先于策略的两道门（`router.candidates_for`，策略零改动）：**模型许可**（IGW 只收窄未绑定候选，
-显式绑定不受探针否决）与**每服务容量硬排除**（`registry.capacity_exclusion`）。后者必须是排除而不是打分，
-因为 cache_aware 命中亲和时按 URL 直取 tenant、完全不看负载——「超限但粘人」的 worker 会把这条规则想搬走
-的流量原样留下；唯一不会与之打架的位置就是让它根本进不了候选数组。见 [gap-worker-caps.md](gap-worker-caps.md) §1。
+候选集层面先于策略的门，按 `candidates_for`（`router.lua:1634`）里的实际顺序：
+**健康与池成员**（`registry.is_available`）→ **白名单/绑定**（legacy `workers` 与 `candidates` 并存时取交集）
+→ **模型许可**（IGW 只收窄未绑定候选，显式绑定不受探针否决）→ **每服务容量硬排除**
+（`registry.capacity_exclusion`）→ **组门**（`router.lua:1723`，只作用于组条目；此时 IGW 那道门整个让位，
+条件里多了 `and not group`，`router.lua:1693`）。容量那条必须是排除而不是打分，因为 cache_aware 命中亲和时
+按 URL 直取 tenant、完全不看负载——「超限但粘人」的 worker 会把这条规则想搬走的流量原样留下；唯一不会与之
+打架的位置就是让它根本进不了候选数组。见 [gap-worker-caps.md](gap-worker-caps.md) §1。
 
 路由文本抽取契约（策略稳定键的来源）：messages 按 system/user/tool/developer 序拼 content、
 assistant 含 `reasoning_content`、数组 content 只取 `{type=text}` 片段以单空格拼接、
@@ -193,6 +196,22 @@ assistant 含 `reasoning_content`、数组 content 只取 `{type=text}` 片段�
 per-model policy hint：worker 注册元数据可携带策略提示（`metadata.policy`），`policy_for` 按
 模型解析——这是 P2 CPU 项的来源之一（见 parity-cpu-ablation.md）。
 
+### 6.1 虚拟入口一棵树（用户裁定 2026-10-02）
+
+组模式（`profile.explicit_targets == true`，`profile_model_group` `router.lua:677`）下**策略实例的 key
+用入口名而不是任一成员模型名**（`policy_for` 的组分支 `router.lua:284-293`，键由 `group_key_name`
+`router.lua:1549` 给出）。理由：`policies/` 一律按 worker 的 (pool, model) 分桶——cache_aware 的
+`make_tree_key`（`policies/cache_aware.lua:31`）、consistent_hashing/prefix_hash 的环键、bucket 的桶键都读
+`utils.worker_model_id`（`policies/utils.lua:369`）——一个跨两个模型的入口会裂成两棵互不相见的树，
+亲和与负载逃逸就只在各自模型内成立、跨组失效，而这正是本功能存在的意义。落法是候选装配处把整组
+盖成同一个池：组候选写 `record.model_id = 入口名`（`router.lua:1775`），`policies/` 依旧零改动。
+hint 来自整组的活成员（`group_policy_hint` `router.lua:1574`），且第四参数必须是布尔 `live > 0`——
+把计数直接递给 `policy.for_model` 会让「最后一个 worker 走了就丢弃该实例」永久失效。
+
+per-alias 的 `policy`/`effort` 停用之后，「给这个入口换策略」只剩 `model_policies` 一条路，而策略实例
+的 key 恰是入口名，所以入口名也进 `policy_document`（`config_store.lua:1991` 补进行集）——否则路由
+策略页永远列不出入口那一行，最关键的调度开关反而没有 UI 入口。
+
 ## 7. 周边集成
 
 | 系统 | 方向 | 机制与注意 |
@@ -200,7 +219,8 @@ per-model policy hint：worker 注册元数据可携带策略提示（`metadata.
 | 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | worker 0 三源发现（targets/dockersock/proc）、严格 `/v1/models` 探针、十条守卫、宽限期；独立容器已退役。探针确认不可用按分档摘除：确定性否定当轮摘、传输层未知攒 `SMG_WATCHER_PROBE_FAILURES`(2) 轮再摘、单轮摘除超 owned 一半降级为只 warn。测试 mock 仍会短暂入池，根治需端口黑白名单（见 [gap-watcher-merge.md](gap-watcher-merge.md)） |
 | GPU 负载源 | worker/监控 → registry | `gpu_load.lua` 两路：抓 worker `/metrics` 的 DCGM 类指标 + 远程 Prometheus 查询；keep-last/grace。这类**转发路径上的**探测失败只损失选路精度、不参与摘除判定（摘除分档只属于上一行的 watcher 严格探针，见 agent-handover.md §4），详见 [gap-gpu-load.md](gap-gpu-load.md) |
 | 每服务容量上限（新增） | 操作员配置 + 两个实时读数 → 选路 | `registry.capacity_exclusion`（`lo:` 本网关在飞计数 / `pw:` gpu_load 采到的毫瓦）在 `router.candidates_for` 装配候选时**硬排除**：超限的 worker 进不了候选数组，即使 cache_aware 亲和命中也迁走；不摘 worker、不改健康。**读数未知 → 不排除**（`pw:` 缺席=未知≠0，监控故障只许损失精度不许损失容量）。全场都在上限上时 fail-closed 503 `no_available_workers`（不放宽），message 追加「N at their configured concurrency/power cap」以区分「池子空了」与「池子满了」。指标 `smg_worker_capacity_excluded_total{reason}`（Lua 独有超集，Rust 无此能力）。见 [gap-worker-caps.md](gap-worker-caps.md) |
-| 虚拟模型多绑定（新增） | config → 选路与改写 | `virtual_models` 条目的 `target` 变可选、新增 `candidates:[{worker, model?}]`：一个别名可把不同实例绑到相同或不同的上游模型，转发体的 `model` 与 effort/ctx 卡都跟着**选中候选的绑定名**走。worker 记录多 `models`（主模型恒居首）与 `models_verified`（只有引擎 `/v1/models` 答过的才盖章；手填/声明不盖章 → 不构成排除依据）。旧形状原样兼容。见 [gap-virtual-models.md](gap-virtual-models.md) §8 |
+| 虚拟服务入口 1 对多（2026-10-02 语义反转） | config → 选路与改写 | 虚拟名是**对下游暴露的服务主入口**，`targets[]` 映射一组实际模型（1..N，可来自不同上游），由**调度策略在组内选路**；**策略 key 用入口名**，一入口一棵树（`policies/` 零改动），亲和与逃逸在这一组实际模型之间成立而非按模型名分裂。条目级只允许配 `context_window`：显式配置恒定生效（对下游统一），未配取**整组卡片最小值**。per-alias `policy`/`effort` 停用（仍往返、热路径不读），改由 `model_policies`（按入口名）与模型卡承担。旧形状（`{model,target}` / candidates-only / env）由 `explicit_targets` 旗标保证逐字节不变（`profile_model_group` `router.lua:677`、组门 `router.lua:1723`、条目级 clamp `config_store._M.virtual_ctx_cap` `config_store.lua:1826`、转发名取 `lr_bound_model`：读 `router.lua:2915`、改写 `router.lua:2926`）。见 [gap-virtual-models.md](gap-virtual-models.md) |
+| 管理台页面合并（2026-10-02） | 操作员 → /_ui/admin | **服务池 = 运行态池 + 声明层同页**：`ui/admin/workers.html` 把 `GET /workers`（3s 轮询）与 `GET /_ui/config` 的 `upstreams` 段（20s 轮询）按规范化 URL（折叠尾斜杠 + 大小写）全外合并，一个地址一行；原「远程服务/服务接入」（`ui/admin/upstreams.html`）缩成重定向占位以保住旧链接并消灭「同一份声明层被两个页面各自整表替换」的分叉。上限的**事实来源是声明层**：`cap_owner === 'declared'` 当且仅当有声明且（未入池或池行 `discovery === 'config'`）——因为 `reconcile_upstreams`（`config_store.lua:2501`）只 patch config 行，「同地址被 watcher 抢先认领 → 声明惰性」是稳态；这类行的**运行态编辑入口整体隐藏**（不止上限），理由是 `upstream_drifts`（`config_store.lua:2422`）连 priority/cost/labels 一起比较并写回。这类行打三态徽章 `cap_drift`（等自愈·与声明不一致）/`cap_shadowed`（声明管不到这行）/`key_inert`（声明里的 api_key 此刻没下发）。导航按使用频度重排为**模型管理 → 服务池 → 路由策略 → 日志**（`ui/admin/app.js:14`），历史锚点 `#upstreams.html` 经 `legacyPages`（`ui/admin/app.js:16`）落到合并页；模型页改名**「模型管理」**（`ui/admin/models.html`：虚拟模型入口页，也是全仓最常用的配置页，虚拟模型卡片排在页面最上面）。见 [gap-pool-merge.md](gap-pool-merge.md) |
 | mesh peer | router↔router | `SMG_MESH_PEERS` 种子 + gossip 同步 worker 视图；身份统一由 sync_with 并键（幻影键已修，mesh_two 门钉住）；`/_mesh/internal/*` 无鉴权，只能开在可信网络 |
 | authz 边缘 | client→router | 生产经隧道域名时 authz 闸门加会话登录或 x-api-key；网关自身零鉴权，全部端点开放 |
 

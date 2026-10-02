@@ -1,14 +1,19 @@
 /*
   lua-router 管理控制台 · 主壳
 
-  与 authz/admin 同构：左侧 q-drawer 菜单 + 右侧 iframe 承载独立应用页
-  （workers.html / models.html / routing.html / logs.html），页面自带内联逻辑，壳只负责
-  导航、语言广播与网关健康摘要。零 Vue Router：#锚点 记录当前页，刷新可恢复。
+  与 authz/admin 同构：左侧 q-drawer 菜单 + 右侧 iframe 承载独立应用页，页面自带内联逻辑，
+  壳只负责导航、语言广播与网关健康摘要。零 Vue Router：#锚点 记录当前页，刷新可恢复。
+
+  页序按使用频度排（root 裁定 2026-10-02）：模型管理 → 服务池 → 路由策略 → 日志监控。
+  「远程服务/服务接入」已并入服务池（workers.html 同时呈现运行态池行与声明层条目），
+  旧的 #upstreams.html 锚点仍接受，落到合并后的服务池页。
 */
 const { computed, onBeforeUnmount, onMounted, ref } = Vue
 
-// 五个管理页 + 原版聊天界面（跳出壳，新标签打开）
-const pages = ['workers.html?v=1', 'upstreams.html?v=1', 'models.html?v=1', 'routing.html?v=1', 'logs.html?v=1']
+// 四个管理页 + 原版聊天界面（跳出壳，新标签打开）
+const pages = ['models.html?v=2', 'workers.html?v=2', 'routing.html?v=2', 'logs.html?v=2']
+// 已合并页面的历史锚点：命中即落到合并后的页面，而不是 404 回首页
+const legacyPages = { 'upstreams.html': pages[1] }
 
 function hashTarget () {
   const raw = String(window.location.hash || '').replace(/^#/, '')
@@ -24,7 +29,8 @@ function resolvePage (target) {
   if (!target) return ''
   const wanted = urlBase(target)
   const hit = pages.find(page => urlBase(page) === wanted)
-  return hit || ''
+  if (hit) return hit
+  return legacyPages[wanted] || ''
 }
 
 const app = Vue.createApp({
@@ -54,11 +60,10 @@ const app = Vue.createApp({
           id: 'gateway',
           label: dict.groupManagement,
           items: [
-            { id: 'workers', page: pages[0], icon: 'mdi-server-network', label: dict.workers, note: dict.workersTitle },
-            { id: 'upstreams', page: pages[1], icon: 'mdi-cloud-plus-outline', label: dict.upstreams, note: dict.upstreamsTitle },
-            { id: 'models', page: pages[2], icon: 'mdi-sitemap', label: dict.models, note: dict.modelsTitle },
-            { id: 'routing', page: pages[3], icon: 'mdi-call-split', label: dict.routing, note: dict.routingTitle },
-            { id: 'logs', page: pages[4], icon: 'mdi-text-box-search-outline', label: dict.logs, note: dict.logsTitle }
+            { id: 'models', page: pages[0], icon: 'mdi-sitemap', label: dict.models, note: dict.modelsTitle },
+            { id: 'workers', page: pages[1], icon: 'mdi-server-network', label: dict.workers, note: dict.workersTitle },
+            { id: 'routing', page: pages[2], icon: 'mdi-call-split', label: dict.routing, note: dict.routingTitle },
+            { id: 'logs', page: pages[3], icon: 'mdi-text-box-search-outline', label: dict.logs, note: dict.logsTitle }
           ]
         },
         {
@@ -109,11 +114,10 @@ const app = Vue.createApp({
 
     function syncFrameTitle () {
       const dict = window.lmrI18n.messages[locale.value].shell
-      if (activeApp.value.startsWith(pages[0])) activeTitle.value = dict.workers
-      else if (activeApp.value.startsWith(pages[1])) activeTitle.value = dict.upstreams
-      else if (activeApp.value.startsWith(pages[2])) activeTitle.value = dict.models
-      else if (activeApp.value.startsWith(pages[3])) activeTitle.value = dict.routing
-      else if (activeApp.value.startsWith(pages[4])) activeTitle.value = dict.logs
+      if (activeApp.value.startsWith(pages[0])) activeTitle.value = dict.models
+      else if (activeApp.value.startsWith(pages[1])) activeTitle.value = dict.workers
+      else if (activeApp.value.startsWith(pages[2])) activeTitle.value = dict.routing
+      else if (activeApp.value.startsWith(pages[3])) activeTitle.value = dict.logs
       else activeTitle.value = dict.frameTitle
     }
 
