@@ -4329,9 +4329,40 @@ local function metrics_handler()
         "text/plain; version=0.0.4; charset=utf-8")
 end
 
----GET /_ui/logs?cursor=&limit= - the ring buffer as JSON, oldest first.
+---GET /_ui/logs?cursor=&limit=&model=&forwarded_model=&worker=&status=
+---    &route_type=&stream=&since_ms=&until_ms=&session=
+---
+---The ring buffer as JSON, oldest first. Every filter is optional and
+---omitting all of them keeps the response byte-identical to the
+---cursor+limit shape this route had before filtering existed.
+---
+---A bad parameter is a 400, never a silently empty array: a UI that cannot
+---tell "nothing matched" from "you typed the filter wrong" will show
+---the user an empty table and send them looking for a data problem.
 local function ui_logs_handler(params, ctx, req)
     local query = req.get_query()
+    local filter, bad_param, bad_msg = observability.parse_query(query)
+    if bad_param then
+        return send_error(400, "BAD_REQUEST",
+            tostring(bad_param) .. ": " .. tostring(bad_msg))
+    end
+    if filter then
+        local head, requests, meta = observability.query(filter, query.cursor, query.limit)
+        if #requests == 0 then
+            requests = cjson.empty_array
+        end
+        return {
+            cursor = head,
+            capacity = observability.log_capacity(),
+            requests = requests,
+            returned = meta.returned,
+            total_matched = meta.total_matched,
+            earliest_seq = meta.earliest_seq,
+            latest_seq = meta.latest_seq,
+            truncated_buffer = meta.truncated_buffer,
+            truncated_page = meta.truncated_page,
+        }
+    end
     local cursor = tonumber(query.cursor) or 0
     local limit = tonumber(query.limit) or 500
     local head, requests = observability.snapshot(cursor, limit)

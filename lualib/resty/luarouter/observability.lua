@@ -1283,7 +1283,8 @@ end
 ---@param filter table @ as produced by parse_query
 ---@param cursor number
 ---@param limit number
----@return table doc
+---@return table doc @ {cursor, capacity, requests, returned, total_matched,
+---  earliest_seq, latest_seq, truncated_buffer, truncated_page, next_cursor}
 function _M.query(filter, cursor, limit)
     local d = logdict()
     local head = d:get("head") or 0
@@ -1316,11 +1317,16 @@ function _M.query(filter, cursor, limit)
         -- 写入量超过容量 = 有比 earliest_seq 更早的行被覆盖掉过。
         truncated_buffer = head > capacity,
         truncated_page = false,
+        -- 翻页游标：把它原样当 cursor 传回来就是「下一页」。只有 truncated_page
+        -- 为真时才有意义，但缺了它，前端拿到「还有下一页」也无处可去。
+        next_cursor = start - 1,
     }
     if start > head then
         -- 游标越过保留区（缓冲被覆盖，或 head 仍是 0）：保留区塌成空，避免 UI 画出
-        -- earliest > latest 这种反着的区间。
+        -- earliest > latest 这种反着的区间；next_cursor 保持调用方给的游标，
+        -- 不后退（后退会让无脑循环把同一段重读一遍）。
         doc.earliest_seq = head
+        doc.next_cursor = cursor
         doc.requests = cjson.empty_array
         return doc
     end
@@ -1338,7 +1344,9 @@ function _M.query(filter, cursor, limit)
                 if doc.returned < limit then
                     doc.returned = doc.returned + 1
                     doc.requests[doc.returned] = record
+                    doc.next_cursor = seq
                 else
+                    -- 命中数已经越过本页页长：后面还有，前端据 next_cursor 续问。
                     doc.truncated_page = true
                 end
             end
