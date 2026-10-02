@@ -204,3 +204,41 @@ hinted 之类，端口是高位随机数，进程早已不存在（ps 查 mock_l
    Codex with a ChatGPT account"——直连同样报，所以是上游自身约束（该账号不支持这些模型），
    不是网关改写出的问题。它 /v1/models 广告的 16 个模型里只有一部分可实际调用。
 
+## 生产 235.t :8800 部署 lua-router:8800-20261002-9（2026-10-02）
+
+虚拟模型语义反转（服务入口 1 对多）+ 服务池页合并上线。compose 只换镜像，**没有新增任何
+env**（功率通道仍未在 235.t 启用）。回滚：把 compose 镜像改回
+`lua-router:8800-20261002-8`（或更早的 `8800-20261001-8`）再 compose up -d。
+
+### 真机验证：1 对多与 context_window 统一口径
+
+生产 `virtual_models` 部署前是空数组，所以这次可以自由构造。建了一个入口：
+
+    {"model":"team-chat","targets":["q38fn","llm-248/Q38-Flash-Next"],"context_window":32000}
+
+- **1 对多组内选路**：6 个请求全部 200，落点在两个**不同上游的不同实际模型**之间调度
+  （4 次 Q38-Flash-Next、2 次 q38fn），正是「虚拟名是主入口、策略在组内选」的语义。
+- **context_window 对下游统一**（决定性证据）：把入口的 context_window 改成 8，再用
+  max_tokens=999999 请求，三次全部 `finish_reason=length` 且恰好输出 8 token
+  —— 无论落到组内哪台实例，钳制都是 8。这就是「对下游保持统一」：同一个入口、同一个
+  上限，与选中哪个实际模型无关。改回 32000 后恢复正常。
+- `/\_ui/logs` 的 `forwarded_model` 字段生效：同一个入口的行能看到各自落在哪个实际模型上
+  （`model` 列是组头代表值，`forwarded_model` 是真实落点）。
+- 配置回显无损：`targets` 两项与 `context_window` 原样返回，**没有长出幻影 `target`**。
+- 验证完已把 `team-chat` 清回，生产不留示例配置（`virtual_models: []`，upstreams 保持
+  217 那条原有声明，q38fn 推理 200）。
+
+### 验收
+
+health OK；2 个 worker 全部 `smg_worker_health=1`、`cb_state=0`；q38fn 推理 200；
+管理台 / 模型管理页 / 服务池页均 200；旧的 upstreams.html 走重定向也是 200（不 404）。
+
+### 又一次踩到：重启后需等一个巡检周期
+
+`SMG_HEALTH_CHECK_INTERVAL_SECS=30` + `health_success_threshold=2`，所以重启后第一个
+巡检周期内请求会回 503。上游直连 health 200、熔断 closed、容器日志无 error——别把这个
+当成部署失败，等约 60s 再判断。
+
+本轮没有再出现 61 → 2 那种僵尸池大清理：第 10 条守卫已在 `-8` 那轮把测试 mock 残留清掉，
+这次部署前后都是 2 个真实上游。
+
