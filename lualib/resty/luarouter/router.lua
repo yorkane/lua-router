@@ -4351,21 +4351,11 @@ local function ui_logs_handler(params, ctx, req)
             tostring(bad_param) .. ": " .. tostring(bad_msg))
     end
     if filter then
-        local head, requests, meta = observability.query(filter, query.cursor, query.limit)
-        if #requests == 0 then
-            requests = cjson.empty_array
+        local doc = observability.query(filter, query.cursor, query.limit)
+        if #doc.requests == 0 then
+            doc.requests = cjson.empty_array
         end
-        return {
-            cursor = head,
-            capacity = observability.log_capacity(),
-            requests = requests,
-            returned = meta.returned,
-            total_matched = meta.total_matched,
-            earliest_seq = meta.earliest_seq,
-            latest_seq = meta.latest_seq,
-            truncated_buffer = meta.truncated_buffer,
-            truncated_page = meta.truncated_page,
-        }
+        return doc
     end
     local cursor = tonumber(query.cursor) or 0
     local limit = tonumber(query.limit) or 500
