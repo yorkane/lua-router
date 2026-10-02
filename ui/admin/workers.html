@@ -120,7 +120,9 @@
                       <div>
                         <strong>{{ props.row.url }}</strong>
                         <span>{{ props.row.id || props.row.url }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span></span>
-                        <span v-if="coveredModels(props.row).length" class="mono" style="font-size:11px">{{ t.servedModels }} {{ coveredModels(props.row).join(', ') }}</span>
+                        <div v-if="coveredModels(props.row).length" class="served-models" style="margin-top:4px">
+                          <span class="model-tag" v-for="m in coveredModels(props.row)" :key="m">{{ m }}</span>
+                        </div>
                         <q-badge v-if="modelsVerifiedOf(props.row) !== null" outline
                                  :color="modelsVerifiedOf(props.row) ? 'teal-4' : 'grey-6'" class="chip-soft"
                                  :label="modelsVerifiedOf(props.row) ? t.modelsVerified : t.modelsDeclared"></q-badge>

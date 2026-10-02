@@ -166,6 +166,13 @@ tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); paddin
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .code-pill { padding: 3px 7px; border: 1px solid rgba(139, 145, 184, .12); border-radius: 7px; background: #1a1d2e; color: #c7cad9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .chip-soft { border-radius: 7px; font-size: 11.5px; }
+/* 标签/模型列表：允许换行，行高加大，避免把表格宽度撑破 */
+.label-cell { display: flex; flex-wrap: wrap; gap: 4px; max-width: 100%; }
+.label-cell .q-chip { margin: 0; }
+/* 模型列表：一行一个模型名，或逗号分隔但允许断行 */
+.served-models { display: flex; flex-wrap: wrap; gap: 4px; }
+.served-models .model-tag { display: inline-block; padding: 1px 6px; background: rgba(139,145,184,.12); border-radius: 6px; font-size: 11px; }
+
 .json-ta { width: 100%; min-height: 300px; padding: 10px 12px; border: 1px solid var(--line-strong, rgba(139, 145, 184, .22)); border-radius: 10px; background: #171a29; color: #d9dbe7; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; }
 .empty-state { display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--muted); font-size: 13px; padding: 26px 0; }
 
