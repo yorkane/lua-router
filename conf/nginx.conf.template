@@ -21,6 +21,9 @@
 # 两个都可省略：默认按 Rust 的 20 s 采样、槽位 TTL 3600 s。
 env LR_INFLIGHT_SAMPLE_SECS;
 env LR_INFLIGHT_TTL_SECS;
+# 按虚拟入口/实际模型/服务聚合的指标族（smg_entry_* / smg_worker_requests_total）。
+# 缺省开启；LR_MODEL_METRICS=off 是高基数逃生阀：写侧停写、抓取侧按族名前缀过滤。
+# 漏声明会被 nginx 的 env 白名单静默忽略（读不到值也不报错），所以三份 conf 必须同步。env LR_MODEL_METRICS;
 
 # 进程内 watcher（doc/gap-watcher-merge.md，独立 llm-watcher 守护进程的合并形态）：
 # SMG_WATCHER_* 由 resty.luarouter.config 在 init_by_lua 里解析（与其余 SMG_* 同一
