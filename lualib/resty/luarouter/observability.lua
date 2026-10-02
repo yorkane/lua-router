@@ -558,6 +558,171 @@ end
 
 -- ------------------------------------------------------------------ metric API
 
+-- -------------------------------------------------- 入口 × 落点模型 × 服务维度
+--
+-- 既有族按 model 记，而 1 对多之后那个 model 是**入口的代表值**（组头）：同一个虚拟入口
+-- 的 N 发请求在旧族里长得一模一样，「这个入口的流量有没有跑到预期的那台服务上」在指标
+-- 上读不出来（日志行有 forwarded_model，指标族没有对应维度）。这六个族补的就是这一格：
+-- entry 是客户端命名的服务入口，model 是选中候选的绑定名（实际落点），worker 是服务地址。
+--
+-- 两条口径刻意分开记账：worker 维度按 **attempt** 记（每次真实发出 +1，重试与熔断逃逸
+-- 各算一发），entry 维度按**最终结果**只记一次（2xx）。两者相除才是重试/逃逸放大率，
+-- 混进同一个口径这个数就永远算不出来。
+--
+-- 维度全部自取 ngx.ctx（lr_requested_model / lr_forwarded_model / lr_worker），router.lua
+-- 只在 send_attempt 里加了一行 record_worker_attempt，其余入口都寄生在既有 record_* 上，
+-- 所以这一组族的调用点与既有族完全一致，不存在「新族有数据、旧族没数据」的错位。
+
+local ENTRY_FAMILY_PREFIX = "smg_entry_"
+local ATTEMPT_FAMILY = "smg_worker_requests_total"
+
+-- 逃生阀的状态：nil 表示还没读过环境。与 LR_INFLIGHT_* 同一顾虑 —— worker 环境在 fork
+-- 之后被 nginx 重建，只有 conf 里 env 声明过的名字读得到（三份 conf 已声明 LR_MODEL_METRICS），
+-- 缺省（未声明/未设）按开启处理，这样老部署的行为一字不变。
+local model_metrics_conf = { enabled = nil }
+
+---按入口/模型/服务聚合的六个族是否写。off 之外的一切取值都算开启（与 config.bool 相反，
+---因为这里的语义是「例外关闭」而不是「显式打开」）。
+---@return boolean enabled
+function _M.model_metrics_enabled()
+    if model_metrics_conf.enabled == nil then
+        local value = os.getenv("LR_MODEL_METRICS")
+        if type(value) == "string" then
+            value = value:lower()
+        end
+        model_metrics_conf.enabled = not (value == "off" or value == "0"
+            or value == "false" or value == "no")
+    end
+    return model_metrics_conf.enabled
+end
+
+---测试/复位用：清掉进程内的开关读数（线上没有调用点，关掉再打开开关要靠 reload）。
+function _M.reset_model_metrics_switch()
+    model_metrics_conf.enabled = nil
+end
+
+--- 归一（高基数的唯一防线）：model/entry 是**客户端可控**的字符串，直接进标签等于让它
+--- 决定 series 数 —— 一个脚本轮换 1000 个假模型名就能把 lr_stats 的 LRU 打穿，连带把
+--- 既有族的 counter 一起蒸发。所以只认「网关说过的名字」：虚拟入口名 ∪ 注册模型名，
+--- 其余一律记 other。
+---
+--- 名字集合取 config_store.models_document()：那已经是「注册（引擎/配置报过的）∪ 卡片 ∪
+--- 入口名」的合并视图，本模块自己不再拼一遍 registry 与 config 的两张表，也不再摆一层
+--- 副本缓存（它是内存快照的读出，config_store 内部已有 SNAPSHOT_TTL 与 shdict 层）。
+--- 落点模型必然出自这个集合（请求只能落在引擎承认的模型上），所以 other 只在客户端乱传
+--- 名字时出现，它本身就是「这个入口收到了不认识的名字」的信号。
+local OTHER = "other"
+
+---本请求的已知名字集合。缓在 ngx.ctx 而不是模块变量：一个请求要为六个族做近十次归一，
+---每来一次请求重新读一遍 config_store（reload 之后自然跟上新的入口/注册表）。
+---@return table @ @[model] = true
+local function known_name_set()
+    local ctx = ngx and ngx.ctx
+    if type(ctx) == "table" and type(ctx.lr_metric_names) == "table" then
+        return ctx.lr_metric_names
+    end
+    local set = {}
+    local ok, store = pcall(require, "resty.luarouter.config_store")
+    if ok and type(store) == "table" and type(store.models_document) == "function" then
+        local read_ok, rows = pcall(store.models_document)
+        if read_ok and type(rows) == "table" then
+            for i = 1, #rows do
+                local row = rows[i]
+                local name = type(row) == "table" and row.model or nil
+                if type(name) == "string" and name ~= "" then
+                    set[name] = true
+                end
+            end
+        end
+    end
+    if type(ctx) == "table" then
+        ctx.lr_metric_names = set
+    end
+    return set
+end
+
+---@param value any
+---@return string
+local function known_name(value)
+    if type(value) ~= "string" or value == "" then
+        return OTHER
+    end
+    local set = known_name_set()
+    if set[value] then
+        return value
+    end
+    return OTHER
+end
+
+---本请求的三个维度：入口名、落点模型（回退到入口代表值）、端点标签。
+---@return table ctx, string entry, string model, string endpoint
+local function request_dims()
+    local ctx = ngx and ngx.ctx
+    if type(ctx) ~= "table" then
+        ctx = {}
+    end
+    local endpoint = type(ctx.lr_endpoint) == "string" and ctx.lr_endpoint or "other"
+    return ctx, known_name(ctx.lr_requested_model),
+        known_name(ctx.lr_forwarded_model or ctx.lr_model), endpoint
+end
+
+---一次**真实发出**的 upstream attempt（不是最终结果）：调用点是 router.lua 的 send_attempt，
+---重试与熔断逃逸的每一发都在这里，因此 N 发 attempt 只对应一次 entry 记账。
+---worker 用带 scheme 的完整 url，与 smg_worker_cb_* 的 worker 标签同一拼法，两个族才能在
+---Grafana 里按同一个键叠在一起。
+---@param worker table|nil @ 选中的记录（send_attempt 的参数）；缺失时回退 ngx.ctx.lr_worker
+function _M.record_worker_attempt(worker)
+    if not _M.model_metrics_enabled() then
+        return
+    end
+    local ctx, _, model, endpoint = request_dims()
+    local url = type(worker) == "table" and worker.url or nil
+    if type(url) ~= "string" and type(ctx.lr_worker) == "table" then
+        url = ctx.lr_worker.url
+    end
+    if type(url) ~= "string" or url == "" then
+        return
+    end
+    _M.counter("smg_worker_requests_total", {
+        { "endpoint", endpoint }, { "model", model }, { "worker", url },
+    })
+end
+
+---入口维度的一次性记账，挂在 record_router_duration 上（router.lua 只在选中 worker 且
+---2xx 时才调它，正好就是「最终成功服务」的口径）。
+---@param seconds number
+---@param endpoint string|nil @ 调用点传的端点标签，缺省回退 ngx.ctx
+local function note_entry_request(seconds, endpoint)
+    if not _M.model_metrics_enabled() then
+        return
+    end
+    local ctx, entry, model, label = request_dims()
+    if type(endpoint) == "string" and endpoint ~= "" then
+        label = endpoint
+    end
+    _M.counter("smg_entry_requests_total", {
+        { "endpoint", label }, { "entry", entry }, { "model", model },
+        { "streaming", ctx.lr_stream == true and "true" or "false" },
+    })
+    _M.observe("smg_entry_request_duration_seconds",
+        { { "entry", entry }, { "model", model } }, seconds)
+    -- ttft 与 tpot 走同一批读数（lr_ttft / lr_tokens），和 smg_router_ttft_seconds 的
+    -- 来源一致，区别只在标签：这里按 入口×落点 分，于是「换一台服务首字慢多少」可读。
+    local ttft = tonumber(ctx.lr_ttft)
+    if ttft then
+        _M.observe("smg_entry_ttft_seconds",
+            { { "entry", entry }, { "model", model } }, ttft)
+        local tokens = ctx.lr_tokens
+        local completion = type(tokens) == "table" and tonumber(tokens[2]) or 0
+        if completion > 1 then
+            -- 与既有 tpot 同式：(总时长 - ttft) / (输出 token - 1)，饱和相减。
+            _M.observe("smg_entry_tpot_seconds",
+                { { "entry", entry }, { "model", model } },
+                math.max(0, seconds - ttft) / (completion - 1))
+        end
+    end
+end
+
 ---Layer 1: a request hit the router.
 function _M.record_http_request(method, path)
     _M.counter("smg_http_requests_total",
@@ -611,6 +776,9 @@ function _M.record_router_duration(model, endpoint, seconds)
     }, seconds)
     local ttft = ngx.ctx.lr_ttft
     local tokens = ngx.ctx.lr_tokens
+    -- 入口维度（新族）搭这同一班车：调用点 router.lua 已经保证「选中了 worker 且回 2xx」，
+    -- 于是 smg_entry_requests_total 天然就是「最终成功服务」的口径，不需要在这里再看状态码。
+    note_entry_request(seconds, endpoint)
     if ttft and type(tokens) == "table" and (tonumber(tokens[2]) or 0) > 1 then
         -- saturating subtract, as Rust does: a response whose last chunk lands in
         -- the same clock tick as the first records 0 rather than being skipped.
@@ -673,6 +841,15 @@ function _M.record_router_tokens(model, endpoint, token_type, count)
         { "router_type", "http" }, { "backend_type", "regular" },
         { "model", model }, { "endpoint", endpoint }, { "token_type", token_type },
     }, count)
+    -- 同一份读数的入口×落点视角：token_type 沿用 prompt/completion/cached/reasoning 的
+    -- 既有取值（doc/gap-token-accounting.md 的口径），新族只换维度、不改统计口径。
+    if _M.model_metrics_enabled() then
+        local _, entry, entry_model, label = request_dims()
+        _M.counter("smg_entry_tokens_total", {
+            { "endpoint", endpoint or label }, { "entry", entry },
+            { "model", entry_model }, { "token_type", token_type },
+        }, count)
+    end
 end
 
 ---Did the gateway have to ask the backend for a usage frame on the client's
