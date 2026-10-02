@@ -242,3 +242,27 @@ health OK；2 个 worker 全部 `smg_worker_health=1`、`cb_state=0`；q38fn 推
 本轮没有再出现 61 → 2 那种僵尸池大清理：第 10 条守卫已在 `-8` 那轮把测试 mock 残留清掉，
 这次部署前后都是 2 个真实上游。
 
+## 健康巡检优化 + 日志查询过滤（lua-router:8801-20261002-6，2026-10-02）
+
+两个改动一起上线：
+
+### 1. 健康巡检跳过最近有流量的服务
+
+- registry 新增 last_active_at（K_ACTIVE 键，请求完成时 touch）
+- check_all 跳过 SMG_HEALTH_CHECK_IDLE_SECS（缺省 300s）内有流量的 worker
+- 流量就是健康的证明：有请求经过的 worker 不需要额外探活
+- 设为 0 或负数 = 不跳过（兼容旧行为）
+- 探活开关仍是 SMG_DISABLE_HEALTH_CHECK，未改动
+
+### 2. /_ui/logs 查询过滤
+
+带过滤参数时返回完整元信息：returned / total_matched / earliest_seq / latest_seq /
+truncated_buffer / truncated_page。不带过滤参数时返回体逐字节不变。
+
+过滤参数（全部精确匹配，非法值 400）：
+model（虚拟入口名，匹配 requested_model 或 model）、forwarded_model、worker、
+status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、session。
+
+**踩过的坑**：/_ui/logs 被 conf/ui.conf 的 location 接管，调用的是 observability.handle_logs()，
+不是 router.lua 的 ui_logs_handler。改 handler 没用，必须改 handle_logs()。
+
