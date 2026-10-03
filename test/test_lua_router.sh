@@ -2109,8 +2109,12 @@ if section ui_fixed; then
     request "$UI_BASE" GET /_ui/
     assert_eq "/_ui/ serves the SPA" "$STATUS" "200"
     assert_contains "/_ui/ is html" "$CONTENT_TYPE" "text/html"
-    request "$UI_BASE" GET /_ui/logs.html
-    assert_eq "/_ui/logs.html status" "$STATUS" "200"
+    # The legacy tool pages are gone (doc/ui-trim-legacy-pages.md): the admin
+    # console covers them, so each must now answer from the static 404 sink.
+    for gone in /_ui/logs.html /_ui/metrics.html /_ui/config.html /_ui/lmr-tabs.js; do
+        request "$UI_BASE" GET "$gone"
+        assert_eq "$gone is removed" "$STATUS" "404"
+    done
     request "$UI_BASE" GET /_ui/definitely-missing.js
     assert_eq "/_ui/ static miss is 404" "$STATUS" "404"
 fi

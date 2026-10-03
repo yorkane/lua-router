@@ -1,6 +1,6 @@
 -- Request log ring buffer, sliding-window stats and Prometheus text export.
 --
--- Field names and metric names are the wire contract with ui/logs.html and the
+-- Field names and metric names are the wire contract with ui/admin/logs.html and
 -- Grafana dashboards that already target the Rust gateway, so both are copied
 -- from gateway/src/observability/{request_log,metrics}.rs rather than invented.
 --

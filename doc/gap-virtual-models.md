@@ -162,7 +162,10 @@ per-alias `policy` / `effort` 的停用是**读侧**的（热路径不读），*
 - effort：`model_effort`（按落点模型名）→ 模型卡 `model_configs[].effort`
 - policy：`model_policies`（**按虚拟入口名**，因为策略实例的 key 就是入口名）→ 全局 `policy`
 
-## 8. JSON 编辑（config.html）
+## 8. JSON 编辑（现位于 `ui/admin/models.html` 的「配置 JSON」对话框）
+
+> 2026-10-03：原 `ui/config.html` 已随根目录工具页移除（doc/ui-trim-legacy-pages.md），
+> 本节的 JSON 视图整体迁到管理台模型管理页；`GET /_ui/config` 与 `POST /_ui/config/apply` 不变。
 
 `/\_ui/config` 的 JSON 视图是权威面：
 - `vmRow` **不再白名单取键**，未知键与形状非法的已知键一律进 `row.extra` 原样带回——

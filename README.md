@@ -18,14 +18,14 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261002-030544.log`（串行独占，**20 passed /
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261003-034756.log`（串行独占，**21 passed /
 0 failed / 0 skipped**）。代码基线：Lua 24 417 行 / 15 个模块 + policies/ 6 文件、单测 10 文件。
 
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
 | unit | luajit 8 + resty 1 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 267 / gpu_load 274 / routing_dyn 122 / profiles 619 / caps_routing 64；resty 侧 integration 125（全部 0 failed） |
-| contract | **650 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
+| contract | **653 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
 | e2e_stateful | 91 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
 | e2e_policies | 65 / 0 | 各策略真流量 + `LMR_MODEL_CTX` clamp |
@@ -42,8 +42,8 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | e2e_caps | 120 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务并发/功率上限（到限即迁走、读数缺失不排除、上限不摘健康、缺省零变化） |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
-契约 650 的 23 段构成：gate 3、public 30、workers 75、inference 38、headers 13、mesh 44、
-not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 57、tls_upstream 11、
+契约 653 的 23 段构成：gate 3、public 30、workers 75、inference 38、headers 13、mesh 44、
+not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 60、tls_upstream 11、
 cb_race 6、igw 7、discovery 5、prometheus 14、probes 29、cors 37、virtual_models 15、ratelimit 14、
 inflight_age 32、tls_server 19、profiles_upstreams 64。
 
@@ -57,7 +57,7 @@ inflight_age 32、tls_server 19、profiles_upstreams 64。
 | `docker-entrypoint.sh` | env 校验 → envsubst → `openresty -t` → exec；缺省策略 `cache_aware`；cache_aware 或 mesh 开启且未显式给 `NGINX_WORKER_PROCESSES` 时把 worker 数收到 1；渲染独立 metrics 监听（缺省 `:29000`，`SMG_METRICS_PORT=0` 关闭） |
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` 门 |
 | `lualib/resty/luarouter/` | 实现（15 模块 + policies/ 6 文件）：router / init / registry / watcher / gpu_load / policy / hb / config_store / config / observability / mesh / hash / limit / ui / props，全部接进请求路径 |
-| `ui/` | 原版 llama.cpp webui（`/_ui/`）+ `ui/admin/`（Quasar UMD 管理台四页：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`logs-inject.js` 向原版 webui 注入 Logs/Admin 入口 |
+| `ui/` | 原版 llama.cpp webui（`/_ui/`）+ `ui/admin/`（Quasar UMD 管理台四页：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`） |
 | `test/final_gates.sh` | 21 门串行硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING`） |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），23 段 |
 | `test/unit/` | 纯 Lua 单测 10 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径 |

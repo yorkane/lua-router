@@ -65,7 +65,8 @@ lualib/resty/luarouter/  15 模块 + policies/（6 个复杂策略文件；rando
 ui/                  原版 llama.cpp webui（/_ui/）+ ui/admin/（Quasar UMD 管理台四页，中英双语：
                      模型管理/服务池/路由策略/日志；upstreams.html 只剩重定向占位，服务池同页呈现
                      运行态池 + 声明层，上限以声明为准、cap_owner==='declared' 的行隐藏运行态编辑入口）
-  logs-inject.js     向原版 webui 左导航注入 Logs/Admin 入口（MutationObserver 防抖判重模式，别破坏）
+  admin-inject.js    向原版 webui 左导航注入 Admin 入口（MutationObserver 防抖判重模式，别破坏；
+                     旧 Logs 入口随根目录工具页移除，差异记录见 doc/ui-trim-legacy-pages.md）
 conf/                nginx.conf.template（生产模板，envsubst）+ lua-router.conf（裸部署字面量）+ ui.conf
 docker-entrypoint.sh env 校验→envsubst→openresty -t→exec；cache_aware/mesh 时未显式给 worker 数则钉 1
 ```

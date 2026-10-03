@@ -283,7 +283,8 @@ Rust 侧没有每服务上限这个能力，`smg_worker_capacity_excluded_total`
 - `ui/admin/upstreams.html`：阈值列 + 声明式 `models` 逗号输入（声明该端点覆盖哪些模型）；三态同上。
 - `ui/admin/models.html`：虚拟模型行的 `candidates` 逐条编辑（加/删/改模型名），候选下拉用池成员的
   `models` 实际覆盖度填（该实例覆盖的模型排在前面），并有「离线 / 未经引擎验证 / 需要模型名」的备注。
-- `ui/config.html`：JSON 视图无损读写 `candidates` 与 `upstreams` 的新字段（含两个上限），表单页
+- ~~`ui/config.html`~~（2026-10-03 已移除，JSON 视图迁至 `ui/admin/models.html` 的「配置 JSON」对话框，
+  见 doc/ui-trim-legacy-pages.md）：JSON 视图无损读写 `candidates` 与 `upstreams` 的新字段（含两个上限），表单页
   不画 candidates 编辑区，靠 raw 原样带回——**后端把整表替换当成事实来源**，所以任何一次提交漏掉
   `candidates` 就等于把它抹掉，这条容错读法（形状不对整条丢弃、空数组整体缺席而不是写 `[]`）是必须的。
 

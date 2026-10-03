@@ -1,8 +1,11 @@
 /*
-  llm-router：在官方 llama.cpp webui（/_ui/）左侧导航里注入单个 Logs 入口。
-  由 index.html 以 <script src="./logs-inject.js" defer></script> 引入（见 watcher/patch_ui_logs.sh）。
-  单文件方案：按钮由本文件注入（ENTRY 数组），index.html 只需一行注入，
-  官方 webui 升级后重跑 patch_ui_logs.sh 即可全部恢复。
+  lua-router：在官方 llama.cpp webui（/_ui/）左侧导航里注入 Admin 管理台入口。
+  由 index.html 以 <script src="./admin-inject.js" defer></script> 引入。
+
+  历史：本文件原名 logs-inject.js，同时注入 Logs 与 Admin 两个入口。根目录下的
+  /_ui/logs.html、/_ui/metrics.html、/_ui/config.html 三个工具页已移除（功能与
+  /_ui/admin/ 重叠，差异记录见 doc/ui-trim-legacy-pages.md），Logs 入口随之删除，
+  只保留 Admin。
 
   为什么需要 MutationObserver：导航容器（aside div[class*="px-2"][class*="flex-col"][class*="gap-1"]）
   由 Svelte 持有 children 引用，点「Expand navigation」展开/折叠侧栏会触发该区域重渲染，
@@ -10,7 +13,7 @@
   observer 回调必须防抖 + 判重，否则「注入自身触发 mutation → 再注入」会死循环。
 
   官方 webui 升级后如何恢复：本文件不在 SvelteKit 产物与 sw.js precache 列表里，升级 ui/ 目录后
-  只需重打 index.html 的注入行：bash watcher/patch_ui_logs.sh。若升级导致导航类名变化，
+  只需重打 index.html 的注入行（本文件这一行）。若升级导致导航类名变化，
   下面 NAV_SELECTORS 的第一条是实测锚点，退化策略会自动去找「含 New chat 按钮的同类容器」。
 
   约束：零第三方依赖；不修改页面其它内容；任何异常静默失败（不影响聊天页）。
@@ -18,8 +21,8 @@
 (function () {
   'use strict';
   try {
-    if (window.__lmrLogsInject) return;             // 同一页面重复引入时只跑一次
-    window.__lmrLogsInject = true;
+    if (window.__lmrAdminInject) return;             // 同一页面重复引入时只跑一次
+    window.__lmrAdminInject = true;
 
     var MARK = 'data-lmr-inject';                    // 幂等判重标记
     var NAV_SELECTORS = [
@@ -29,18 +32,13 @@
     /* 与既有 New chat / Search / Settings 按钮完全同一套类名，尺寸天然一致
        （折叠态 36x36 圆形：p-0 h-9 w-9 rounded-full hover:bg-accent） */
     var BTN_CLASS = 'inline-flex items-center justify-center shrink-0 gap-2 p-0 h-9 w-9 rounded-full hover:bg-accent text-sm font-medium';
-    var SVG_LOGS = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"' +
-      ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide h-4 w-4">' +
-      '<path d="M15 12h3v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>' +
-      '<path d="m9 11 2 2 4-4"/></svg>';
     var SVG_ADMIN = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"' +
       ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide h-4 w-4">' +
       '<rect width="7" height="9" x="9" y="3" rx="1"/><rect width="7" height="5" x="14" y="16" rx="1"/>' +
       '<rect width="7" height="5" x="3" y="16" rx="1"/><path d="M21 16v-2a2 2 0 0 0-2-2h-3"/>' +
       '<path d="M7 16V8a2 2 0 0 1 2-2h7"/></svg>';
-    /* Logs 同页跳转；Admin（Quasar 管理控制台）新开标签页，避免丢掉当前会话状态 */
+    /* Admin（Quasar 管理控制台）新开标签页，避免丢掉当前会话状态 */
     var ENTRIES = [
-      { mark: 'logs', label: 'Logs', icon: SVG_LOGS, href: 'logs.html' },
       { mark: 'admin', label: 'Admin', icon: SVG_ADMIN, href: 'admin/index.html', blank: true }
     ];
 

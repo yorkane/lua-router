@@ -10,6 +10,24 @@
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
   <link rel="stylesheet" href="./app.css?v=5">
+  <style>
+    /* 聚合表（原 metrics 页的三张表）：沿用 app.css 的 surface-card / mono / muted 口径，
+       这里只补原生 table 需要的行距与右对齐数字，不新增配色变量。 */
+    .agg-body { padding: 4px 16px 16px; }
+    .agg-block + .agg-block { margin-top: 20px; }
+    .agg-scroll { overflow-x: auto; }
+    .agg-table { width: 100%; min-width: 880px; border-collapse: collapse; }
+    .agg-table.small { min-width: 520px; }
+    .agg-table th,
+    .agg-table td { padding: 7px 12px; border-bottom: 1px solid rgba(139, 145, 184, .1); white-space: nowrap; }
+    .agg-table th { background: rgba(255, 255, 255, .018); color: #9196ad; font-size: 11.5px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; text-align: left; }
+    .agg-table td { color: #d9dbe7; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; }
+    .agg-table td.num,
+    .agg-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .agg-table tbody tr:hover td { background: rgba(255, 255, 255, .018); }
+    .agg-table td.ellipsis { max-width: 34ch; }
+    .agg-empty td { color: var(--muted); text-align: center; padding: 18px 12px; }
+  </style>
 </head>
 <body>
   <div id="q-app">
@@ -185,6 +203,115 @@
               <span class="muted">{{ loadedNote }}</span>
             </div>
           </q-card>
+
+          <!-- 聚合三表（原 ui/metrics.html 被删除后迁到这里）：不再自己 fetch，
+               直接用本页已加载的 rows（环形缓冲整段）+ logBackends 的 gpu 标签在浏览器端聚合。 -->
+          <q-card flat class="surface-card">
+            <q-card-section class="surface-heading" style="cursor:pointer" @click="aggOpen = !aggOpen">
+              <div>
+                <div class="surface-title">{{ ta('aggTitle') }}</div>
+                <div class="surface-subtitle">{{ aggNote }}</div>
+              </div>
+              <q-btn flat dense no-caps class="secondary-button" :icon="aggOpen ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+                     :label="aggOpen ? ta('aggCollapse') : ta('aggExpand')" @click.stop="aggOpen = !aggOpen"></q-btn>
+            </q-card-section>
+
+            <template v-if="aggOpen">
+              <q-separator dark></q-separator>
+              <q-card-section class="agg-body">
+                <section class="agg-block">
+                  <h4 class="detail-title">{{ ta('aggModelTitle') }}</h4>
+                  <div class="agg-scroll">
+                    <table class="agg-table">
+                      <thead>
+                        <tr>
+                          <th>{{ ta('thModel') }}</th>
+                          <th class="num">{{ ta('thRequests') }}</th>
+                          <th class="num">{{ ta('thErrors') }}</th>
+                          <th class="num">{{ ta('thSuccess') }}</th>
+                          <th class="num">{{ ta('thAvgDuration') }}</th>
+                          <th class="num">{{ ta('thAvgTtft') }}</th>
+                          <th class="num">{{ ta('thP95') }}</th>
+                          <th class="num">{{ ta('thAvgRate') }}</th>
+                          <th class="num">{{ ta('thPrompt') }}</th>
+                          <th class="num">{{ ta('thCompletion') }}</th>
+                          <th class="num">{{ ta('thCached') }}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="item in aggModelRows" :key="'agg-m-' + item.key">
+                          <td class="ellipsis" :title="item.key"><strong>{{ item.key }}</strong></td>
+                          <td class="num mono">{{ item.requests }}</td>
+                          <td class="num mono" :class="item.errors ? 'st-code s5' : ''">{{ item.errors }}</td>
+                          <td class="num mono" :class="item.rateClass">{{ item.success }}</td>
+                          <td class="num mono">{{ item.avgDuration }}</td>
+                          <td class="num mono">{{ item.avgTtft }}</td>
+                          <td class="num mono">{{ item.p95Duration }}</td>
+                          <td class="num mono">{{ item.avgRate }}</td>
+                          <td class="num mono">{{ item.prompt }}</td>
+                          <td class="num mono">{{ item.completion }}</td>
+                          <td class="num mono">{{ item.cached }}</td>
+                        </tr>
+                        <tr v-if="!aggModelRows.length" class="agg-empty"><td colspan="11">{{ ta('aggEmptyLogs') }}</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+
+                <section class="agg-block">
+                  <h4 class="detail-title">{{ ta('aggBackendTitle') }}</h4>
+                  <div class="agg-scroll">
+                    <table class="agg-table small">
+                      <thead>
+                        <tr>
+                          <th style="width:22%">{{ ta('thWorker') }}</th>
+                          <th class="num" style="width:12%">{{ ta('thRequests') }}</th>
+                          <th class="num" style="width:12%">{{ ta('thErrors') }}</th>
+                          <th class="num" style="width:16%">{{ ta('thAvgDuration') }}</th>
+                          <th>{{ ta('thServedModels') }}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="item in aggBackendRows" :key="'agg-b-' + item.key">
+                          <td class="mono" :title="item.key">{{ item.label }}</td>
+                          <td class="num mono">{{ item.requests }}</td>
+                          <td class="num mono" :class="item.errors ? 'st-code s5' : ''">{{ item.errors }}</td>
+                          <td class="num mono">{{ item.avgDuration }}</td>
+                          <td class="ellipsis muted" :title="item.modelsText">{{ item.modelsText }}</td>
+                        </tr>
+                        <tr v-if="!aggBackendRows.length" class="agg-empty"><td colspan="5">{{ ta('aggEmptyBackends') }}</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+
+                <section class="agg-block">
+                  <h4 class="detail-title">{{ ta('aggEffortTitle') }}</h4>
+                  <div class="agg-scroll">
+                    <table class="agg-table small">
+                      <thead>
+                        <tr>
+                          <th style="width:30%">{{ ta('thEffort') }}</th>
+                          <th class="num" style="width:20%">{{ ta('thRequests') }}</th>
+                          <th class="num" style="width:26%">{{ ta('thRewrites') }}</th>
+                          <th>{{ ta('thRewriteExample') }}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="item in aggEffortRows" :key="'agg-e-' + item.key">
+                          <td>{{ item.key }}</td>
+                          <td class="num mono">{{ item.requests }}</td>
+                          <td class="num mono" :class="item.rewrites ? 'st-code s4' : ''">{{ item.rewrites }}</td>
+                          <td class="mono muted">{{ item.example }}</td>
+                        </tr>
+                        <tr v-if="!aggEffortRows.length" class="agg-empty"><td colspan="4">{{ ta('aggEmptyEffort') }}</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              </q-card-section>
+            </template>
+          </q-card>
         </q-page>
       </q-page-container>
     </q-layout>
@@ -285,6 +412,228 @@
           return streamConnected.value ? t.value.liveOn : t.value.liveReconnecting
         })
 
+        // ── 聚合三表（原 ui/metrics.html 的独有能力）─────────────────────────
+        // 数据源就是本页已加载的 rows 与 /_ui/logs/backends 的 gpu 标签：不新增 fetch，
+        // 轮询/SSE 推进 rows 时这三张表跟着重算。文案用页内本地字典（i18n.js 由他人并行占有）。
+        const AGG_DICT = {
+          'zh-CN': {
+            aggTitle: '聚合统计', aggExpand: '展开聚合', aggCollapse: '收起聚合',
+            aggNote: '基于已加载的 {n} 条记录（网关环形缓冲整段，非历史累计）',
+            aggModelTitle: '按模型聚合', aggBackendTitle: '按后端聚合', aggEffortTitle: '推理强度分布',
+            thModel: '模型', thRequests: '请求数', thErrors: '错误数', thSuccess: '成功率',
+            thAvgDuration: '平均耗时', thAvgTtft: '平均 TTFT', thP95: 'P95 耗时', thAvgRate: '平均 tok/s',
+            thPrompt: '输入 tokens', thCompletion: '输出 tokens', thCached: '缓存命中',
+            thWorker: 'worker', thServedModels: '服务过的模型',
+            thEffort: 'effort（生效档位）', thRewrites: '被改写次数', thRewriteExample: '改写示例',
+            aggEmptyLogs: '暂无请求记录', aggEmptyBackends: '暂无已路由到后端的请求',
+            aggEmptyEffort: '暂无带推理强度的请求',
+            effortDefault: '(默认)', dash: '—', unknownModel: '(未知模型)'
+          },
+          'en-US': {
+            aggTitle: 'Aggregates', aggExpand: 'Expand aggregates', aggCollapse: 'Collapse aggregates',
+            aggNote: 'Based on {n} loaded records (whole gateway ring buffer, not lifetime totals)',
+            aggModelTitle: 'By model', aggBackendTitle: 'By backend', aggEffortTitle: 'Effort distribution',
+            thModel: 'Model', thRequests: 'Requests', thErrors: 'Errors', thSuccess: 'Success',
+            thAvgDuration: 'Avg duration', thAvgTtft: 'Avg TTFT', thP95: 'P95 duration', thAvgRate: 'Avg tok/s',
+            thPrompt: 'Prompt tokens', thCompletion: 'Completion tokens', thCached: 'Cached',
+            thWorker: 'Worker', thServedModels: 'Served models',
+            thEffort: 'Effort (effective)', thRewrites: 'Rewritten', thRewriteExample: 'Rewrite example',
+            aggEmptyLogs: 'No request records', aggEmptyBackends: 'No requests routed to a backend',
+            aggEmptyEffort: 'No requests with an effort level',
+            effortDefault: '(default)', dash: '—', unknownModel: '(unknown model)'
+          }
+        }
+        const EFFORT_DEFAULT_KEY = String(AGG_DICT['zh-CN'].effortDefault)
+        const EFFORT_ORDER = (window.lmrApi && window.lmrApi.effortLevels) || []
+        const aggOpen = ref(false)
+        // /_ui/logs/backends 的原始负载（{ backends: [{url, model, gpu}] }）：
+        // 由 initialLoad 顺带刷新，这里只做规范化索引，不自己发请求。
+        const logBackendsPayload = ref(null)
+        const gpuIndex = computed(() => {
+          const index = Object.create(null)
+          const list = logBackendsPayload.value && logBackendsPayload.value.backends
+          if (Array.isArray(list)) {
+            list.forEach(entry => {
+              if (!entry || !entry.url) return
+              index[normalizeUrl(entry.url)] = (entry.gpu === null || entry.gpu === undefined || entry.gpu === '') ? null : String(entry.gpu)
+            })
+          }
+          return index
+        })
+
+        function ta (key, values) {
+          const dict = AGG_DICT[locale.value] || AGG_DICT['zh-CN']
+          let text = dict[key]
+          if (text === undefined) text = AGG_DICT['zh-CN'][key]
+          if (text === undefined) return key
+          if (!values) return text
+          return text.replace(/\{(\w+)\}/g, (match, name) => (
+            values[name] === undefined || values[name] === null ? match : String(values[name])
+          ))
+        }
+
+        const aggNote = computed(() => ta('aggNote', { n: rows.value.length }))
+
+        function normalizeUrl (value) {
+          return String(value).replace(/^https?:\/\//, '').replace(/\/+$/, '')
+        }
+
+        function numOrNull (value) {
+          const n = Number(value)
+          return Number.isFinite(n) ? n : null
+        }
+        function newAgg () {
+          return { requests: 0, errors: 0, durations: [], ttfts: [], rates: [], prompt: 0, completion: 0, cached: 0, models: [] }
+        }
+        function addAggRecord (acc, record) {
+          acc.requests += 1
+          const status = numOrNull(record.status)
+          if (status !== null && status >= 400) acc.errors += 1
+          const duration = numOrNull(record.duration_ms)
+          if (duration !== null) acc.durations.push(duration)
+          const ttft = numOrNull(record.ttft_ms)
+          if (ttft !== null) acc.ttfts.push(ttft)
+          const rate = numOrNull(record.tok_per_s)
+          if (rate !== null) acc.rates.push(rate)
+          acc.prompt += numOrNull(record.prompt_tokens) || 0
+          acc.completion += numOrNull(record.completion_tokens) || 0
+          acc.cached += numOrNull(record.cached_tokens) || 0
+          if (record.model) acc.models.push(record.model)
+        }
+        function meanOf (list) {
+          if (!list.length) return null
+          let total = 0
+          for (let i = 0; i < list.length; i++) total += list[i]
+          return total / list.length
+        }
+        // P95：升序后取最近秩（ceil(0.95n)-1），样本少时直接落最大档；无样本 → —
+        function p95Of (list) {
+          if (!list.length) return null
+          const sorted = list.slice().sort((a, b) => a - b)
+          return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)]
+        }
+        function fmtCount (value) {
+          const n = numOrNull(value)
+          if (n === null) return ta('dash')
+          return new Intl.NumberFormat(locale.value, { notation: 'compact', maximumFractionDigits: 1 }).format(n)
+        }
+        // 页面自带的 fmtMs 对 null 会算出 0（Number(null)===0），聚合里无样本必须显示 —，
+        // 所以均值/分位数先过一层显式空判定。
+        function fmtAvg (list) {
+          const mean = meanOf(list)
+          return mean === null ? ta('dash') : fmtMs(mean)
+        }
+        function fmtP95 (list) {
+          const value = p95Of(list)
+          return value === null ? ta('dash') : fmtMs(value)
+        }
+        function fmtAvgRate (list) {
+          const mean = meanOf(list)
+          return mean === null ? ta('dash') : mean.toFixed(1)
+        }
+        function successCell (acc) {
+          if (!acc.requests) return { text: ta('dash'), rateClass: 'muted' }
+          const rate = (acc.requests - acc.errors) / acc.requests * 100
+          const rateClass = acc.errors === 0 ? 'st-code s2' : (rate < 90 ? 'st-code s5' : 'st-code s4')
+          return { text: rate.toFixed(1) + '%', rateClass }
+        }
+        // 后端标签：:端口 + gpu 号（gpu 来自 logBackends.backends[].gpu，拿不到只有端口）
+        function backendGpu (key) {
+          const gpu = gpuIndex.value[key]
+          return (gpu === undefined || gpu === null) ? null : gpu
+        }
+        function backendLabel (key) {
+          const plain = normalizeUrl(key)
+          const colon = plain.lastIndexOf(':')
+          const port = colon >= 0 ? plain.slice(colon) : plain
+          const gpu = backendGpu(plain)
+          return gpu === null ? port : `${port} · gpu${gpu}`
+        }
+        function sortAccMap (map) {
+          return Object.keys(map)
+            .map(key => ({ key, acc: map[key] }))
+            .sort((a, b) => (b.acc.requests - a.acc.requests) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+        }
+
+        const aggModelRows = computed(() => {
+          const map = Object.create(null)
+          rows.value.forEach(record => {
+            if (!record || typeof record !== 'object') return
+            const key = record.model || record.requested_model || ta('unknownModel')
+            if (!map[key]) map[key] = newAgg()
+            addAggRecord(map[key], record)
+          })
+          return sortAccMap(map).map(({ key, acc }) => {
+            const success = successCell(acc)
+            return {
+              key,
+              requests: String(acc.requests),
+              errors: String(acc.errors),
+              success: success.text,
+              rateClass: success.rateClass,
+              avgDuration: fmtAvg(acc.durations),
+              avgTtft: fmtAvg(acc.ttfts),
+              p95Duration: fmtP95(acc.durations),
+              avgRate: fmtAvgRate(acc.rates),
+              prompt: fmtCount(acc.prompt),
+              completion: fmtCount(acc.completion),
+              cached: fmtCount(acc.cached)
+            }
+          })
+        })
+
+        const aggBackendRows = computed(() => {
+          const map = Object.create(null)
+          rows.value.forEach(record => {
+            if (!record || typeof record !== 'object') return
+            const raw = record.worker || record.selected
+            if (!raw) return
+            const key = String(raw).replace(/^https?:\/\//, '').replace(/\/+$/, '')
+            if (!map[key]) map[key] = newAgg()
+            addAggRecord(map[key], record)
+          })
+          return sortAccMap(map).map(({ key, acc }) => {
+            const models = [...new Set(acc.models)].sort()
+            return {
+              key,
+              label: backendLabel(key),
+              requests: String(acc.requests),
+              errors: String(acc.errors),
+              avgDuration: fmtAvg(acc.durations),
+              models: models,
+              modelsText: models.length ? models.join(', ') : ta('dash')
+            }
+          })
+        })
+
+        const aggEffortRows = computed(() => {
+          const map = Object.create(null)
+          rows.value.forEach(record => {
+            if (!record || typeof record !== 'object') return
+            const key = record.effort || record.requested_effort || EFFORT_DEFAULT_KEY
+            const entry = map[key] || (map[key] = { requests: 0, rewrites: 0, example: '' })
+            entry.requests += 1
+            // 改写 = 客户端要的档位与网关实际下发的档位不同；生效档位未知（null）时不算改写
+            if (record.requested_effort && record.effort && record.requested_effort !== record.effort) {
+              entry.rewrites += 1
+              if (!entry.example) entry.example = `${record.requested_effort} → ${record.effort}`
+            }
+          })
+          const weightOf = key => {
+            if (key === EFFORT_DEFAULT_KEY) return EFFORT_ORDER.length + 1
+            const index = EFFORT_ORDER.indexOf(key)
+            return index === -1 ? EFFORT_ORDER.length : index
+          }
+          return Object.keys(map)
+            .sort((a, b) => (weightOf(a) - weightOf(b)) || (map[b].requests - map[a].requests) || (a < b ? -1 : a > b ? 1 : 0))
+            .map(key => ({
+              key: key === EFFORT_DEFAULT_KEY ? ta('effortDefault') : key,
+              requests: String(map[key].requests),
+              rewrites: String(map[key].rewrites),
+              example: map[key].example || ta('dash')
+            }))
+        })
+
         function unique (list) {
           return [...new Set(list.filter(value => value !== null && value !== undefined && value !== ''))].sort()
         }
@@ -352,7 +701,8 @@
         }
 
         async function initialLoad () {
-          try { logBackends = await window.lmrApi.logBackends() } catch (err) {}
+          // 聚合表的 GPU 标签随本函数一起刷（2s 轮询与手动刷新都走这里），不另开轮询
+          try { logBackendsPayload.value = await window.lmrApi.logBackends() } catch (err) { logBackendsPayload.value = null }
           loading.value = true
           loadError.value = ''
           try {
@@ -475,6 +825,7 @@
           bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters, fmtInt, fmtMs, fmtRate,
           fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
           effortCell, toggleRow,
+          aggOpen, aggNote, aggModelRows, aggBackendRows, aggEffortRows, ta,
           live, modelFilterOptions, olderLoading, pagination, pathFilter, pathFilterOptions, refreshStats,
           reload, resetFilters, rows, stats, statusClass, statusOptions, streamConnected, streamLabel, t,
           visibleRows, windowNote

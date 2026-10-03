@@ -26,6 +26,7 @@
             <div class="heading-actions">
               <q-badge outline :color="watcherColor" class="chip-soft">{{ watcherLabel }}</q-badge>
               <q-btn outline no-caps icon="mdi-refresh" :label="c.retry" class="secondary-button" :loading="loading" @click="load"></q-btn>
+              <q-btn outline no-caps icon="mdi-code-json" :label="cj.jsonButton" :disable="!doc" class="secondary-button" @click="openConfigJson"></q-btn>
             </div>
           </header>
 
@@ -349,6 +350,37 @@
               </q-card-actions>
             </q-card>
           </q-dialog>
+
+          <!-- 配置 JSON（源码编辑）：整份配置的权威编辑面，移植自旧 ui/config.html 的 JSON 视图。
+               保存走 POST /_ui/config/apply 整表替换；表单画不出的字段（未识别键、candidates 的
+               特殊形状）必须有一条不丢字段的通路，所以这里只在**顶层段**做过滤，行内字段一律原样往返。 -->
+          <q-dialog v-model="jsonOpen" persistent>
+            <q-card class="dialog-card json-card">
+              <q-card-section>
+                <div class="dialog-title">{{ cj.jsonTitle }}</div>
+                <div class="dialog-copy">{{ cj.jsonCopy }}</div>
+                <div class="dialog-copy muted" style="margin-top:8px">{{ cj.jsonCopyVirtual }}</div>
+                <div class="dialog-copy muted" style="margin-top:8px">{{ cj.jsonCopyKeys }}</div>
+              </q-card-section>
+              <q-card-section>
+                <textarea
+                  v-model="jsonText"
+                  class="json-ta mono"
+                  rows="22"
+                  spellcheck="false"
+                  :placeholder="cj.jsonPlaceholder"
+                ></textarea>
+                <div v-if="jsonError" class="text-red-4" style="font-size:12px;margin-top:6px;white-space:pre-wrap">{{ jsonError }}</div>
+              </q-card-section>
+              <q-card-actions align="right">
+                <span class="muted" style="margin-right:auto;font-size:11px">{{ cj.jsonHint }}</span>
+                <q-btn flat no-caps :label="c.cancel" :disable="saving" @click="closeConfigJson"></q-btn>
+                <q-btn flat no-caps icon="mdi-content-copy" :label="cj.jsonCopyBtn" :disable="saving" @click="copyConfigJson"></q-btn>
+                <q-btn flat no-caps icon="mdi-refresh" :label="cj.jsonReload" :disable="saving" @click="resetConfigJson"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="cj.jsonApply" @click="saveConfigJson"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
         </q-page>
       </q-page-container>
     </q-layout>
@@ -361,6 +393,93 @@
     const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
     const EFFORTS = window.lmrApi.effortLevels
     const MODALITIES = window.lmrApi.modalityLevels
+
+    // ── 本地字典覆盖（同 pageTitle 的先例）：i18n.js 由他人并行维护，新文案先进这里，
+    //    等键并进 i18n.js 的 models 块后可以删掉这一段 ──
+    const JSON_LOCAL = {
+      'zh-CN': {
+        jsonButton: '配置 JSON',
+        jsonTitle: '配置 JSON（源码编辑）',
+        jsonCopy: '这份 JSON 等价于容器环境变量，可以先导出再粘进 compose 固化。「校验并应用」走 '
+          + 'POST /_ui/config/apply 整表替换：缺省的段视为清空，任一字段非法则整体拒绝、不产生半提交。'
+          + 'model_map 会转发 llm-watcher 落地改名。',
+        jsonCopyVirtual: 'virtual_models 是对外主入口：一行 model（别名）用 targets 映射一组实际模型名，可带 '
+          + 'workers（规范化 url 白名单）与 context_window（正整数，该入口唯一允许的覆盖，网关据此钳制下游的 '
+          + 'max_tokens / max_completion_tokens；不想要覆盖就把整个键删掉，写 null 或空数组会被旧 build 误判）。'
+          + 'target 是旧形状的代表值，写了 targets 时可省。调度策略与思考强度不在这里配（分别在路由策略页、模型卡片）。'
+          + '本对话框无损读写：读到的 candidates 与任何未识别的键都原样写回，只过滤顶层段键，绝不过滤行内字段。',
+        jsonCopyKeys: 'upstreams 的 api_key 回显恒 null（脱敏）：提交时保持 null 或删掉该键 = 不动已存密钥，'
+          + '填 "" = 清除，填值 = 设置。',
+        jsonPlaceholder: '加载配置后此处显示可编辑 JSON 子集',
+        jsonHint: '解析失败不发请求；应用成功后本页表单同步刷新。',
+        jsonCopyBtn: '复制',
+        jsonReload: '重新载入',
+        jsonApply: '校验并应用',
+        jsonApplied: '配置已整体应用',
+        jsonMustBeObject: 'JSON 顶层必须是对象（object）',
+        jsonParseFailed: 'JSON 解析失败：{message}',
+        jsonParseAt: '（第 {line} 行，第 {col} 列）',
+        jsonReloaded: 'JSON 已按服务器状态重新载入',
+        jsonCopyOk: '已复制到剪贴板',
+        jsonCopyFail: '复制失败：当前环境不支持剪贴板',
+        jsonBadReply: '应用成功但响应不是合法 document，已重新拉取',
+        jsonConfirmTitle: '确认整表替换',
+        jsonConfirmEmpty: '提交的可编辑段全为空，将清空磁盘上的对应配置（当前 {n} 个入口 / {m} 个实例声明）。',
+        jsonConfirmWipe: '可编辑段比服务器少了若干条目：整表替换会删除这些条目（{parts}）。',
+        jsonConfirmVirtualLabel: '虚拟入口',
+        jsonConfirmUpstreamsLabel: '实例声明',
+        jsonConfirmWatch: '本次提交会把 model_map 缩到 {after} 条（当前 {before} 条）：apply 会把缩掉的名字转发 llm-watcher 落地删除。',
+      },
+      'en-US': {
+        jsonButton: 'Config JSON',
+        jsonTitle: 'Config JSON (source editor)',
+        jsonCopy: 'This JSON is equivalent to the container environment variables, so it can be exported and '
+          + 'pasted into compose. "Validate & apply" posts to POST /_ui/config/apply as a whole-document replace: '
+          + 'an omitted section counts as cleared, and any invalid field rejects the whole body without a partial '
+          + 'commit. model_map is forwarded to llm-watcher so renames land.',
+        jsonCopyVirtual: 'virtual_models is the public entry point: one model row (the alias) maps a group of real '
+          + 'model names through targets, optionally with workers (normalized url allowlist) and context_window (a '
+          + 'positive integer, the only per-entry override, used by the gateway to clamp downstream max_tokens / '
+          + 'max_completion_tokens; delete the whole key to drop the override — null or [] is misread by older '
+          + 'builds). target is the representative value of the old shape and can be omitted once targets is set. '
+          + 'Scheduling policy and effort are configured elsewhere (routing page, model cards). This dialog reads '
+          + 'and writes losslessly: only top-level sections are filtered, candidates and any unrecognised key are '
+          + 'written back verbatim, and inline row fields are never filtered.',
+        jsonCopyKeys: 'upstreams.api_key is always shown as null (masked): keep it null or delete the key to leave '
+          + 'the stored secret alone, submit "" to clear it, or submit a value to set it.',
+        jsonPlaceholder: 'Editable JSON subset appears here once the config loads',
+        jsonHint: 'Nothing is sent when parsing fails; the form on this page refreshes after a successful apply.',
+        jsonCopyBtn: 'Copy',
+        jsonReload: 'Reload',
+        jsonApply: 'Validate & apply',
+        jsonApplied: 'Configuration applied',
+        jsonMustBeObject: 'The JSON root must be an object',
+        jsonParseFailed: 'JSON parse failed: {message}',
+        jsonParseAt: '(line {line}, column {col})',
+        jsonReloaded: 'JSON reloaded from the server state',
+        jsonCopyOk: 'Copied to clipboard',
+        jsonCopyFail: 'Copy failed: clipboard is unavailable here',
+        jsonBadReply: 'Applied, but the reply was not a valid document; reloaded from the server',
+        jsonConfirmTitle: 'Confirm whole-document replace',
+        jsonConfirmEmpty: 'Every editable section is empty: this clears the stored configuration ({n} virtual entries / {m} upstream declarations).',
+        jsonConfirmWipe: 'The editable sections hold fewer rows than the server: a whole-document replace deletes them ({parts}).',
+        jsonConfirmVirtualLabel: 'virtual entries',
+        jsonConfirmUpstreamsLabel: 'upstream declarations',
+        jsonConfirmWatch: 'This submit shrinks model_map to {after} row(s) (currently {before}): apply forwards the dropped names to llm-watcher so the renames are deleted.'
+      }
+    }
+
+    // 取值顺序：i18n.js 里**当前语言**的 models 块 → 本地字典 → translate 的跨语言回退。
+    // 不能先问 translate：它对缺失的键会回退到中文块，en-US 下会把本地英文文案盖掉。
+    function localText (which, key, values) {
+      const dict = window.lmrI18n.messages[which]
+      const block = dict && dict.models
+      let text = block ? block[key] : undefined
+      if (text === undefined && JSON_LOCAL[which]) text = JSON_LOCAL[which][key]
+      if (text === undefined) return window.lmrI18n.translate(which, 'models', key, values)
+      if (!values) return text
+      return String(text).replace(/\{(\w+)\}/g, (match, name) => (values[name] === undefined ? match : String(values[name])))
+    }
 
     const app = Vue.createApp({
       setup () {
@@ -392,6 +511,15 @@
           return window.lmrI18n.translate(locale.value, 'models', key, values)
         }
         const pageTitle = computed(() => tv('pageTitle'))
+        // 对话框文案：模板用 cj.xxx，脚本用 cjText()（带插值），两者都过 localText，
+        // 这样将来键并进 i18n.js 时可以整块删掉本地字典而不改模板
+        const cj = computed(() => {
+          const dict = JSON_LOCAL[locale.value] || JSON_LOCAL['zh-CN']
+          const out = {}
+          Object.keys(dict).forEach(key => { out[key] = localText(locale.value, key) })
+          return out
+        })
+        function cjText (key, values) { return localText(locale.value, key, values) }
         const t = computed(() => window.lmrI18n.messages[locale.value].models)
         const pagination = reactive({ rowsPerPage: 15 })
 
@@ -1065,6 +1193,244 @@
           })
         }
 
+        // ── 配置 JSON（源码编辑）：移植自旧 ui/config.html 的 JSON 视图 ──
+        // POST /_ui/config/apply 是整表替换（config_store.apply_document → cfg_from_document
+        // 从 new_cfg() 重新装配），所以「文本里没有的段」= 清空该段：这是旧页面就有的语义，
+        // 因此这里只允许过滤**顶层段键**。行内字段（virtual_models 的 candidates / targets /
+        // context_window、upstreams 的 models 与容量上限、以及任何本页面不认识的后端新键）
+        // 一律整条原样往返——漏一个字段就等于清空它。
+        const JSON_SECTION_KEYS = ['default_effort', 'effort_map', 'model_ctx', 'model_effort',
+          'model_configs', 'virtual_models', 'upstreams']
+        // apply 还会读、但编辑器画不出来的段：路由策略页的 policy / model_policies（还有后端
+        // 以后新增的任意顶层段）。整表替换下「文本里没有」= 清空，而这些段在这里既看不见也
+        // 删不掉，操作员无从表达「清空」，所以提交时从当前 document 原样补回，否则开一次 JSON
+        // 面就把路由策略抹平（旧页面在这两处确有数据丢失，这里显式补上）。
+        const JSON_SERVER_ONLY_KEYS = ['models', 'env_defaults', 'watcher', 'persist',
+          'reconcile', 'warning', 'watcher_model_map']
+
+        const jsonOpen = ref(false)
+        const jsonText = ref('')
+        const jsonError = ref('')
+
+        function cloneJson (value) {
+          return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+        }
+        // 键序无关的深度比较（与 workers.html 的 normJson 同口径），用来判断「有未应用的本地编辑」
+        function normJson (value) {
+          if (value === null || typeof value !== 'object') return JSON.stringify(value)
+          if (Array.isArray(value)) return '[' + value.map(normJson).join(',') + ']'
+          return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + normJson(value[key])).join(',') + '}'
+        }
+        function configJsonBaseline () {
+          const s = doc.value || {}
+          const out = {}
+          JSON_SECTION_KEYS.forEach(key => {
+            if (s[key] !== undefined) out[key] = cloneJson(s[key])
+          })
+          // model_map 的唯一来源是 watcher 回显的对象。watcher 不可达（或没配）时整个键缺席
+          // = 本次不转发改名；写 {} 反而是「按空表落地」。
+          const map = s.watcher && s.watcher.model_map
+          if (map && typeof map === 'object' && !Array.isArray(map)) out.model_map = cloneJson(map)
+          return JSON.stringify(out, null, 2)
+        }
+        function configJsonLive () {
+          return jsonText.value === '' ? configJsonBaseline() : jsonText.value
+        }
+        function configJsonDirty () {
+          if (jsonText.value === '') return false
+          try {
+            return normJson(JSON.parse(jsonText.value)) !== normJson(JSON.parse(configJsonBaseline()))
+          } catch (error) {
+            return true
+          }
+        }
+        // 各浏览器 JSON.parse 的报错形态不一（新版 V8 直接给 line/column，老版与其它引擎给
+        // position），统一成一句行列提示：操作员手改几百行时靠这个定位，报全文是重复
+        function jsonParseLocation (draft, message) {
+          const atLine = /line (\d+) column (\d+)/i.exec(message)
+          if (atLine) return cjText('jsonParseAt', { line: atLine[1], col: atLine[2] })
+          const atPos = /position (\d+)/.exec(message)
+          if (!atPos) return ''
+          const end = Math.min(Number(atPos[1]), draft.length)
+          let line = 1
+          let col = 1
+          for (let i = 0; i < end; i++) {
+            if (draft[i] === '\n') { line += 1; col = 1 } else { col += 1 }
+          }
+          return cjText('jsonParseAt', { line, col })
+        }
+        async function openConfigJson () {
+          jsonError.value = ''
+          const wasDirty = configJsonDirty()
+          if (!wasDirty) {
+            // 整表替换的基线必须是**最新**的 document：打开时静默重取一次，避免拿过期快照
+            // 覆盖别的页面（路由策略页 / 服务池页）刚写进去的段。只换 doc，不走 hydrate —
+            // 表单里未保存的编辑（虚拟模型行、卡片草稿）不该被「点开 JSON 面」冲掉；
+            // 拿不到新 document 就退回内存里的 doc，不阻塞编辑。
+            try { doc.value = await window.lmrApi.config() } catch (err) { /* 保持内存态 */ }
+          }
+          jsonText.value = wasDirty ? jsonText.value : configJsonBaseline()
+          jsonOpen.value = true
+        }
+        function closeConfigJson () {
+          jsonOpen.value = false
+        }
+        function resetConfigJson () {
+          jsonText.value = configJsonBaseline()
+          jsonError.value = ''
+          Quasar.Notify.create({ message: cjText('jsonReloaded'), type: 'positive', position: 'top-right', timeout: 2200 })
+        }
+        function copyConfigJson () {
+          const text = configJsonLive()
+          const fallback = () => {
+            const ta = document.querySelector('.json-card .json-ta')
+            if (!ta) {
+              Quasar.Notify.create({ message: cjText('jsonCopyFail'), type: 'negative', position: 'top-right', timeout: 2600 })
+              return
+            }
+            ta.focus()
+            ta.select()
+            let ok = false
+            try { ok = document.execCommand('copy') } catch (err) { ok = false }
+            Quasar.Notify.create({
+              message: ok ? cjText('jsonCopyOk') : cjText('jsonCopyFail'),
+              type: ok ? 'positive' : 'negative', position: 'top-right', timeout: 2200
+            })
+          }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+              Quasar.Notify.create({ message: cjText('jsonCopyOk'), type: 'positive', position: 'top-right', timeout: 1600 })
+            }, fallback)
+          } else fallback()
+        }
+        // 组装请求体：可编辑段严格按「缺席 = 清空」（旧页面语义），只把编辑器画不出的
+        // 策略段从当前 document 补回。
+        function configJsonBody (parsed) {
+          const s = doc.value || {}
+          const body = {}
+          JSON_SECTION_KEYS.forEach(key => {
+            if (key in parsed) {
+              body[key] = parsed[key]
+            } else if (key === 'default_effort') {
+              body[key] = null
+            } else {
+              body[key] = []
+            }
+          })
+          // model_map 三态：文本里有 → 原样转发 watcher 落地改名；文本里没有 → 整个键缺席 =
+          // 「这次不转发改名」，绝不自作主张发 {}（那会被 watcher 当成清空账本）。
+          if ('model_map' in parsed) body.model_map = parsed.model_map
+          // 其余顶层段（policy / model_policies 与任何本页面不认识的后端新键）一律跟随服务端
+          const derived = JSON_SERVER_ONLY_KEYS.concat(JSON_SECTION_KEYS, ['model_map'])
+          Object.keys(s).forEach(key => {
+            if (derived.indexOf(key) !== -1) return
+            if (key in parsed) body[key] = parsed[key]
+            else if (s[key] !== undefined) body[key] = cloneJson(s[key])
+          })
+          return body
+        }
+        // 整表替换最危险的入口就是这个面板：粘成 [] 或删掉几行，保存即落盘并 reclaim
+        // 掉对应声明。表单路径每次只碰一条，无需确认；整段保存必须在缩表时问一次。
+        function configJsonRisk (body) {
+          const s = doc.value || {}
+          const count = value => (Array.isArray(value) ? value.length : 0)
+          const notes = []
+          const filled = key => (key === 'default_effort'
+            ? !(body[key] === null || body[key] === undefined || body[key] === '')
+            : count(body[key]) > 0)
+          const bodyHasConfig = JSON_SECTION_KEYS.some(filled)
+          const serverHadConfig = JSON_SECTION_KEYS.some(key => {
+            if (key === 'default_effort') return !(s[key] === null || s[key] === undefined || s[key] === '')
+            return count(s[key]) > 0
+          })
+          if (!bodyHasConfig && serverHadConfig) {
+            notes.push(cjText('jsonConfirmEmpty', { n: count(s.virtual_models), m: count(s.upstreams) }))
+          } else {
+            // 只点名真的缩了的那一段：把没动的段也报进确认框，操作员会以为它也要被删
+            const parts = []
+            const pair = (key, name) => {
+              const before = count(s[key])
+              const after = count(body[key])
+              if (after < before) parts.push(name + ' ' + before + ' → ' + after)
+            }
+            pair('virtual_models', cjText('jsonConfirmVirtualLabel'))
+            pair('upstreams', cjText('jsonConfirmUpstreamsLabel'))
+            if (parts.length) notes.push(cjText('jsonConfirmWipe', { parts: parts.join(', ') }))
+          }
+          // 改名账本只在「本次真的会把账本清空」时才要确认：文本里没有 model_map 键是安全
+          // 的（不转发、账本不动），而写了 {} —— 或写的条数比服务端回显的少 —— 才是删改名。
+          const loaded = s.watcher && s.watcher.model_map
+          if ('model_map' in body && loaded && typeof loaded === 'object' && !Array.isArray(loaded)) {
+            const loadedCount = Object.keys(loaded).length
+            const submitted = body.model_map
+            const submittedCount = (submitted && typeof submitted === 'object' && !Array.isArray(submitted))
+              ? Object.keys(submitted).length : 0
+            if (typeof submitted !== 'string' && submittedCount < loadedCount) {
+              notes.push(cjText('jsonConfirmWatch', { before: loadedCount, after: submittedCount }))
+            }
+          }
+          return notes.length ? notes.join('\n') : ''
+        }
+        async function applyConfigJson (body) {
+          saving.value = true
+          try {
+            const result = await window.lmrApi.configApply(body)
+            jsonOpen.value = false
+            jsonText.value = ''
+            jsonError.value = ''
+            Quasar.Notify.create({ message: cjText('jsonApplied'), type: 'positive', position: 'top-right', timeout: 2400 })
+            if (result && typeof result === 'object' && !Array.isArray(result)
+                && (Array.isArray(result.models) || Array.isArray(result.effort_map))) {
+              // 复用本页的文档驱动入口：表单与各下拉立刻以服务端返回的 document 为准
+              hydrate(result)
+            } else {
+              // 少数后端只回 {ok:true} 形状：没有可复用的 document 就重新拉一次，
+              // 保证表单与 JSON 面同源于服务端
+              await load()
+              Quasar.Notify.create({ message: cjText('jsonBadReply'), type: 'warning', position: 'top-right', timeout: 3200 })
+            }
+            warningMessage.value = (result && typeof result.warning === 'string') ? result.warning : ''
+          } catch (error) {
+            // 后端 400 的 error 文本（cfg_from_document 的逐段校验话术）留在对话框里
+            jsonError.value = error.message || String(error)
+          } finally {
+            saving.value = false
+          }
+        }
+        async function saveConfigJson () {
+          const draft = configJsonLive()
+          let parsed
+          try {
+            parsed = JSON.parse(draft)
+          } catch (error) {
+            const reason = error.message || String(error)
+            const where = jsonParseLocation(draft, reason)
+            jsonError.value = cjText('jsonParseFailed', { message: reason })
+              + (where ? '\n' + where : '')
+            return                                                   // 解析失败不发请求
+          }
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            jsonError.value = cjText('jsonMustBeObject')
+            return
+          }
+          jsonError.value = ''
+          const body = configJsonBody(parsed)
+          const risk = configJsonRisk(body)
+          if (risk) {
+            Quasar.Dialog.create({
+              title: cjText('jsonConfirmTitle'),
+              message: risk,
+              cancel: true,
+              persistent: true,
+              ok: { label: c.value.confirm, color: 'negative', flat: true }
+            }).onOk(async () => {
+              await applyConfigJson(body)
+            })
+            return
+          }
+          await applyConfigJson(body)
+        }
+
         function applyLocale (nextLocale) {
           locale.value = nextLocale
           document.documentElement.lang = nextLocale
@@ -1088,6 +1454,9 @@
           filteredModelOptions,
           modalitiesText, mutate, openCard, pagination, persistNote, preview, previewResult, saving, saveCard, saveGlobal,
           saveLegacyCtx, saveModelMap, saveVirtual, t, tv, pageTitle, virtualRows,
+          // 配置 JSON 对话框：漏一项就是运行期 undefined（模板用 with(_ctx) 解析，编译期不报错）
+          cj, openConfigJson, closeConfigJson, resetConfigJson, copyConfigJson, saveConfigJson,
+          jsonOpen, jsonText, jsonError,
           addTarget, removeTarget, addVirtualRow, displayTargets, groupOfRow, legacyChips, touchRow,
           targetModelOptions, normWorker, poolWorkers, workerOptionsFor,
           previewServing,
