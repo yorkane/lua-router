@@ -76,8 +76,8 @@
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
-              <div class="stat-label">{{ t.summaryOut }} / {{ t.summaryIn }}</div>
-              <div class="stat-value">{{ fmtRate(stats.output_tok_s) }} <span class="muted" style="font-size:15px">/ {{ fmtRate(stats.input_tok_s) }}</span></div>
+              <div class="stat-label">输出 tok/s / 输入 token(10s)</div>
+              <div class="stat-value">{{ fmtRate(stats.output_tok_s) }} <span class="muted" style="font-size:15px">/ {{ fmtInt(stats.input_tokens_window) }} tok</span></div>
               <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
@@ -760,7 +760,19 @@
             const now = Date.now()
             const win = rows.value.filter(r => now - (r.ts_ms || 0) < 10000)
             const errs = win.filter(r => (r.status || 0) >= 400).length
-            const outTok = win.reduce((a, r) => a + (r.completion_tokens || 0), 0)
+            // 输出 tok/s：每条请求的生成速率（completion/duration）取中位数，
+            // 乘以当前并发数。这是操作员肉眼能对上的数——一条 30 秒产出 3000 token
+            // 的请求是 100 tok/s，五条并发是 500 tok/s。把窗口内完成的所有请求的
+            // token 总量除以窗口秒数会把 30 秒的产出压进 10 秒里算出 3 倍的假速率。
+            const perReqRates = win
+              .filter(r => r.duration_ms > 1000 && r.completion_tokens > 0)
+              .map(r => r.completion_tokens / (r.duration_ms / 1000))
+              .sort((a, b) => a - b)
+            const medianRate = perReqRates.length ? perReqRates[Math.floor(perReqRates.length / 2)] : 0
+            const concurrent = win.filter(r => r.duration_ms > 1000).length
+            const outTok = Math.round(medianRate * Math.max(1, concurrent))
+            // 输入 token：prompt 是一次性提交的，不是流式流入——除以时间是误导。
+            // 显示窗口内处理的总 token 数，让操作员自己看规模。
             const inTok = win.reduce((a, r) => a + (r.prompt_tokens || 0), 0)
             const durs = win.filter(r => r.duration_ms != null).map(r => r.duration_ms)
             const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
@@ -770,10 +782,11 @@
               ...raw,
               requests_window: win.length,
               errors_window: errs,
-              output_tok_s: outTok / 10,
-              input_tok_s: inTok / 10,
+              output_tok_s: outTok,
+              input_tok_s: null,  // 改用 input_tokens_window，不显示假速率
               avg_duration_ms: avgDur,
               avg_ttft_ms: avgTtft,
+              input_tokens_window: inTok,
               window_s: 10,
             }
           } catch (error) {
