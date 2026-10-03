@@ -77,7 +77,7 @@
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
               <div class="stat-label">输出 tok/s / 输入 token(10s)</div>
-              <div class="stat-value">{{ fmtRate(stats.output_tok_s) }} <span class="muted" style="font-size:15px">/ {{ fmtInt(stats.input_tokens_window) }} tok</span></div>
+              <div class="stat-value">{{ fmtOne(stats.output_tok_s / 1000) }}k <span class="muted" style="font-size:15px">/ {{ fmtOne(stats.input_tokens_window / 1000) }}k</span></div>
               <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
@@ -126,8 +126,8 @@
                            :aria-label="props.expand ? t.collapse : t.expand" @click="toggleRow(props.row)"></q-btn>
                   </q-td>
                   <!-- tok/s 作为第一个数据列：扫表时先看解码速率 -->
-                  <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
                   <q-td key="time" :props="props"><span class="mono">{{ formatTime(props.row.ts_ms) }}</span></q-td>
+                  <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
                   <q-td key="model" :props="props">
                     <div class="model-cell">
                       <strong>{{ props.row.model }}</strong>
@@ -353,8 +353,8 @@
         const columns = computed(() => [
           { name: 'detail', label: '', field: 'seq', align: 'center', style: 'width:34px' },
           // tok/s 紧跟 detail 列，成为第一个数据列
-          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'time', label: t.value.colTime, field: 'ts_ms', align: 'left', sortable: true, style: 'width:110px' },
+          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
 
           { name: 'status', label: t.value.colStatus, field: 'status', align: 'left', sortable: true, style: 'width:90px' },
@@ -362,7 +362,7 @@
           { name: 'ttft', label: t.value.colTtft, field: 'ttft_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'tokens', label: t.value.colTokens, field: 'completion_tokens', align: 'left', sortable: true, style: 'width:110px' },
           // 缓存命中率：cached_tokens / prompt_tokens 的百分比，绝对值在详情行展示
-          { name: 'cached', label: '缓存命中%', field: 'cached_tokens', align: 'left', sortable: true, style: 'width:90px' },
+          { name: 'cached', label: 'cache', field: 'cached_tokens', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'effort', label: t.value.detailEffort, field: 'effort', align: 'left', style: 'width:90px' },
           { name: 'worker', label: t.value.colWorker, field: 'worker', align: 'left', sortable: true, style: 'width:150px' },
           { name: 'route', label: t.value.colRoute, field: 'route_type', align: 'left', style: 'width:110px' }
@@ -771,7 +771,7 @@
             // 采样桶数当分母，稀疏流量时 elapsed 极小，外推出夸张的瞬时值。
             // inflight/buffered/uptime 仍从后端取（它们是实时计数器不是窗口统计）。
             const now = Date.now()
-            const win = rows.value.filter(r => now - (r.ts_ms || 0) < 10000)
+            const win = rows.value.filter(r => now - (r.ts_ms || 0) < 60000)
             const errs = win.filter(r => (r.status || 0) >= 400).length
             // 输出 tok/s：每条请求的生成速率（completion/duration）取中位数，
             // 乘以当前并发数。这是操作员肉眼能对上的数——一条 30 秒产出 3000 token
@@ -800,7 +800,7 @@
               avg_duration_ms: avgDur,
               avg_ttft_ms: avgTtft,
               input_tokens_window: inTok,
-              window_s: 10,
+              window_s: 60,
             }
           } catch (error) {
             // 日志关闭或瞬时故障：摘要保持上一次的值
