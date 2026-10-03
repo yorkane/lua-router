@@ -76,8 +76,8 @@
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
-              <div class="stat-label">输出 tok/s / 输入 token(10s)</div>
-              <div class="stat-value">{{ fmtOne(stats.output_tok_s / 1000) }}k <span class="muted" style="font-size:15px">/ {{ fmtOne(stats.input_tokens_window / 1000) }}k</span></div>
+              <div class="stat-label">{{ t.summaryOut }} · {{ t.summaryTokWindow }}</div>
+              <div class="stat-value">{{ fmtOne(stats.output_tok_s / 1000) }}k <span class="muted" style="font-size:15px">/ {{ fmtK(stats.completion_tokens_window) }} / {{ fmtK(stats.input_tokens_window) }}</span></div>
               <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
@@ -142,7 +142,7 @@
                   </q-td>
                   <q-td key="duration" :props="props"><span class="mono">{{ fmtMs(props.row.duration_ms) }}</span></q-td>
                   <q-td key="ttft" :props="props"><span class="mono">{{ fmtMs(props.row.ttft_ms) }}</span></q-td>
-                  <q-td key="tokens" :props="props"><span class="mono">{{ fmtInt(props.row.completion_tokens) }} / {{ fmtInt(props.row.prompt_tokens) }}</span></q-td>
+                  <q-td key="tokens" :props="props"><span class="mono">{{ fmtK(props.row.completion_tokens) }} / {{ fmtK(props.row.prompt_tokens) }}</span></q-td>
                   <q-td key="cached" :props="props"><span class="mono">{{ cacheHitPct(props.row) }}</span></q-td>
                   <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
                   <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span><span v-if="props.row.gpuLabel" class="muted" style="font-size:10px;margin-left:4px">{{ props.row.gpuLabel }}</span></q-td>
@@ -174,7 +174,7 @@
                           <span class="k">{{ t.detailEffort }}</span>
                           <span class="v mono">{{ (props.row.requested_effort || '—') + ' → ' + (props.row.effort || '—') }}</span>
                           <span class="k">{{ t.colTokens }}</span>
-                          <span class="v mono">{{ fmtInt(props.row.completion_tokens) }} / {{ fmtInt(props.row.prompt_tokens) }}
+                          <span class="v mono">{{ fmtK(props.row.completion_tokens) }} / {{ fmtK(props.row.prompt_tokens) }}
                             <span class="muted">({{ t.detailCached }} {{ fmtInt(props.row.cached_tokens) }} · {{ t.detailReasoning }} {{ fmtInt(props.row.reasoning_tokens) }})</span>
                             <span v-if="props.row.tokens_estimated"> · {{ t.detailEstimated }}</span>
                           </span>
@@ -660,6 +660,12 @@
 
         function fmtInt (value) { return Number.isFinite(Number(value)) ? String(Math.round(Number(value))) : '—' }
         function fmtOne (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
+        // token 计数用 k 口径：>=1000 显示一位小数的 k，<1000 显示整数原值。
+        function fmtK (value) {
+          const n = Number(value)
+          if (!Number.isFinite(n)) return '—'
+          return Math.abs(n) >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(Math.round(n))
+        }
         function fmtRate (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
         // 缓存命中率：cached_tokens 占 prompt_tokens 的百分比。
         // prompt_tokens 为 0（缺失/未计费）或 cached_tokens 为 0（完全没命中）时显示占位符，
@@ -788,6 +794,8 @@
             // 输入 token：prompt 是一次性提交的，不是流式流入——除以时间是误导。
             // 显示窗口内处理的总 token 数，让操作员自己看规模。
             const inTok = win.reduce((a, r) => a + (r.prompt_tokens || 0), 0)
+            // 窗口内 completion_tokens 总数，与 inTok 同口径（60 秒），供顶部 card 的 Tok 出/入使用。
+            const outTokSum = win.reduce((a, r) => a + (r.completion_tokens || 0), 0)
             const durs = win.filter(r => r.duration_ms != null).map(r => r.duration_ms)
             const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
             const ttfts = win.filter(r => r.ttft_ms != null).map(r => r.ttft_ms)
@@ -801,6 +809,7 @@
               avg_duration_ms: avgDur,
               avg_ttft_ms: avgTtft,
               input_tokens_window: inTok,
+              completion_tokens_window: outTokSum,
               window_s: 60,
             }
           } catch (error) {
@@ -878,7 +887,8 @@
         Vue.watch(live, on => (on ? openStream() : closeStream()))
 
         return {
-          bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters, fmtInt, fmtMs, fmtRate,
+          bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters,
+          fmtInt, fmtK, fmtMs, fmtOne, fmtRate,
           cacheHitPct,
           fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
           effortCell, toggleRow,
