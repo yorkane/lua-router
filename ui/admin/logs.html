@@ -72,14 +72,12 @@
 
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading filter-bar">
-              <div class="filter-group">
+              <div class="filter-group" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
                 <q-select v-model="filters.status" dense outlined dark options-dense :options="statusOptions"
-                          map-options emit-value :label="t.filterStatus" popup-content-style="min-width:150px"></q-select>
+                          map-options emit-value :label="t.filterStatus" style="min-width:120px" popup-content-style="min-width:150px"></q-select>
                 <q-select v-model="filters.model" dense outlined dark options-dense use-input input-debounce="120"
-                          :options="modelFilterOptions" map-options emit-value :label="t.filterModel" @filter="modelFilter"></q-select>
-                <q-select v-model="filters.path" dense outlined dark options-dense use-input input-debounce="120"
-                          :options="pathFilterOptions" map-options emit-value :label="t.filterPath" @filter="pathFilter"></q-select>
-              </div>
+                          :options="modelFilterOptions" map-options emit-value :label="t.filterModel" style="min-width:160px" @filter="modelFilter"></q-select>
+                </div>
               <q-input v-model="filters.text" dense outlined dark debounce="200" :placeholder="t.filterTextPlaceholder" class="search-input">
                 <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
               </q-input>
@@ -117,7 +115,7 @@
                         {{ props.row.requested_model }} →</span>
                     </div>
                   </q-td>
-                  <q-td key="path" :props="props"><span class="mono">{{ props.row.path || '—' }}</span></q-td>
+
                   <q-td key="status" :props="props">
                     <span class="st-code" :class="statusClass(props.row.status)">{{ props.row.status }}</span>
                     <q-badge v-if="props.row.stream" outline color="blue-4" class="chip-soft q-ml-xs">SSE</q-badge>
@@ -125,9 +123,11 @@
                   <q-td key="duration" :props="props"><span class="mono">{{ fmtMs(props.row.duration_ms) }}</span></q-td>
                   <q-td key="ttft" :props="props"><span class="mono">{{ fmtMs(props.row.ttft_ms) }}</span></q-td>
                   <q-td key="tokens" :props="props"><span class="mono">{{ fmtInt(props.row.completion_tokens) }} / {{ fmtInt(props.row.prompt_tokens) }}</span></q-td>
+                  <q-td key="cached" :props="props"><span class="mono">{{ props.row.cached_tokens > 0 ? fmtInt(props.row.cached_tokens) : '—' }}</span></q-td>
                   <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
                   <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
                   <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span></q-td>
+                  <q-td key="gpu" :props="props"><span class="mono" style="font-size:11px">{{ props.row.gpu || '—' }}</span></q-td>
                   <q-td key="route" :props="props"><span class="mono">{{ props.row.route_type || '—' }}</span></q-td>
                 </q-tr>
                 <q-tr v-show="props.expand" :key="'exp-' + props.row.seq" class="lmr-detail-row">
@@ -227,14 +227,16 @@
           { name: 'detail', label: '', field: 'seq', align: 'center', style: 'width:34px' },
           { name: 'time', label: t.value.colTime, field: 'ts_ms', align: 'left', sortable: true, style: 'width:110px' },
           { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
-          { name: 'path', label: t.value.colPath, field: 'path', align: 'left', sortable: true, style: 'width:190px' },
+
           { name: 'status', label: t.value.colStatus, field: 'status', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'duration', label: t.value.colDuration, field: 'duration_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'ttft', label: t.value.colTtft, field: 'ttft_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'tokens', label: t.value.colTokens, field: 'completion_tokens', align: 'left', sortable: true, style: 'width:110px' },
+          { name: 'cached', label: 'Cache', field: 'cached_tokens', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'effort', label: t.value.detailEffort, field: 'effort', align: 'left', style: 'width:90px' },
           { name: 'worker', label: t.value.colWorker, field: 'worker', align: 'left', sortable: true, style: 'width:150px' },
+          { name: 'gpu', label: 'GPU', field: 'gpu', align: 'left', sortable: false, style: 'width:90px' },
           { name: 'route', label: t.value.colRoute, field: 'route_type', align: 'left', style: 'width:110px' }
         ])
 
@@ -350,10 +352,12 @@
         }
 
         async function initialLoad () {
+          try { logBackends = await window.lmrApi.logBackends() } catch (err) {}
           loading.value = true
           loadError.value = ''
           try {
             const result = await window.lmrApi.logs(0, PAGE_LIMIT)
+            if (result.requests) result.requests.reverse()
             rows.value = (result.requests || []).slice(-LOCAL_CAP)
             cursor.value = Number(result.cursor) || 0
             capacity.value = Number(result.capacity) || 0
@@ -385,6 +389,10 @@
           }
         }
 
+        async function autoRefresh () {
+          if (!live.value || loading.value) return
+          try { await initialLoad() } catch (err) {}
+        }
         async function refreshStats () {
           try {
             stats.value = await window.lmrApi.stats()
@@ -452,10 +460,12 @@
           unsubscribeLocale = window.lmrI18n.subscribe(applyLocale)
           initialLoad().then(openStream)
           statsTimer = window.setInterval(refreshStats, STATS_POLL_MS)
+          autoTimer = window.setInterval(autoRefresh, 2000)
         })
         onBeforeUnmount(() => {
           closeStream()
           window.clearInterval(statsTimer)
+          if (autoTimer) window.clearInterval(autoTimer)
           if (unsubscribeLocale) unsubscribeLocale()
         })
 
