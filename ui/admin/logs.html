@@ -144,8 +144,7 @@
                   <q-td key="cached" :props="props"><span class="mono">{{ props.row.cached_tokens > 0 ? fmtInt(props.row.cached_tokens) : '—' }}</span></q-td>
                   <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
                   <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
-                  <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span></q-td>
-                  <q-td key="gpu" :props="props"><span class="mono" style="font-size:11px">{{ props.row.gpu || '—' }}</span></q-td>
+                  <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span><span v-if="props.row.gpuLabel" class="muted" style="font-size:10px;margin-left:4px">{{ props.row.gpuLabel }}</span></q-td>
                   <q-td key="route" :props="props"><span class="mono">{{ props.row.route_type || '—' }}</span></q-td>
                 </q-tr>
                 <q-tr v-show="props.expand" :key="'exp-' + props.row.seq" class="lmr-detail-row">
@@ -339,7 +338,7 @@
         const disabledReason = ref('')
         const live = ref(true)
         const streamConnected = ref(false)
-        const filters = reactive({ status: '', model: '', path: '', text: '' })
+        const filters = reactive({ status: '', model: '', text: '' })
         const modelSuggest = ref([])
         const pathSuggest = ref([])
         const pagination = reactive({ rowsPerPage: 50, sortBy: 'seq', descending: true })
@@ -363,7 +362,6 @@
           { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'effort', label: t.value.detailEffort, field: 'effort', align: 'left', style: 'width:90px' },
           { name: 'worker', label: t.value.colWorker, field: 'worker', align: 'left', sortable: true, style: 'width:150px' },
-          { name: 'gpu', label: 'GPU', field: 'gpu', align: 'left', sortable: false, style: 'width:90px' },
           { name: 'route', label: t.value.colRoute, field: 'route_type', align: 'left', style: 'width:110px' }
         ])
 
@@ -650,7 +648,7 @@
 
         function cellText (col, row) {
           if (col.name === 'time') return formatTime(row.ts_ms)
-          if (col.name === 'path' || col.name === 'worker') return row[col.field] || '—'
+          if (col.name === 'worker') return row[col.field] || '—'
           if (col.name === 'route') return row.route_type || '—'
           if (col.name === 'rate') return fmtRate(row.tok_per_s)
           return row[col.field] === null || row[col.field] === undefined ? '—' : row[col.field]
@@ -694,6 +692,10 @@
           if (!record || typeof record !== 'object') return
           if (!Number.isFinite(Number(record.seq))) return
           if (rows.value.some(row => row.seq === record.seq)) return
+
+          const sk = normalizeUrl(record.worker || record.selected || "")
+          const sg = gpuIndex.value[sk]
+          if (sg !== null && sg !== undefined) record.gpuLabel = 'GPU(' + sg + ')'
           rows.value = rows.value.concat([record])
           const overflow = rows.value.length - LOCAL_CAP
           if (overflow > 0) rows.value = rows.value.slice(overflow)
@@ -709,6 +711,11 @@
             const result = await window.lmrApi.logs(0, PAGE_LIMIT)
             if (result.requests) result.requests.reverse()
             rows.value = (result.requests || []).slice(-LOCAL_CAP)
+            rows.value.forEach(r => {
+              const wk = normalizeUrl(r.worker || r.selected || "")
+              const wg = gpuIndex.value[wk]
+              if (wg !== null && wg !== undefined) r.gpuLabel = 'GPU(' + wg + ')'
+            })
             cursor.value = Number(result.cursor) || 0
             capacity.value = Number(result.capacity) || 0
             disabledReason.value = ''
@@ -745,10 +752,32 @@
         }
         async function refreshStats () {
           try {
-            stats.value = await window.lmrApi.stats()
-            if (stats.value.capacity) capacity.value = Number(stats.value.capacity)
+            const raw = await window.lmrApi.stats()
+            if (raw.capacity) capacity.value = Number(raw.capacity)
+            // 窗口统计从本页日志行实时算，不信任 /_ui/stats 的 tok/s——后端用
+            // 采样桶数当分母，稀疏流量时 elapsed 极小，外推出夸张的瞬时值。
+            // inflight/buffered/uptime 仍从后端取（它们是实时计数器不是窗口统计）。
+            const now = Date.now()
+            const win = rows.value.filter(r => now - (r.ts_ms || 0) < 10000)
+            const errs = win.filter(r => (r.status || 0) >= 400).length
+            const outTok = win.reduce((a, r) => a + (r.completion_tokens || 0), 0)
+            const inTok = win.reduce((a, r) => a + (r.prompt_tokens || 0), 0)
+            const durs = win.filter(r => r.duration_ms != null).map(r => r.duration_ms)
+            const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
+            const ttfts = win.filter(r => r.ttft_ms != null).map(r => r.ttft_ms)
+            const avgTtft = ttfts.length ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null
+            stats.value = {
+              ...raw,
+              requests_window: win.length,
+              errors_window: errs,
+              output_tok_s: outTok / 10,
+              input_tok_s: inTok / 10,
+              avg_duration_ms: avgDur,
+              avg_ttft_ms: avgTtft,
+              window_s: 10,
+            }
           } catch (error) {
-            // 日志关闭或瞬时故障：摘要保持上一次的值，原因由列表侧提示
+            // 日志关闭或瞬时故障：摘要保持上一次的值
           }
         }
 
