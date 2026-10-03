@@ -125,6 +125,8 @@
                     <q-btn flat round dense size="sm" :icon="props.expand ? 'mdi-chevron-up' : 'mdi-chevron-down'"
                            :aria-label="props.expand ? t.collapse : t.expand" @click="toggleRow(props.row)"></q-btn>
                   </q-td>
+                  <!-- tok/s 作为第一个数据列：扫表时先看解码速率 -->
+                  <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
                   <q-td key="time" :props="props"><span class="mono">{{ formatTime(props.row.ts_ms) }}</span></q-td>
                   <q-td key="model" :props="props">
                     <div class="model-cell">
@@ -141,8 +143,7 @@
                   <q-td key="duration" :props="props"><span class="mono">{{ fmtMs(props.row.duration_ms) }}</span></q-td>
                   <q-td key="ttft" :props="props"><span class="mono">{{ fmtMs(props.row.ttft_ms) }}</span></q-td>
                   <q-td key="tokens" :props="props"><span class="mono">{{ fmtInt(props.row.completion_tokens) }} / {{ fmtInt(props.row.prompt_tokens) }}</span></q-td>
-                  <q-td key="cached" :props="props"><span class="mono">{{ props.row.cached_tokens > 0 ? fmtInt(props.row.cached_tokens) : '—' }}</span></q-td>
-                  <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
+                  <q-td key="cached" :props="props"><span class="mono">{{ cacheHitPct(props.row) }}</span></q-td>
                   <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
                   <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span><span v-if="props.row.gpuLabel" class="muted" style="font-size:10px;margin-left:4px">{{ props.row.gpuLabel }}</span></q-td>
                   <q-td key="route" :props="props"><span class="mono">{{ props.row.route_type || '—' }}</span></q-td>
@@ -351,6 +352,8 @@
 
         const columns = computed(() => [
           { name: 'detail', label: '', field: 'seq', align: 'center', style: 'width:34px' },
+          // tok/s 紧跟 detail 列，成为第一个数据列
+          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'time', label: t.value.colTime, field: 'ts_ms', align: 'left', sortable: true, style: 'width:110px' },
           { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
 
@@ -358,8 +361,8 @@
           { name: 'duration', label: t.value.colDuration, field: 'duration_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'ttft', label: t.value.colTtft, field: 'ttft_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'tokens', label: t.value.colTokens, field: 'completion_tokens', align: 'left', sortable: true, style: 'width:110px' },
-          { name: 'cached', label: 'Cache', field: 'cached_tokens', align: 'left', sortable: true, style: 'width:80px' },
-          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
+          // 缓存命中率：cached_tokens / prompt_tokens 的百分比，绝对值在详情行展示
+          { name: 'cached', label: '缓存命中%', field: 'cached_tokens', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'effort', label: t.value.detailEffort, field: 'effort', align: 'left', style: 'width:90px' },
           { name: 'worker', label: t.value.colWorker, field: 'worker', align: 'left', sortable: true, style: 'width:150px' },
           { name: 'route', label: t.value.colRoute, field: 'route_type', align: 'left', style: 'width:110px' }
@@ -657,6 +660,16 @@
         function fmtInt (value) { return Number.isFinite(Number(value)) ? String(Math.round(Number(value))) : '—' }
         function fmtOne (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
         function fmtRate (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
+        // 缓存命中率：cached_tokens 占 prompt_tokens 的百分比。
+        // prompt_tokens 为 0（缺失/未计费）或 cached_tokens 为 0（完全没命中）时显示占位符，
+        // 避免把"没有前缀缓存"和"命中率 0%"混成同一个读数。
+        function cacheHitPct (row) {
+          const cached = Number(row && row.cached_tokens)
+          const prompt = Number(row && row.prompt_tokens)
+          if (!Number.isFinite(cached) || !Number.isFinite(prompt)) return '—'
+          if (cached <= 0 || prompt <= 0) return '—'
+          return (cached / prompt * 100).toFixed(1) + '%'
+        }
         function fmtMs (value) {
           if (!Number.isFinite(Number(value))) return '—'
           const ms = Number(value)
@@ -865,6 +878,7 @@
 
         return {
           bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters, fmtInt, fmtMs, fmtRate,
+          cacheHitPct,
           fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
           effortCell, toggleRow,
           aggOpen, aggNote, aggModelRows, aggBackendRows, aggEffortRows, ta,
