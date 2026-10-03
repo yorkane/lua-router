@@ -15,10 +15,10 @@
 -- Writes update all available layers so every worker sees the change.
 --
 -- Outbound control-plane HTTP (the /props probe) also lives here, as a
--- dependency-free cosocket client: _M.raw_request / _M.request_json. The
--- model-map proxy half was deleted with the watcher merge
--- (doc/gap-watcher-merge.md): /_ui/config/model-map now calls the in-process
--- watcher module directly, so nothing here reaches an external watcher URL.
+-- dependency-free cosocket client: _M.raw_request. The model-map proxy that used
+-- to ride on it is gone with the watcher merge (doc/gap-watcher-merge.md):
+-- /_ui/config/model-map calls resty.luarouter.watcher in process, so there is no
+-- external watcher URL left to point at.
 -- props.lua reuses it rather than requiring lua-resty-http, which the image is
 -- not guaranteed to ship.
 
@@ -295,7 +295,7 @@ function _M._reset_pool_module_caches()
 end
 
 ---Router config for the pool knobs, or nil when the router is not initialised.
----Cached: this is on the path of every /props and model-map proxy call.
+---Cached: this is on the path of every /props probe.
 local cached_pool_config
 local function store_config()
     if cached_pool_config ~= nil then
@@ -2784,8 +2784,8 @@ function _M.raw_request(method, url, body, headers, timeout_ms)
             headers = headers,
             -- lua-resty-http has its own pool, keyed by host:port and scheme, and
             -- it only reuses when the caller opts in. The old `keepalive = false`
-            -- meant one fresh TCP+TLS handshake per /props and per model-map proxy
-            -- call; the timeouts are the router's pool knobs so both client paths
+            -- meant one fresh TCP+TLS handshake per /props probe; the timeouts are
+            -- the router's pool knobs so both client paths
             -- agree on how long an idle socket may live.
             keepalive = true,
             keepalive_timeout = pool_cfg and (pool_cfg.pool_idle_timeout_secs * 1000) or 50000,
@@ -2911,33 +2911,66 @@ function _M.raw_request(method, url, body, headers, timeout_ms)
     return status, hdrs, out
 end
 
---- JSON POST/GET helper: returns parsed value or nil, err.
-function _M.request_json(method, url, payload, timeout_ms)
-    local headers = { Accept = "application/json" }
-    local body = false
-    if payload ~= nil then
-        headers["Content-Type"] = "application/json"
-        body = cjson.encode(payload)
-    end
-    local status, _, resp_body = _M.raw_request(method, url, body, headers, timeout_ms)
-    if not status then return nil, resp_body end
-    local parsed = cjson.decode(resp_body or "")
-    if not status or status < 200 or status >= 300 then
-        local detail = type(parsed) == "table"
-            and (parsed.error ~= nil and tostring(parsed.error) or "watcher rejected the request")
-            or "watcher rejected the request"
-        return nil, string.format("watcher said %d: %s", status, detail)
-    end
-    return parsed or {}
+--- The watcher lives in this process (doc/gap-watcher-merge.md), so the rename
+--- ledger is read and written through the module instead of an HTTP round trip to
+--- our own port. Same pcall posture init.lua uses: a module that cannot load
+--- degrades the state section, it never takes the whole document down.
+local function watcher_module()
+    local ok, watcher = pcall(require, "resty.luarouter.watcher")
+    if ok and type(watcher) == "table" then return watcher end
+    return nil
 end
 
---- Forward a rename request to the watcher /model-map (Rust proxy_model_map).
-function _M.proxy_model_map(url, body)
-    return _M.request_json("POST", url .. "/model-map", body, 5000)
+--- SMG_WATCHER_ENABLED as the watcher itself reads it. The table start() captured
+--- is authoritative when present (init.lua parses the environment once, before the
+--- fork); the env fallback keeps the answer honest outside nginx, with the same
+--- truth table as resty.luarouter.config.bool().
+local function watcher_state(watcher)
+    local captured = type(watcher.config) == "function" and watcher.config() or nil
+    if type(captured) == "table" and type(captured.enabled) == "boolean" then
+        return captured.enabled, captured
+    end
+    local raw = lower(env("SMG_WATCHER_ENABLED") or "")
+    return raw == "1" or raw == "true" or raw == "yes" or raw == "on", captured
 end
 
-local function fetch_watcher_model_map(url)
-    return _M.request_json("GET", url .. "/model-map", nil, 3000)
+--- Effective rename ledger, or nil when the ledger is empty. An empty map is
+--- reported as a deliberate null rather than `{}`: the config UI reads a null
+--- model_map as "this save forwards no renames", where an explicit {} would wipe
+--- the ledger.
+local function watcher_ledger(watcher, captured)
+    if type(watcher.effective_map) ~= "function" then return nil end
+    local ok, map = pcall(watcher.effective_map, captured)
+    if not ok or type(map) ~= "table" or next(map) == nil then return nil end
+    return map
+end
+
+--- Merge a rename body into the ledger in process. `raw` is the request body text
+--- so all four accepted shapes (and the cjson {} trap) stay watcher-side.
+--- Returns the daemon-shaped document, or nil, reason, ignored-list on refusal.
+local function apply_model_map_inprocess(raw)
+    local watcher = watcher_module()
+    if not watcher then
+        return nil, "the watcher module is not loadable"
+    end
+    if type(watcher.apply_model_map) ~= "function" then
+        return nil, "the watcher module has no model-map API"
+    end
+    local ok, merged, failure = pcall(watcher.apply_model_map, raw)
+    if not ok then return nil, tostring(merged), nil end
+    if merged == nil then
+        return nil, (failure and failure.error) or "watcher rejected the body",
+            failure and failure.ignored
+    end
+    -- Both key families, exactly like GET/POST /model-map: `renamed`/`status` from
+    -- the task contract plus the daemon's `model_map`/`note`, so a consumer written
+    -- against either keeps reading the same document.
+    return {
+        renamed = merged,
+        status = "queued",
+        model_map = merged,
+        note = "owned workers are re-registered on the next pass",
+    }
 end
 
 --- Full Config-page document: snapshot + env_defaults + watcher state.
@@ -2947,16 +2980,24 @@ function _M.document()
     -- response half of contract 3.4 masks it here.
     snap.upstreams = sanitize_upstream_rows(snap.upstreams)
     snap.env_defaults = _M.env_defaults()
-    local url = _M.watcher_url()
-    local reachable, model_map = false, JSON_NULL
-    if url then
-        local map, err = fetch_watcher_model_map(url)
-        if map then
+    -- url stays an explicit null: the watcher is in process, so there is no control
+    -- plane address to echo, and the key itself is part of the /_ui/config document
+    -- shape (the superset assertion in test_lua_router.sh pins it). `enabled` is what
+    -- the model page's badge reads now: it tells "watcher off" apart from "watcher on
+    -- with an empty ledger", which url=none used to conflate.
+    local reachable, model_map, enabled = false, JSON_NULL, false
+    local watcher = watcher_module()
+    if watcher then
+        local captured
+        enabled, captured = watcher_state(watcher)
+        local map = watcher_ledger(watcher, captured)
+        if map ~= nil then
             reachable = true
             model_map = map
         end
     end
-    snap.watcher = { url = nul(url), reachable = reachable, model_map = model_map }
+    snap.watcher = { url = JSON_NULL, reachable = reachable,
+                     enabled = enabled, model_map = model_map }
     snap.persist = { file = nul(env("LMR_CONFIG_FILE")) }
     return snap
 end
@@ -3037,6 +3078,24 @@ function _M.handle_config_get()
     local doc = _M.document()
     doc.models = _M.models_document()
     return respond_json(ngx.HTTP_OK, doc)
+end
+
+--- Raw request bytes, or nil plus the reason there are none. The model-map route
+--- needs the text (not a decoded table) because watcher.parse_model_map_body owns
+--- the four accepted body shapes, including the bare `a:b,c:d` form that never
+--- decodes as JSON.
+local function raw_body_text()
+    ngx.req.read_body()
+    local raw = ngx.req.get_body_data()
+    if not raw then
+        local file = ngx.req.get_body_file()
+        if file then
+            local f = io.open(file, "r")
+            if f then raw = f:read("*a"); f:close() end
+        end
+    end
+    if not raw or raw == "" then return nil, "empty request body" end
+    return raw
 end
 
 local function read_json_body()
@@ -3137,13 +3196,25 @@ function _M.handle_config_policy()
     return respond_json(ngx.HTTP_OK, _M.policy_document())
 end
 
---- POST /_ui/config/model-map  forward verbatim to the watcher.
+--- POST /_ui/config/model-map  merge a rename into the in-process watcher ledger.
+--- The route stays (the config page and any script written against it keep working)
+--- but there is no proxy hop and no LMR_WATCHER_URL guard: the watcher is this
+--- process, so an unconfigured environment is a normal success path again.
 function _M.handle_config_model_map()
-    -- deprecated: use /model-map directly (watcher is in-process)
-    return respond_json(ngx.HTTP_MOVED_PERMANENTLY, {
-        ok = false,
-        error = "deprecated: use /model-map directly",
-    })
+    local raw, err = raw_body_text()
+    if raw == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
+    local result, apply_err, ignored = apply_model_map_inprocess(raw)
+    if not result then
+        -- Body-level refusals carry the daemon's {error,ignored} document; the
+        -- status stays the proxy era's 502 so any script pinning it is unaffected.
+        return respond_json(ngx.HTTP_BAD_GATEWAY, {
+            ok = false,
+            error = apply_err,
+            ignored = ignored or JSON_NULL,
+        })
+    end
+    result.ok = true
+    return respond_json(ngx.HTTP_OK, result)
 end
 
 --- POST /_ui/config/apply  whole-document replace, optional model_map section.
@@ -3173,15 +3244,19 @@ function _M.handle_config_apply()
             map = nil
         end
         if map then
-            local url = _M.watcher_url()
-            if not url then
-                warning = "watcher not configured; model_map not applied"
+            -- In process: no URL to configure, so the only reasons this can fail are
+            -- a body the ledger rejects (400-shaped message) or a missing lr_watch
+            -- dict (a deployment gap). Both stay a warning, never a failed apply:
+            -- the document itself already landed.
+            local encoded = cjson.encode(map)
+            if encoded == nil then
+                warning = "model_map is not encodable; not applied"
             else
-                local result, proxy_err = _M.proxy_model_map(url, map)
+                local result, apply_err = apply_model_map_inprocess(encoded)
                 if result then
                     doc.watcher_model_map = result
                 else
-                    warning = "model_map not applied: " .. tostring(proxy_err)
+                    warning = "model_map not applied: " .. tostring(apply_err)
                 end
             end
         end
