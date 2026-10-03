@@ -9,7 +9,7 @@
   <title>Service pool · llm-router</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
-  <link rel="stylesheet" href="./app.css?v=6">
+  <link rel="stylesheet" href="./app.css?v=__UI_VERSION__">
 </head>
 <body>
   <div id="q-app">
@@ -373,8 +373,8 @@
     </q-layout>
   </div>
   <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
-  <script src="./i18n.js?v=6"></script>
-  <script src="./api.js?v=5"></script>
+  <script src="./i18n.js?v=__UI_VERSION__"></script>
+  <script src="./api.js?v=__UI_VERSION__"></script>
   <script>
     const { computed, onBeforeUnmount, onMounted, reactive, ref, watch } = Vue
     const HEALTH_WAIT_MS = 150000       // 生产健康探测 30s 一轮 × 成功阈值 2 → 需要约 60-90s

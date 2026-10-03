@@ -9,7 +9,7 @@
   <title>Logs · llm-router</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
-  <link rel="stylesheet" href="./app.css?v=5">
+  <link rel="stylesheet" href="./app.css?v=__UI_VERSION__">
   <style>
     /* 聚合表（原 metrics 页的三张表）：沿用 app.css 的 surface-card / mono / muted 口径，
        这里只补原生 table 需要的行距与右对齐数字，不新增配色变量。 */
@@ -317,8 +317,8 @@
   </div>
 
   <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
-  <script src="./i18n.js?v=3"></script>
-  <script src="./api.js?v=2"></script>
+  <script src="./i18n.js?v=__UI_VERSION__"></script>
+  <script src="./api.js?v=__UI_VERSION__"></script>
   <script>
     const { computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
     const PAGE_LIMIT = 500          // /_ui/logs 单次上限（后端 2000）

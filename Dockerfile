@@ -27,6 +27,10 @@ RUN chmod +x /docker-entrypoint.sh
 COPY conf/ui.conf /usr/local/openresty/nginx/conf/lua-router/ui.conf
 COPY ui/ /usr/local/share/llama-ui/
 
+# 构建时把 UI 版本占位符替换为 ARG 注入的版本号
+ARG UI_VERSION=dev
+RUN find /usr/local/share/llama-ui \( -name "*.html" -o -name "*.js" \) -exec sed -i "s/__UI_VERSION__/$UI_VERSION/g" {} +
+
 # 30000 inference, 29000 Prometheus.
 EXPOSE 30000 29000
 

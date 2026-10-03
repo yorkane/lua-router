@@ -11,7 +11,11 @@
 const { computed, onBeforeUnmount, onMounted, ref } = Vue
 
 // 四个管理页 + 原版聊天界面（跳出壳，新标签打开）
-const pages = ['models.html?v=2', 'workers.html?v=2', 'routing.html?v=2', 'logs.html?v=2']
+// 版本号由 index.html 注入（Dockerfile 构建时用 git hash 替换 __UI_VERSION__）
+// 本地直开时 LMR_UI_VERSION 还是占位符，用时间戳保证每次刷新
+const UI_V = (typeof window.LMR_UI_VERSION !== 'undefined' && window.LMR_UI_VERSION !== '__UI_VERSION__')
+  ? window.LMR_UI_VERSION : Date.now().toString(36)
+const pages = ['models.html?v=' + UI_V, 'workers.html?v=' + UI_V, 'routing.html?v=' + UI_V, 'logs.html?v=' + UI_V]
 // 已合并页面的历史锚点：命中即落到合并后的页面，而不是 404 回首页
 const legacyPages = { 'upstreams.html': pages[1] }
 
