@@ -266,7 +266,7 @@ docker run -d --name lua-router --network host \
 等价，第 10 条是本地新增的摘除策略（按探针失败原因分档：确定性否定当轮摘、传输层未知连续失败
 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）次才摘），对照表与
 偏差在 [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md)。`POST /model-map` 兼容原版四种
-body 形态做注册时改名。其余旋钮：`SMG_WATCHER_PROBE_TIMEOUT_SECS`(4)、
+body 形态做注册时改名（watcher 在进程内，`/_ui/config/model-map` 与管理台的改名直接调这个模块，无外部 watcher 地址需要配置）。其余旋钮：`SMG_WATCHER_PROBE_TIMEOUT_SECS`(4)、
 `SMG_WATCHER_REMOVE_GRACE_SECS`(300)、`SMG_WATCHER_MAX_MODELS`(8)、
 `SMG_WATCHER_KEEP_LAST_GRACE_SECS`(1800)。指标：`lr_watch_*` 家族。
 
