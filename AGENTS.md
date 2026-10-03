@@ -45,6 +45,7 @@
    发版、文档计数更新、生产镜像替换必须 `GATE_TIER=full` 全量 21 门全绿（快速档绿不算全绿锚点）。
 2. **临时文件一律 /data/tmp/**；生产验证文档更新进 doc/。
 3. **生产容器白名单**：本仓只许动 `lua-router-8800`（compose 在 /data/app/lua-router/）；
+   **21.k:8801 是生产，未经用户明确要求不得更新**——改动只在 21.k:8802（测试）上验证，用户确认后才推 8801；
    `authz`、`searxng-*`、`qdrant-faces`、`face-*`、`va-*`、`pg18-video`、`n8nc`、`resdown-*`、
    `wx-liushi-monitor` 及一切名字不带 lr- 的容器不许碰。已退役的 `llm-watcher`（Exited）不要重启。
 4. **设计红线**：推理体字节透传（顶层精确改写，不整表重编码）；流式不缓冲；跨请求状态只走 shdict；
