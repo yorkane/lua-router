@@ -402,7 +402,7 @@
         jsonTitle: '配置 JSON（源码编辑）',
         jsonCopy: '这份 JSON 等价于容器环境变量，可以先导出再粘进 compose 固化。「校验并应用」走 '
           + 'POST /_ui/config/apply 整表替换：缺省的段视为清空，任一字段非法则整体拒绝、不产生半提交。'
-          + 'model_map 会转发 llm-watcher 落地改名。',
+          + 'model_map 由进程内 watcher 直接落地改名。',
         jsonCopyVirtual: 'virtual_models 是对外主入口：一行 model（别名）用 targets 映射一组实际模型名，可带 '
           + 'workers（规范化 url 白名单）与 context_window（正整数，该入口唯一允许的覆盖，网关据此钳制下游的 '
           + 'max_tokens / max_completion_tokens；不想要覆盖就把整个键删掉，写 null 或空数组会被旧 build 误判）。'
@@ -428,7 +428,7 @@
         jsonConfirmWipe: '可编辑段比服务器少了若干条目：整表替换会删除这些条目（{parts}）。',
         jsonConfirmVirtualLabel: '虚拟入口',
         jsonConfirmUpstreamsLabel: '实例声明',
-        jsonConfirmWatch: '本次提交会把 model_map 缩到 {after} 条（当前 {before} 条）：apply 会把缩掉的名字转发 llm-watcher 落地删除。',
+        jsonConfirmWatch: '本次提交会把 model_map 缩到 {after} 条（当前 {before} 条）：apply 会把缩掉的名字交给进程内 watcher 落地删除。',
       },
       'en-US': {
         jsonButton: 'Config JSON',
@@ -436,7 +436,7 @@
         jsonCopy: 'This JSON is equivalent to the container environment variables, so it can be exported and '
           + 'pasted into compose. "Validate & apply" posts to POST /_ui/config/apply as a whole-document replace: '
           + 'an omitted section counts as cleared, and any invalid field rejects the whole body without a partial '
-          + 'commit. model_map is forwarded to llm-watcher so renames land.',
+          + 'commit. model_map is applied by the in-process watcher so renames land.',
         jsonCopyVirtual: 'virtual_models is the public entry point: one model row (the alias) maps a group of real '
           + 'model names through targets, optionally with workers (normalized url allowlist) and context_window (a '
           + 'positive integer, the only per-entry override, used by the gateway to clamp downstream max_tokens / '
@@ -465,7 +465,7 @@
         jsonConfirmWipe: 'The editable sections hold fewer rows than the server: a whole-document replace deletes them ({parts}).',
         jsonConfirmVirtualLabel: 'virtual entries',
         jsonConfirmUpstreamsLabel: 'upstream declarations',
-        jsonConfirmWatch: 'This submit shrinks model_map to {after} row(s) (currently {before}): apply forwards the dropped names to llm-watcher so the renames are deleted.'
+        jsonConfirmWatch: 'This submit shrinks model_map to {after} row(s) (currently {before}): apply hands the dropped names to the in-process watcher so the renames are deleted.'
       }
     }
 
@@ -563,15 +563,15 @@
           })
         }
 
+        // watcher 已并入 router 进程（doc/gap-watcher-merge.md）：徽标只看
+        // document().watcher.enabled，外部 URL 可达性这一维随代理层一起消失。
         const watcherLabel = computed(() => {
           const watcher = doc.value && doc.value.watcher
-          if (!watcher || !watcher.url) return t.value.watcherNotConfigured
-          return watcher.reachable ? t.value.watcherReachable : t.value.watcherUnreachable
+          return watcher && watcher.enabled ? t.value.watcherReachable : t.value.watcherDisabled
         })
         const watcherColor = computed(() => {
           const watcher = doc.value && doc.value.watcher
-          if (!watcher || !watcher.url) return 'grey-6'
-          return watcher.reachable ? 'teal-4' : 'red-4'
+          return watcher && watcher.enabled ? 'teal-4' : 'grey-6'
         })
         const persistNote = computed(() => {
           const file = doc.value && doc.value.persist && doc.value.persist.file
@@ -1227,8 +1227,8 @@
           JSON_SECTION_KEYS.forEach(key => {
             if (s[key] !== undefined) out[key] = cloneJson(s[key])
           })
-          // model_map 的唯一来源是 watcher 回显的对象。watcher 不可达（或没配）时整个键缺席
-          // = 本次不转发改名；写 {} 反而是「按空表落地」。
+          // model_map 的唯一来源是进程内 watcher 回显的账本。账本为空时整个键为 null
+          // （视图里缺席）= 本次不提交改名；写 {} 反而是「按空表落地清空账本」。
           const map = s.watcher && s.watcher.model_map
           if (map && typeof map === 'object' && !Array.isArray(map)) out.model_map = cloneJson(map)
           return JSON.stringify(out, null, 2)
@@ -1317,8 +1317,8 @@
               body[key] = []
             }
           })
-          // model_map 三态：文本里有 → 原样转发 watcher 落地改名；文本里没有 → 整个键缺席 =
-          // 「这次不转发改名」，绝不自作主张发 {}（那会被 watcher 当成清空账本）。
+          // model_map 三态：文本里有 → 原样提交给进程内 watcher 落地改名；文本里没有 → 整个键缺席 =
+          // 「这次不提交改名」，绝不自作主张发 {}（那会被 watcher 当成清空账本）。
           if ('model_map' in parsed) body.model_map = parsed.model_map
           // 其余顶层段（policy / model_policies 与任何本页面不认识的后端新键）一律跟随服务端
           const derived = JSON_SERVER_ONLY_KEYS.concat(JSON_SECTION_KEYS, ['model_map'])

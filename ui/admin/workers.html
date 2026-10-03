@@ -380,7 +380,7 @@
     const HEALTH_WAIT_MS = 150000       // 生产健康探测 30s 一轮 × 成功阈值 2 → 需要约 60-90s
     const HEALTH_POLL_MS = 3000
     const POOL_POLL_MS = 3000
-    const DECL_POLL_MS = 20000           // 声明层走 GET /_ui/config（会顺带探 watcher），比池慢一档
+    const DECL_POLL_MS = 20000           // 声明层走 GET /_ui/config（watcher 在进程内，只是读账本，没有外部探活），比池慢一档
 
     // 两种数据源按规范化 URL 对齐：尾斜杠与大小写差异必须折叠掉，否则声明与池行判成两条
     function normUrl (value) {
