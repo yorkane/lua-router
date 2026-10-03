@@ -153,6 +153,7 @@
                     <div class="kv-grid">
                       <div>
                         <h4 class="detail-title">{{ t.colRoute }} / {{ t.detailSelected }}</h4>
+                          <span class="k">prompt</span><span class="v mono" style="font-size:11px;overflow-wrap:anywhere">{{ (props.row.prompt_preview || props.row.prompt_preview === "") ? props.row.prompt_preview : '——' }}</span>
                         <div class="kv">
                           <span class="k">{{ t.detailId }}</span><span class="v mono">{{ props.row.id }}</span>
                           <span class="k">{{ t.detailSeq }}</span><span class="v mono">{{ props.row.seq }}</span>

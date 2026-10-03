@@ -4478,6 +4478,26 @@ local function log_inference_request(duration_s, ttft_s)
         endpoint = endpoint,
         status = status,
         stream = ngx.ctx.lr_stream == true,
+        prompt_preview = (function()
+            -- 提取第一个 user 消息的前 50 字符，给 UI 日志页快速定位用
+            local msgs = type(body) == "table" and body.messages
+            if type(msgs) ~= "table" then return nil end
+            for _, m in ipairs(msgs) do
+                if m and m.role == "user" then
+                    local c = m.content
+                    if type(c) == "string" then
+                        return c:sub(1, 50)
+                    elseif type(c) == "table" then
+                        for _, part in ipairs(c) do
+                            if type(part) == "table" and part.type == "text" and type(part.text) == "string" then
+                                return part.text:sub(1, 50)
+                            end
+                        end
+                    end
+                end
+            end
+            return nil
+        end)(),
         model = model,
         requested_model = ngx.ctx.lr_requested_model or model,
         requested_effort = ngx.ctx.lr_requested_effort or cjson.null,
