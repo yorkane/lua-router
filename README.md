@@ -211,7 +211,6 @@ docker run -d --name lua-router --network host \
 | `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/_ui/config` 写 |
 | `LMR_MODEL_MODALITIES` | `/_ui/props` 广告的能力位（`text,image`） |
 | `LMR_CONFIG_FILE` | RuntimeConfig 原子落盘路径，reload/重建后恢复；未设 = 内存态 |
-| `LMR_WATCHER_URL` | `/_ui/config/model-map` 代理到 watcher 的控制面；未配时该路由回 503 |
 | `LMR_UI_DIR` / `LMR_UI_ROUTER_MODE` | 静态 SPA 目录（默认 `/usr/local/share/llama-ui`）/ 路由模式开关。`SMG_UI_DIR` 由入口脚本映射到 `LMR_UI_DIR`（两者同时给出时 `LMR_` 优先），裸 conf 直跑只认 `LMR_UI_DIR` |
 | `LMR_REQUEST_LOG_CAPACITY` / `LMR_LOGS_BUFFER` | 请求日志环形缓冲容量，**`0` = 关闭，四个 `/_ui/logs*`/`stats` 转 503** |
 | `LR_STATS_WINDOW_S` | `/_ui/stats` 的聚合窗口（缺省 10s）；空窗口的 `avg_*` 为 null |

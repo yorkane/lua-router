@@ -4051,7 +4051,7 @@ end
 ---GET/POST /model-map - the watcher's rename table (doc/gap-watcher-merge.md).
 ---
 ---The standalone daemon served this on its metrics port; merged into the router it
----moves to the main port, which is what LMR_WATCHER_URL now points at. All four body
+---moves to the main port, this handler calls the module directly. All four body
 ---shapes the daemon accepted are accepted here (plain object, `{"map":{...}}`, bare
 ---`a:b,c:d`, `{"map":"a:b,c:d"}`), a POST merges rather than replaces, and an empty
 ---new id deletes the entry. Owned workers are recycled by the next reconcile pass, so

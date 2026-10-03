@@ -165,7 +165,7 @@
       models: {
         title: '模型管理', description: '虚拟模型别名是日常服务的主入口：一个别名映射多个实际模型，由调度策略选路；这里只保留对下游统一的上下文长度与档位覆盖。',
         persistHint: '配置落盘于 {file}', watcherReachable: 'watcher 在线', watcherUnreachable: 'watcher 不可达',
-        watcherNotConfigured: '未配置 LMR_WATCHER_URL', globalSection: '全局档位策略', globalCopy: '没有按模型覆盖时对所有请求生效',
+        globalSection: '全局档位策略', globalCopy: '没有按模型覆盖时对所有请求生效',
         defaultEffort: '默认推理强度', defaultEffortHint: '请求未指名档位时使用；留空表示交给引擎默认', effortMapTitle: '档位改写',
         effortMapCopy: '请求指定档位时的映射，例如 high → max', modelEffortTitle: '强制档位（旧字段）',
         modelEffortCopy: '对某个模型一律下发固定档位，优先级最高', mapFrom: '请求档位', mapTo: '下发档位', modelField: '模型 ID',
@@ -427,7 +427,7 @@
         title: 'Model manager',
         description: 'Virtual aliases are the everyday entry point: one alias maps to several real models and the policy picks one. This page keeps the downstream-uniform context and effort overrides.',
         persistHint: 'Persisted to {file}', watcherReachable: 'watcher online',
-        watcherUnreachable: 'watcher unreachable', watcherNotConfigured: 'LMR_WATCHER_URL not set',
+        watcherUnreachable: 'watcher unreachable',
         globalSection: 'Global effort policy', globalCopy: 'Applies to every request without a model override',
         defaultEffort: 'Default effort',
         defaultEffortHint: 'Used when the request names no effort; blank leaves the engine default',

@@ -14,8 +14,11 @@
 --   3. env defaults                  (LMR_* baseline)
 -- Writes update all available layers so every worker sees the change.
 --
--- Outbound control-plane HTTP (the llm-watcher model-map proxy) also lives
--- here, as a dependency-free cosocket client: _M.raw_request / _M.request_json.
+-- Outbound control-plane HTTP (the /props probe) also lives here, as a
+-- dependency-free cosocket client: _M.raw_request / _M.request_json. The
+-- model-map proxy half was deleted with the watcher merge
+-- (doc/gap-watcher-merge.md): /_ui/config/model-map now calls the in-process
+-- watcher module directly, so nothing here reaches an external watcher URL.
 -- props.lua reuses it rather than requiring lua-resty-http, which the image is
 -- not guaranteed to ship.
 
@@ -208,7 +211,7 @@ _M.ENV_NAMES = {
     "SMG_POLICY",
     "LMR_DEFAULT_EFFORT", "LMR_EFFORT_MAP", "LMR_MODEL_CTX", "LMR_MODEL_EFFORT",
     "LMR_MODEL_EFFORT_MAP", "LMR_MODEL_MODALITIES", "LMR_VIRTUAL_MODELS",
-    "LMR_WATCHER_URL", "LMR_CONFIG_FILE", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
+    "LMR_CONFIG_FILE", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
     "LMR_LOGS_BUFFER", "LMR_UPSTREAMS_FILE",
 }
 
@@ -2765,10 +2768,6 @@ end
 
 -- ------------------------------------------------------------- watcher
 
-function _M.watcher_url()
-    return env("LMR_WATCHER_URL")
-end
-
 
 --- Minimal HTTP/1.1 client on ngx.socket.tcp. Returns status, headers(table,
 --- lowercase), body — or nil, err. Supports Content-Length and chunked.
@@ -3140,19 +3139,11 @@ end
 
 --- POST /_ui/config/model-map  forward verbatim to the watcher.
 function _M.handle_config_model_map()
-    local body, err = read_json_body()
-    if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
-    local url = _M.watcher_url()
-    if not url then
-        return respond_json(ngx.HTTP_SERVICE_UNAVAILABLE,
-            { ok = false, error = "watcher not configured (set LMR_WATCHER_URL)" })
-    end
-    local result, proxy_err = _M.proxy_model_map(url, body)
-    if not result then
-        return respond_json(ngx.HTTP_BAD_GATEWAY, { ok = false, error = proxy_err })
-    end
-    result.ok = true
-    return respond_json(ngx.HTTP_OK, result)
+    -- deprecated: use /model-map directly (watcher is in-process)
+    return respond_json(ngx.HTTP_MOVED_PERMANENTLY, {
+        ok = false,
+        error = "deprecated: use /model-map directly",
+    })
 end
 
 --- POST /_ui/config/apply  whole-document replace, optional model_map section.

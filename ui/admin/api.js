@@ -76,8 +76,8 @@
     // 服务接入池（doc/gap-virtual-models.md 3.5）：整表替换 + 立即 reconcile
     configUpstreams: entries => post('/config/upstreams', { entries }, UI_BASE),
     configApply: document => post('/config/apply', document, UI_BASE),
-    // 改名映射转发给 watcher 的 /model-map；body 支持 {"orig":"new"} 形状，空值即删除
-    configModelMap: mapping => post('/config/model-map', mapping, UI_BASE),
+    // 模型改名映射（直接调 /model-map）；body 支持 {"orig":"new"} 形状，空值即删除
+    configModelMap: mapping => post('/model-map', mapping),
 
     // ── 路由策略（/_ui/config/policy，doc/gap-routing-dyn.md） ──
     // GET 返回策略链文档（候选策略 + 全局 + per-model 行），PUT 提交变更并回显新文档。
