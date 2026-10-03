@@ -2098,10 +2098,7 @@ function _M.request_effort_for(model, requested)
         local level = wanted and EFFORT_SET[wanted] and wanted or nil
         if level then
             if card.effort_map[level] then return card.effort_map[level] end
-            if next(card.effort_map) or card.default_effort then
-                return card.default_effort or level
-            end
-            return cfg.effort_map[level] or level
+            return level  -- 请求显式指定的 effort 没有映射时透传
         end
         if card.default_effort then return card.default_effort end
         if wanted then
