@@ -7,7 +7,8 @@
   1. 对拍的是**不变量**，不是逐次落点。两边哈希不同（Lua = blake3 over 前 N 个
      字符，Rust = xxh3 over 前 N 个 token），bucket / power_of_two 的内部状态也
      各自独立演化，所以断言只取三类：同输入是否粘滞、前缀截断与长度分桶的边界
-     是否成立、以及 χ² 均匀性或偏斜检查。
+     是否成立、以及均匀性/偏斜检查。**均匀性判据是 TOST 等价性检验，χ² 已降级为报告项**
+     （依据与标定见 tost_uniform 的注释：E[χ²]=df 与 N 无关，α=0.05 等于每轮门禁自带约 5% 红概率）。
   2. Rust 侧两个策略入口的可用性是**实测的权威结论**，这里固化成断言；上游一旦
      把入口修好，这几条会失败，那正是「需要重开对拍」的信号：
        - prefix_hash：CLI 接受 --policy prefix_hash，但 HTTP 面 tokens 恒为 None
@@ -34,11 +35,18 @@ Env knobs:
   LR_RUST_IMAGE=ghcr.io/yorkane/llm-router:latest   固定本地 tag，不做 pull
   LR_PP_N=10000            random 每侧样本数（下限 10000）
   LR_PP_CONC=16            closed-loop 并发
-  LR_PP_POT_N=240          power_of_two closed-loop 样本数
+  LR_PP_POT_N=1200         power_of_two closed-loop 样本数（两类判据共用；假红率按这个
+                           N 标定，调小等于换判据）
+  LR_PP_WARMUP=40          正式计数前烧掉的冷启动请求数
+  LR_PP_TOST_D=0.065       TOST 等价边界（每桶份额相对 1/3 的容许偏差，不含抽样噪声项）
+  LR_PP_TH_AVOID_LUA=0.25  「仍避开慢 worker」的慢份额上限（Lua 有/无 loads 两条）
+  LR_PP_TH_AVOID_RUST=0.28 「仍避开慢 worker」的慢份额上限（Rust 有 loads）
+  LR_PP_TOST_D_RANDOM=0.008 random 轮的 TOST 等价边界（N=10000/侧，口径见 round_random）
   LR_PP_SLOW_MS=120        慢 worker 的时延
 """
-import json, os, subprocess, sys, threading, time
+import json, math, os, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from statistics import NormalDist
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (free_port, http, check, start_router, logs, stop_router, wait_ready,
@@ -47,10 +55,18 @@ from _lib import (free_port, http, check, start_router, logs, stop_router, wait_
 RUST_IMAGE = os.environ.get("LR_RUST_IMAGE", "ghcr.io/yorkane/llm-router:latest")
 N_RANDOM = max(10000, int(os.environ.get("LR_PP_N", 10000)))
 CONC = int(os.environ.get("LR_PP_CONC", 16))
-POT_N = int(os.environ.get("LR_PP_POT_N", 240))
+POT_N = int(os.environ.get("LR_PP_POT_N", 1200))
+POT_WARMUP = int(os.environ.get("LR_PP_WARMUP", 40))
+TOST_D = float(os.environ.get("LR_PP_TOST_D", 0.065))
+TH_AVOID_LUA = float(os.environ.get("LR_PP_TH_AVOID_LUA", 0.25))
+TH_AVOID_RUST_WITH = float(os.environ.get("LR_PP_TH_AVOID_RUST", 0.28))
 SLOW_MS = float(os.environ.get("LR_PP_SLOW_MS", 120))
 PREFIX_CHARS = 32
-CHI2_P005, CHI2_P001 = 5.991, 9.210          # df = 2 (3 workers)
+CHI2_P005, CHI2_P001 = 5.991, 9.210          # df = 2 (3 workers)；降为报告项，见 tost_uniform
+P0_UNIFORM = 1.0 / 3.0                       # 3 workers 时的均匀份额
+# TOST 由 6 个单侧检验拼成（3 桶 × 两侧边界），Bonferroni 后每侧 α = 0.05/6。
+TOST_Z = NormalDist().inv_cdf(1.0 - 0.05 / 6.0)
+TOST_D_RANDOM = float(os.environ.get("LR_PP_TOST_D_RANDOM", 0.008))  # random 轮，见 round_random
 L_MAX = 4096                                  # Rust bucket.rs l_max
 OUT_DIR = os.environ.get("LR_POLICY_EXTRA_OUT", "/data/tmp/parity/policy-extra")
 REPORT = {}
@@ -65,6 +81,132 @@ def chi2(counts):
         return 0.0
     exp = n / len(counts)
     return sum((c - exp) ** 2 / exp for c in counts)
+
+
+def tost_uniform(counts, d=None, n_total=None):
+    """等价性检验（TOST）：断言每一桶份额与 1/3 的偏差都 <= tol。返回 (green, max_dev, tol)。
+
+    为什么把 chi2 从**判据**降成**报告项**（这段是本次修改的全部依据，下一个人动这里之前先读完）：
+
+    chi2 拟合优度检验的期望 E[chi2] = df = k-1 = 2，**公式里根本没有 N**，于是
+        P(chi2 > 5.991 | 真均匀) = exp(-5.991/2) = 0.05001      <- 与样本量无关的常数
+    标定实测（/data/tmp/chi2_power/，每格 15 万~40 万次抽样）：N=240/480/1200/2400/4800
+    分别红 5.09%/4.95%/5.07%/5.05%/5.06%。所以「偶发红」既不是抖动也不是回归，
+    **加大 N 一分不减**；它是 alpha=0.05 这个 tail cut 自身的性质——等于
+    **每轮全量门禁自带约 5% 的红概率预算**，同一文件里多条 chi2 判据还各自独立再抽一次。
+    门禁天天跑，这份预算迟早必中（本轮 3 次实测 chi2 = 0.475/4.825/6.400 就在这条尾部上跳）。
+
+    方向也错了：「chi2 没超临界值」只等于**没能拒绝均匀**，样本不足时同样绿，属无证据即无罪。
+    TOST 把假设反过来，绿的含义是**证明了与均匀不可区分**；其假红率 = P(任一台份额跳出 tol)，
+    tol 的噪声项 Z*sd ~ 1/sqrt(N) 随 N 变窄，所以 N=1200 / d=0.065 下真均匀红率 3.0e-12
+    （原判据 5%），检测力一侧也不损：真不再退化（慢份额 0.11）时 TOST 误判绿的概率 4.2e-35。
+
+    **唯一真软肋是过散**。以上全部建立在 iid 抽样模型上：closed-loop 流量的逐轮状态
+    （in-flight 计数、节流窗口、LoadMonitor 刷新时机）会在轮间漂移，形态等价于
+    beta-binomial 的 rho。模拟给出 rho=0.001 时红率 4.7e-05、rho=0.01 时 0.17、rho=0.02 时 0.41，
+    而**真实 rho 从未实测过**（标定全是抽样模型，没有真跑 router）。所以这条上线后若仍红，
+    **优先怀疑环节流漂移而不是样本量；加 N 只会更糟**（N 越大 tol 越贴住真值、漂移越容易
+    被判红），对策是放宽 d（LR_PP_TOST_D）。chi2 与 TOST 两个数每条都一起打印，
+    结论矛盾时如实标出并一律按 TOST 定性，不挑好看的报。
+
+    真实 rho 的实测证据（2026-10-04，**真跑了 router**：5 轮完整 e2e_policy_parity，
+    N=1200、40 warmup，数据 /data/tmp/chi2_power_mine/reps/run*/）：把每个断言点的
+    慢桶份额跨 5 轮的标准差和 iid 二项标准差做矩估计（beta-binomial），得
+      rust no-loads（**本条判据所在点**） shares 0.3208~0.3517，sd=0.0123 vs iid 0.0136 → rho_hat≈0
+      rust with-loads  sd 0.0146 vs 0.0108 → rho_hat≈0.0007
+      Lua  with-loads  sd 0.0154 vs 0.0095 → rho_hat≈0.0014
+      Lua  no-loads    sd 0.0175 vs 0.0095 → rho_hat≈0.0020
+    也就是说**没有证据显示被门禁的这一点存在过散**（点估计贴 0，甚至略低于 iid）；
+    真正有点过散迹象的是 Lua 那两点（rho≈0.002），而那两点跑的是 skew 判据（要求 dev **大于**
+    tol），过散只会让它更不容易红，方向安全。5 轮实测 dev = 0.0067~0.0183，
+    tol=0.0976，**最差的一轮也还在边界内 5.3 倍**；同点 iid 红率 3.3e-06。
+    样本仍偏少（5 轮估 rho 的置信区间很宽），所以判断仍然只是「暂无风险信号」：
+    REPORT["power_of_two"] 每轮都落 counts，攒够 30 轮重估；若 rho 逼近 0.008，
+    对策是把 d 放宽到 0.080（rho=0.008 时红率从 6.8e-02 降到 2.8e-02），**不是**动 N
+    """
+    vals = list(counts.values()) if isinstance(counts, dict) else list(counts)
+    n = float(sum(vals)) if n_total is None else float(n_total)
+    if n == 0:
+        return False, 1.0, 0.0
+    d = TOST_D if d is None else float(d)
+    tol = d + TOST_Z * math.sqrt(P0_UNIFORM * (1.0 - P0_UNIFORM) / n)
+    dev = max(abs(c / n - P0_UNIFORM) for c in vals)
+    return dev <= tol, dev, tol
+
+
+def avoid_gate(counts, slow, th):
+    """「仍避开慢 worker」判据：慢桶份额 <= th。返回 (green, share)。
+
+    theta 与 N 一起标定（同一份 /data/tmp/chi2_power/ 口径，N=1200，按 40 请求 warmup
+    burn 掉后的 depleted 分布算，比 iid 保守）：真随机（p=1/3）时误判绿的概率
+    theta=0.25 -> 8.5e-10、0.26 -> 6.4e-08、0.27 -> 2.8e-06、0.28 -> 6.9e-05、0.30 -> 9.2e-03。
+    两个方向的错误要显式权衡：**放过真退化的代价是生产事故，偶发红的代价是门禁天天误报**。
+    裁定取**更怕偶发红**（门禁天天跑），所以宁可让 theta 留余量：Rust 有 loads 的实测慢份额
+    区间 0.000~0.225（doc/parity-policy-extra.md 3.1 节），theta=0.27 时按 p=0.225 算偶发红
+    1.7e-04、放过真退化 2.8e-06；theta=0.28 时偶发红 6.7e-06、放过 6.9e-05。取 **theta=0.28**：
+    偶发红压到 1e-05 量级（约 15 万轮一遇），放过概率仍在 1e-04 以下。
+    旧判据 N=240 / theta=0.30 的放过率是 **0.187（约 1/5）**，那条基本等于没检。
+    Lua 侧实测份额 0.096~0.108，离 0.25 有 0.14 余量，theta=0.25 的 8.5e-10 已足够低，
+    不必再收紧；数值不变，只是 N 从 240 提到 1200，放过真退化从 3.2e-03 降到 8.5e-10。
+    """
+    vals = list(counts.values()) if isinstance(counts, dict) else list(counts)
+    n = float(sum(vals))
+    sh = counts[slow] / n if n else 0.0
+    return sh <= th, sh
+
+
+def stat_line(tag, counts, chi2_value, tost_green, dev, tol, extra="", d=None):
+    """每次都把 chi2 与 TOST 两个数摊开：让人看得出结论靠哪一侧支撑。"""
+    chi2_green = chi2_value < CHI2_P005
+    v = lambda g: ("绿" if g else "红")
+    vals = list(counts.values()) if isinstance(counts, dict) else list(counts)
+    msg = ("STAT   %-28s N=%-5d chi2=%7.3f(crit %.3f -> %s)  "
+           "TOST max|share-1/3|=%.4f tol=%.4f (d=%.3f -> %s)"
+           % (tag, sum(vals), chi2_value, CHI2_P005, v(chi2_green), dev, tol,
+              TOST_D if d is None else float(d), v(tost_green)))
+    if chi2_green != tost_green:
+        msg += "  [两判据结论相反：按 TOST 定性，chi2 一侧只表示没能拒绝均匀]"
+    if extra:
+        msg += "  " + extra
+    print(msg)
+    return chi2_green
+
+
+def stat_selftest():
+    """判别性自测：真退化必须判红。只验「均匀时不红」是半个测试。
+
+    纯算术、不联网、不占端口，所以在 main() 开头无条件跑；只在**判错方向**时计入 check，
+    正常轮次一条都不加。
+    """
+    uni = [400, 400, 400]                 # 真均匀（= 退化成立）
+    deg = [132, 534, 534]                 # 真不再退化：慢份额 0.11
+    obs = [320, 400, 480]                 # 实测到过的最差真实行为：慢份额 0.267
+    near = [335, 432, 433]                # 0.2792，贴在 theta=0.28 内侧
+    bad = []
+    g, dev, tol = tost_uniform(uni)
+    if not g:
+        bad.append("真均匀被判红：dev=%.4f tol=%.4f" % (dev, tol))
+    g, dev, tol = tost_uniform(deg)
+    if g:
+        bad.append("真退化（慢份额 0.11）被 TOST 放过：dev=%.4f tol=%.4f" % (dev, tol))
+    g, dev, tol = tost_uniform(obs)
+    if not g:
+        bad.append("实测最差真实行为 0.267 被 d=%.3f 判红：等价边界过紧 dev=%.4f tol=%.4f"
+                   % (TOST_D, dev, tol))
+    g, sh = avoid_gate(deg, 0, TH_AVOID_LUA)
+    if not g:
+        bad.append("真避开（0.11）没过 avoid 判据：share=%.4f" % sh)
+    g, sh = avoid_gate(uni, 0, TH_AVOID_LUA)
+    if g:
+        bad.append("真随机（份额 1/3）被误判成避开：share=%.4f" % sh)
+    g, sh = avoid_gate(near, 0, TH_AVOID_RUST_WITH)
+    if not g:
+        bad.append("0.279 应过 theta=0.28：share=%.4f" % sh)
+    print("STAT   %-28s 判别性自测（真均匀绿 / 真退化红 / 最差观测 0.267 绿）: %s"
+          % ("stat_selftest", "PASS" if not bad else "FAILED"))
+    for b in bad:
+        check("[power_of_two/stat-selftest] 判据方向正确", False, b)
+    return not bad
 
 
 def counts_of(wids, order):
@@ -502,18 +644,36 @@ def round_power_of_two(have_rust):
     base = "http://127.0.0.1:%d" % lua
     tag = "power_of_two/Lua"
     ok = check("[%s] 3 workers healthy" % tag, lua_healthy(lua, ports, 3), logs(name)[:200])
-    REPORT["power_of_two"] = {"slow_ms": SLOW_MS, "n": POT_N, "slow_worker": slow}
+    REPORT["power_of_two"] = {"slow_ms": SLOW_MS, "n": POT_N, "slow_worker": slow,
+                              "warmup": POT_WARMUP,
+                              "criteria": {"uniformity": "TOST(d=%.3f, Z=%.4f, alpha=0.05/6)"
+                                           % (TOST_D, TOST_Z),
+                                           "chi2": "report-only (crit %.3f)" % CHI2_P005,
+                                           "avoid_theta": {"lua": TH_AVOID_LUA,
+                                                           "rust_with_loads": TH_AVOID_RUST_WITH}}}
     if not ok:
         stop_router(name)
     else:
-        sample(base, model, lambda i: "warm %d" % i, 40)          # exclude cold start
+        sample(base, model, lambda i: "warm %d" % i, POT_WARMUP)   # exclude cold start
         dl = counts_of(sample(base, model, lambda i: "pot probe %d shared body text" % i, POT_N), order)
         cl = chi2(list(dl.values()))
-        check("[%s] 两随机候选取低负载：避开 %dms 慢 worker（slow_share=%.3f < 0.25）"
-              % (tag, SLOW_MS, share(dl, slow)), share(dl, slow) < 0.25,
-              "%s share=%.3f" % (dl, share(dl, slow)))
-        check("[%s] 偏斜说明确实在比负载而不是随机撒点（χ²=%.3f > %.3f）" % (tag, cl, CHI2_P005),
-              cl > CHI2_P005, "%s chi2=%.3f" % (dl, cl))
+        # avoid 判据（theta 标定见 avoid_gate）：慢桶份额必须 <= theta。
+        gl_av, sh_l = avoid_gate(dl, slow, TH_AVOID_LUA)
+        check("[%s] 两随机候选取低负载：避开 %dms 慢 worker（slow_share=%.3f <= %.2f，N=%d）"
+              % (tag, SLOW_MS, sh_l, TH_AVOID_LUA, POT_N), gl_av,
+              "%s share=%.3f theta=%.2f" % (dl, sh_l, TH_AVOID_LUA))
+        # skew 判据 = TOST 的**反面**：dev 必须**超出** tol，才说明真在比负载而不是随机撒点。
+        # 用同一个 tol 而不是 χ² 临界值，两侧共用一套口径。实测 Lua 份额 0.096~0.146
+        # 对应 dev 0.19~0.23，是 tol=0.0976 的 2 倍，判红概率实测 0（60 万次抽样）。
+        # 注意这条比旧 χ²>5.991 **更严**：旧判据在 share≈0.29 时仍绿（期望 χ²=10），
+        # 新判据 share>0.237 就红。于是「仍在避开」的有效上限由这条的 0.237 决定，
+        # 而不是 avoid_gate 的 θ=0.25 —— 方向是收紧、不是放松，Lua 实测离两者都远。
+        gl_sk, dev_l, tol_l = tost_uniform(list(dl.values()))
+        stat_line("power_of_two/Lua with-loads", list(dl.values()), cl, gl_sk, dev_l, tol_l,
+                  "skew-assert: need dev>tol; slow_share=%.4f" % sh_l)
+        check("[%s] 偏斜说明确实在比负载而不是随机撒点（max|share-1/3|=%.4f > tol=%.4f；"
+              "报告项 χ²=%.3f vs 临界 %.3f）" % (tag, dev_l, tol_l, cl, CHI2_P005),
+              dev_l > tol_l, "%s dev=%.4f tol=%.4f chi2=%.3f" % (dl, dev_l, tol_l, cl))
         cnt = selection_counter(http("GET", base + "/metrics")[1], model, "power_of_two")
         check("[%s] worker_selection_total{policy=power_of_two} 计数 > 0" % tag, (cnt or 0) > 0,
               "counter=%s" % cnt)
@@ -533,11 +693,15 @@ def round_power_of_two(have_rust):
     okn = check("[power_of_two/Lua no-loads] 3 workers healthy", lua_healthy(lun, nports, 3),
                 logs(nname)[:200])
     if okn:
-        sample(lunb, nmodel, lambda i: "warm %d" % i, 40)
+        sample(lunb, nmodel, lambda i: "warm %d" % i, POT_WARMUP)
         dn = counts_of(sample(lunb, nmodel, lambda i: "pot noloads %d shared body text" % i, POT_N), norder)
+        gn_av, sh_n = avoid_gate(dn, nslow, TH_AVOID_LUA)
+        _gn, _dev, _tol = tost_uniform(list(dn.values()))
+        stat_line("power_of_two/Lua no-loads", list(dn.values()), chi2(list(dn.values())),
+                  _gn, _dev, _tol, "slow_share=%.4f theta=%.2f" % (sh_n, TH_AVOID_LUA))
         check("[power_of_two/Lua no-loads] 仍用自己的 in-flight 计数，避开慢 worker"
-              "（slow_share=%.3f < 0.25）" % share(dn, nslow), share(dn, nslow) < 0.25,
-              "%s share=%.3f" % (dn, share(dn, nslow)))
+              "（slow_share=%.3f <= %.2f，N=%d）" % (sh_n, TH_AVOID_LUA, POT_N), gn_av,
+              "%s share=%.3f theta=%.2f" % (dn, sh_n, TH_AVOID_LUA))
         REPORT["power_of_two"]["lua_no_loads"] = {"counts": dn, "chi2": round(chi2(list(dn.values())), 3),
                                                  "slow_share": round(share(dn, nslow), 4)}
     stop_router(nname)
@@ -547,11 +711,18 @@ def round_power_of_two(have_rust):
         r = RustRouter(rname, "power_of_two", ports, order, model, worker_urls=True)
         if check("[power_of_two/Rust] --worker-urls 启动后 3 workers healthy", r.healthy(),
                  logs(rname)[:250]):
-            sample(r.base, model, lambda i: "warm %d" % i, 40)
+            sample(r.base, model, lambda i: "warm %d" % i, POT_WARMUP)
             dr = counts_of(sample(r.base, model, lambda i: "pot probe %d shared body text" % i, POT_N), order)
-            check("[power_of_two/Rust] 有 /v1/loads 时同样避开慢 worker（slow_share=%.3f < 0.30；"
-                  "随机基线 0.333）" % share(dr, slow), share(dr, slow) < 0.30,
-                  "%s share=%.3f" % (dr, share(dr, slow)))
+            # θ 从 0.30 收到 0.28 并把 N 提到 1200：旧口径 N=240 / θ=0.30 在真随机
+            # （p=1/3，即完全没避开）下**放过率 0.187，约 1/5**，等于没检。
+            # 新口径放过率 6.9e-05、偶发红 6.7e-06（θ 的取舍见 avoid_gate 注释）。
+            gr_av, sh_r = avoid_gate(dr, slow, TH_AVOID_RUST_WITH)
+            _gr, _devr, _tolr = tost_uniform(list(dr.values()))
+            stat_line("power_of_two/Rust with-loads", list(dr.values()), chi2(list(dr.values())),
+                      _gr, _devr, _tolr, "slow_share=%.4f theta=%.2f" % (sh_r, TH_AVOID_RUST_WITH))
+            check("[power_of_two/Rust] 有 /v1/loads 时同样避开慢 worker（slow_share=%.3f <= %.2f；"
+                  "随机基线 0.333，N=%d）" % (sh_r, TH_AVOID_RUST_WITH, POT_N), gr_av,
+                  "%s share=%.3f theta=%.2f" % (dr, sh_r, TH_AVOID_RUST_WITH))
             REPORT["power_of_two"]["rust_with_loads"] = {
                 "counts": dr, "chi2": round(chi2(list(dr.values())), 3),
                 "slow_share": round(share(dr, slow), 4),
@@ -561,19 +732,29 @@ def round_power_of_two(have_rust):
         r2name = "lr-pp2n-r" + RUN[-4:]
         r2 = RustRouter(r2name, "power_of_two", nports, norder, nmodel, worker_urls=True)
         if check("[power_of_two/Rust no-loads] 3 workers healthy", r2.healthy(), logs(r2name)[:250]):
-            sample(r2.base, nmodel, lambda i: "warm %d" % i, 40)
+            sample(r2.base, nmodel, lambda i: "warm %d" % i, POT_WARMUP)
             drn = counts_of(sample(r2.base, nmodel, lambda i: "pot noloads %d shared body text" % i,
                                    POT_N), norder)
             crn = chi2(list(drn.values()))
             log_txt = docker_logs(r2name)
             noloads_lines = log_txt.count("No loads fetched")
-            # 判据用 0.22（Lua 同场景实测上限 0.146、随机基线 0.333，Rust 跨轮观测
-            # 0.271~0.362）：留出抖动余量，同时不会把「仍避开慢 worker」误判成退化。
+            # 判据 = TOST 等价性检验（绿 = **证明了**与均匀不可区分），χ² 只作报告项。
+            # 旧判据 (share > 0.22 and χ² < 5.991) 的偶发红全部来自 χ² 那一侧：
+            # E[χ²]=df=2 与 N 无关，P(χ²>5.991|真均匀)=exp(-5.991/2)=5.0%。
+            # 实测跨轮 slow_share 0.271~0.362（基线 0.333）对应 dev <= 0.062，
+            # 距 d=0.065 的边界 tol=0.0976 有 0.035 余量，所以 d 取 0.065 而不是标定的 0.055
+            # —— d=0.055 在最差真实观测（0.267，counts 64/80/96）上仍红 4.4%。
+            gn_de, dev_n, tol_n = tost_uniform(list(drn.values()))
+            stat_line("power_of_two/Rust no-loads", list(drn.values()), crn, gn_de, dev_n, tol_n,
+                      "degraded-assert: need dev<=tol; slow_share=%.4f floor>0.22"
+                      % share(drn, nslow))
             check("[power_of_two/Rust no-loads] 背离复现：负载取不到时退化成均匀随机"
-                  "（slow_share=%.3f > 0.22，χ²=%.3f < %.3f）"
-                  % (share(drn, nslow), crn, CHI2_P005),
-                  share(drn, nslow) > 0.22 and crn < CHI2_P005,
-                  "%s share=%.3f chi2=%.3f" % (drn, share(drn, nslow), crn))
+                  "（TOST max|share-1/3|=%.4f <= tol=%.4f，d=%.3f；慢份额 %.3f > 0.22；"
+                  "报告项 χ²=%.3f vs 临界 %.3f）"
+                  % (dev_n, tol_n, TOST_D, share(drn, nslow), crn, CHI2_P005),
+                  gn_de and share(drn, nslow) > 0.22,
+                  "%s share=%.3f dev=%.4f tol=%.4f chi2=%.3f"
+                  % (drn, share(drn, nslow), dev_n, tol_n, crn))
             probe_loads = [http("GET", "http://127.0.0.1:%d/v1/loads?include=core" % nports[w],
                                 timeout=3)[0] for w in norder]
             check("[power_of_two/Rust no-loads] 原因确认：worker 的 /v1/loads 全部 404（LoadMonitor "
@@ -607,11 +788,27 @@ def round_random(have_rust):
         vals = list(dl.values())
         exp = sum(vals) / float(len(vals))
         dev = 100.0 * max(abs(v - exp) for v in vals) / exp
-        check("[%s] N=%d 均匀性 χ²=%.3f < %.3f（0.05）" % (tag, N_RANDOM, cl, CHI2_P005),
-              cl < CHI2_P005, "%s chi2=%.3f" % (dl, cl))
-        check("[%s] 更严一档 χ²=%.3f < %.3f（0.01）" % (tag, cl, CHI2_P001), cl < CHI2_P001,
-              "%s chi2=%.3f" % (dl, cl))
-        check("[%s] 最大偏移 %.2f%% < 3%%" % (tag, dev), dev < 3.0, json.dumps(dl))
+        # 判据 = TOST（绿 = 证明了与均匀不可区分）。三条旧判据各自带内置红预算：
+        # χ²<5.991 是 5%、χ²<9.210 是 1%、max_dev<3% 折成份额偏移只有 2.12 个 sd
+        # （0.01 / 0.00471），3 桶取 max 后偶发红 **8.5%** —— 三条叠起来约 10%，
+        # 所以这一轮在全量门禁里本来就是常态性贴线红（本轮实测 χ²=6.679、偏移 3.61%）。
+        # 新口径 d_random=0.008 -> tol=0.0193（4.1 个 sd），真均匀下假红 1.7e-04，
+        # 而任何有实际意义的偏斜（0.40/0.30/0.30，dev=0.0667）漏检概率 0。
+        gl, gd, gt = tost_uniform(vals, d=TOST_D_RANDOM)
+        stat_line(tag + " random", vals, cl, gl, gd, gt, d=TOST_D_RANDOM)
+        check("[%s] N=%d 均匀性 TOST max|share-1/3|=%.4f <= tol=%.4f (d=%.3f)；"
+              "报告项 chi2=%.3f vs %.3f/%.3f" % (tag, N_RANDOM, gd, gt, TOST_D_RANDOM,
+                                                cl, CHI2_P005, CHI2_P001),
+              gl, "%s dev=%.4f tol=%.4f chi2=%.3f" % (dl, gd, gt, cl))
+        # 反向护栏：真 random 的 dev 不可能是 0。贴得太均匀 = 其实在严格轮转
+        # （round_robin 的签名），这才是旧 max_dev 那条**没在管**的方向。
+        # 实测 P(dev <= 0.0002 | 真 random) = 1.0e-03（150 万次抽样）。
+        check("[%s] 不像被换成严格轮转：max|share-1/3|=%.4f > 0.0002"
+              "（真 random 下该值 <=2e-04 的概率仅 1.0e-03）" % (tag, gd),
+              gd > 0.0002, "%s dev=%.4f" % (dl, gd))
+        check("[%s] 三桶都有份额且不塌缩（每桶 share %.4f~%.4f）"
+              % (tag, min(vals) / float(sum(vals)), max(vals) / float(sum(vals))),
+              all(0.20 < v / float(sum(vals)) < 0.47 for v in vals), json.dumps(dl))
         cnt = selection_counter(http("GET", base + "/metrics")[1], model, "random")
         check("[%s] worker_selection_total{policy=random} 计数 >= N" % tag, (cnt or 0) >= N_RANDOM,
               "counter=%s n=%d" % (cnt, N_RANDOM))
@@ -631,12 +828,16 @@ def round_random(have_rust):
         r = RustRouter(rname, "random", ports, order, model)
         if check("[random/Rust] 3 workers healthy", r.healthy(), logs(rname)[:250]):
             dr = counts_of(sample(r.base, model, lambda i: "random probe %d" % i, N_RANDOM), order)
-            cr = chi2(list(dr.values()))
             vr = list(dr.values())
+            cr = chi2(vr)
             expr = sum(vr) / float(len(vr))
             devr = 100.0 * max(abs(v - expr) for v in vr) / expr
-            check("[random/Rust] N=%d 均匀性 χ²=%.3f < %.3f（两侧各自过检，不逐次比对）"
-                  % (N_RANDOM, cr, CHI2_P005), cr < CHI2_P005, "%s chi2=%.3f" % (dr, cr))
+            gr, gdr, gtr = tost_uniform(vr, d=TOST_D_RANDOM)
+            stat_line("random/Rust", vr, cr, gr, gdr, gtr, d=TOST_D_RANDOM)
+            check("[random/Rust] N=%d 均匀性 TOST max|share-1/3|=%.4f <= tol=%.4f (d=%.3f)；"
+                  "两侧各自过检，不逐次比对；报告项 chi2=%.3f vs %.3f"
+                  % (N_RANDOM, gdr, gtr, TOST_D_RANDOM, cr, CHI2_P005),
+                  gr and gdr > 0.0002, "%s dev=%.4f tol=%.4f chi2=%.3f" % (dr, gdr, gtr, cr))
             cntr = selection_counter(r.metrics(), model, "random")
             check("[random/Rust] worker_selection_total{policy=random} 计数 >= N",
                   (cntr or 0) >= N_RANDOM, "counter=%s" % cntr)
@@ -729,6 +930,7 @@ class RustRouter:
 
 
 def main():
+    stat_selftest()
     have_rust = rust_available()
     print("rust image %s: %s" % (RUST_IMAGE, "present" if have_rust else
                                  "MISSING -> Rust-side checks skipped"))
