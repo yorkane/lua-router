@@ -214,6 +214,13 @@ _M.ENV_NAMES = {
     -- 声明进 ENV_NAMES 是硬要求：nginx 会把未声明的变量从 worker 环境里剥掉，
     -- 漏了这一行则 LMR_MODEL_CONTEXT_LIMIT 只在 master 里可见，worker 读到 nil。
     "LMR_MODEL_CONTEXT_LIMIT",
+    -- /v1/models「只广告虚拟入口」开关（030dab5 落的路由侧读的就是这个键的 env 层）。
+    -- 它当时绕开 config_store 直读磁盘原文，正是为了躲「没进 ENV_NAMES 的键在 worker 里
+    -- 恒为 nil」这一层；名册补齐之后 config_store 与 router 读到的是同一份读数。
+    -- 另注：本仓三份 conf 里没有任何 env LMR_* 白名单（只放行 LR_* / SMG_*），LMR_* 一律
+    -- 靠 capture_env 在 init_by_lua（fork 之前）抓进 _G.LMR_ENV_CACHE，所以这里加名就是
+    -- 全部要做的事，不需要也不应该去 conf 里再加一行 env 指令。
+    "LMR_MODELS_VIRTUAL_ONLY",
     "LMR_CONFIG_FILE", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
     "LMR_LOGS_BUFFER", "LMR_UPSTREAMS_FILE",
 }
@@ -257,6 +264,17 @@ end
 local function nul(value)
     if value == nil then return JSON_NULL end
     return value
+end
+
+--- 布尔开关的读数真值表：true、以及 "true"/"1"/"yes"/"on" 这四种写法算开，其余一律关。
+--- 与 router.lua 的 models_advertise.truthy 同一套口径（两处读数必须给出同一个答案，
+--- 否则磁盘层与环境层各说一遍），也刻意「不认识即关」而不是「非假即真」：一个写错的
+--- 字符串该退回缺省行为，而不是把一个改变对外形状的开关于 inadvertent 打开。
+local function advertise_truthy(value)
+    if value == true then return true end
+    if type(value) ~= "string" then return false end
+    local v = lower(trim(value))
+    return v == "true" or v == "1" or v == "yes" or v == "on"
 end
 
 --- cjson renders an empty table as {} unless it carries the array metatable.
@@ -1287,6 +1305,18 @@ local function new_cfg()
         virtual_profiles = {},
         -- Ordered upstream declaration layer (normalized url + key tri-state).
         upstreams = {},
+        -- /v1/models「只广告虚拟入口」开关，两份读数按**来源**分家（见
+        -- _M.models_virtual_only 的优先级说明）：
+        --   * models_virtual_only      = 磁盘快照里操作员声明的那一份，nil = 「没说」
+        --   * models_virtual_only_env  = 环境层那一份，nil = 「没说」
+        -- 只有磁盘那一份会被 snapshot_of 回写。两份都必须三态（nil / true / false）而不是
+        -- 合并成一个布尔：false 是「说了要全量广告」这个结论，要能压过另一层的 true，而 nil
+        -- 只是沉默（与硬规则 9 第二条同一套三态纪律）。合并成一份的代价更实在 —— 任何
+        -- 「env 赢进来又被 write_snapshot 落盘」的路径，都会把一个只存在于环境变量里的声明
+        -- 冻结进配置文件，操作员之后删掉 env 也关不掉它（本文件为 target / explicit_targets
+        -- 已经立过两次同样的规矩）。
+        models_virtual_only = nil,
+        models_virtual_only_env = nil,
     }
 end
 
@@ -1347,6 +1377,18 @@ local function cfg_from_env()
     local cfg = new_cfg()
     local default_effort = _M.normalize_effort(env("LMR_DEFAULT_EFFORT"))
     if default_effort and default_effort ~= false then cfg.default_effort = default_effort end
+
+    -- 开关的环境层，写进 models_virtual_only_env（不写磁盘层那一份，理由见 new_cfg）。
+    -- env() 对「未声明」和「空串」都答 nil，所以这里只认「说过」= 非 nil，值本身交给
+    -- advertise_truthy 判定；缺省不设 = 关 = /v1/models 逐字节与开关落地前一致
+    -- （AGENTS.md「新开关缺省零行为变化」）。
+    --
+    -- env 的 false 不单独造一个「明确说关」的三态：LMR_MODELS_VIRTUAL_ONLY=false 在这里
+    -- 就是关，和没说一样，反正磁盘层无论如何都压过它（见 _M.models_virtual_only）。
+    local virtual_only_env = env("LMR_MODELS_VIRTUAL_ONLY")
+    if virtual_only_env ~= nil then
+        cfg.models_virtual_only_env = advertise_truthy(virtual_only_env)
+    end
 
     for _, pair in ipairs(parse_pairs(env("LMR_EFFORT_MAP"))) do
         local from = _M.normalize_effort(pair[1])
@@ -1584,7 +1626,7 @@ local function snapshot_of(cfg)
     for _, model in ipairs(sorted_keys(cfg.model_policies)) do
         model_policies[#model_policies + 1] = { model = model, policy = cfg.model_policies[model] }
     end
-    return {
+    local snap = {
         default_effort = nul(cfg.default_effort),
         effort_map = arr(effort_map),
         model_ctx = arr(model_ctx),
@@ -1596,6 +1638,19 @@ local function snapshot_of(cfg)
         model_policies = arr(model_policies),
         upstreams = arr(upstreams),
     }
+    -- 开关的回写半：只有磁盘层那一份会被 re-emit，而且只在操作员真的在这份文件里说过时
+    -- 才有键 —— 缺席而不是显式 null，与 target / explicit_targets / caps 同一套「绝不无中生有
+    -- 一个没人声明过的字段」的约定（也保住「从没碰过这个开关的部署，落盘字节与今天逐字节
+    -- 相同」）。环境层刻意不回写：把 env 的读数冻结进配置文件，等于让操作员删了环境变量也
+    -- 关不掉它。
+    --
+    -- 这一支就是「从 /_ui/config 保存一次会把这个键抹掉」那个 bug 的正解：整表替换走
+    -- cfg_from_document -> snapshot_of，未知键在两端都没有落点，于是每次保存都把它从磁盘上
+    -- 擦掉。读侧（cfg_from_document）与写侧（这里）必须同时有，缺一个都等于没修。
+    if cfg.models_virtual_only ~= nil then
+        snap.models_virtual_only = cfg.models_virtual_only
+    end
+    return snap
 end
 
 -- --------------------------------------------------------------- validation
@@ -1985,6 +2040,26 @@ local function cfg_from_document(doc, previous)
         cfg.model_configs = built
     end
 
+    -- /v1/models「只广告虚拟入口」开关的磁盘层。三态与缺省纪律：
+    --   * 键缺席（含老配置文件）= 「没说」= 保持 nil,让给环境层；
+    --   * 显式 null 同上,是 JSON 编辑器里「擦掉这条声明」的写法,不是「关」；
+    --   * true / false 都是结论,false 也是「说了要全量广告」,必须压过 env 的 true。
+    -- 非布尔的垃圾值按「未知字段拒绝」的老口径报错（同 supports_tool_use 文案家族）：
+    -- 这是 /_ui/config 权威面的整表写入口,静默吞掉一个能改变对外广告形状的键,等于让
+    -- 操作员以为他打开了开关。
+    do
+        local raw = rawget(doc, "models_virtual_only")
+        if raw ~= nil then
+            if raw == JSON_NULL then
+                cfg.models_virtual_only = nil
+            elseif type(raw) == "boolean" then
+                cfg.models_virtual_only = raw
+            else
+                return nil, "models_virtual_only must be a boolean or null"
+            end
+        end
+    end
+
     return cfg
 end
 
@@ -2122,6 +2197,32 @@ function _M.env_defaults()
         _M._env_defaults = snap
     end
     return _M._env_defaults
+end
+
+--- /v1/models「只广告虚拟入口」开关的权威读数：磁盘快照优先，其次 env，都没说过 = 关。
+---
+--- 为什么不直接读 current().models_virtual_only：current() 是「文件整层赢 env 整层」的二选一
+--- 合并（快照存在且合法就整份用文件、否则整份退回 env），它不会逐字段 merge。于是「文件里没
+--- 写这个键、但 env 里设了」这一情形下，current() 返回的是文件那份 cfg，其 models_virtual_only
+--- 与 models_virtual_only_env 都是 nil，env 的 true 会被整个吞掉。这里改成逐键的两层读数：
+--- 先看快照里的原始键（未擦除则它就是操作员的结论，false 也压过 env 的 true），键不在才让给
+--- env，两层都没说过才 false。这正是 router.lua:4173 那份 models_advertise 自己读盘的口径 ——
+--- 两边指向同一份数据、同一套真值表，router 侧刻意不动（030dab5 已定稿），此处只是把同一答案
+--- 从 config_store 也答一遍，供 /_ui/config 的往返与任何想走 store 的读者用。
+---@return boolean
+function _M.models_virtual_only()
+    local snap = read_snapshot()
+    if type(snap) == "table" then
+        local raw = rawget(snap, "models_virtual_only")
+        -- JSON null 与 Lua nil 都算「文件里没说」，让给 env；显式布尔（含 false）就是结论。
+        if raw ~= nil and raw ~= JSON_NULL then
+            if type(raw) == "boolean" then return raw end
+            return advertise_truthy(raw)
+        end
+    end
+    local e = env("LMR_MODELS_VIRTUAL_ONLY")
+    if e ~= nil then return advertise_truthy(e) end
+    return false
 end
 
 -- ------------------------------------------------------------- readers
@@ -3000,12 +3101,60 @@ local function upstream_patch(item, record)
     return patch
 end
 
+--- Caps-only patch for a row the declaration layer does NOT own (protected:
+--- watcher / SMG_WORKER_URLS bootstrap / manual POST /workers). Returns nil when
+--- the row has nothing to say.
+---
+--- 为什么这一份要单独写、而不是复用 upstream_patch：上游那份会把 model_id / priority /
+--- cost / labels / disable_health_check 一起下发，而 registry.update 对 protected 行恰恰
+--- 拒绝其中判身份的那几个（registry.lua:3159 那道 current.discovery == "config" 的门：
+--- 非 config 行的 model_id / models 会被丢掉）。丢掉是对的（那是「手填配置不能冒充引擎
+--- 读数」的守卫），但正因为它会丢，拿 upstream_drifts 去判 protected 行会永远报漂移 ——
+--- 声明写的 model_id 与探针学到的那个不同、而 update 又永远改不动它，于是 init.lua 的
+--- 30s 自愈计时器每轮都重写同一个 worker、每轮都不收敛（正是 models_covered 存在理由所
+--- 针对的那类死循环）。所以判漂移与下补丁都必须只看 caps。
+---
+--- 只「下发」不「清除」，同样是刻意的：声明层没写 caps 时这里答 nil（= 沉默），而不像
+--- upstream_patch 那样补一个 0 去抹掉存量上限。protected 行的上限可能来自操作员手工
+--- PUT /workers，那是声明层从未主张过所有权的读数；「我这行没写」应当读成「我对这行
+--- 无话可说」，而不是「我命令它回到无上限」。不对称的代价如实登记在此：从声明里删掉一个
+--- caps 不会立刻摘掉 dynamic 行上的存量上限，它会在下一次容器重启（记录重新播种）时自然
+--- 消失；要当场摘，用 PUT /workers 显式写 0。
+---@param item table @ declared row
+---@param record table @ live pool row
+---@return table|nil patch @ nil = nothing to project
+local function upstream_caps_only_patch(item, record)
+    local patch
+    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+        local integer = field == "max_concurrency"
+        local want = declared_cap(item[field], integer)
+        if want ~= nil then
+            local have = record and declared_cap(record[field], integer) or nil
+            if have ~= want then
+                patch = patch or {}
+                patch[field] = want
+            end
+        end
+    end
+    return patch
+end
+--- 红线口径（doc/gap-worker-caps.md 第 312 行第 4 项）。原话「手填配置不能凭它判死一个健康
+--- 实例」被落地成了「protected 行整行不许声明层碰」，这个表述会误导下一个人继续绕开 caps
+--- （本函数存在的全部理由就是那次误解）。红线保护的对象是身份与健康判定：discovery、
+--- is_healthy、探活结论、判死逻辑，以及 model_id / models 这两份引擎读数 —— 声明层一个字都
+--- 改不动，执行由 registry.update 里那道 current.discovery == "config" 的门负责（本函数
+--- 刻意不往补丁里放这些键，即便放了也会被那扇门丢掉，两道保险）。红线不覆盖调度旋钮：
+--- caps 从不判死，只在超限时把请求迁走（registry.capacity_exclusion 是排除而不是否决，
+--- 读数未知时连排除都不做），因此下发它们不触碰原话担心的那件事。
+
 --- Idempotent projection of the declared upstreams into the worker pool
---- (contract 3.1 / 3.2). Discovery-tagged rows only: watcher, bootstrap and
---- manual workers are never overwritten, and only config rows are reclaimed.
---- Returns a summary {added=,updated=,removed=,skipped=} (arrays also carry the
---- affected urls). Without a usable registry module (unit caliber, stripped
---- build) every counter is 0 and nothing counts as an error.
+--- (contract 3.1 / 3.2). Rows the declaration layer owns (discovery == "config")
+--- are projected whole; a protected row (watcher / bootstrap / manual) gets only
+--- the scheduling knobs it still needs to survive a restart -- see
+--- upstream_caps_only_patch for what that excludes and why. Only config rows are
+--- ever reclaimed. Returns a summary {added=,updated=,removed=,skipped=} (arrays
+--- also carry the affected urls). Without a usable registry module (unit caliber,
+--- stripped build) every counter is 0 and nothing counts as an error.
 function _M.reconcile_upstreams()
     local summary = { added = 0, updated = 0, removed = 0, skipped = 0 }
     local reg = store_registry()
@@ -3092,9 +3241,38 @@ function _M.reconcile_upstreams()
                 end
             end
         else
-            -- Held by the watcher / bootstrap / an operator: the declaration
-            -- stands, the pool row is left exactly as it is.
-            summary.skipped = summary.skipped + 1
+            -- Held by the watcher / bootstrap / an operator: the row is left as it
+            -- is, with one narrow exception. The pool record only lives in the
+            -- lr_workers shdict (there is no on-disk path for it), so a container
+            -- restart re-seeds it bare from SMG_WORKER_URLS and any cap the operator
+            -- set through PUT /workers evaporates. The declaration layer is the only
+            -- thing that survives a restart, so the caps have to ride it, otherwise
+            -- there is no spelling at all that outlives a restart: the create path is
+            -- closed by registry.add refusing an existing url and the update path was
+            -- closed by this very branch.
+            --
+            -- Caps only (see upstream_caps_only_patch): identity and health verdicts
+            -- stay untouched, and a row that declares no cap is left exactly as it
+            -- was, which is what keeps the pre-feature behaviour byte-identical for
+            -- every pool row that never opted in.
+            local caps_patch = upstream_caps_only_patch(item, record)
+            if caps_patch then
+                local upd_id = record.id
+                if type(upd_id) ~= "string" then
+                    local ok_id, derived = pcall(reg.worker_id_for_url, item.url)
+                    upd_id = ok_id and derived or nil
+                end
+                local res, uerr = reg.update(upd_id, caps_patch)
+                if res then
+                    summary.updated = summary.updated + 1
+                else
+                    ngx_log_warn("luarouter upstream caps update failed for ",
+                        item.url, ": ", uerr or "?")
+                    summary.skipped = summary.skipped + 1
+                end
+            else
+                summary.skipped = summary.skipped + 1
+            end
         end
     end
 
