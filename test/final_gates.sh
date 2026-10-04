@@ -61,6 +61,13 @@
 #                  S5 pool-full 503 keeps code no_available_workers with the cap
 #                  count in the message; S7 a renamed config row stops routing the
 #                  old name under IGW; S5c default-off pool behaviour unchanged)
+#   e2e_models_advertisement integration/e2e_models_advertisement.py (/v1/models 的对外
+#                  形状过一遍真 HTTP：S1 官方 required 四字段逐行齐（改动前真实模型那一支
+#                  漏 created）；S2 采集链路把引擎自报的 capabilities/reasoning_efforts
+#                  如实带出来，同一场景用两个不同的 context_length 跑两遍证明这个数不是
+#                  网关造的；S3 缺数据=删键，不出现 null / [] / {}；S4 操作员 config 卡片
+#                  压过引擎广告（引擎那个数整份响应里不许出现）；S5 虚拟入口的 owned_by
+#                  老口径与组内聚合能力。跑盘上 lualib，判别性通道 LR_LEGACY_LUALIB=<旧树>)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
 #   e2e_tls_chain  integration/e2e_tls_chain.py (server-side TLS: runtime-built
@@ -133,7 +140,8 @@ mkdir -p "$LOG_DIR"
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
             e2e_errors e2e_effort head_routes mesh_http
             e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
-            e2e_routing_dyn e2e_profiles e2e_caps mesh_two e2e_tls_chain)
+            e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement
+            mesh_two e2e_tls_chain)
 
 # quick tier: only the gates that verify in seconds-to-minutes without the
 # slow e2e container suites. The default for ordinary changes.
@@ -308,7 +316,11 @@ gate_unit() {
     # test_caps_routing：并发/功率上限与 candidates 交集的纯 luajit 单测（无端口，
     # 与其余 luajit 组同档）；它钉的判定在 router.lua/registry.lua 里，HTTP 面只有
     # e2e_caps 一份门禁，二者缺一就会漏掉"上限写成排序项"这类回归。
-    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing; do
+    # test_models_shape：/v1/models 对外形状的纯 luajit 单测（切真源码配桩，无端口）。
+    # 它钉输出层的纪律，e2e_models_advertisement 钉采集链路过真 HTTP；两者覆盖面不同
+    # （单测能造"上游只说了一半""脏读数""组内口径不一致"这些真 HTTP 里造不出来的形状，
+    # e2e 才能证明探针真的调了归一化层）。
+    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing test_models_shape; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
@@ -342,6 +354,7 @@ gate_e2e_profiles()   { run_integration e2e_profiles.py 1500; }
 # 与 e2e_profiles 相邻：同样依赖 virtual_models/profiles 形状（candidates 绑定/交集
 # 走的是同一套 config_store 校验与 candidates_for 过滤）。
 gate_e2e_caps()       { run_integration e2e_caps.py 900; }
+gate_e2e_models_advertisement() { run_integration e2e_models_advertisement.py 900; }
 gate_e2e_token_accounting() { run_integration e2e_token_accounting.py 900; }
 gate_e2e_gpu_load()    { run_integration e2e_gpu_load.py 900; }
 gate_e2e_routing_dyn() { run_integration e2e_routing_dyn.py 900; }
@@ -371,6 +384,7 @@ gate e2e_policy_parity
 gate e2e_watcher
 gate e2e_profiles
 gate e2e_caps
+gate e2e_models_advertisement
 gate e2e_token_accounting
 gate e2e_gpu_load
 gate e2e_routing_dyn

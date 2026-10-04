@@ -986,6 +986,27 @@ if section public; then
     assert_eq "/v1/models after registration" "$STATUS" "200"
     assert_json "/v1/models object" '.object' "list"
     assert_json "/v1/models contains test-model" '[.data[].id] | index("test-model") != null | tostring' "true"
+    # OpenAI's Model object has exactly four members and all four are required
+    # (id/object/created/owned_by). The real-model row used to ship without
+    # created, so the whole table is walked here rather than the first row: a
+    # per-row sweep is the only shape that catches "the alias rows are fine but
+    # the engine rows are not".
+    assert_json "/v1/models every row carries the four required fields" \
+        '[.data[] | select((has("id") and has("object") and has("created") and has("owned_by")) | not)] | length' "0"
+    # `(. | floor)` rather than `floor(.)`: jq reads the latter as floor/1 and refuses
+    # to compile the filter, which assert_json would report as a broken filter rather
+    # than a failed check. `| tostring` keeps the verdict out of jq's -e exit code so a
+    # false answer prints as a normal FAIL with the body, not as "invalid filter".
+    assert_json "/v1/models created is a non-negative integer everywhere" \
+        '[.data[].created | (type == "number" and . >= 0 and . == (. | floor))] | all | tostring' "true"
+    # The other half of "省略而不是 null": with a worker that advertises nothing but
+    # its id, a row must carry EXACTLY the four required members. An added key would
+    # mean somebody started writing a default (an empty capabilities block, a
+    # reasoning_effort: null) for a value the gateway was never told.
+    assert_json "/v1/models advertises no key the engine never stated" \
+        '[.data[] | select(((keys - ["id","object","created","owned_by"]) | length) > 0)] | length' "0"
+    assert_json "/v1/models body contains no JSON null" \
+        '[.. | select(. == null)] | length' "0"
 fi
 
 # ==========================================================================

@@ -17,9 +17,13 @@ Environment knobs:
 Discovery/strict-probe knob (doc/gap-watcher-merge.md 1.1 guard 10). It dirties
 ONLY the model list, never the health surface, so a watcher can blame the strict
 /v1/models probe and not the health sweep:
-  MODELS_MODE           normal | no_ids | empty_data | error500 | not_json
+  MODELS_MODE           normal | rich | plain | no_ids | empty_data | error500 | not_json
                         (default normal, which is byte-identical to what every
                         pre-existing suite saw)
+                        rich:       200 with the full capability shape (see
+                                    MODELS_RICH below) -- the collection-chain input
+                        plain:      the default three-field answer, spelled out so a
+                                    test can leave rich and come back on the SAME url
                         no_ids:     200 with data[] entries that carry no id
                         empty_data: 200 with {"object":"list","data":[]}
                         error500:   500 on /v1/models
@@ -32,6 +36,31 @@ ONLY the model list, never the health surface, so a watcher can blame the strict
   sweep thresholds in config.lua. GET /state reports the live value; GET /reset
   deliberately does NOT clear it, so a shared reset helper cannot silently undo
   an injected fault.
+  POST /fault {"models_caps_json":{...}} retunes the rich entry on the same url
+  too (null-valued members delete a field, see MODELS_CAPS_JSON), and
+  {"models_rich":false} turns the advertisement back off. Both are read live by
+  the /v1/models answer, so one mock process can be the engine that "changes its
+  mind" without becoming a new discovery row.
+
+Capability-advertisement knob (doc/gap-model-advertisement.md, /v1/models 输出形状).
+It dirties NOTHING by default: MODELS_RICH unset keeps the pre-existing three-field
+answer byte for byte, which is what the dozen suites that share this mock pin.
+  MODELS_RICH           1: GET /v1/models answers the rich OpenAI-ecosystem shape
+                        (the opencodex/SGLang spelling the gateway is supposed to
+                        collect and re-serve): created, capabilities.context_length /
+                        max_output_tokens / *_modalities / supports_*, plus the
+                        reasoning_effort ladder. Without it the registry can only ever
+                        learn the model id, so every advertised field would be
+                        "absent" in every test and the collection chain would go
+                        untested.
+  MODELS_CAPS_JSON      object merged over that template so a test can move a single
+                        reading (context_length: 262144) or delete one by naming it
+                        null ({"capabilities":{"supports_vision":null}}) -- the
+                        "engine did not say it" branch, which must come out as an
+                        ABSENT key and never as null / [] / {}.
+                        Merged one level into "capabilities" so a partial override
+                        cannot silently drop the rest of that block.
+  --models-rich / --models-caps-json set the same two from argv.
 
 Streaming usage knobs (doc/gap-token-accounting.md). These exist so a test can
 reproduce what the real engines actually do — an OpenAI-compatible backend sends
@@ -75,6 +104,11 @@ STATE = {
     # Strict-probe fault shape for GET /v1/models; see MODELS_MODE in the module
     # docstring. normal keeps the pre-existing byte shape untouched.
     "models_mode": (os.environ.get("MODELS_MODE", "normal") or "normal").lower(),
+    # Rich capability advertisement; see MODELS_RICH in the module docstring. Both
+    # default to "off", which is the untouched three-field answer.
+    "models_rich": (os.environ.get("MODELS_RICH", "") or "").lower()
+                   in ("1", "true", "yes"),
+    "models_caps_json": os.environ.get("MODELS_CAPS_JSON", "") or "",
     "started": time.time(),
     "requests": 0,
     "fail_once_used": False,
@@ -96,7 +130,70 @@ LOCK = threading.Lock()
 CONTENT_TYPE_JSON = "application/json"
 
 # Accepted values for the MODELS_MODE fault (see the module docstring).
-MODELS_MODES = ("normal", "no_ids", "empty_data", "error500", "not_json")
+MODELS_MODES = ("normal", "rich", "plain", "no_ids", "empty_data", "error500",
+                "not_json")
+
+
+def models_rich_entry(model):
+    """The rich /v1/models entry for MODELS_RICH (see the module docstring).
+
+    形状抄的是真实上游：opencodex 那一路的顶层 reasoning_efforts picker + capabilities
+    里的判定面，以及 SGLang 那一类的 context 读数。两份档位**刻意不一致**（阶梯给
+    low/medium/high/max，判定面只 low/high/max）——那正是用户给的样例，也是唯一能把
+    「网关把 picker 虚构进判定面」这种写错照出来的输入。
+    """
+    entry = {
+        "id": model,
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "local",
+        "supports_reasoning_effort": True,
+        "reasoning_effort": "medium",
+        "reasoning_efforts": [
+            {"value": "low", "label": "Low Effort"},
+            {"value": "medium", "label": "medium Effort", "default": True},
+            {"value": "high", "label": "High Effort"},
+            {"value": "max", "label": "Max Effort"},
+        ],
+        "capabilities": {
+            "context_length": 1000000,
+            "max_output_tokens": 128000,
+            "output_modalities": ["text"],
+            "input_modalities": ["text", "image"],
+            "supports_tool_use": True,
+            "supports_streaming": True,
+            "supports_reasoning": True,
+            "supports_vision": True,
+            "reasoning_effort": ["low", "high", "max"],
+        },
+    }
+    raw = STATE["models_caps_json"]
+    if not raw:
+        return entry
+    try:
+        override = json.loads(raw)
+    except ValueError:
+        sys.stderr.write("[mock] MODELS_CAPS_JSON is not JSON, ignored: %s\n" % raw[:120])
+        return entry
+    if not isinstance(override, dict):
+        sys.stderr.write("[mock] MODELS_CAPS_JSON must be an object, ignored\n")
+        return entry
+    for key, value in override.items():
+        if key != "capabilities":
+            if value is None:
+                entry.pop(key, None)
+            else:
+                entry[key] = value
+    caps_override = override.get("capabilities")
+    if isinstance(caps_override, dict):
+        caps = dict(entry["capabilities"])
+        for key, value in caps_override.items():
+            if value is None:
+                caps.pop(key, None)
+            else:
+                caps[key] = value
+        entry["capabilities"] = caps
+    return entry
 
 
 def env_float(name, default=0.0):
@@ -230,10 +327,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"object": "list", "data": []})
         elif mode == "no_ids":
             self._send(200, {"object": "list", "data": [{"object": "model"}]})
-        else:
+        elif mode == "rich":
+            # The capability shape (see MODELS_RICH above). The strict probe reads
+            # data[].id only, so this mode can never be mistaken for one of the four
+            # fault shapes above: the watcher still sees a healthy row here.
+            self._send(200, {"object": "list",
+                             "data": [models_rich_entry(STATE["model"])]})
+        elif mode == "plain":
+            # Explicit spelling of the default answer, so a test that flips a mock to
+            # rich can flip it back without restarting it (a new port would be a new
+            # discovery row, not the same engine changing its answer).
             self._send(200, {"object": "list", "data": [
                 {"id": STATE["model"], "object": "model", "created": int(STATE["started"]),
                  "owned_by": "local"}]})
+        else:
+            rich = False
+            with LOCK:
+                rich = STATE["models_rich"]
+            if rich:
+                self._send(200, {"object": "list", "data": [
+                    models_rich_entry(STATE["model"])]})
+            else:
+                self._send(200, {"object": "list", "data": [
+                    {"id": STATE["model"], "object": "model",
+                     "created": int(STATE["started"]), "owned_by": "local"}]})
 
     # --------------------------------------------------------------------- GET
     def do_GET(self):
@@ -391,6 +508,49 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     STATE["models_mode"] = mode
                 self._send(200, {"models_mode": mode})
+            return
+        if path == "/fault_models":
+            # Runtime retune of the capability advertisement (MODELS_RICH /
+            # MODELS_CAPS_JSON). Kept as its OWN route rather than another member of
+            # the models_mode branch above: that branch answers as soon as the mode is
+            # valid, so a body that only names caps fields would be accepted and then
+            # silently ignored -- the worst kind of green test.
+            #
+            # Validation happens before the swap: a malformed caps override must not
+            # leave the mock advertising a half-applied shape, and it must not answer
+            # 200 either, or the caller cannot tell "retuned" from "rejected".
+            changed = {}
+            with LOCK:
+                if "models_rich" in body:
+                    want = body["models_rich"]
+                    STATE["models_rich"] = bool(want)
+                    changed["models_rich"] = STATE["models_rich"]
+                if "models_caps_json" in body:
+                    raw = body["models_caps_json"]
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw or "{}")
+                        except ValueError:
+                            self._send(400, {"error": {
+                                "message": "mock: models_caps_json is not JSON",
+                                "type": "invalid_request_error",
+                                "code": "BAD_MODELS_CAPS_JSON"}})
+                            return
+                    if raw is not None and not isinstance(raw, dict):
+                        self._send(400, {"error": {
+                            "message": "mock: models_caps_json must be an object or null",
+                            "type": "invalid_request_error",
+                            "code": "BAD_MODELS_CAPS_JSON"}})
+                        return
+                    STATE["models_caps_json"] = "" if raw is None else json.dumps(raw)
+                    changed["models_caps_json"] = STATE["models_caps_json"]
+            if not changed:
+                self._send(400, {"error": {
+                    "message": "mock: /fault_models wants models_rich and/or "
+                               "models_caps_json",
+                    "type": "invalid_request_error", "code": "NO_FAULT_FIELDS"}})
+                return
+            self._send(200, changed)
             return
         if STATE["latency_ms"] > 0:
             time.sleep(STATE["latency_ms"] / 1000.0)
@@ -787,6 +947,13 @@ def main():
     parser.add_argument("--models-mode", default=None, choices=list(MODELS_MODES),
                         help="dirty GET /v1/models (the strict-probe fault); /health"
                              " and /metrics stay 200 in every mode")
+    parser.add_argument("--models-rich", action="store_true",
+                        help="advertise the rich capability shape on /v1/models"
+                             " (same as MODELS_RICH=1; the default answer stays the"
+                             " three-field shape every other suite pins)")
+    parser.add_argument("--models-caps-json", default=None,
+                        help="object merged over the rich /v1/models entry; a null"
+                             " member deletes that field (MODELS_CAPS_JSON)")
     parser.add_argument("--require-auth", action="store_true",
                         help="401 /v1* requests that carry no Authorization header")
     args = parser.parse_args()
@@ -799,6 +966,10 @@ def main():
         STATE["fail_mode"] = args.fail_mode
     if args.models_mode:
         STATE["models_mode"] = args.models_mode
+    if args.models_rich:
+        STATE["models_rich"] = True
+    if args.models_caps_json:
+        STATE["models_caps_json"] = args.models_caps_json
     if args.require_auth:
         STATE["require_auth"] = True
 
