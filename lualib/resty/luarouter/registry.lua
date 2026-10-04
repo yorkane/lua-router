@@ -787,6 +787,620 @@ end
 _M.needs_models_refresh = needs_models_refresh
 
 
+-- ------------------------------------------------- upstream capability capture
+--
+-- 对外 /v1/models 要按 OpenAI 生态的丰富形状输出（capabilities.context_length、
+-- reasoning_efforts[] 等），而那些数字只存在于上游 /v1/models 的回答里。原来的探针
+-- 只取 data[].id，其余字段当场丢弃，于是网关对"这个实例到底能干什么"一无所知，
+-- 输出面就只能报 {id, object, owned_by}。这一块负责**先把它留住**：
+--   * probe_advertised_entries()  -- 拿上游答的完整 data[] 条目（原样，不归一）
+--   * model_caps_from_entries()    -- 纯函数，把条目归一成统一形状（可单测、可注入）
+--   * _M.model_caps()              -- 跨 worker 汇总，按"最完整的那份"合并
+-- 三条口径写在这里，是因为它们都是"宁缺勿假"的具体形态：
+--   1. **绝不猜、绝不填默认值**。上游没给的字段留 nil（整个表里没有这个 key），
+--      下游输出面据此决定"报已知"还是"不报"。一个编出来的 context_length 会被
+--      客户端当作事实拿去做预算，比不报糟糕得多。
+--   2. **采集失败不影响转发**。这里所有函数都不碰健康位、不碰熔断，解析异常一律
+--      吞掉（AGENTS.md 硬规则 4：转发路径上的探测失败只损失精度）。
+--   3. **来源可追溯**。同一字段多处都有时按 capabilities.* > 顶层同名字段 >
+--      max_model_len 取值，顺序就是"上游说得有多明确"，不是"我更喜欢哪个"。
+
+---Non-negative integer out of a JSON value, tolerating the numeric-string spelling
+---some engines use (context_length: "524288"). Anything else -- a table, a bool, a
+---negative, a fraction, a word -- is "no reading", i.e. nil.
+---@param value any
+---@param max_value number|nil @ upper bound; a nonsense magnitude counts as no reading
+---@return number|nil
+local function caps_int(value, max_value)
+    local number = type(value) == "number" and value
+        or (type(value) == "string" and tonumber(value))
+    if type(number) ~= "number" or number ~= number or number < 0 then
+        -- number ~= number is the NaN test: NaN compares >= 0 against every bound and
+        -- would land in the record as an un-encodable value.
+        return nil
+    end
+    local integral = math.floor(number + 0.5)
+    if integral < 0 then
+        return nil
+    end
+    if max_value and integral > max_value then
+        return nil
+    end
+    return integral
+end
+
+---Boolean out of a JSON value, tolerating the "true"/"false" string spelling.
+---Anything else (1, "yes", a table) is "no reading" -> nil, never false: false is a
+---statement that the capability is absent, and only the engine may make it.
+---@param value any
+---@return boolean|nil
+local function caps_bool(value)
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "string" then
+        local lowered = value:lower()
+        if lowered == "true" then
+            return true
+        elseif lowered == "false" then
+            return false
+        end
+    end
+    return nil
+end
+
+---Array of non-empty strings out of a JSON value: dedup, order preserved, junk items
+---dropped. nil when nothing usable came through (a field the engine did not answer).
+---@param value any
+---@return table|nil
+local function caps_str_list(value)
+    if type(value) ~= "table" then
+        return nil
+    end
+    local out, seen = {}, {}
+    for i = 1, #value do
+        local item = value[i]
+        if type(item) == "string" then
+            local trimmed = item:match("^%s*(.-)%s*$"):lower()
+            if trimmed ~= "" and not seen[trimmed] then
+                seen[trimmed] = true
+                out[#out + 1] = trimmed
+            end
+        end
+    end
+    if #out == 0 then
+        return nil
+    end
+    return out
+end
+
+---Sequence table? Used to tell an array (reasoning_efforts) from a map (supports),
+---because the two merge differently: an array is replaced wholesale, a map is merged
+---sub-key by sub-key.
+---@param value any
+---@return boolean
+local function caps_is_seq(value)
+    if type(value) ~= "table" then
+        return false
+    end
+    local n = 0
+    for k in pairs(value) do
+        if type(k) ~= "number" then
+            return false
+        end
+        n = n + 1
+    end
+    return n == #value
+end
+
+-- 来源优先级的取值器：候选按"上游说得有多明确"排序（capabilities.* > 条目顶层 >
+-- max_model_len），逐个试，返回**第一个能读成目标类型**的值。
+-- 为什么不是"第一个非 nil 就停"：一个类型不对的 readings（context_length 写成数组、
+-- 写成 "abc"）在语义上是"这台引擎没说清"，此时继续往下看下一个来源才是对的；当场停住
+-- 会让一个坏字段把后面本来可用的读数一起挡掉，等于让上游的笔误变成我们的信息缺失。
+
+---@param max_value number|nil
+---@param ... any
+---@return number|nil
+local function caps_pick_int(max_value, ...)
+    for i = 1, select("#", ...) do
+        local parsed = caps_int(select(i, ...), max_value)
+        if parsed ~= nil then
+            return parsed
+        end
+    end
+    return nil
+end
+
+---@param ... any
+---@return boolean|nil
+local function caps_pick_bool(...)
+    for i = 1, select("#", ...) do
+        local parsed = caps_bool(select(i, ...))
+        if parsed ~= nil then
+            return parsed
+        end
+    end
+    return nil
+end
+
+---@param ... any
+---@return table|nil
+local function caps_pick_str_list(...)
+    for i = 1, select("#", ...) do
+        local parsed = caps_str_list(select(i, ...))
+        if parsed ~= nil then
+            return parsed
+        end
+    end
+    return nil
+end
+
+---Reasoning-effort ladder out of whatever spelling the engine used.
+---
+--- Three shapes seen in the wild, all normalized to {value,label,default}:
+---   * opencodex 顶层 reasoning_efforts[] = {value,label,default}  (the rich one)
+---   * capabilities.reasoning_effort[] = {["low","high","max"]}    (values only)
+---   * nothing at all                                              -> nil
+--- An effort entry whose only usable member is its value still counts: the ladder is
+--- the client's picker content, and "these are the names" is information the engine
+--- really did give. default is false unless the engine said otherwise -- the *string*
+--- default (top-level reasoning_effort) is folded in separately, not here.
+---@param value any
+---@return table|nil
+local function caps_efforts(value)
+    if type(value) ~= "table" then
+        return nil
+    end
+    local out, seen = {}, {}
+    for i = 1, #value do
+        local raw = value[i]
+        local entry_value, label, default
+        -- 档位名只接受字符串：数字 5 转写成 "5"、布尔转写成 "true" 都是替上游编话，
+        -- 下游要拿这个名字去比对请求里的 reasoning_effort，编出来的名字谁也匹配不上。
+        if type(raw) == "string" then
+            entry_value = raw
+        elseif type(raw) == "table" then
+            entry_value = string_field(raw.value or raw.name or raw.effort)
+            label = string_field(raw.label or raw.name_label or raw.title)
+            default = caps_bool(raw["default"] or raw.is_default) or false
+        end
+        if entry_value then
+            local key = entry_value:lower()
+            if not seen[key] then
+                seen[key] = true
+                out[#out + 1] = {
+                    value = entry_value,
+                    label = label,
+                    ["default"] = default and true or false,
+                }
+            end
+        end
+    end
+    if #out == 0 then
+        return nil
+    end
+    return out
+end
+
+---@param ... any
+---@return table|nil
+local function caps_pick_efforts(...)
+    for i = 1, select("#", ...) do
+        local parsed = caps_efforts(select(i, ...))
+        if parsed ~= nil then
+            return parsed
+        end
+    end
+    return nil
+end
+
+---Normalize one decoded /v1/models entry into the registry's capability shape.
+---
+---形状（所有字段都可能缺，缺=没这个 key）：
+---  context_length            number  上下文总窗口（输入+输出），引擎报的那个数
+---  max_output_tokens         number  单次输出预算上限
+---  modalities                { input = {..}, output = {..} }  小写字符串数组
+---  supports                  { tool_use, streaming, reasoning, vision } 布尔
+---  reasoning_efforts         { {value,label,default}, ... } 档位阶梯（客户端 picker）
+---  reasoning_effort          string  引擎自己声明的缺省档
+---  created                   number  上游答里的 unix 时间（OpenAI Model.created）
+---  owned_by                  string  上游答里的 owned_by
+---来源优先级（同一字段多处在）：capabilities.* > 条目顶层同名字段 > max_model_len。
+---SGLang 只报 max_model_len，它映射成 context_length；opencodex 报整套 capabilities。
+---
+---刻意**不**从别处推：
+---  * 不读条目顶层的 context_window：那是**本网关配置层**的字段名（对外声明的窗口，见
+---    AGENTS.md 2026-10-04 裁定块）。把它和引擎读数混成一个字段，就等于重犯"把三个不同
+---    的量当成同一个数"的那次事故。
+---  * 不从 input_modalities 里有 image 反推 supports.vision=true：那是同一件事的两种说法
+---    时才对，而"报了 modalities 没报 supports"也可能只是引擎少写一列。宁可少一个字段。
+---@param entry any @ one decoded element of the upstream data[] array
+---@return table|nil @ normalized caps, or nil when the entry carried nothing usable
+function _M.model_caps_from_entry(entry)
+    if type(entry) ~= "table" then
+        return nil
+    end
+    local caps = type(entry.capabilities) == "table" and entry.capabilities or nil
+    local out = {}
+
+    -- 上限 1e8：真实引擎不会超过这个量级，而"一个明显是别的含义的数被放错了字段"
+    -- （比如把字节数、把 token id 写成 context_length）应该读作没有读数。
+    out.context_length = caps_pick_int(100000000,
+        caps and caps.context_length,
+        entry.context_length,
+        caps and caps.max_position_embeddings,
+        entry.max_model_len,
+        entry.max_context_length)
+    out.max_output_tokens = caps_pick_int(100000000,
+        caps and caps.max_output_tokens,
+        entry.max_output_tokens,
+        caps and caps.max_tokens,
+        entry.max_tokens)
+
+    local input_modalities = caps_pick_str_list(
+        caps and caps.input_modalities, entry.input_modalities)
+    local output_modalities = caps_pick_str_list(
+        caps and caps.output_modalities, entry.output_modalities)
+    if input_modalities or output_modalities then
+        out.modalities = { input = input_modalities, output = output_modalities }
+    end
+
+    local supports
+    local function support(target, ...)
+        local flag = caps_pick_bool(...)
+        if flag ~= nil then
+            supports = supports or {}
+            supports[target] = flag
+        end
+    end
+    -- entry 在上面已经判过是 table，这里只剩 caps 是否存在。
+    support("tool_use", caps and caps.supports_tool_use, entry.supports_tool_use)
+    support("streaming", caps and caps.supports_streaming, entry.supports_streaming)
+    support("reasoning", caps and caps.supports_reasoning, entry.supports_reasoning)
+    support("vision", caps and caps.supports_vision, entry.supports_vision)
+    if supports then
+        out.supports = supports
+    end
+
+    -- 档位信息在上游有两种拼写，含义不同，所以**各留各的**、不互相覆盖：
+    --   * out.reasoning_efforts       客户端 picker 的可选项（含 label / default）
+    --   * out.reasoning_effort_values 下游**接受**的档位判定面（capabilities.reasoning_effort）
+    -- 为什么不做交集：实测用户给的样例里两份就不一致（顶层阶梯 low/medium/high/max，
+    -- capabilities 只 low/high/max），取交集会丢掉 medium 连同它身上的 default=true，客户端
+    -- 反而没有缺省档可用；取并集又会报出下游可能不接受的名字。分成两个字段就都不用猜——
+    -- 两份都是引擎原话，由输出面决定各自画在哪个位置。
+    -- 为什么不做"整条取一份"：取带标签的那份会少两档，取值数组那份会丢全部 label 与 default。
+    -- 阶梯与缺省档必须自洽：out.reasoning_effort 永远等于阶梯里 default 为真的那一档，
+    -- 绝不写阶梯里没有的名字——那等于让 picker 选出一个自己列表里没有的档位。
+    local efforts = caps_pick_efforts(entry.reasoning_efforts,
+        caps and caps.reasoning_efforts, caps and caps.reasoning_effort)
+    local accepted = caps_pick_str_list(caps and caps.reasoning_effort)
+    local declared = string_field(entry.reasoning_effort)
+    if efforts then
+        local chosen
+        for i = 1, #efforts do
+            if efforts[i]["default"] then
+                chosen = efforts[i].value
+                break
+            end
+        end
+        if not chosen and declared then
+            local lowered = declared:lower()
+            for i = 1, #efforts do
+                local name = efforts[i].value
+                if name:lower() == lowered then
+                    efforts[i]["default"] = true
+                    chosen = name
+                end
+            end
+        end
+        out.reasoning_efforts = efforts
+        out.reasoning_effort = chosen
+    elseif declared then
+        -- 只有缺省档、没有阶梯：仍然报出来（引擎确实说了默认用哪个），但客户端无从枚举。
+        out.reasoning_effort = declared
+    end
+    -- 只有 capabilities 那份判定面、且它与阶梯不完全同形时才单列；两者一致时单列一次就够，
+    -- 免得输出面拿到两份语义相同、拼写不同的数据去纠结该信谁。
+    if accepted and #accepted > 0 then
+        local same_as_ladder = false
+        if efforts and #efforts == #accepted then
+            same_as_ladder = true
+            for i = 1, #accepted do
+                if not efforts[i] or efforts[i].value:lower() ~= accepted[i]:lower() then
+                    same_as_ladder = false
+                    break
+                end
+            end
+        end
+        if not same_as_ladder then
+            out.reasoning_effort_values = accepted
+        end
+    end
+
+    out.created = caps_pick_int(4294967295, entry.created)
+    out.owned_by = string_field(entry.owned_by)
+
+    if next(out) == nil then
+        return nil
+    end
+    return out
+end
+
+---Normalize a whole decoded /v1/models body into { [model_id] = caps }.
+---
+---接受三种输入：完整的响应体（{data=...}）、裸的 data 数组、以及老引擎的字符串数组。
+---没有一条能提取出能力时返回 nil（调用方据此保持"从没采到"，而不是存一张空表）。
+---@param listing any
+---@return table|nil
+function _M.model_caps_from_listing(listing)
+    local data = listing
+    if type(listing) == "table" and type(listing.data) == "table" then
+        data = listing.data
+    end
+    if type(data) ~= "table" then
+        return nil
+    end
+    local out, found = {}, false
+    for i = 1, #data do
+        local raw = data[i]
+        local id, entry
+        if type(raw) == "table" then
+            entry = raw
+            id = string_field(raw.id) or string_field(raw.model)
+        elseif type(raw) == "string" then
+            -- Bare-string data[] (older engines): the id is all the engine said, so
+            -- this model legitimately has no capability fields. norm_models filters the
+            -- placeholder and empty names the same way the id list does.
+            id = string_field(raw)
+        end
+        if id and id ~= "unknown" then
+            local caps = _M.model_caps_from_entry(entry or {})
+            -- 名字知道、能力一个字没采到的模型**不进这张表**：覆盖面由 record.models 负责，
+            -- 能力表里"有这个 key"就只意味着"引擎真的说过它的能力"。留一个空条目会让它被
+            -- 编码成 {}，读起来像"引擎答了这个模型但拒绝描述它"，与"从没答过"无法区分。
+            if caps and next(caps) ~= nil then
+                out[id] = caps
+                found = true
+            end
+        end
+    end
+    if not found then
+        return nil
+    end
+    return out
+end
+
+---How much information a caps table actually carries (leaf count, arrays included).
+---This is the "信息最全的那份" measure used by the fold below.
+---@param value any
+---@return number
+local function caps_weight(value)
+    if value == nil or value == cjson.null then
+        return 0
+    end
+    if type(value) ~= "table" then
+        return 1
+    end
+    local total = 0
+    for _, item in pairs(value) do
+        total = total + caps_weight(item)
+    end
+    return total
+end
+
+---Deep copy of one JSON-shaped table (caps entries are plain maps/arrays/scalars).
+---Defined next to caps_weight because both walk the same shape.
+---@param value any
+---@return any
+local function caps_clone(value)
+    if type(value) ~= "table" then
+        return value
+    end
+    local out = {}
+    for key, item in pairs(value) do
+        out[key] = caps_clone(item)
+    end
+    return out
+end
+
+---Deterministic rendering of a caps table, used only as a tie-break key.
+---@param value any
+---@return string
+local function caps_signature(value)
+    if value == nil then
+        return "nil"
+    end
+    if type(value) ~= "table" then
+        local encoded = json_encode(value)
+        return encoded or tostring(value)
+    end
+    local keys = {}
+    for key in pairs(value) do
+        keys[#keys + 1] = tostring(key)
+    end
+    table.sort(keys)
+    local parts = {}
+    for i = 1, #keys do
+        local key = keys[i]
+        parts[#parts + 1] = key .. "=" .. caps_signature(value[key])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+---Fold several workers' claims about *one model* into a single entry.
+---
+---规则（root 裁定 2026-10-04）：
+---  * 逐字段取非 nil 的那份：一台实例没报 max_output_tokens 而另一台报了，合并结果就该有它
+---    （互补字段两边都要留住，这是跨实例合并的全部意义）。
+---  * 同一字段两份都有且值不同：取**整条信息最全的那份**（leaf 数多者）的值，而不是逐字段
+---    投票。原因是一个引擎对自己能力的陈述是**成套**的，把 A 台的 context_length 和 B 台的
+---    max_output_tokens 拼在一起，会造出一份谁都没说过的组合，而那种组合同样会被客户端
+---    当成事实拿去做预算。
+---  * 为什么不用"取最新"：合并发生在每次查询时，"最新"取决于哪台 worker 的记录后写，而写
+---    的顺序由巡检与调度时序决定。那会让同一个模型的对外读数是**抖动的**——同一份配置、同
+---    一个上游，两次 /v1/models 给出不同的 context_length，客户端就无法据此缓存任何东西，
+---    排查时也没人能复现"昨天那个数是多少"。所以定序只看内容本身（leaf 数，再比字典序），
+---    与调用顺序、写入顺序一律无关。
+---  * 数组字段（reasoning_efforts）整条取，不按下标拼：两份阶梯的下标没有对齐语义。
+---  * 映射字段（supports / modalities）逐子键合，冲突时同样按整条 leaf 数定序。
+---没有任何一份带信息时返回 nil。
+---@param entries table[] @ normalized caps tables from several workers, same model
+---@return table|nil
+function _M.merge_model_caps(entries)
+    if type(entries) ~= "table" or #entries == 0 then
+        return nil
+    end
+    -- 每条候选 = 某个字段（或某个子字段）在某个 worker 那一份里的读数，连同**它所属整条**
+    -- 的完整度。冲突时比整条完整度、而不是比这两个值本身——值本身没有"谁更详细"可言
+    -- （true 和 false 一样重），能决定可信度的是报这个数的那台引擎一共说了多少话。
+    --
+    -- 形状：node = { scalar = {cand..}, subs = { [sub] = {cand..} } }。用两层表而不是把
+    -- 子键拼进字符串键：Lua 的 pattern 在 C 侧以 NUL 结尾，任何含 \0 的分隔符都会让
+    -- match 在分隔符处提前结束（写成 key:match("^(.-)\0(.*)$") 时 sub 恒为 nil，
+    -- 于是 bucket[nil] 直接抛 "table index is nil"）。
+    local nodes = {}
+    local field_order, seen_field = {}, {}
+    local function node_for(field)
+        local node = nodes[field]
+        if not node then
+            node = { subs = {}, sub_order = {}, seen_sub = {} }
+            nodes[field] = node
+            if not seen_field[field] then
+                seen_field[field] = true
+                field_order[#field_order + 1] = field
+            end
+        end
+        return node
+    end
+    local function offer(field, sub, cand)
+        local node = node_for(field)
+        if sub == nil then
+            local list = node.scalar
+            if not list then
+                list = {}
+                node.scalar = list
+            end
+            list[#list + 1] = cand
+        else
+            local list = node.subs[sub]
+            if not list then
+                list = {}
+                node.subs[sub] = list
+                node.seen_sub[sub] = true
+                node.sub_order[#node.sub_order + 1] = sub
+            end
+            list[#list + 1] = cand
+        end
+    end
+    for i = 1, #entries do
+        local entry = entries[i]
+        if type(entry) == "table" and next(entry) ~= nil then
+            local entry_weight = caps_weight(entry)
+            local entry_sig = caps_signature(entry)
+            for field, value in pairs(entry) do
+                if type(value) == "table" and not caps_is_seq(value) then
+                    for sub, sub_value in pairs(value) do
+                        if sub_value ~= nil and sub_value ~= cjson.null then
+                            offer(field, tostring(sub), {
+                                value = sub_value, weight = entry_weight, sig = entry_sig,
+                                vtag = caps_signature(sub_value),
+                            })
+                        end
+                    end
+                elseif value ~= nil and value ~= cjson.null then
+                    offer(field, nil, {
+                        value = value, weight = entry_weight, sig = entry_sig,
+                        vtag = caps_signature(value),
+                    })
+                end
+            end
+        end
+    end
+    -- 定序全看成：完整度 > 整条签名 > 值签名。三层都不含时间、不含 worker 顺序，
+    -- 所以把 entries 数组倒过来传，赢家一定是同一个（探针第 7 项钉的就是这条）。
+    local function winner(list)
+        local best
+        for i = 1, #list do
+            local cand = list[i]
+            if not best or cand.weight > best.weight
+                or (cand.weight == best.weight
+                    and (cand.sig > best.sig
+                        or (cand.sig == best.sig and cand.vtag > best.vtag))) then
+                best = cand
+            end
+        end
+        return best
+    end
+    local out = {}
+    -- 每个字段先铺子键（映射形状），标量只在没有任何子键时兜底：同一字段既有被当映射报的、
+    -- 又有被当标量报的，说明上游把形状写坏了（supports=true 对上 supports={tool_use=true}）。
+    -- 这时按内容定胜负——报出了结构的那份更可信——而不是让遍历先后决定，否则又回到
+    -- "结果随调用顺序变化"。
+    for i = 1, #field_order do
+        local field = field_order[i]
+        local node = nodes[field]
+        local bucket, bucket_any = nil, false
+        for j = 1, #node.sub_order do
+            local sub = node.sub_order[j]
+            local best = winner(node.subs[sub])
+            if best then
+                if not bucket then
+                    bucket = {}
+                end
+                bucket[sub] = caps_clone(best.value)
+                bucket_any = true
+            end
+        end
+        if bucket_any then
+            out[field] = bucket
+        else
+            local best = winner(node.scalar)
+            if best then
+                out[field] = caps_clone(best.value)
+            end
+        end
+    end
+    if next(out) == nil then
+        return nil
+    end
+    return out
+end
+
+---Copy a { [model] = caps } map, dropping empty entries so the stored record never
+---carries a model that says nothing (an empty entry would encode as `{}` and read as
+---"the engine answered this model and refused to describe it" — indistinguishable from
+---"no data", which is exactly the state we promised never to fake).
+---@param caps any
+---@return table|nil
+local function clone_model_caps(caps)
+    if type(caps) ~= "table" then
+        return nil
+    end
+    local out = {}
+    for name, entry in pairs(caps) do
+        if type(name) == "string" and name ~= "" and type(entry) == "table"
+            and next(entry) ~= nil then
+            out[name] = caps_clone(entry)
+        end
+    end
+    if next(out) == nil then
+        return nil
+    end
+    return out
+end
+
+---内容比较（而不是引用比较）：patch_record 用它决定"这次要不要重写记录"。
+---cjson 对 hash 部分的键序不作保证，所以先按键名排一遍再生成签名。
+---@param a any
+---@param b any
+---@return boolean
+local function caps_equal(a, b)
+    return caps_signature(a) == caps_signature(b)
+end
+
+
 ---Queue the registration of a worker (202 semantics live in router.lua).
 ---@param req table @ decoded POST /workers body
 ---@param cfg table @ router config providing the health-check defaults
@@ -884,6 +1498,11 @@ function _M.add(req, cfg)
             models = norm_models(rawget(req, "models"),
                 type(req.model_id) == "string" and req.model_id
                     or (type(req.labels) == "table" and req.labels.served_model_name)),
+            -- Engine-answered capabilities ride the same record (see the capability
+            -- capture block). Stored only when the caller actually has a captured map
+            -- -- normally the watcher or a DP rank's inheritance -- so a registration
+            -- without it keeps its exact pre-feature record shape.
+            model_caps = clone_model_caps(rawget(req, "model_caps")),
             priority = tonumber(req.priority) or 50,
             cost = tonumber(req.cost) or 1.0,
             -- Per-worker capacity caps (doc/gap-worker-caps.md): stored only when a
@@ -2107,9 +2726,15 @@ local function patch_record(id, patch, opts)
     -- worker A -> C sometimes folds the old list back in ({"C","A","B"}) and sometimes
     -- replaces it, so the same declaration would converge differently per tick.
     local models_patch, models_seen = nil, false
+    -- model_caps 与 models 同批落地，并共用 models_replace 这个"引擎亲口答过"的印章：
+    -- 能力读数与覆盖列表必须来自同一次 /v1/models 观测，否则会出现"列表说没有这个模型、
+    -- 能力表还在对外报它"的分裂。见 _M.probe_advertised_entries 的注释。
+    local caps_patch, caps_seen = nil, false
     for key, value in pairs(patch) do
         if key == "models" then
             models_patch, models_seen = value, true
+        elseif key == "model_caps" then
+            caps_patch, caps_seen = value, true
         elseif key == "labels" then
             if opts and opts.labels_replace then
                 local next_labels = {}
@@ -2166,6 +2791,57 @@ local function patch_record(id, patch, opts)
             end
         end
     end
+    if caps_seen or (opts and opts.models_replace) then
+        -- 观测（models_replace）时整表重建：引擎这次没提到的模型、以及提到但没给任何能力
+        -- 字段的模型，其条目都要走掉——和 models 的 replace 语义同一个理由，那份列表是
+        -- 唯一陈述覆盖面与能力的来源。非观测的补丁（操作员/配置层）只并集，绝不清空：
+        -- 人在打字说他知道什么，不等于引擎说别人不知道。
+        local next_caps
+        if caps_seen and opts and opts.models_replace then
+            next_caps = clone_model_caps(caps_patch)
+        elseif caps_seen then
+            next_caps = clone_model_caps(record.model_caps) or {}
+            local incoming = clone_model_caps(caps_patch)
+            for name, entry in pairs(incoming or {}) do
+                -- 逐模型整条替换：同一模型的旧读数可能来自已经重启过的引擎，
+                -- 逐字段并只会让它的新旧两代混在一份里。
+                next_caps[name] = entry
+            end
+            if next_caps ~= nil and next(next_caps) == nil then
+                next_caps = nil
+            end
+        else
+            next_caps = clone_model_caps(record.model_caps)
+        end
+        if next_caps and opts and opts.models_replace then
+            -- Prune against the list the engine just gave, so a model it dropped cannot
+            -- keep being advertised with capabilities.
+            local keep = {}
+            if type(record.models) == "table" then
+                for i = 1, #record.models do
+                    keep[record.models[i]] = true
+                end
+            end
+            if type(record.model_id) == "string" and record.model_id ~= "unknown" then
+                keep[record.model_id] = true
+            end
+            local kept = {}
+            local kept_any = false
+            for name, entry in pairs(next_caps) do
+                if keep[name] then
+                    kept[name] = entry
+                    kept_any = true
+                end
+            end
+            next_caps = kept_any and kept or nil
+        end
+        -- 内容比较而不是引用比较：巡检每轮都带同一份读数回来，用 ~={} 会每次都重写记录
+        -- （连带 mesh 镜像与 applied-revision 抖动）。
+        if not caps_equal(record.model_caps, next_caps) then
+            record.model_caps = next_caps
+            changed = true
+        end
+    end
     if not changed then
         return record
     end
@@ -2182,6 +2858,27 @@ local function patch_record(id, patch, opts)
     return record
 end
 
+--- Turn one upstream data[] array into the normalized id list.
+---
+--- Split out of _M.probe_advertised_models so the capability capture below can derive
+--- both readings from **one** GET: the coverage list and the data[] entries then cannot
+--- disagree about what the engine advertises (a list of three models with capabilities
+--- for one would otherwise be a legitimate-looking state with nobody to blame).
+--- Behaviour is byte-for-byte what the probe always did: data[].id, tolerate a
+--- bare-string data[], nil when there is no usable entry.
+---@param data any @ the decoded data[] array
+---@return table|nil @ array of ids
+local function ids_from_entries(data)
+    if type(data) ~= "table" then
+        return nil
+    end
+    local ids = {}
+    for j = 1, #data do
+        ids[j] = type(data[j]) == "table" and data[j].id or data[j]
+    end
+    return norm_models(ids, nil)
+end
+
 --- Ask one worker what it advertises, as a normalized id list.
 ---
 --- Shared by the metadata-discovery fallback and by the coverage refresh below so
@@ -2191,6 +2888,29 @@ end
 ---@param headers table|nil
 ---@return table|nil @ array of ids, or nil when the endpoint did not answer
 function _M.probe_advertised_models(url, timeout_ms, headers)
+    local entries = _M.probe_advertised_entries(url, timeout_ms, headers)
+    if not entries then
+        return nil
+    end
+    return ids_from_entries(entries)
+end
+
+--- Ask one worker what it advertises and keep the **whole** data[] answer.
+---
+--- 与 _M.probe_advertised_models 的分工：那一个只给归一化后的 id 列表，形状被契约与
+--- 若干调用方钉住（探针/巡检/watcher 都吃它），所以它一个字都不能改；这一个是**能力
+--- 采集**的入口，把上游原文交给 _M.model_caps_from_listing。两条路径共用一次 GET 的
+--- 读法（同 url、同 timeout、同 header），因此"探到了哪些模型"与"它们各自能干什么"永远
+--- 来自同一份回答，不会出现"列表说有三条、能力说只有一条"的分裂。
+---
+--- 返回上游 data[] 的原文数组（不归一、不猜），容忍老引擎的裸字符串数组——那种情况下
+--- 调用方拿到的是名字数组，能力字段自然是 nil。非 200、非 JSON、没有可用数组都返回 nil，
+--- 调用方据此保持"从没采到"；本函数绝不抛。
+---@param url string
+---@param timeout_ms number
+---@param headers table|nil
+---@return table|nil @ decoded data[] entries array, or nil
+function _M.probe_advertised_entries(url, timeout_ms, headers)
     local hb = require "resty.luarouter.hb"
     local status, body = hb.http_get(url .. "/v1/models", timeout_ms, headers)
     if status ~= 200 then
@@ -2198,14 +2918,83 @@ function _M.probe_advertised_models(url, timeout_ms, headers)
     end
     local listing = json_decode(body or "")
     local data = type(listing) == "table" and listing.data or nil
-    if type(data) ~= "table" then
+    if type(data) ~= "table" or #data == 0 then
+        -- 与老探针同一个判据：没有可用数组就等于对方没答，两条读数的 nil 语义保持一致。
         return nil
     end
-    local ids = {}
-    for j = 1, #data do
-        ids[j] = type(data[j]) == "table" and data[j].id or data[j]
+    return data
+end
+
+--- The capability entries one worker's engine itself answered, plus the coverage
+--- provenance bit that decides whether that answer is trustworthy.
+---
+--- 单独导出这一条是为了让"引擎亲口答过"这件事只有一种判定方式：能力读数只能来自
+--- `/v1/models` 的**观测**（models_verified），不能来自配置声明。否则操作员在配置里写
+--- 的一个名字会被当成引擎的能力陈述往外报，而那正是 context_window 事故的形状。
+--- 调用方（router 的输出合成）应先用 _M.models_are_verified 判一次，再取条目。
+---@param id_or_record string|table
+---@return table|nil @ { [model_name] = caps } or nil when nothing captured
+function _M.record_model_caps(id_or_record)
+    local record
+    if type(id_or_record) == "table" then
+        record = id_or_record
+    elseif type(id_or_record) == "string" and id_or_record ~= "" then
+        record = _M.record(id_or_record)
     end
-    return norm_models(ids, nil)
+    if type(record) ~= "table" or not _M.models_are_verified(record) then
+        return nil
+    end
+    local caps = record.model_caps
+    if type(caps) ~= "table" or next(caps) == nil then
+        return nil
+    end
+    return caps
+end
+
+--- Cross-worker view of what the fleet's engines advertised about their models.
+---
+--- 输出面（router.lua 合成 /v1/models）按模型名查这一张表：同一个模型可能被多台实例
+--- 广告（一个虚拟入口后面挂多个上游、或两台机器跑同一个模型），它们的读数互补时合并，
+--- 冲突时取信息最全的那份——规则的完整论证在 _M.merge_model_caps 的注释里，一句话版是
+--- 「取最新会让对外读数随调度抖动，所以定序只看内容，不看时序」。
+---
+--- 没有任何数据时返回**空表而不是 nil**：调用方是输出合成路径，那里为每个模型判一次
+--- nil 与判一次 next() 等价，但少一种错误可能。表是新构造的，调用方可以随意改。
+---
+--- 只统计引擎亲口答过的记录（record_model_caps 的判定），配置声明的名字不贡献读数。
+--- @return table<string, table> @ { [model_name] = normalized caps }
+function _M.model_caps()
+    local out = {}
+    local ok_records, records = pcall(_M.records)
+    if not ok_records or type(records) ~= "table" then
+        return out
+    end
+    local grouped, order = {}, {}
+    for i = 1, #records do
+        local caps = _M.record_model_caps(records[i])
+        if caps then
+            for name, entry in pairs(caps) do
+                if type(name) == "string" and name ~= ""
+                    and type(entry) == "table" and next(entry) ~= nil then
+                    local bucket = grouped[name]
+                    if not bucket then
+                        bucket = {}
+                        grouped[name] = bucket
+                        order[#order + 1] = name
+                    end
+                    bucket[#bucket + 1] = entry
+                end
+            end
+        end
+    end
+    for i = 1, #order do
+        local name = order[i]
+        local merged = _M.merge_model_caps(grouped[name])
+        if merged then
+            out[name] = merged
+        end
+    end
+    return out
 end
 
 --- How many coverage probes one worker may spend before we believe its list is final.
@@ -2258,17 +3047,23 @@ function _M.refresh_models(record, cfg, opts)
     local timeout_ms = cfg.health_check_timeout_secs * 1000
     local headers = record.api_key and { ["Authorization"] = "Bearer " .. record.api_key }
         or nil
-    local list = _M.probe_advertised_models(record.url, timeout_ms, headers)
+    -- One GET, two readings: the coverage list and the capability map come from the
+    -- same upstream answer, so they can never describe two different answers.
+    local entries = _M.probe_advertised_entries(record.url, timeout_ms, headers)
+    local list = ids_from_entries(entries)
     if not list then
         -- No answer, or an engine without the endpoint: leave the coverage as it is.
         -- worker_serves_model answers nil for "never learned", which the caller treats
         -- as usable, so a failed probe costs nothing beyond the budgets above.
+        -- Same for capabilities: nothing captured, nothing rewritten, health untouched.
         return nil
     end
+    local caps = _M.model_caps_from_listing(entries)
     -- One stamp serves both budgets: a worker that answered gets its next look when
     -- the window lapses, and a thin list that finally answered stops spending attempts.
     d:set(K_MPROBE_OK .. record.id, 1, MODELS_REFRESH_COOLDOWN_SECS)
-    return patch_record(record.id, { models = list }, { models_replace = true })
+    return patch_record(record.id, { models = list, model_caps = caps },
+        { models_replace = true })
 end
 
 -- ------------------------------------------------------------------ PUT update
@@ -2451,6 +3246,7 @@ function _M.discover(record, cfg)
     -- Declared before the probes so the /v1/models branch (nested two conditionals
     -- deep) can hand its full answer to the write at the bottom without shadowing.
     local discovered_models
+    local discovered_entries
     local present = function(value)
         if type(value) == "string" and value ~= "" then
             return value
@@ -2484,7 +3280,10 @@ function _M.discover(record, cfg)
 
     if not labels.model_path and not labels.served_model_name then
         -- llama.cpp workers expose neither: ask the OpenAI discovery endpoint.
-        discovered_models = _M.probe_advertised_models(record.url, timeout_ms)
+        -- 同 refresh_models 的"一次 GET、两份读数"：这条路径是 llama.cpp 那类引擎唯一会
+        -- 看到 /v1/models 的地方，能力条目不在这儿交下去，它们就永远没有描述。
+        discovered_entries = _M.probe_advertised_entries(record.url, timeout_ms)
+        discovered_models = ids_from_entries(discovered_entries)
         if discovered_models then
             labels.served_model_name = present(discovered_models[1])
         end
@@ -2510,7 +3309,9 @@ function _M.discover(record, cfg)
     -- has since been reloaded with a different model set goes away on the next sweep
     -- rather than lingering as a coverage claim).
     return patch_record(record.id, { model_id = model_id, labels = merged,
-        models = discovered_models }, { models_replace = true })
+        models = discovered_models,
+        model_caps = _M.model_caps_from_listing(discovered_entries) },
+        { models_replace = true })
 end
 
 -- ---------------------------------------------------------- DP-aware ranks
@@ -2612,6 +3413,9 @@ local function expansion_requests(base, dp_size, meta)
             -- multi-binding filter, and a binding naming its second model would filter
             -- the rank out of a pool that can actually serve it.
             models = norm_models({ meta.model_id or base.model_id }, base.models),
+            -- 能力读数刻意**不**跟着继承：rank 是新建记录、models_verified 尚未盖章，
+            -- 而能力只认证引擎亲口答过（见 _M.record_model_caps）。盖章前继承一份读数是
+            -- 纯死重——巡检第一轮就会自己探到，届时 replace 会整表重建它。
             priority = base.priority,
             cost = base.cost,
             api_key = base.api_key,
