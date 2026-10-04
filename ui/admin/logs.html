@@ -76,9 +76,9 @@
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
-              <div class="stat-label">{{ t.summaryOut }} · {{ t.summaryTokWindow }}</div>
-              <div class="stat-value">{{ fmtOne(stats.output_tok_s / 1000) }}k <span class="muted" style="font-size:15px">/ {{ fmtK(stats.completion_tokens_window) }} / {{ fmtK(stats.input_tokens_window) }}</span></div>
-              <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
+              <div class="stat-label">{{ t.summaryOut }} · {{ t.summaryIn }} {{ t.summaryWindow60 }}</div>
+              <div class="stat-value">{{ fmtThousands(stats.output_tok_s) }} <span class="muted" style="font-size:15px">/ {{ fmtThousands(stats.input_tok_s) }}</span></div>
+              <div class="stat-note">{{ t.summaryTokOut }} {{ fmtK(stats.completion_tokens_window) }} / {{ t.summaryTokIn }} {{ fmtK(stats.input_tokens_window) }} · {{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-database-sync" class="stat-icon red"></q-icon>
@@ -153,8 +153,8 @@
                     <div class="kv-grid">
                       <div>
                         <h4 class="detail-title">{{ t.colRoute }} / {{ t.detailSelected }}</h4>
-                          <span class="k">prompt</span><span class="v mono" style="font-size:11px;overflow-wrap:anywhere">{{ (props.row.prompt_preview || props.row.prompt_preview === "") ? props.row.prompt_preview : '——' }}</span>
                         <div class="kv">
+                          <span class="k">prompt</span><span class="v mono" style="font-size:11px;overflow-wrap:anywhere">{{ promptPreview(props.row) }}</span>
                           <span class="k">{{ t.detailId }}</span><span class="v mono">{{ props.row.id }}</span>
                           <span class="k">{{ t.detailSeq }}</span><span class="v mono">{{ props.row.seq }}</span>
                           <span class="k">{{ t.colRoute }}</span><span class="v mono">{{ props.row.route_type || '—' }}</span>
@@ -667,6 +667,12 @@
           return Math.abs(n) >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(Math.round(n))
         }
         function fmtRate (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
+        // 速率用千分位纯数字，不套 k 后缀——k 留给 token 总量，避免把速率读成计数。
+        function fmtThousands (value) {
+          const n = Number(value)
+          if (!Number.isFinite(n)) return '—'
+          return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+        }
         // 缓存命中率：cached_tokens 占 prompt_tokens 的百分比。
         // prompt_tokens 为 0（缺失/未计费）或 cached_tokens 为 0（完全没命中）时显示占位符，
         // 避免把"没有前缀缓存"和"命中率 0%"混成同一个读数。
@@ -676,6 +682,15 @@
           if (!Number.isFinite(cached) || !Number.isFinite(prompt)) return '—'
           if (cached <= 0 || prompt <= 0) return '—'
           return (cached / prompt * 100).toFixed(1) + '%'
+        }
+        // 请求 prompt 预览：后端在路由阶段从已解码的请求体里取首条 user 消息前 50 字符，
+        // 经 ngx.ctx 落到日志行。字段缺失（旧记录/非 messages 端点）返回占位符，
+        // 空串要与「没有这个字段」区分开，所以空串显示 (empty)。
+        function promptPreview (row) {
+          const v = row && row.prompt_preview
+          if (typeof v !== 'string') return '—'
+          if (v === '') return '(empty)'
+          return v
         }
         function fmtMs (value) {
           if (!Number.isFinite(Number(value))) return '—'
@@ -780,22 +795,13 @@
             const now = Date.now()
             const win = rows.value.filter(r => now - (r.ts_ms || 0) < 60000)
             const errs = win.filter(r => (r.status || 0) >= 400).length
-            // 输出 tok/s：每条请求的生成速率（completion/duration）取中位数，
-            // 乘以当前并发数。这是操作员肉眼能对上的数——一条 30 秒产出 3000 token
-            // 的请求是 100 tok/s，五条并发是 500 tok/s。把窗口内完成的所有请求的
-            // token 总量除以窗口秒数会把 30 秒的产出压进 10 秒里算出 3 倍的假速率。
-            const perReqRates = win
-              .filter(r => r.duration_ms > 1000 && r.completion_tokens > 0)
-              .map(r => r.completion_tokens / (r.duration_ms / 1000))
-              .sort((a, b) => a - b)
-            const medianRate = perReqRates.length ? perReqRates[Math.floor(perReqRates.length / 2)] : 0
-            const concurrent = win.filter(r => r.duration_ms > 1000).length
-            const outTok = Math.round(medianRate * Math.max(1, concurrent))
-            // 输入 token：prompt 是一次性提交的，不是流式流入——除以时间是误导。
-            // 显示窗口内处理的总 token 数，让操作员自己看规模。
-            const inTok = win.reduce((a, r) => a + (r.prompt_tokens || 0), 0)
-            // 窗口内 completion_tokens 总数，与 inTok 同口径（60 秒），供顶部 card 的 Tok 出/入使用。
+            // 吞吐口径：窗口内 token 总量 ÷ 窗口秒数（60），即窗口平均吞吐。
+            // 输出 tok/s 与副行的「Tok 出」总量同源，操作员用 总量/60 就能验算，
+            // 也不再有"中位数速率×条数"那种把请求条数当并发乘出来的虚高值。
             const outTokSum = win.reduce((a, r) => a + (r.completion_tokens || 0), 0)
+            const inTok = win.reduce((a, r) => a + (r.prompt_tokens || 0), 0)
+            const outTok = Math.round(outTokSum / 60)
+            const inTokPerS = Math.round(inTok / 60)
             const durs = win.filter(r => r.duration_ms != null).map(r => r.duration_ms)
             const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
             const ttfts = win.filter(r => r.ttft_ms != null).map(r => r.ttft_ms)
@@ -805,7 +811,7 @@
               requests_window: win.length,
               errors_window: errs,
               output_tok_s: outTok,
-              input_tok_s: null,  // 改用 input_tokens_window，不显示假速率
+              input_tok_s: inTokPerS,
               avg_duration_ms: avgDur,
               avg_ttft_ms: avgTtft,
               input_tokens_window: inTok,
@@ -888,8 +894,8 @@
 
         return {
           bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters,
-          fmtInt, fmtK, fmtMs, fmtOne, fmtRate,
-          cacheHitPct,
+          fmtInt, fmtK, fmtMs, fmtOne, fmtRate, fmtThousands,
+          cacheHitPct, promptPreview,
           fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
           effortCell, toggleRow,
           aggOpen, aggNote, aggModelRows, aggBackendRows, aggEffortRows, ta,
