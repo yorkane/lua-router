@@ -312,9 +312,11 @@ Rust 侧没有每服务上限这个能力，`smg_worker_capacity_excluded_total`
 4. 手工 `POST /workers` 与 `SMG_WORKER_URLS` 种子进来的行属 protected（`discovery ~= config`），
    watcher 不摘；严格探针的确定性否定对它们同样不生效——这是「手填配置不能凭它判死一个健康
    实例」这条红线的延伸。
-5. `registry.all_models()` :1232 / `worker_models()` :1252 / `record_models()` :1264 目前
-   **暂无消费者**（`/v1/models` 的正链是 `http_workers`）。写了但没接线这件事要登记在这里，
-   别让人以为已经有读者。
+5. `registry.all_models()`（`registry.lua:1853`）/ `worker_models()`（`registry.lua:1873`）/
+   `record_models()`（`registry.lua:1885`）目前**暂无消费者**。写了但没接线这件事要登记在这里，
+   别让人以为已经有读者。两条模型列表链各自用的是：对外 `GET /v1/models` 走 `registry.models()`
+   （Rust 对拍钉住的那一列，`models_handler` `router.lua:4108`）；管理台 `GET /_ui/v1/models` 走
+   `props.http_workers()`（`ui.lua:198`）。两者都不吃上面那三个 reader。
 6. 全场封顶是 503，不是排队：没有「等一个槽位释放」的语义（与 429 闸门的排队能力是两套东西）。
    需要削峰平滑的负载应该配并发闸 + 上游重试，而不是靠 `max_concurrency` 兜。
 7. `lr_workers` 2m 容量竞争：`pw:` 写失败只在 `set_power_w` 的 shdict 写分支 WARN 一行

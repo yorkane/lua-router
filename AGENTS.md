@@ -100,3 +100,14 @@
 7. **提交与推送**：user.name=yorkane / yorkane@users.noreply.github.com；main 直推 GitHub
    （github.com/yorkane/lua-router）。文档计数改动必须与一次全绿门禁日志同锚。
 8. 子智能体 provider 偶发半截返回：验收以盘上文件与日志为准；派活时给文件所有权边界。
+9. **`/v1/models` 的对外形状有三件不可自作主张的事**（字段表与来源优先级见 README〈`/v1/models` 的模型对象形状〉、
+   doc/gap-virtual-models.md §5）：① **官方四字段 `id` / `object` / `created` / `owned_by` 都是 required**，每个模型
+   对象必须带齐；`created` 取不到上游读数时用常量 `MODEL_CREATED_UNKNOWN = 0`（`router.lua:3579`），**不塞
+   `ngx.time()`**——那会让同一条目每次请求产出不同字节，打掉客户端缓存与前后对比。② 扩展字段（`capabilities`
+   命名空间与旁挂的 `supports_reasoning_effort` / `reasoning_effort` / `reasoning_efforts`，都不是官方字段）的来源
+   优先级固定为**操作员 config 声明 > 引擎自报（`registry.model_caps`）> 整个键省略**，**宁可不报也不猜**；省略是删键，
+   不写 `null`、不写空数组冒充「支持零个」。③ **`data[].id` 的取值集合与 `owned_by` 语义是老契约**——真实模型恒
+   `"local"`，单目标入口 `"llm-router-><model>"`、多目标入口 `"llm-router"` + 整组 `owned_by_models`；registry 的
+   worker 判定、watcher 的覆盖探针与客户端的模型选择全按 id 与 owned_by 建，改动前必须先想清楚。
+   另注：registry 采集能力时刻意**不读上游条目的顶层 `context_window`**（那是本网关配置层的字段名，混进引擎读数
+   就是重犯 2026-10-04 那次把声明总窗口当单次输出预算的事故）。

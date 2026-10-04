@@ -132,7 +132,7 @@ docker run -d --name lua-router --network host \
 
 | 面 | 路由 | 回答 |
 |---|---|---|
-| 公开面 | `/health` `/liveness` `/readiness` `/v1/models` `/model_info` `/server_info`（各有 GET 与 HEAD 别名）、`/metrics`、`/engine_metrics`、`/health_generate` | 200；`/readiness`、`/v1/models`、`/health_generate`、`/engine_metrics` 在无可用 worker 时分别回 503 / 503 / 503 / 500（`/engine_metrics` 的 500 是契约钉住的 worker-free 形态）。`/v1/models` 会把虚拟服务入口一起广告出去（`created: 0`、单模型入口 `owned_by: llm-router-><model>`、多模型入口 `owned_by: llm-router` + `owned_by_models`、按 id 升序、不覆盖真实 id） |
+| 公开面 | `/health` `/liveness` `/readiness` `/v1/models` `/model_info` `/server_info`（各有 GET 与 HEAD 别名）、`/metrics`、`/engine_metrics`、`/health_generate` | 200；`/readiness`、`/v1/models`、`/health_generate`、`/engine_metrics` 在无可用 worker 时分别回 503 / 503 / 503 / 500（`/engine_metrics` 的 500 是契约钉住的 worker-free 形态）。`/v1/models` 每条带齐官方四字段，另附 `capabilities` 扩展（形状、字段来源与优先级见下文〈`/v1/models` 的模型对象形状〉）；虚拟服务入口一并广告：单模型入口 `owned_by: llm-router-><model>`、多模型入口 `owned_by: llm-router` + `owned_by_models`，按 id 升序、不覆盖真实 id |
 | 推理面 | `/v1/chat/completions` `/v1/completions` `/v1/embeddings` `/v1/rerank` `/v1/classify` `/v1/responses` `/generate` | 字节透传 + 顶层 `model` 定点改写（虚拟入口转发的是选中候选的绑定名，不是入口名）；**输出预算三写法一律原样透传**——`max_tokens` / `max_completion_tokens` / `/v1/responses` 用的 `max_output_tokens` 都由调用方决定，网关既不改小也不在缺失时代填（用户裁定 2026-10-04），所以引擎拒的一定是调用方自己要的数；受 `SMG_MAX_CONCURRENT_REQUESTS` 限流（拒绝回 **429 空体**）。请求日志行的 `model` 是入口代表值，**实际落点模型看 `forwarded_model`**，调用方给的那个输出预算记在日志行的 `output_budget`（修复后恒等于请求原值）；组入口（显式写过 `targets`）被健康引擎一致拒绝整组模型名时，503 message 是「No available workers (N healthy engines serve none of the mapped models)」，与「全部熔断或不健康」分开定性。`/v1/responses` 是纯透传路由：非流式 2xx 时对响应顶层回填请求侧元数据六字段（`previous_response_id` / `instructions` / `metadata` / `store` / `model` / `safety_identifier`；`conversation` 不回显，它只对已删除的存储平面有意义），只做出站改写、不入库；流式只透传 |
 | 控制面 | `POST /workers`（202 + Location）、`PUT /workers/{id}`（202，三键 `{status,worker_id,message}`）、`GET /workers[/{id}]`、`DELETE /workers/{id}`、`POST /flush_cache`、`GET /v1/loads` | `PUT` 可改 priority / cost / labels（合并）/ api_key / 健康旋钮 / **每服务上限 `max_concurrency` 与 `max_power_w`**，身份字段忽略；非 UUID → 400、未知 → 404、坏 JSON → 400。`GET /workers` 每条带 `models`（该实例真实广告过的模型，主模型恒居首）、`inflight_requests`（纯在飞数，并发上限的比较对象）、`power_w`（新鲜瓦特读数，**缺席=未知**）与两个已归一的上限；未声明的上限字段**缺席而不是 0**。`worker_type` 与 `connection_mode` 收成单值：只有 `regular` 与 `http`（或其 serde 对象拼写、缺省）被接受，其它值一律 400。`/flush_cache` 向全部 worker POST `{}`（5s 超时），回 `{results:[{worker,status,result}], success, all_failed}`；`/v1/loads` 回 `{workers:[{worker,load}], total_workers, successful, failed}`（worker 侧非 2xx / 超时 / 缺字段记 -1）——两者与 Rust 形状不同，有意偏差 |
 | mesh / HA 面 | `/ha/{status,health,workers[/id],policies[/id],config[/key],rate-limit,rate-limit/stats,stats,shutdown}` + `/_mesh/internal/{ping,sync,apply,state}` | `SMG_ENABLE_MESH` 未设（缺省）→ `/ha/*` 全部固定 503 `{"error":"mesh not enabled"}`；开启后委托 `mesh.dispatch`，未知的深路径回 404 `{"error":"unknown ha route: <METHOD> <path>"}`。`/_mesh/internal/*` 无鉴权无 loopback 围栏，**信任边界就是网络本身** |
@@ -147,6 +147,106 @@ docker run -d --name lua-router --network host \
 只在 origin 命中时回显并收窄 Allow-Methods/Headers。预检 `OPTIONS` 在任何路由（含未注册路径）
 都回 200，由 conf 的 server 级 `rewrite_by_lua_block` 在选定 location 之前提前应答——未注册路径的
 预检在 Rust 侧是 404，这条保留为有意偏差。`/_ui` 也在 CORS 覆盖面里，比 Rust 宽。
+
+## `/v1/models` 的模型对象形状
+
+实现是 `router.lua` 的 `models_handler`（`router.lua:4108`）→ `advertise_real_model`
+（`router.lua:3974`）/ `advertise_virtual_entry`（`router.lua:3998`）→ `fill_model_fields`
+（`router.lua:3949`）。对外列表里的模型名来自 `registry.models()`（`registry.lua:1831`）——它是 Rust 对拍钉住的那一列，
+只取每条 worker 的**主模型** `model_id`，因此一台引擎广告多个名字时只有主模型出现在这里
+（多广告的那些走 `all_models()` / `worker_models()`，目前无人消费，见 doc/gap-worker-caps.md §8）。
+虚拟入口由 `inject_virtual_models`（`router.lua:4065`）追加：入口名与某个真实 worker 同名则丢弃别名，
+最后整表按 id 升序。无可用 worker 时整个响应是 503 纯文本 `No models available`（不是 JSON——Rust 侧只重写带
+`data` 数组的响应，这个文本答案原样透传，`router.lua:4111-4114`）。
+
+### 第一层：官方四字段，四个都是 required
+
+OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created` / `owned_by`，四个都 required。
+真实模型那一支以前只有三个（整个漏了 `created`），属于不合规，现在每条带齐。`created` 取上游答里的
+读数，取不到用常量 `MODEL_CREATED_UNKNOWN = 0`（`router.lua:3579`）表示「未知」，与虚拟入口一直的写法
+相同；**刻意不塞 `ngx.time()`**——那会让同一条目每次请求产出不同字节，把客户端缓存和前后对比全打掉。
+
+### 第二层：`capabilities` 命名空间 + 顶层三个 effort 键（都不是官方字段）
+
+`capabilities` / `reasoning_effort` / `reasoning_efforts` / `max_output_tokens` / `owned_by_models`
+是 vLLM、opencodex 这类服务器自加的生态扩展，各家形状还不一样。收在 `capabilities` 下面是与官方四字段的
+物理隔离，官方 SDK 只读它认识的四个；顶层那三个（`supports_reasoning_effort` / `reasoning_effort` /
+`reasoning_efforts`）沿用 opencodex 已经在用的位置，让照它写死的客户端继续照旧读。
+
+| 位置 | 键 | 含义 |
+|---|---|---|
+| 顶层 | `supports_reasoning_effort` | 有任一份档位读数（阶梯 / 判定面 / 缺省档）才是 `true`，否则整个键省略 |
+| 顶层 | `reasoning_effort` | 缺省档位（picker 预选那一档），字符串 |
+| 顶层 | `reasoning_efforts` | 客户端 picker 的档位阶梯 `[{value,label,default}]`；`label` 只在引擎给了才写，`default` 恒唯一 |
+| `capabilities` | `context_length` | 上下文**总窗口（输入+输出）** |
+| `capabilities` | `max_output_tokens` | 单次输出预算上限，**只有引擎自报这一档**（config 层无对应声明字段，`router.lua:3753` 直取 `caps.max_output_tokens`）。它只是把上游给的数往外报，绝不构成网关改写调用方预算的依据——输出预算三写法原样透传（用户裁定 2026-10-04） |
+| `capabilities` | `input_modalities` / `output_modalities` | 去重的非空字符串数组 |
+| `capabilities` | `supports_tool_use` / `supports_streaming` / `supports_reasoning` / `supports_vision` | 支持位，三态：`true` / `false` / 整个键省略 |
+| `capabilities` | `reasoning_effort` | 引擎**接受**的档位判定面，字符串数组（与顶层同名字段是两个含义，各画各的） |
+| 顶层 | `owned_by_models` | 多目标入口的整组模型名数组 |
+
+档位在上游有两种拼写、两个含义，registry 刻意各留一份、输出面各画各位：picker 的阶梯带 label 与
+`default`，判定面是下游真正接受的集合。**不把阶梯里的档位虚构进判定面**——判定面优先用引擎亲口给的
+`reasoning_effort_values`，只有它缺席时才退到阶梯序列（`router.lua:3814`）。实测样例里两份就不一致：
+阶梯 `low/medium/high/max`，判定面只有 `low/high/max`；取交集会连 `medium` 身上那个 `default=true` 一起
+丢掉，客户端反而没有缺省档可用，取并集又会报出下游可能不接受的名字，所以两份都留、各画各位。
+单目标入口透传引擎原话（含「缺省档不在判定面里」这种上游自带的自相矛盾）；多目标入口的判定面取交集，
+交集把缺省档挤掉就整个删键（`common_acceptance` `router.lua:3914`）。
+
+### 填充纪律：宁可不报，不要猜
+
+数据源优先级固定为 **操作员 config 声明 > 引擎自报 > 整个键省略**。「省略」是**删键**——不输出 `null`，
+也不输出空数组冒充「支持零个」（`[]` 是一份肯定答复，而这里要表达的是不知道）。整行一个读数都没有时，
+条目就退回官方那四个 required 字段。每个维度独立取源，所以「操作员只声明了模态」不会连带把引擎报的
+上下文丢掉。
+
+两个数据源：
+
+1. **操作员声明层**（`config_store` 快照，`router.lua` 的 `resolve_model_caps`
+   `router.lua:3744`）：模型卡片 `context_limit`＝引擎真实能力，操作员按引擎启动参数抄录，平铺写法
+   `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层（`declared_context_limit`
+   `router.lua:3649`）；卡片 `modalities`（`config_store.modalities_for`）；缺省档位由
+   `model_effort` 强制行 → 卡片 `default_effort` → 全局 `default_effort` 给出。`context_length` 这一维
+   还多一个来源：先问 `store_mod.ctx_cap`（卡片 `ctx` / 平铺 `model_ctx`，`router.lua:3747`），它排在
+   `context_limit` **之前**；两者都只是对外声明的读数，**不参与任何 max_tokens 计算**（用户裁定 2026-10-04）。
+2. **引擎自报层**：worker 自己 `GET /v1/models` 的回答，由 `registry.probe_advertised_entries()`
+   （`registry.lua:2913`）连覆盖探针一起采——**一次 GET 两份读数**，「探到了哪些模型」与「它们各自能干什么」
+   永远来自同一份回答。原文经 `registry.model_caps_from_listing()`（`registry.lua:1137`）→
+   `model_caps_from_entry()`（`registry.lua:1020`）归一，跨 worker 汇总走 `registry.model_caps()`
+   （`registry.lua:2966`）：字段互补则两边都留，值冲突则取信息最全的那份**整条**读数，定序只看内容与
+   完整度、不看写入顺序，避免对外读数随调度抖动。SGLang 只报 `max_model_len`（映射成 `context_length`），
+   opencodex 报整套 `capabilities`。能力读数只认「引擎亲口答过」那一枚印章（`models_verified`，
+   `registry.record_model_caps` `registry.lua:2937`），配置声明的名字不贡献读数。
+
+`capabilities` 内部还有一层来源序（同一字段多处都有时）：`capabilities.*` > 条目顶层同名字段 >
+`max_model_len`。这个顺序是「上游说得有多明确」，不是「我更喜欢哪个」。类型不对的读数一律按「这台没说清」
+处理（`context_length` 写成数组、写成布尔都算没有读数），整条解析失败即跳过。
+
+**registry 侧刻意不读上游条目的顶层 `context_window`**：那是**本网关配置层**的字段名（入口对外声明的
+总窗口，见 `doc/gap-virtual-models.md` §4），把它和引擎读数混成一个字段，就等于重犯 2026-10-04 那次
+context_window 事故——把声明的总窗口当成单次输出预算写进 `max_tokens`。
+
+`supports_vision` 的正负向不对称（`router.lua:3781-3787`）：registry 归一层**从不**反推它（引擎少写一列很常见，
+据此替上游编话不如少一个字段，`registry.lua:1016`）；输出层只允许**正向**反推——模态里列了 `image`/`video`
+就报 `true`，无论这份模态来自引擎还是操作员；**负向**（报 `false`）只在操作员声明时给，因为只有卡片的模态是
+穷尽列表（写入路径把 `text` 常开，显式提交空列表也落成只含 `text` 的一份，`config_store.lua:1529`）；
+「操作员没列 image」才是「不收图」这句话，引擎自报的列表缺 image 只能读作「没说」。
+
+### 虚拟入口那一行
+
+入口本身没有引擎，能力一律从组内的**实际模型**聚合，并且只在整组口径一致时才对外声明：数值取最窄、
+支持位要求每台都报且一致、picker 要求每台档位序列完全一致、判定面取交集；任何一支凑不齐就删键。
+单成员入口就是那台引擎本身，读数原样透传，免得同一个模型在它的真实行与入口行上说出两种能力。
+对外声明的 `capabilities.context_length` 优先取条目自己写的 `context_window`（作用只是让客户端更早触发
+压缩），其次才是组内各实际模型读数的最小值。
+
+`owned_by` 的两套口径是**不能改的老契约**，有客户端在读它：真实模型恒 `"local"`（引擎自报的 owned_by 是
+各家上游的说法，不上外）；单目标入口 `"llm-router-><model>"`，多目标入口 `"llm-router"` 加整组的
+`owned_by_models`。`data[].id` 的取值集合、排序与别名遮蔽规则同样不变——registry 的 worker 判定、
+watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连带影响选路。
+
+注意 `GET /_ui/v1/models`（`ui.lua` 的 `ui.models()`，`ui.lua:198`）是管理台模型选择器用的**另一份**列表，
+形状与本节无关：每条恒 `created: 0`、`owned_by: "llm-router"`，另带 `status.value`，只用来枚举候选名。
 
 ## 环境变量
 
@@ -213,8 +313,8 @@ docker run -d --name lua-router --network host \
 | `SMG_ENABLE_IGW` | 按 `model` 查表路由；开启后未知 model → 503 `no_available_workers` |
 | `SMG_WORKER_URLS` | 逗号分隔的启动播种 worker 列表 |
 | `LMR_DEFAULT_EFFORT` / `LMR_EFFORT_MAP` | 八档 effort 阶梯的默认值与改写表（`low:medium,high:xhigh`） |
-| `LMR_MODEL_CTX` | 每模型上下文上限，模型卡片 `model_configs[].ctx` 的平铺写法（同一份文档里叫 `model_ctx`）。**只用于展示，不参与转发改写**（用户裁定 2026-10-04，见下一行与 doc/gap-virtual-models.md §4）：网关不再拿它去动 `max_tokens` / `max_completion_tokens`。它现在唯一的读者是 `/_ui/props`——`props.with_ctx` 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口 |
-| `LMR_MODEL_CONTEXT_LIMIT` | 每模型**服务实际上下文限制**＝引擎真实能力（操作员按引擎启动参数抄录）。`model=value` 形状，与上一项同一解析口径；卡片写法是 `model_configs[].context_limit`，卡片优先于这一平铺层。**唯一用途是配置期校验**：虚拟入口声明的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则 `/_ui/config` 拒绝保存（`config_store.validate_declared_context_windows`，挂在 `apply_profiles` / `apply_document` 两条写入路径）。组内没有任何卡片声明读数 = 不知道引擎能力 = 不校验不报错。同样**不参与**转发改写与任何 max_tokens 计算；新 env 必须进 `config_store.ENV_NAMES`，否则 nginx 把它从 worker 环境里剥掉 |
+| `LMR_MODEL_CTX` | 每模型上下文上限，模型卡片 `model_configs[].ctx` 的平铺写法（同一份文档里叫 `model_ctx`）。**只用于展示，不参与转发改写**（用户裁定 2026-10-04，见下一行与 doc/gap-virtual-models.md §4）：网关不再拿它去动 `max_tokens` / `max_completion_tokens`。它现在的读者只有展示面两处：`/_ui/props` 的 `props.with_ctx` 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口；另一处是 `/v1/models` 的合成层——`resolve_model_caps`（`router.lua:3744`）先问 `store_mod.ctx_cap` 拿它当 `capabilities.context_length` 的**声明层**读数（这一层里它排在卡片 `context_limit` **之前**），见〈`/v1/models` 的模型对象形状〉 |
+| `LMR_MODEL_CONTEXT_LIMIT` | 每模型**服务实际上下文限制**＝引擎真实能力（操作员按引擎启动参数抄录）。`model=value` 形状，与上一项同一解析口径；卡片写法是 `model_configs[].context_limit`，卡片优先于这一平铺层。**两个用途**：① 配置期校验——虚拟入口声明的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则 `/_ui/config` 拒绝保存（`config_store.validate_declared_context_windows`，挂在 `apply_profiles` / `apply_document` 两条写入路径）。② `/v1/models` 对外 `capabilities.context_length` 的**声明层**兜底读数——卡片 `context_limit` 缺席时由 `declared_context_limit` 读它，见〈`/v1/models` 的模型对象形状〉。两个用途都**不参与**转发改写与任何 max_tokens 计算；新 env 必须进 `config_store.ENV_NAMES`，否则 nginx 把它从 worker 环境里剥掉 |
 | `LMR_MODEL_EFFORT` / `LMR_MODEL_EFFORT_MAP` | 每模型覆盖，优先级高于上两项 |
 | `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/_ui/config` 写。条目级 `context_window` 是**对外声明的上下文总窗口（输入+输出）**，作用只是让客户端更早触发压缩；它不是输出预算，也不参与 max_tokens 计算，且必须严格小于组内 `context_limit` 的最小值 |
 | `LMR_MODEL_MODALITIES` | `/_ui/props` 广告的能力位（`text,image`） |

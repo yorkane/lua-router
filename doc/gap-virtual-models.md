@@ -1,7 +1,7 @@
 # 虚拟模型（服务入口）· 服务接入(upstreams) · JSON 编辑
 
 日期：2026-10-01 首版；**2026-10-02 语义反转重写**；**2026-10-04 改输出预算口径**（§1 第 3 条、
-§2 字段表、§4 整节重写）。决策人：用户。
+§2 字段表、§4 整节重写）；**2026-10-04 再扩容 §5**（`/v1/models` 的官方四字段与 `capabilities` 扩展，字段表与两个数据源另见 README〈`/v1/models` 的模型对象形状〉）。决策人：用户。
 
 ## 1. 语义（用户裁定，以此为准）
 
@@ -177,17 +177,77 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
 （`config_store.lua:1970`）实现原样保留、`test/unit/test_profiles.lua` 仍钉着它们，但**热路径已无调用者**。
 转发热路径上只剩 `apply_effort_policy`（`router.lua:3160`）还在改写请求体。
 
-`_M.ctx_cap` 唯一的生产读者是 `/_ui/props`：`props.with_ctx`（`props.lua:129`，取值在 `props.lua:133`）
-用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口——那是展示面，
-不影响任何转发字节。同理 `_M.ctx_cap` 里那道「入口名命中 virtual_profiles / virtual_models 时返回 nil」
+`_M.ctx_cap` 的读者只在展示面两处：`/_ui/props` 的 `props.with_ctx`（`props.lua:129`，取值在 `props.lua:133`）
+用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口；另一处是 §5 的 `/v1/models`
+合成层——`resolve_model_caps`（`router.lua:3744`）调 `store_mod.ctx_cap` 拿它当 `capabilities.context_length`
+的**声明层**读数，而且排在卡片 `context_limit` **之前**（顺序见 §5.1）。两处都不影响任何转发字节。同理 `_M.ctx_cap` 里那道「入口名命中 virtual_profiles / virtual_models 时返回 nil」
 的守卫仍在函数内，随它一起降级为只读用途：没有人再拿它决定转发体的数字。
 
-## 5. /v1/models 广告
+## 5. /v1/models 广告（2026-10-04 形状扩容）
 
+> 完整字段表、两个数据源与优先级见 README〈`/v1/models` 的模型对象形状〉。本节只登记**入口那一行**的口径
+> （采集 commit 5978f28 + 合成 commit 5417bb8）。
+
+- **官方四字段是 required**：每条（真实模型行与入口行）都带齐 `id` / `object` / `created` / `owned_by`。
+  改之前真实模型那一支只有 `{id, object, owned_by}`，整个漏了 `created`，属于不合规。`created` 取上游答里的读数，
+  取不到用常量 `MODEL_CREATED_UNKNOWN = 0`（`router.lua:3579`），入口行恒 0；**不塞 `ngx.time()`**——同一条目每次请求
+  产出不同字节，等于打掉客户端缓存与前后对比。
 - **单模型行**保持 `owned_by = "llm-router->"..<model>`（契约钉死的 legacy 形状，逐字节不变）。
-- **多模型行**改标 `owned_by = "llm-router"` + `owned_by_models`（整组），供 UI 展示。
+- **多模型行**改标 `owned_by = "llm-router"` + `owned_by_models`（整组），供 UI 展示。真实模型行恒 `"local"`：
+  引擎自报的 `owned_by` 是各家上游的说法，而有客户端在按 `"local"` 判「这是我方实例」。
+- **扩展字段收在 `capabilities` 命名空间**，旁挂 `supports_reasoning_effort` / `reasoning_effort` /
+  `reasoning_efforts` 三个 opencodex 位置上的键（都不是官方字段，官方 SDK 只读那四个 required）。填充纪律是
+  **操作员 config 声明 > 引擎自报 > 整个键省略**；省略是删键——不写 `null`、不写空数组（`[]` 是一份「一个都不支持」
+  的肯定答复，而这里要表达的是不知道）。
+- **入口的能力从组内实际模型聚合，只在整组口径一致时对外声明**（`advertise_virtual_entry` `router.lua:3998`，
+  与 `virtual_ctx_cap` 同一个安全理由：一组由该入口**不控制**的引擎提供服务）。数值取最窄（`narrowest_number`）；
+  支持位要求每台都报且一致（`common_boolean`）；picker 阶梯要求每台**序列完全一致**（`common_ladder`——并起来会
+  造出「在另一台上会被拒」的选项）；判定面取交集且必须含缺省档（`common_acceptance`）。任何一支凑不齐就删键。
+  **单成员入口例外**：它就是那台引擎本身，读数原样透传（含上游自己「缺省档不在判定面里」那种自相矛盾），
+  免得同一个模型在它的真实行与入口行上说出两种能力。
+- 入口对外声明的 `capabilities.context_length` 优先取条目自己写的 `context_window`（§1 第 3 条：让客户端更早触发压缩
+  的总窗口，**不参与任何 max_tokens 计算**），其次才是组内各实际模型读数取最窄。
+- **档位在上游有两种拼写、两个含义，各画各的**：picker 的 `reasoning_efforts`（带 `label` / `default`）画在顶层，
+  判定面 `capabilities.reasoning_effort` 画在命名空间里，用引擎亲口说的可接受集合，**不把阶梯里的档位虚构进判定面**
+  （实测样例两份就不一致：阶梯 low/medium/high/max，判定面只有 low/high/max）。
 - 「与真实 worker 同名则丢弃别名」这条规则守的是**入口自己的 id**，不会因为某个被映射的模型名
   与入口重名而误伤。
+
+### 5.1 能力数据的两个来源，以及 registry 侧为什么不读上游的 `context_window`
+
+- **操作员声明层**（`resolve_model_caps` `router.lua:3744` 读 `config_store` 快照）：模型卡片 `context_limit`＝引擎
+  真实能力（操作员按启动参数抄录；平铺写法 `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于
+  平铺层，`declared_context_limit` `router.lua:3649`）；卡片 `modalities`（`config_store.modalities_for`
+  `config_store.lua:2002`）；缺省档位取 `model_effort` 强制行 → 卡片 `default_effort` → 全局 `default_effort`。
+  注意 `context_length` 这一维**先问 `store_mod.ctx_cap`**（卡片 `ctx` / 平铺 `model_ctx`），它排在 `context_limit`
+  之前（`router.lua:3747-3753`）：同一份声明层里 `ctx` 说话更响，`context_limit` 只在没有 `ctx` 时兜住引擎读数。
+- **引擎自报层**：worker 自己 `GET /v1/models` 的回答。`registry.probe_advertised_entries()`（`registry.lua:2913`）
+  与覆盖探针**共用一次 GET**——「探到了哪些模型」与「它们各自能干什么」永远来自同一份回答，不会出现
+  「列表说三条、能力说一条」的分裂。原文经 `model_caps_from_listing()`（`registry.lua:1137`）→
+  `model_caps_from_entry()`（`registry.lua:1020`）归一，跨 worker 汇总走 `registry.model_caps()`（`registry.lua:2966`）：
+  字段互补两边都留，值冲突取信息最全的**整条**读数，定序只看内容与完整度、不看写入顺序（否则对外读数随调度抖动）。
+  SGLang 只报 `max_model_len`（映射成 `context_length`），opencodex 报整套 `capabilities`。字段级来源序是
+  `capabilities.*` > 条目顶层同名字段 > `max_model_len`——顺序按「上游说得有多明确」排，不是按「我更喜欢哪个」。
+- **能力读数只认证「引擎亲口答过」**：`model_caps` 与 `models` 同批落地、共用 `models_replace` 那枚印章
+  （`registry.lua:2729`），取用侧先过 `record_model_caps`（`registry.lua:2937`）里的 `models_are_verified` 判定
+  （`registry.lua:2010`）。**配置声明的名字不贡献能力读数**——否则操作员在配置里写的一个名字会被当成引擎的能力
+  陈述往外报。
+- **刻意不读上游条目的顶层 `context_window`**（`registry.lua:1013` 的注释钉住）：那是**本网关配置层**的字段名
+  （入口对外声明的总窗口，见 §4 与 AGENTS.md 2026-10-04 裁定块）。把它和引擎读数混成一个字段，等于重犯
+  「把三个不同的量当成同一个数」的那次生产事故（`context_window=350000` 被凭空写进 `max_tokens`，而服务真实窗口
+  262144）。
+- **`supports_vision` 的正负向不对称**：registry 归一层**从不**反推它（`registry.lua:1016`——引擎少写一列很常见，
+  据此替上游编话不如少一个字段）；输出层（`router.lua:3781-3787`）只允许**正向**反推——模态里列了 `image`/`video`
+  就报 `true`，这份模态来自引擎还是操作员都一样；**负向**（报 `false`）只在操作员声明时给，因为只有卡片的模态是
+  穷尽列表（写入路径把 `text` 常开、空列表落成 `{"text"}`，`config_store.lua:1529`），此时「没列 image」才是操作员
+  说了「不收图」。引擎自报的列表缺 image 只能读作「没说」。
+- 采集失败不改健康位、不摘 worker（AGENTS.md 硬规则 4：转发路径上的探测只损失精度）。整表读不出东西时
+  `model_caps()` 返回空表，输出面的扩展字段整体省略，条目退回官方那四个 required 字段。
+
+### 5.2 别和 `GET /_ui/v1/models` 搞混
+
+`ui.models()`（`ui.lua:198`）是管理台模型选择器用的**另一份**列表：每条恒 `created: 0`、`owned_by: "llm-router"`，
+另带 `status.value`，只用来枚举候选名，**不承载本节任何能力读数**。
 
 ## 6. upstreams 声明层
 

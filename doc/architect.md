@@ -119,7 +119,7 @@ sequenceDiagram
 |---|---:|---|---|
 | router.lua | 4722 | 入口与总装：路由表、转发泵、重试、/_ui 处理、metrics handler、DP rank 注入；候选装配 `candidates_for` 的门序（健康→白名单/绑定→模型许可→容量硬排除→**组门**：组条目改问「这一组里有没有你能服务的」并就地定下转发绑定）与 per-attempt 卡片解析 | init.lua / 各 conf 的 *_by_lua |
 | config_store.lua | 3203 | 热配置：虚拟模型 1 对多（`targets` 组 + 派生组三档回退 + `explicit_*` 旗标 + `virtual_models` 降级为派生只读视图）+ 条目级 `context_window`（对外声明的上下文总窗口，不改写输出预算）+ 模型卡 `context_limit`（服务实际上下文限制，只用于配置期校验）与 upstreams（含每服务上限声明）/effort/ctx/policy（`LMR_CONFIG_FILE` 原子落盘 + shdict 快照） | router/init |
-| registry.lua | 2795 | worker 注册表（shdict 持久）、健康状态、`/model_info` 元数据发现、DP 展开 url@rank、负载字段折叠、**每服务上限判定 `capacity_exclusion`**、`models`/`models_verified` 覆盖度 | router/hb/mesh/watcher |
+| registry.lua | 2795 | worker 注册表（shdict 持久）、健康状态、`/model_info` 元数据发现、DP 展开 url@rank、负载字段折叠、**每服务上限判定 `capacity_exclusion`**、`models`/`models_verified` 覆盖度、**上游能力采集 `probe_advertised_entries` / `model_caps`**（喂 `/v1/models` 的 `capabilities`，只认证引擎亲口答过的观测）| router/hb/mesh/watcher |
 | mesh.lua | 2525 | HA gossip：成员表、快照同步、/ha/* 端点、身份统一（sync_with 并键）、suspect/down 状态机 | init 定时器 |
 | watcher.lua | 2362（描述性，非计数口径） | 进程内服务发现：targets/docker.sock/proc 三源、严格 /v1/models 探针、十条守卫（1-9 移植自 Python 守护进程，第 10 条=探针确认不可用即按分档摘除，见 gap-watcher-merge.md §1.1）、ledger+宽限期、model-map 注册时改名 | init 定时器（worker 0 单飞） |
 | observability.lua | 1460 | Prometheus 家族渲染（HELP/TYPE 对齐 Rust）、请求日志环形缓冲、inflight 年龄槽表 | router/metrics handler |
