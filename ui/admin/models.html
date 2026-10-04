@@ -43,15 +43,18 @@
 
           <!-- 虚拟模型：本页的主入口（root ruling 2026-10-02 语义反转）。
                一个虚拟名 = 日常服务入口，一对多映射一组实际模型，由调度策略在组内选路；
-               条目只允许 context_window 一个覆盖字段。policy 归路由策略页、effort 归模型卡片，
-               所以这里刻意不提供 per-alias 的档位/策略编辑器。 -->
+               条目只允许 context_window 一个覆盖字段：它是本入口对外声明的上下文总窗口
+               （输入+输出），供客户端决定何时压缩，网关不拿它改写任何输出预算（2026-10-04 裁定，
+               见 commit 75ecc37）。真正的引擎能力读数是模型卡片上的 context_limit，
+               声明值必须严格小于组内各卡片的最小值，否则后端拒绝保存。
+               policy 归路由策略页、effort 归模型卡片，所以这里刻意不提供 per-alias 的档位/策略编辑器。 -->
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading">
               <div>
                 <div class="surface-title">{{ tv('virtualSection') }}</div>
                 <div class="surface-subtitle">{{ tv('virtualCopy') }}</div>
               </div>
-              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :label="tv('virtualSave')" @click="saveVirtual"></q-btn>
+              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :disable="virtualCtxBlocking" :label="tv('virtualSave')" @click="saveVirtual"></q-btn>
             </q-card-section>
             <q-separator dark></q-separator>
             <q-card-section class="surface-body">
@@ -72,6 +75,9 @@
                     <span v-else class="muted">{{ tv('virtualNoTargets') }}</span>
                     <q-badge outline :color="row.context_window ? 'teal-4' : 'grey-6'" class="chip-soft">
                       {{ row.context_window ? tv('virtualCtxCovered') + ' ' + row.context_window : tv('virtualCtxFollow') }}</q-badge>
+                    <!-- 声明窗口 ≥ 组内服务实际限制：后端会拒绝，这里提前在行上标出来 -->
+                    <q-badge v-if="virtualCtxOverflow(row)" outline color="orange-4" class="chip-soft">
+                      {{ tv('virtualCtxOverChip') }}</q-badge>
                     <q-badge v-for="chip in legacyChips(row)" :key="'vl' + index + '-' + chip" outline color="orange-4" class="chip-soft">{{ chip }}</q-badge>
                     <span style="flex:1 1 auto"></span>
                     <span class="muted" style="font-size:11px">{{ tv('virtualDeleteHint') }}</span>
@@ -82,7 +88,8 @@
                     <q-input v-model="row.model" dense outlined dark class="mono" :label="tv('virtualAlias')"
                              :placeholder="tv('virtualAliasPlaceholder')" @update:model-value="touchRow(row)"></q-input>
                     <q-input v-model="row.context_window" dense outlined dark type="number" :label="tv('virtualCtxField')"
-                             :hint="tv('virtualCtxHint')" @update:model-value="touchRow(row)"></q-input>
+                             :hint="tv('virtualCtxHint')" :error="Boolean(virtualCtxOverflow(row))"
+                             :error-message="virtualCtxOverflow(row)" @update:model-value="touchRow(row)"></q-input>
                     <span class="muted" style="font-size:11px">{{ tv('virtualCtxCopy') }}</span>
                   </div>
                   <!-- 实际模型组：每行一个模型名，可选把该行绑到某个实例 -->
@@ -149,6 +156,10 @@
                 <div><span class="k">{{ t.previewResultCtx }}</span><span class="code-pill">{{ previewResult.ctxText }}</span>
                   <span v-if="previewResult.ctx" class="muted q-ml-sm">{{ previewResult.ctxSourceNote || t.previewCtxNote }}</span>
                   <span v-else-if="previewResult.group.length > 1" class="muted q-ml-sm">{{ tv('previewCtxGroupNone') }}</span></div>
+                <!-- 声明窗口 vs 引擎真实能力：context_limit 是操作员按引擎启动参数抄录的读数，
+                     组内取最小值（该入口可能被组里任何一台服务）；没有卡片声明就是「无从校验」 -->
+                <div><span class="k">{{ tv('colContextLimit') }}</span><span class="code-pill">{{ previewResult.limitText }}</span>
+                  <span v-if="previewResult.limitNote" class="muted q-ml-sm">{{ previewResult.limitNote }}</span></div>
                 <div><span class="k">{{ t.previewServing }}</span><span class="code-pill">{{ previewServing.text }}</span></div>
               </div>
             </q-card-section>
@@ -196,6 +207,7 @@
                 </q-td>
               </template>
               <template v-slot:body-cell-ctx="props"><q-td :props="props"><span class="code-pill">{{ props.row.ctx === null || props.row.ctx === undefined ? t.previewNoCtx : props.row.ctx }}</span></q-td></template>
+              <template v-slot:body-cell-context_limit="props"><q-td :props="props"><span class="code-pill" :class="{ muted: contextLimitText(props.row) === t.contextLimitUnknown }">{{ contextLimitText(props.row) }}</span></q-td></template>
               <template v-slot:body-cell-default_effort="props"><q-td :props="props"><span class="muted">{{ effortText(props.row.default_effort) }}</span></q-td></template>
               <template v-slot:body-cell-effort_map="props">
                 <q-td :props="props">
@@ -227,6 +239,8 @@
                   <q-input v-model="cardForm.model" dense outlined dark readonly class="mono" :label="t.colModel"></q-input>
                   <div class="form-grid-2">
                     <q-input v-model="cardForm.ctx" dense outlined dark type="number" :label="t.ctxField" :hint="t.ctxHint" :rules="[ctxRule]"></q-input>
+                    <q-input v-model="cardForm.context_limit" dense outlined dark type="number" :label="t.contextLimitField"
+                             :hint="t.contextLimitHint" :rules="[contextLimitRule]"></q-input>
                     <q-select v-model="cardForm.default_effort" dense outlined dark :options="effortOptions" map-options emit-value clearable
                               :label="t.colDefaultEffort"></q-select>
                   </div>
@@ -311,8 +325,9 @@
           + 'POST /_ui/config/apply 整表替换：缺省的段视为清空，任一字段非法则整体拒绝、不产生半提交。'
           + 'model_map 由进程内 watcher 直接落地改名。',
         jsonCopyVirtual: 'virtual_models 是对外主入口：一行 model（别名）用 targets 映射一组实际模型名，可带 '
-          + 'workers（规范化 url 白名单）与 context_window（正整数，该入口唯一允许的覆盖，网关据此钳制下游的 '
-          + 'max_tokens / max_completion_tokens；不想要覆盖就把整个键删掉，写 null 或空数组会被旧 build 误判）。'
+          + 'workers（规范化 url 白名单）与 context_window（正整数，该入口对下游统一声明的上下文总窗口'
+          + '（输入+输出），供客户端决定何时压缩；网关不改写任何输出预算字段，声明值必须严格小于组内各卡片的 '
+          + 'context_limit，后端会拒绝保存违反的配置；不想声明就把整个键删掉，写 null 或空数组会被旧 build 误判）。'
           + 'target 是旧形状的代表值，写了 targets 时可省。调度策略与思考强度不在这里配（分别在路由策略页、模型卡片）。'
           + '本对话框无损读写：读到的 candidates 与任何未识别的键都原样写回，只过滤顶层段键，绝不过滤行内字段。',
         jsonCopyKeys: 'upstreams 的 api_key 回显恒 null（脱敏）：提交时保持 null 或删掉该键 = 不动已存密钥，'
@@ -346,12 +361,14 @@
           + 'commit. model_map is applied by the in-process watcher so renames land.',
         jsonCopyVirtual: 'virtual_models is the public entry point: one model row (the alias) maps a group of real '
           + 'model names through targets, optionally with workers (normalized url allowlist) and context_window (a '
-          + 'positive integer, the only per-entry override, used by the gateway to clamp downstream max_tokens / '
-          + 'max_completion_tokens; delete the whole key to drop the override — null or [] is misread by older '
-          + 'builds). target is the representative value of the old shape and can be omitted once targets is set. '
-          + 'Scheduling policy and effort are configured elsewhere (routing page, model cards). This dialog reads '
-          + 'and writes losslessly: only top-level sections are filtered, candidates and any unrecognised key are '
-          + 'written back verbatim, and inline row fields are never filtered.',
+          + 'positive integer: the total context window (input + output) the entry advertises downstream so clients '
+          + 'know when to compress; the gateway rewrites no output budget field, and the declared value must stay '
+          + 'strictly below every card context_limit in the group — the backend refuses a violating save; delete the '
+          + 'whole key to drop the declaration — null or [] is misread by older builds). target is the '
+          + 'representative value of the old shape and can be omitted once targets is set. Scheduling policy and '
+          + 'effort are configured elsewhere (routing page, model cards). This dialog reads and writes losslessly: '
+          + 'only top-level sections are filtered, candidates and any unrecognised key are written back verbatim, '
+          + 'and inline row fields are never filtered.',
         jsonCopyKeys: 'upstreams.api_key is always shown as null (masked): keep it null or delete the key to leave '
           + 'the stored secret alone, submit "" to clear it, or submit a value to set it.',
         jsonPlaceholder: 'Editable JSON subset appears here once the config loads',
@@ -403,7 +420,7 @@
         // 池成员的实时形状（url / model_id / models / models_verified）：给候选下拉用，
         // 拉取失败时退化为「只能手填 url」，不阻塞本页其它编辑
         const poolWorkers = ref([])
-        const cardForm = reactive({ model: '', ctx: '', default_effort: null, effort_map: [], modalities: [] })
+        const cardForm = reactive({ model: '', ctx: '', context_limit: '', default_effort: null, effort_map: [], modalities: [] })
         const preview = reactive({ model: '', effort: null, modelFilter: '' })
         const filteredModelOptions = ref([])
         let unsubscribeLocale
@@ -477,6 +494,7 @@
           { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
           { name: 'registered', label: t.value.colRegistered, field: 'registered', align: 'left', sortable: true },
           { name: 'ctx', label: t.value.colCtx, field: 'ctx', align: 'left', sortable: true, style: 'width:120px' },
+          { name: 'context_limit', label: t.value.colContextLimit, field: 'contextLimit', align: 'left', sortable: true, style: 'width:120px' },
           { name: 'default_effort', label: t.value.colDefaultEffort, field: 'default_effort', align: 'left', style: 'width:120px' },
           { name: 'effort_map', label: t.value.colCardMap, field: 'effort_map', align: 'left' },
           { name: 'modalities', label: t.value.colModalities, field: 'modalities', align: 'left', style: 'width:150px' },
@@ -494,6 +512,10 @@
             if (!cards.has(card.model)) cards.set(card.model, { ...card, registered: false, sources: [] })
           })
           const rows = [...cards.values()]
+          // context_limit 统一在这里按后端同口径装配（卡片优先、平铺层 model_context_limit 兜底）：
+          // registered 行来自 models_document（那里尚未带出该字段），查卡比查行稳，
+          // 也让列的 sortable 有真实的数值可比
+          rows.forEach(row => { row.contextLimit = contextLimitOf(row.model) })
           const aliases = (doc.value && doc.value.virtual_models) || []
           aliases.forEach(entry => {
             if (!entry || !entry.model) return
@@ -585,11 +607,16 @@
           const group = entry ? groupOfEntry(entry) : (requested ? [requested] : [])
           const resolved = previewRepresentative(entry, requested)
           const effort = previewEffort(resolved, preview.effort)
-          // 条目级钳制优先且与落点无关（这正是条目级覆盖存在的理由：一个服务名一个预算）；
-          // 没有条目级值时退回该模型自己的卡片，与 router.apply_ctx_cap 的 entry 参数同语义
-          const entryCap = requested ? virtualCtxCap(entry) : null
+          // 声明窗口（不是钳制！2026-10-04 裁定后网关不改写任何输出预算，commit 75ecc37）：
+          // 条目级显式 context_window 优先且与落点无关；没有条目级值时取整组各卡片声明的最小值
+          // （一组由该入口不控制的引擎服务，只有按最窄的声明对外才算安全口径），
+          // 单模型组就等于该模型自己卡片的声明。
           const explicit = entry && Number.isFinite(Number(entry.context_window)) && Number(entry.context_window) >= 1
-          const cap = requested ? (entryCap !== null ? entryCap : previewCtx(resolved)) : null
+            ? Math.floor(Number(entry.context_window)) : null
+          const groupDeclared = requested ? groupDeclaredWindow(group) : null
+          const declared = explicit !== null ? explicit : groupDeclared
+          // 服务实际限制的组内最小值：null = 组内没有卡片（或平铺层）声明过引擎真实能力，无从校验
+          const limit = requested ? narrowestLimitOfGroup(group) : null
           // 档位卡是按落点模型配的（router 的 card_key_for 在选中实例之后才取名字），所以整组
           // 有多个模型时预览必须逐个模型各推一次：一致就显示一个值，不一致就把每个落点写清楚，
           // 否则操作员会以为整组吃同一档位
@@ -608,11 +635,18 @@
               : effortPerModel.map(item => item.model + ' → ' + (item.effort.effort || c.value.unset)).join(' · '),
             effortChain: effortSame ? (effort.chain || '') : tv('previewEffortGroupNote'),
             effortPerModel,
-            ctx: cap,
-            ctxText: cap ? String(cap) : t.value.previewNoCtx,
-            ctxSourceNote: cap && entryCap !== null
-              ? (explicit ? tv('previewCtxFromEntry') : tv('previewCtxFromGroupMin'))
-              : (tv('previewCtxFromCard') || '')
+            ctx: declared,
+            ctxText: declared !== null ? String(declared) : t.value.previewNoCtx,
+            ctxSourceNote: declared === null ? (tv('previewCtxFromCard') || '')
+              : (explicit !== null ? tv('previewCtxFromEntry')
+                : (group.length > 1 ? tv('previewCtxFromGroupMin') : (tv('previewCtxFromCard') || ''))),
+            limit,
+            limitText: limit === null ? t.value.contextLimitUnknown : String(limit),
+            limitNote: limit === null ? tv('previewLimitNone')
+              : (declared === null ? ''
+                : (declared >= limit
+                  ? tv('previewCtxOverLimit', { declared: String(declared), limit: String(limit) })
+                  : tv('previewLimitOk')))
           }
         })
 
@@ -708,7 +742,10 @@
         //
         // 条目形状以 config_store.profile_from_entry 为唯一口径：
         //   model（虚拟名，必填）、targets（一组实际模型名，新主字段）、
-        //   candidates（[{worker, model}]，可选的逐实例绑定）、context_window（唯一覆盖字段）。
+        //   candidates（[{worker, model}]，可选的逐实例绑定）、context_window（唯一覆盖字段：
+        //   对下游声明的上下文总窗口，输入+输出）。2026-10-04 裁定后网关不再拿它改写任何输出
+        //   预算（commit 75ecc37），引擎真实能力看卡片上的 context_limit，声明值必须严格小于
+        //   组内各卡片的最小值，后端 validate_declared_context_windows 会拒绝违反的保存。
         // 旧的单值 target / workers 白名单 / policy / effort 仍被后端接受，UI 不再提供编辑器，
         // 只靠 row.raw 原样带回：画不出 ≠ 不存在，删掉它们必须是操作员在 JSON 视图里的动作。
         function cleanModelName (value) { return String(value === null || value === undefined ? '' : value).trim() }
@@ -894,6 +931,11 @@
           if (cleanModelName(raw.target) === alias) return alias + ' · ' + tv('virtualSame')
           const cw = String(row.context_window || '').trim()
           if (cw && (!/^\d+$/.test(cw) || Number(cw) < 1)) return tv('virtualCtxRule')
+          // 声明窗口 ≥ 组内服务实际限制的最小值：后端 validate_declared_context_windows
+          // 必定 400，这里提前拦（保存按钮已同时禁用，这是防任何路径绕过按钮的直接调用）。
+          // 组内没人声明 context_limit 时 virtualCtxOverflow 返回 ''，不拦：网关无从得知引擎能力。
+          const overflow = virtualCtxOverflow(row)
+          if (overflow) return overflow
           // 重复的虚拟名在后端是「后者覆盖前者」而不是报错：不提前拦住就等于悄悄丢一份配置
           if (virtualRows.value.some(other => other !== row && cleanModelName(other.model) === alias)) {
             return tv('virtualDupAlias', { alias })
@@ -972,28 +1014,68 @@
           }
         }
 
-        // 每别名统一的上下文钳制：复刻 config_store.virtual_ctx_cap。
-        // 显式 context_window 优先；否则整组（>=2 个模型）取各模型 ctx 卡的最小值；
-        // 组内只有一个模型时返回 null，即「没有条目级钳制」，走该模型自己的卡片。
-        function virtualCtxCap (entry) {
-          const explicit = Number(entry && entry.context_window)
-          if (Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit)
-          // 与 config_store.virtual_ctx_cap 同口径：后端的组最小值只看 profile.targets，
-          // 而 profile.targets 对任意形状（显式 targets / 单值 target / candidates 去重）都成立，
-          // 所以这里不做「必须显式写过 targets」的额外收窄——多绑的老配置同样吃组最小值
-          const group = groupOfEntry(entry)
-          if (group.length < 2) return null
-          let cap = null
-          group.forEach(model => {
-            const one = previewCtx(model)
-            if (typeof one === 'number' && one >= 1 && (cap === null || one < cap)) cap = one
-          })
-          return cap
+        // ── 服务实际上下文限制（context_limit）：引擎真实能力，只用于配置期校验 ──
+        //
+        // 2026-10-04 裁定（commit 75ecc37）后网关不再改写任何输出预算，这里也不再复刻
+        // config_store.virtual_ctx_cap 的钳制推算。保留的是同一个「取组内最小值」的形状，
+        // 但读的是卡片的 context_limit（引擎真实能力），唯一用途是让操作员在保存前就看到
+        // 「声明窗口超过引擎能力」这个后端会拒绝的矛盾。
+        // 读数口径与后端 validate_declared_context_windows 一致：卡片的 context_limit 优先，
+        // 其次平铺层 model_context_limit（LMR_MODEL_CONTEXT_LIMIT）；组内一个读数都没有
+        // → null = 网关无从得知引擎能力，不做校验。
+        function contextLimitOf (model) {
+          const cfg = doc.value || {}
+          const card = (cfg.model_configs || []).find(row => row && row.model === model)
+          const fromCard = card ? Number(card.context_limit) : NaN
+          if (Number.isFinite(fromCard) && fromCard >= 1) return Math.floor(fromCard)
+          const flat = (cfg.model_context_limit || []).find(row => row && row.model === model)
+          const fromFlat = flat ? Number(flat.context_limit) : NaN
+          if (Number.isFinite(fromFlat) && fromFlat >= 1) return Math.floor(fromFlat)
+          return null
         }
+        // 组内各卡片 context_limit 的最小值：一组由该入口不控制的引擎提供服务，
+        // 只有按最窄的那台才算安全口径（与后端校验取最小值同一个理由）。
+        function narrowestLimitOfGroup (group) {
+          let narrowest = null
+          (group || []).forEach(model => {
+            const one = contextLimitOf(model)
+            if (one !== null && (narrowest === null || one < narrowest)) narrowest = one
+          })
+          return narrowest
+        }
+        // 条目未声明 context_window 时对外展示的「整组统一声明窗口」：组内各卡片 ctx 的最小值。
+        // 只是展示口径（后端不再据此钳制任何东西），单模型组就等于该模型自己卡片的声明。
+        function groupDeclaredWindow (group) {
+          let out = null
+          (group || []).forEach(model => {
+            const one = previewCtx(model)
+            if (typeof one === 'number' && one >= 1 && (out === null || one < out)) out = one
+          })
+          return out
+        }
+        // 条目编辑区的实时告警：声明窗口 ≥ 组内服务实际限制的最小值 → 返回可操作的文案
+        // （同时用于禁用保存按钮）。组内没有任何卡片声明 context_limit 时返回 ''：
+        // 网关无从得知引擎能力，不显示告警也不拦保存。
+        function virtualCtxOverflow (row) {
+          const raw = String((row && row.context_window) || '').trim()
+          if (!(/^\d+$/.test(raw) && Number(raw) >= 1)) return ''
+          const limit = narrowestLimitOfGroup(groupOfRow(row))
+          if (limit === null || Number(raw) < limit) return ''
+          return tv('virtualCtxExceeds', {
+            alias: cleanModelName(row.model) || tv('virtualNameUnset'),
+            declared: String(Number(raw)), limit: String(limit)
+          })
+        }
+        // 任一条目违反就禁用「保存入口表」：后端必定 400，提前拦住比让操作员吃一个报错好。
+        const virtualCtxBlocking = computed(() => virtualRows.value.some(row => Boolean(virtualCtxOverflow(row))))
         function openCard (row) {
+          // context_limit 的读数与表格列同一个来源（卡片优先、平铺层兜底）：registered 行来自
+          // models_document，那里有没有带出该字段不该影响对话框回显——查卡比查行稳
+          const limit = contextLimitOf(row.model)
           Object.assign(cardForm, {
             model: row.model,
             ctx: row.ctx === null || row.ctx === undefined ? '' : String(row.ctx),
+            context_limit: limit === null ? '' : String(limit),
             default_effort: row.default_effort || null,
             effort_map: (row.effort_map || []).map(entry => ({ from: entry.from, to: entry.to })),
             modalities: (row.modalities || []).filter(item => item !== 'text')
@@ -1005,12 +1087,26 @@
           if (value === '' || value === null) return true
           return (/^\d+$/.test(String(value)) && Number(value) >= 1) || t.value.ctxRule
         }
+        // 服务实际上下文限制的校验与 ctx 同口径：留空 = 不知道引擎限制（不做校验）
+        function contextLimitRule (value) {
+          if (value === '' || value === null) return true
+          return (/^\d+$/.test(String(value)) && Number(value) >= 1) || t.value.ctxRule
+        }
+        // 卡片表里的「服务实际限制」列：统一走 contextLimitOf（卡片优先、平铺层兜底），
+        // 不在表里再复刻一遍读数顺序——registered 行来自 models_document，
+        // 它的 context_limit 取决于后端 models_document 是否已带出该字段，查卡更稳。
+        function contextLimitText (row) {
+          const one = contextLimitOf(row && row.model)
+          return one === null ? t.value.contextLimitUnknown : String(one)
+        }
 
         async function saveCard () {
           if (!ctxRule(cardForm.ctx)) { Quasar.Notify.create({ message: t.value.ctxRule, type: 'negative', position: 'top-right' }); return }
+          if (!contextLimitRule(cardForm.context_limit)) { Quasar.Notify.create({ message: t.value.ctxRule, type: 'negative', position: 'top-right' }); return }
           const patch = {
             model: cardForm.model,
             ctx: cardForm.ctx === '' ? null : Number(cardForm.ctx),
+            context_limit: cardForm.context_limit === '' ? null : Number(cardForm.context_limit),
             default_effort: cardForm.default_effort || null,
             effort_map: cardForm.effort_map.filter(row => row.from && row.to).map(row => ({ from: row.from, to: row.to })),
             modalities: cardForm.modalities.length ? ['text', ...cardForm.modalities] : null
@@ -1038,7 +1134,7 @@
         // context_window、upstreams 的 models 与容量上限、以及任何本页面不认识的后端新键）
         // 一律整条原样往返——漏一个字段就等于清空它。
         const JSON_SECTION_KEYS = ['default_effort', 'effort_map', 'model_ctx', 'model_effort',
-          'model_configs', 'virtual_models', 'upstreams']
+          'model_configs', 'model_context_limit', 'virtual_models', 'upstreams']
         // apply 还会读、但编辑器画不出来的段：路由策略页的 policy / model_policies（还有后端
         // 以后新增的任意顶层段）。整表替换下「文本里没有」= 清空，而这些段在这里既看不见也
         // 删不掉，操作员无从表达「清空」，所以提交时从当前 document 原样补回，否则开一次 JSON
@@ -1285,6 +1381,9 @@
 
         return {
           c, cardColumns, cardCopyText, cardFilter, cardForm, cardOpen, cardRows, clearCard, ctxRule,
+          // context_limit（服务实际上下文限制）：卡片输入框的校验与表格列，
+          // 漏导出 = 模板块静默消失（Vue 对 undefined 调函数直接抛 TypeError，界面无提示）
+          contextLimitRule, contextLimitText,
           doc, effortOptions, effortText, filterModelOptions, load,
           loading, loadError, modelOptionLabel, modelOptions, modalityOptions,
           // 预览下拉的 :options 绑到它自己：模板用 with(_ctx) 解析，漏一项就是运行期 undefined，
@@ -1292,6 +1391,8 @@
           filteredModelOptions,
           modalitiesText, mutate, openCard, pagination, persistNote, preview, previewResult, saving, saveCard,
           saveVirtual, t, tv, pageTitle, virtualRows,
+          // 条目编辑区的实时告警与保存禁用：同样必须在 return 里
+          virtualCtxOverflow, virtualCtxBlocking,
           // 配置 JSON 对话框：漏一项就是运行期 undefined（模板用 with(_ctx) 解析，编译期不报错）
           cj, openConfigJson, closeConfigJson, resetConfigJson, copyConfigJson, saveConfigJson,
           jsonOpen, jsonText, jsonError,
