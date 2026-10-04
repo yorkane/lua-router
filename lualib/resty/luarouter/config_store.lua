@@ -211,6 +211,9 @@ _M.ENV_NAMES = {
     "SMG_POLICY",
     "LMR_DEFAULT_EFFORT", "LMR_EFFORT_MAP", "LMR_MODEL_CTX", "LMR_MODEL_EFFORT",
     "LMR_MODEL_EFFORT_MAP", "LMR_MODEL_MODALITIES", "LMR_VIRTUAL_MODELS",
+    -- 声明进 ENV_NAMES 是硬要求：nginx 会把未声明的变量从 worker 环境里剥掉，
+    -- 漏了这一行则 LMR_MODEL_CONTEXT_LIMIT 只在 master 里可见，worker 读到 nil。
+    "LMR_MODEL_CONTEXT_LIMIT",
     "LMR_CONFIG_FILE", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
     "LMR_LOGS_BUFFER", "LMR_UPSTREAMS_FILE",
 }
@@ -1118,6 +1121,9 @@ local function new_cfg()
         default_effort = nil,
         effort_map = {},
         model_ctx = {},
+        -- 平铺层的「服务实际上下文限制」（与 model_ctx 同形状）：卡片上的
+        -- context_limit 优先，这里是没有卡片时的兜底读数。
+        model_context_limit = {},
         model_effort = {},
         model_configs = {},
         virtual_models = {},
@@ -1168,7 +1174,13 @@ local function sync_virtual_view(cfg)
 end
 
 local function new_card()
-    return { ctx = nil, default_effort = nil, effort_map = {}, modalities = nil }
+    -- context_limit is the *engine's* real capability (what the serving process can
+    -- actually hold), declared by the operator from the engine's own report -- it is
+    -- not the client-facing window an entry advertises. It exists only to validate
+    -- declared context_window values at configuration time; nothing on the hot path
+    -- clamps with it (root ruling 2026-10-04: the gateway rewrites no output budget).
+    return { ctx = nil, context_limit = nil, default_effort = nil,
+             effort_map = {}, modalities = nil }
 end
 
 local function cfg_from_env()
@@ -1183,6 +1195,12 @@ local function cfg_from_env()
     for _, pair in ipairs(parse_pairs(env("LMR_MODEL_CTX"))) do
         local ctx = parse_positive_int(pair[2])
         if ctx then cfg.model_ctx[pair[1]] = ctx end
+    end
+    -- 平铺层的真实上下文限制，与 LMR_MODEL_CTX 同一形状（model=value）。它只是
+    -- 「操作员从引擎自报读数里抄来的真实能力」，用来校验声明窗口，不参与任何钳制。
+    for _, pair in ipairs(parse_pairs(env("LMR_MODEL_CONTEXT_LIMIT"))) do
+        local limit = parse_positive_int(pair[2])
+        if limit then cfg.model_context_limit[pair[1]] = limit end
     end
     for _, pair in ipairs(parse_pairs(env("LMR_MODEL_EFFORT"))) do
         local effort = _M.normalize_effort(pair[2])
@@ -1284,6 +1302,12 @@ local function snapshot_of(cfg)
     for _, model in ipairs(sorted_keys(cfg.model_ctx)) do
         model_ctx[#model_ctx + 1] = { model = model, ctx = cfg.model_ctx[model] }
     end
+    local model_context_limit = {}
+    for _, model in ipairs(sorted_keys(cfg.model_context_limit)) do
+        model_context_limit[#model_context_limit + 1] = {
+            model = model, context_limit = cfg.model_context_limit[model],
+        }
+    end
     local model_effort = {}
     for _, model in ipairs(sorted_keys(cfg.model_effort)) do
         model_effort[#model_effort + 1] = { model = model, effort = cfg.model_effort[model] }
@@ -1298,6 +1322,7 @@ local function snapshot_of(cfg)
         model_configs[#model_configs + 1] = {
             model = model,
             ctx = nul(card.ctx),
+            context_limit = nul(card.context_limit),
             default_effort = nul(card.default_effort),
             effort_map = arr(map),
             modalities = nul(card.modalities),
@@ -1378,6 +1403,7 @@ local function snapshot_of(cfg)
         default_effort = nul(cfg.default_effort),
         effort_map = arr(effort_map),
         model_ctx = arr(model_ctx),
+        model_context_limit = arr(model_context_limit),
         model_effort = arr(model_effort),
         model_configs = arr(model_configs),
         virtual_models = arr(virtual_models),
@@ -1411,6 +1437,31 @@ local function merge_model_patch(card, patch)
             end
         else
             return nil, "ctx must be a number or null"
+        end
+    end
+
+    -- 服务真实上下文限制（引擎自报能力，操作员抄录）。解析口径照抄 ctx：absent =
+    -- leave alone, null = clear back to "unknown"（未知即不校验）。它不参与任何
+    -- max_tokens 钳制（2026-10-04 裁定），唯一用途是配置期校验声明窗口。
+    if patch.context_limit ~= nil then
+        local raw = patch.context_limit
+        if raw == JSON_NULL then
+            card.context_limit = nil
+        elseif type(raw) == "number" then
+            local n = parse_positive_int(raw)
+            if not n then return nil, "context_limit must be greater than zero" end
+            card.context_limit = n
+        elseif type(raw) == "string" then
+            local s = trim(raw)
+            if s == "" then
+                card.context_limit = nil
+            else
+                local n = parse_positive_int(s)
+                if not n then return nil, string.format("context_limit must be a number: %s", s) end
+                card.context_limit = n
+            end
+        else
+            return nil, "context_limit must be a number or null"
         end
     end
 
@@ -1496,6 +1547,68 @@ local function merge_model_patch(card, patch)
     return true
 end
 
+--- Configuration-time check for the *declared* window of a virtual-model entry.
+---
+--- 背景（生产 21.k:8801，2026-10-04）：操作员给入口写 context_window=350000，而该组里的
+--- 引擎实际只装得下 262144（SGLang 报 context_length 524288，但反复告警 derived
+--- context_length 262144，模型 config 的 original_max_position_embeddings 也是 262144）。
+--- 老版本网关还会把这个声明值当输出预算塞进 max_tokens，于是「输入 + 350000」超过真实窗口
+--- 直接 400。router 侧已经不再改写任何输出预算（commit 75ecc37），这里补上另一半：声明窗口
+--- 必须在**配置期**就落在服务真实能力之内，让操作员当场看到矛盾，而不是等线上 400。
+---   * 只在条目真的写了 context_window、且组内**至少一张**卡声明了 context_limit 时判定；
+---     谁都没声明 = 不知道引擎真实能力 = 不校验（宽容，不假装知道）；
+---   * 组内多个读数取**最小值**：一组由该入口不控制的引擎提供服务，只有按最窄的那台才算安全
+---     口径（与 virtual_ctx_cap 取最小值同一个理由）；
+---   * 比较是**严格小于**：声明值等于真实限制同样拒绝（整窗都占满 = 没有余量）。
+--- 读数来源与 ctx_cap 同形状：卡片的 context_limit 优先，其次平铺的 cfg.model_context_limit。
+---
+--- 只在两条**入口写入**路径上调用（apply_profiles 与 apply_document）。两处刻意不判：
+---   * cfg_from_document —— 它同时是磁盘快照的读路径，在那里拒绝会让一份已经落盘的配置在下次
+---     reload 整体退回 env 默认（等于把网关配置抹平）。矛盾要让操作员在保存时看到，不能让已经
+---     跑着的实例在重启时失去配置；
+---   * apply_model_config（单卡写入）—— 那正是操作员**登记引擎真实读数**的动作。若在这里拦下
+---     「已有入口配得过宽」，就变成「因为存在坏入口，所以永远记不下它到底能装多少」，操作员
+---     只能先猜一个数再改回来，等于把修复顺序堵死。读数一登记完，下一次入口保存就被拦。
+---@param cfg table @ 即将生效的配置（map 形态，卡片与条目都已装配好）
+---@return boolean ok, string|nil err
+local function validate_declared_context_windows(cfg)
+    if type(cfg) ~= "table" then return true end
+    local limits = cfg.model_context_limit or {}
+    local cards = cfg.model_configs or {}
+    for _, alias in ipairs(sorted_keys(cfg.virtual_profiles or {})) do
+        local profile = cfg.virtual_profiles[alias]
+        local declared = type(profile) == "table" and profile.context_window or nil
+        if type(declared) == "number" and declared >= 1 then
+            -- 判定范围 = 这个入口的服务组；没有组的单绑定行退到代表值，与 virtual_ctx_cap
+            -- 的「组只有一个成员就是它自己」同口径。
+            local group
+            if type(profile.targets) == "table" and #profile.targets > 0 then
+                group = profile.targets
+            elseif type(profile.target) == "string" and profile.target ~= "" then
+                group = { profile.target }
+            else
+                group = {}
+            end
+            local narrowest, narrowest_model
+            for i = 1, #group do
+                local model = group[i]
+                local card = cards[model]
+                local limit = (card and card.context_limit) or limits[model]
+                if type(limit) == "number" and limit >= 1
+                    and (narrowest == nil or limit < narrowest) then
+                    narrowest, narrowest_model = limit, model
+                end
+            end
+            if narrowest ~= nil and declared >= narrowest then
+                return nil, string.format(
+                    "virtual model %s declares context_window %d, but service %s can only hold %d: the declared window must be strictly smaller than the real context_limit",
+                    alias, declared, tostring(narrowest_model), narrowest)
+            end
+        end
+    end
+    return true
+end
+
 --- Whole-document build (used by apply_document and from_snapshot): every
 --- section is rebuilt from the payload, absent sections stay empty.
 ---@param doc table @ decoded document / stored snapshot
@@ -1553,6 +1666,29 @@ local function cfg_from_document(doc, previous)
                     return nil, string.format("model_ctx for %s must be greater than zero", model)
                 end
                 cfg.model_ctx[model] = ctx
+            end
+        end
+    end
+
+    -- 平铺层的「服务实际上下文限制」，解析口径照抄 model_ctx 那一套：行形状
+    -- {model, context_limit}，值必须是正整数（缺值或非法值与 model_ctx 同文案家族报错）。
+    -- 卡片上的 context_limit 优先，这一层是没有卡片时的兜底读数。
+    if doc.model_context_limit ~= nil then
+        if not is_array(doc.model_context_limit) then
+            return nil, "model_context_limit must be an array"
+        end
+        for _, entry in ipairs(doc.model_context_limit) do
+            local model = trim(entry.model)
+            if model ~= "" then
+                local raw = entry.context_limit
+                if raw == nil or raw == JSON_NULL then
+                    return nil, string.format("model_context_limit for %s needs a numeric context_limit", model)
+                end
+                local limit = parse_positive_int(raw)
+                if not limit then
+                    return nil, string.format("model_context_limit for %s must be greater than zero", model)
+                end
+                cfg.model_context_limit[model] = limit
             end
         end
     end
@@ -1795,6 +1931,9 @@ end
 --- virtual_ctx_cap's decision (uniform across the group, independent of the pick), and
 --- letting a card written under the entry name leak in here would re-open the per-pick
 --- variance the ruling closed.
+---
+--- 已不参与 max_tokens 钳制（2026-10-04 裁定：网关不改写调用方的输出预算，见 router.lua
+--- 的 apply_ctx_cap 恒等空壳）；保留供查看与兼容（UI 与 doc 仍按名字引用，单测也仍断言）。
 function _M.ctx_cap(model)
     if type(model) ~= "string" or model == "" then return nil end
     local cfg = _M.current()
@@ -1824,6 +1963,8 @@ end
 --- An empty/absent group falls back to the representative target's card so a legacy
 --- {model, target} pair keeps clamping exactly as it does today (the group of one *is*
 --- that target, so the minimum is the same number).
+---
+--- 已不参与 max_tokens 钳制（2026-10-04 裁定，同上）；保留供查看与兼容。
 ---@param alias_or_profile table|string|nil
 ---@return number|nil cap
 function _M.virtual_ctx_cap(alias_or_profile)
@@ -2219,6 +2360,11 @@ function _M.apply_model_config(patch)
     if not ok then return nil, err end
     if rawget(patch, "default_effort") ~= nil then cfg.model_effort[model] = nil end
     if rawget(patch, "ctx") ~= nil then cfg.model_ctx[model] = nil end
+    -- 卡片与平铺行是同一个读数的两种拼法，所以照抄上面 ctx 的口径：写了卡片的
+    -- context_limit 就清掉平铺那一行。留着它是个隐形地雷——日后把卡片的读数清成
+    -- null 时，校验会悄悄改用一条谁都不再看作生效的旧数字（卡片说 262144、平铺说
+    -- 131072 的配置根本没法向操作员解释）。
+    if rawget(patch, "context_limit") ~= nil then cfg.model_context_limit[model] = nil end
     cfg.model_configs[model] = card
     write_snapshot(snapshot_of(cfg))
     return snapshot_of(_M.current()), nil
@@ -2244,6 +2390,10 @@ function _M.apply_profiles(entries)
     local cfg = _M.current()
     cfg.virtual_profiles = built
     sync_virtual_view(cfg)
+    -- 声明窗口 vs 服务真实能力（2026-10-04）：用**将要生效**的那份配置判定，所以既看得见
+    -- 本批条目，也看得见磁盘上已有的卡片读数；被拒的批次绝不落盘。
+    local ok_ctx, ctx_err = validate_declared_context_windows(cfg)
+    if not ok_ctx then return nil, ctx_err end
     write_snapshot(snapshot_of(cfg))
     return snapshot_of(_M.current()), nil
 end
@@ -2754,6 +2904,10 @@ function _M.apply_document(doc)
     local previous = previous_upstream_map(_M.current())
     local cfg, err = cfg_from_document(doc, previous)
     if not cfg then return nil, err end
+    -- JSON 编辑器是权威面，因此这里也走同一道配置期校验：一份同时带着「声明窗口过宽」
+    -- 的条目与真实能力读数的文档不能整表落盘。
+    local ok_ctx, ctx_err = validate_declared_context_windows(cfg)
+    if not ok_ctx then return nil, ctx_err end
     write_snapshot(snapshot_of(cfg))
     local summary
     if type(doc) == "table"
