@@ -570,6 +570,144 @@ local function build_context_window(alias, raw)
     return n
 end
 
+--- 条目级的档位/能力声明（用户裁定 2026-10-04：effort 放行到虚拟模型入口）。
+---
+--- 为什么 2026-10-02 停用 per-alias effort 的裁定在这里不适用：那条理由是「一个入口跨
+--- N 个引擎，把档位配在入口上对哪个都不诚实」，对 policy 成立——策略会在入口上建亲和树，
+--- 配错就把一组裂成 N 棵；但 effort 不建树、不参与亲和，它只是「客户端没说话时代事填一个
+--- 档位」，写在入口上与写在卡片上同样诚实（三层阶梯仍然卡片优先，落点引擎自己说的话永远
+--- 压过入口）。所以放行 effort / modalities / tool 三个声明位，policy 继续锁在路由页。
+---
+--- 与 legacy 的 profile.effort 无关：那是 2026-10-02 裁定里「接受、往返、热路径不读」的
+--- 弃用字段。这里的四个是新名字、新语义，两套并存且互不干扰。
+
+--- default_effort：空串 / "null" / "default" / null = 「不覆盖」（返回 nil，让下一层说话）；
+--- 非法档位 = 拒绝保存（口径照抄 context_window 的校验纪律）。
+---@return string|nil level, string|nil err
+local function build_entry_default_effort(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if type(raw) ~= "string" then
+        return nil, string.format("virtual model %s default_effort must be a string or null", alias)
+    end
+    local trimmed = trim(raw)
+    local level = _M.normalize_effort(trimmed)
+    if level == false then
+        return nil, string.format(
+            "unknown default_effort for virtual model %s: %s (want one of %s)",
+            alias, trimmed, EFFORT_LEVELS_JOIN)
+    end
+    return level
+end
+
+--- effort_map：文档形状 { {from=,to=}, ... }（与模型卡片同形）。逐 from 存成查表；
+--- to 为空串 / null 表示「这条不改写」，与卡片同一个口径（卡片那边也是空 to 直接跳过）。
+---@return table|nil map, string|nil err
+local function build_entry_effort_map(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if not is_array(raw) then
+        return nil, string.format(
+            "virtual model %s effort_map must be an array of {from,to}", alias)
+    end
+    local out = {}
+    for _, item in ipairs(raw) do
+        if type(item) ~= "table" then
+            return nil, string.format(
+                "virtual model %s effort_map entries must be objects with a from and a to", alias)
+        end
+        local from_raw = rawget(item, "from")
+        local to_raw = rawget(item, "to")
+        local from = _M.normalize_effort(from_raw)
+        if from == false or from == nil then
+            return nil, string.format(
+                "unknown effort in virtual model %s effort_map: %s (want one of %s)",
+                alias, tostring(from_raw or ""), EFFORT_LEVELS_JOIN)
+        end
+        if to_raw ~= nil and to_raw ~= JSON_NULL and type(to_raw) ~= "string" then
+            return nil, string.format(
+                "virtual model %s effort_map target for %s must be a string or null", alias, from)
+        end
+        local to = _M.normalize_effort(to_raw)
+        if to == false then
+            return nil, string.format(
+                "unknown effort in virtual model %s effort_map target: %s (want one of %s)",
+                alias, tostring(to_raw), EFFORT_LEVELS_JOIN)
+        end
+        if to then out[from] = to end
+    end
+    if next(out) == nil then return nil end
+    return out
+end
+
+--- 条目级模态声明（vision 的操作员声明位）。规范化与卡片同形：text 常开、去重、text 最前。
+--- 与卡片的唯一区别是有意的：卡片当年把未知值静默滤掉，条目这一层拒绝保存——操作员写了
+--- hologram 就是写错了，替他猜成「没写」会让一个拼错的 vision 声明悄悄变成「不收图」。
+---@return string[]|nil caps, string|nil err
+local function build_entry_modalities(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if not is_array(raw) then
+        return nil, string.format("virtual model %s modalities must be an array of strings", alias)
+    end
+    local caps = {}
+    for _, item in ipairs(raw) do
+        if type(item) ~= "string" then
+            return nil, string.format("virtual model %s modalities entries must be strings", alias)
+        end
+        local cap = lower(trim(item))
+        if cap == "" then
+            return nil, string.format("virtual model %s modalities entries must not be blank", alias)
+        end
+        if not MODALITY_SET[cap] then
+            return nil, string.format(
+                "unknown modality for virtual model %s: %s (want one of %s)",
+                alias, cap, table.concat(MODALITY_LEVELS, ", "))
+        end
+        caps[#caps + 1] = cap
+    end
+    table.insert(caps, 1, "text")
+    local seen, ordered = {}, {}
+    for _, cap in ipairs(caps) do
+        if not seen[cap] then seen[cap] = true ordered[#ordered + 1] = cap end
+    end
+    table.sort(ordered, function(a, b)
+        if a == "text" then return b ~= "text" end
+        if b == "text" then return false end
+        return a < b
+    end)
+    return ordered
+end
+
+--- tool use 能力声明：三态。缺键 / null = nil = 「不知道」（不等于 false），读侧据此
+--- 继续退到引擎自报；写了 false 就是操作员说了「这个入口不支持工具」，必须落盘成 false。
+---@return boolean|nil value, string|nil err
+local function build_entry_supports_tool_use(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if type(raw) ~= "boolean" then
+        return nil, string.format(
+            "virtual model %s supports_tool_use must be a boolean or null", alias)
+    end
+    return raw
+end
+
+--- 四个声明字段一起装配；任何一条非法都整条入口拒绝保存（与 context_window 同纪律）。
+---@return table|nil fields, string|nil err
+local function build_entry_declarations(alias, entry)
+    local out = {}
+    local default_effort, derr = build_entry_default_effort(alias, rawget(entry, "default_effort"))
+    if derr then return nil, derr end
+    if default_effort then out.default_effort = default_effort end
+    local effort_map, merr = build_entry_effort_map(alias, rawget(entry, "effort_map"))
+    if merr then return nil, merr end
+    if effort_map then out.effort_map = effort_map end
+    local modalities, moderr = build_entry_modalities(alias, rawget(entry, "modalities"))
+    if moderr then return nil, moderr end
+    if modalities then out.modalities = modalities end
+    local tool_use, terr = build_entry_supports_tool_use(alias, rawget(entry, "supports_tool_use"))
+    if terr then return nil, terr end
+    if tool_use ~= nil then out.supports_tool_use = tool_use end
+    if next(out) == nil then return nil end
+    return out
+end
+
 local function copy_bindings(candidates)
     -- Shallow copy of the binding list: the snapshot and profile_for must not hand out
     -- the live tables, or a caller that edits one row would rewrite the config in place.
@@ -779,6 +917,17 @@ local function profile_from_entry(alias, entry)
                 " declares effort=", level,
                 ", which no longer applies there (configure it on the model card)")
         end
+    end
+    -- 条目级的四个新声明位（2026-10-04 裁定放行；理由见 build_entry_declarations）。
+    -- 必须在 rawget 白名单里显式写出：profile_from_entry 是逐字段读取，漏一个字段就等于
+    -- 该字段被静默忽略、往返丢失。
+    local declarations, decl_err = build_entry_declarations(alias, entry)
+    if decl_err then return nil, decl_err end
+    if declarations then
+        profile.default_effort = declarations.default_effort
+        profile.effort_map = declarations.effort_map
+        profile.modalities = declarations.modalities
+        profile.supports_tool_use = declarations.supports_tool_use
     end
     return profile, nil
 end
@@ -1173,6 +1322,17 @@ local function sync_virtual_view(cfg)
     cfg.virtual_models = map
 end
 
+--- 档位映射的对外形状：内部按 from 建表，磁盘与 UI 用有序数组 {from,to}。卡片、条目、
+--- 全局三层共用这一个序列化器，往返（读回来再写出去）才不会有三种不同的字节。
+local function effort_pairs(map)
+    local out = {}
+    if type(map) ~= "table" then return out end
+    for _, from in ipairs(sorted_keys(map)) do
+        out[#out + 1] = { from = from, to = map[from] }
+    end
+    return out
+end
+
 local function new_card()
     -- context_limit is the *engine's* real capability (what the serving process can
     -- actually hold), declared by the operator from the engine's own report -- it is
@@ -1180,7 +1340,7 @@ local function new_card()
     -- declared context_window values at configuration time; nothing on the hot path
     -- clamps with it (root ruling 2026-10-04: the gateway rewrites no output budget).
     return { ctx = nil, context_limit = nil, default_effort = nil,
-             effort_map = {}, modalities = nil }
+             effort_map = {}, modalities = nil, supports_tool_use = nil }
 end
 
 local function cfg_from_env()
@@ -1224,6 +1384,15 @@ local function cfg_from_env()
     for _, pair in ipairs(parse_pairs(env("LMR_MODEL_MODALITIES"))) do
         local caps = parse_caps(pair[2])
         if caps then card_for(pair[1]).modalities = caps end
+    end
+    -- 卡片级 tool use 声明的 env 层：model=true|false。缺省不设 = 一个卡片都不建，
+    -- 行为与改动前逐字节一致（新开关缺省零行为变化）。只认严格的小写 true/false，
+    -- 其他写法一律当「没写」——env 层的垃圾值历来是忽略而不是拉网关下水。
+    for _, pair in ipairs(parse_pairs(env("LMR_MODEL_TOOL_USE"))) do
+        local value = lower(pair[2])
+        if value == "true" or value == "false" then
+            card_for(pair[1]).supports_tool_use = (value == "true")
+        end
     end
     for _, pair in ipairs(parse_pairs(env("LMR_VIRTUAL_MODELS"))) do
         local alias, target = pair[1], pair[2]
@@ -1326,6 +1495,10 @@ local function snapshot_of(cfg)
             default_effort = nul(card.default_effort),
             effort_map = arr(map),
             modalities = nul(card.modalities),
+            -- Tri-state: absent/null = "unknown" (nul renders the JSON null the editor
+            -- round-trips as "leave alone"), false = the operator said no. The two must
+            -- never merge on the way to disk, hence nul() rather than a bare field.
+            supports_tool_use = nul(card.supports_tool_use),
         }
     end
     local virtual_models = {}
@@ -1359,6 +1532,18 @@ local function snapshot_of(cfg)
         -- operator never deleted can vanish from the authoritative JSON view.
         if profile.policy then entry.policy = profile.policy end
         if profile.effort then entry.effort = profile.effort end
+        -- Entry-level declarations (root ruling 2026-10-04): written only when the
+        -- operator wrote them, same "never invent a field" rule as the block above.
+        -- supports_tool_use is the exception that proves it -- false is *written as*
+        -- false, because false is an answer and not an absence.
+        if profile.default_effort then entry.default_effort = profile.default_effort end
+        if profile.effort_map then
+            entry.effort_map = effort_pairs(profile.effort_map)
+        end
+        if profile.modalities then entry.modalities = { table.unpack(profile.modalities) } end
+        if profile.supports_tool_use ~= nil then
+            entry.supports_tool_use = profile.supports_tool_use
+        end
         if profile.context_window then entry.context_window = profile.context_window end
         virtual_models[#virtual_models + 1] = entry
     end
@@ -1542,6 +1727,21 @@ local function merge_model_patch(card, patch)
             end
         else
             return nil, "modalities must be an array or null"
+        end
+    end
+
+    -- tool use 能力声明：三态（nil = 不知道，false = 操作员说了不支持）。解析口径照抄
+    -- 其他卡片字段：absent = leave alone，null = clear 回「不知道」，布尔 = 写死。
+    -- 这条是「config 声明 > 引擎自报 > 整键省略」优先级里 config 那一层的唯一入口——
+    -- 在此之前 supports_tool_use 只有引擎自报一条来源，操作员无从声明。
+    if patch.supports_tool_use ~= nil then
+        local raw = patch.supports_tool_use
+        if raw == JSON_NULL then
+            card.supports_tool_use = nil
+        elseif type(raw) == "boolean" then
+            card.supports_tool_use = raw
+        else
+            return nil, "supports_tool_use must be a boolean or null"
         end
     end
     return true
@@ -2006,6 +2206,54 @@ function _M.modalities_for(model)
     return nil
 end
 
+--- 操作员在模型卡片上声明的 tool use 能力（三态）。/v1/models 的合成侧
+--- （router.resolve_model_caps）把它填进 capabilities.supports_tool_use 的
+--- 「config 声明」优先位：声明了就用声明的，没声明（nil）才退引擎自报，
+--- 两边都没有就整键省略。nil 与 false 的区别必须一路保住——false 是结论，
+--- nil 只是沉默（硬规则 9②：宁可不报也不猜）。
+---@return boolean|nil
+function _M.card_supports_tool_use(model)
+    if type(model) ~= "string" or model == "" then return nil end
+    local card = _M.current().model_configs[model]
+    if not card then return nil end
+    local value = card.supports_tool_use
+    if type(value) == "boolean" then return value end
+    return nil
+end
+
+--- 虚拟模型条目的能力/档位声明（卡片级的读数由卡片自己出，这里只给条目这一层）。
+--- 接受别名或 profile 表——router 手上往往已经有 profile_for 的拷贝，省一次回查。
+--- 返回的是新表，调用方改不坏存储（与 profile_for 的拷贝纪律同口径）。
+---@param alias_or_profile string|table
+---@return table|nil { default_effort=, effort_map=, modalities=, supports_tool_use= }
+function _M.entry_declaration(alias_or_profile)
+    local profile
+    if type(alias_or_profile) == "table" then
+        profile = alias_or_profile
+    elseif type(alias_or_profile) == "string" and alias_or_profile ~= "" then
+        profile = _M.current().virtual_profiles[alias_or_profile]
+    end
+    if type(profile) ~= "table" then return nil end
+    local out
+    local function field(key, value)
+        if value == nil then return end
+        out = out or {}
+        out[key] = value
+    end
+    field("default_effort", profile.default_effort)
+    if type(profile.effort_map) == "table" and next(profile.effort_map) ~= nil then
+        local map = {}
+        for from, to in pairs(profile.effort_map) do map[from] = to end
+        field("effort_map", map)
+    end
+    if type(profile.modalities) == "table" then
+        field("modalities", { table.unpack(profile.modalities) })
+    end
+    -- 三态：false 要原样带出去（它是要参与决策的声明），nil 不写键。
+    field("supports_tool_use", profile.supports_tool_use)
+    return out
+end
+
 -- ------------------------------------------------------ policy (hot path) reads
 --
 -- policy.lua calls these on every select, so the two keys the chain needs are
@@ -2221,34 +2469,121 @@ function _M.virtual_targets(model)
     return out
 end
 
---- Effective effort for one request (same order as Rust request_effort_for):
---- legacy forced model_effort > model card (map, default) > global map/default.
-function _M.request_effort_for(model, requested)
+--- 把一层的 effort_map 归一成 from->to 的查表；两种拼法都收。
+---@param map table|nil
+---@return table|nil
+local function effort_map_view(map)
+    if type(map) ~= "table" then return nil end
+    -- 两种拼法都收：磁盘/UI 的 { {from,to}, ... } 数组，和装配后进 profile 的查表。
+    -- router 传下来的 entry_fallback 可能出自调用方自己拼的形状，这里不能只认一种。
+    if #map > 0 and type(map[1]) == "table" and rawget(map[1], "from") ~= nil then
+        local out = {}
+        for _, item in ipairs(map) do
+            local from = _M.normalize_effort(item.from)
+            local to = _M.normalize_effort(item.to)
+            if from and to then out[from] = to end
+        end
+        if next(out) == nil then return nil end
+        return out
+    end
+    return map
+end
+
+--- 装配三层查表用的表数组（顺序即优先级）；nil 层跳过，全局层永远在场。
+local function effort_layers(card, entry_fallback, cfg)
+    local layers = {}
+    if type(card) == "table" then
+        layers[#layers + 1] = { map = effort_map_view(card.effort_map),
+                                default_effort = card.default_effort }
+    end
+    if type(entry_fallback) == "table" then
+        layers[#layers + 1] = { map = effort_map_view(entry_fallback.effort_map),
+                                default_effort = entry_fallback.default_effort }
+    end
+    layers[#layers + 1] = { map = effort_map_view(cfg.effort_map),
+                            default_effort = cfg.default_effort }
+    return layers
+end
+
+--- 点名了档位：逐层问「有没有人规定这个档位要改写成谁」，第一个命中的赢。
+--- 查表键是规范化的档位（trim + lower），与它是否在八个已知档位之内无关——映射表里
+--- 只可能有合法档位，未知档位自然查不到，于是走透传，这正是「不猜」的行为。
+local function effort_map_lookup(layers, wanted)
+    for i = 1, #layers do
+        local map = layers[i].map
+        if type(map) == "table" then
+            local hit = map[wanted]
+            if type(hit) == "string" and hit ~= "" then return hit end
+        end
+    end
+    return nil
+end
+
+--- 没点名：逐层找第一个声明了缺省档的层。全空 = 完全不覆盖 = nil。
+--- 层里读到的值重新过一次 normalize_effort：环境/文档层的历史字节可能带大小写或空格。
+local function effort_default_lookup(layers)
+    for i = 1, #layers do
+        local value = layers[i].default_effort
+        if type(value) == "string" then
+            local normalized = _M.normalize_effort(value)
+            if normalized then return normalized end
+        end
+    end
+    return nil
+end
+
+--- Effective effort for one request.
+---
+--- 阶梯（用户裁定 2026-10-04）：model_effort 强制行 > **卡片 > 条目 > 全局**。
+---
+--- 与旧实现的区别就是要修的那个 bug：老代码是「有卡片就整层走卡片，卡片没这条映射时
+--- 直接透传」，于是同一份全局 effort_map 对配了卡片的模型永远不生效——操作员在全局
+--- 页面填了 low->minimal，只要该模型有一张卡片（哪怕卡片只管 ctx），这条映射就悄悄
+--- 失效。新口径是**逐 from 查表**：请求点名的档位依次问三层，第一个给了这条映射的层
+--- 赢，三层都没给才原样透传。default_effort 同理：第一个非 nil 的层赢，三层全空返回
+--- nil，网关一个字节都不改（完全透传）。
+---
+--- 参数名 entry_fallback 与调用方（router.lua 的 apply_effort_policy）逐字一致：它是
+--- 虚拟模型条目那一层的读数，由 router 把手上的 profile 传下来，省掉这里再按别名回查
+--- current()。形状 { default_effort=string|nil, effort_map=map 或 {from,to} 数组 }。
+---
+--- 为什么卡片仍排在条目之上：卡片说的是**落点引擎**自己的说法（配在真实模型名上），
+--- 而入口跨 N 个引擎。放行条目层是加**兜底**，不是把入口提到引擎头上——2026-10-02
+--- 「档位是引擎的属性」那条裁定继续成立。
+---
+---@param model string @ 落点实际模型名
+---@param wanted string|nil @ 请求点名的档位
+---@param entry_fallback table|nil @ 虚拟模型条目那一层的读数
+---@return string|nil
+function _M.request_effort_for(model, wanted, entry_fallback)
     local cfg = _M.current()
     local model_key = (type(model) == "string" and model ~= "") and model or nil
-    local card = model_key and cfg.model_configs[model_key] or nil
+    -- 强制层的位置不变：本来就在最前，而且它是操作员显式按模型钉死的。
     if model_key and cfg.model_effort[model_key] then
         return cfg.model_effort[model_key]
     end
-    local wanted
-    if type(requested) == "string" then
-        local v = lower(trim(requested))
-        if v ~= "" and v ~= "null" and v ~= "default" then wanted = v end
-    end
-    if card then
-        local level = wanted and EFFORT_SET[wanted] and wanted or nil
-        if level then
-            if card.effort_map[level] then return card.effort_map[level] end
-            return level  -- 请求显式指定的 effort 没有映射时透传
+    local card = model_key and cfg.model_configs[model_key] or nil
+    local requested
+    if type(wanted) == "string" then
+        local v = lower(trim(wanted))
+        -- "" / "null" / "default" 是客户端的「没说话」，走缺省档那一支。未知档位
+        -- （例如上游新加的模式名）算「点了名、但没人规定怎么改写」，于是原样透传：
+        -- 网关不替客户端猜档位，也不拿缺省档去覆盖客户端亲口写的值。未命中时返回
+        -- **规范化后的档位**（trim + lower），与改动前两条分支完全一致：客户端写
+        -- " High " 而引擎只认 "high" 是本项目第 2 条要弥补的欠配置请求，替它把大小写
+        -- 顺平是既有行为，不是本次要改的东西。未知档位规范化后仍是原话（不在词表里
+        -- 就没什么可顺的），所以 15c 那条透传口径不受影响。
+        -- 旧实现唯一真正不一致的地方是「有卡片时未知档位被拉去填缺省档、无卡片时不会」
+        -- ——卡片在场与否不该改变语义，这里统一成逐层查表 + 未命中即透传。
+        if v ~= "" and v ~= "null" and v ~= "default" then
+            requested = v
         end
-        if card.default_effort then return card.default_effort end
-        if wanted then
-            return card.default_effort or cfg.default_effort or wanted
-        end
-        return cfg.default_effort
     end
-    if wanted then return cfg.effort_map[wanted] or wanted end
-    return cfg.default_effort
+    local layers = effort_layers(card, entry_fallback, cfg)
+    if requested then
+        return effort_map_lookup(layers, requested) or requested
+    end
+    return effort_default_lookup(layers)
 end
 
 -- ------------------------------------------------------------- mutations
@@ -2437,6 +2772,18 @@ function _M.profile_for(model)
     if profile.candidates then out.candidates = copy_bindings(profile.candidates) end
     out.policy = profile.policy
     out.effort = profile.effort
+    -- Entry-level declarations ride the hot-path profile copy so the router can hand
+    -- them to request_effort_for / entry_declaration without a second store read.
+    -- effort_map is copied (not shared) for the same reason as candidates above: a
+    -- caller must not be able to write through into the live snapshot.
+    out.default_effort = profile.default_effort
+    if profile.effort_map then
+        local declared_map = {}
+        for from, to in pairs(profile.effort_map) do declared_map[from] = to end
+        out.effort_map = declared_map
+    end
+    if profile.modalities then out.modalities = { table.unpack(profile.modalities) } end
+    out.supports_tool_use = profile.supports_tool_use
     return out
 end
 
@@ -2463,6 +2810,17 @@ function _M.profiles_list()
         if profile.workers then entry.workers = { table.unpack(profile.workers) } end
         entry.policy = profile.policy
         entry.effort = profile.effort
+        -- The four entry-level declarations ride the UI round-trip list as well, with
+        -- the same tri-state rule as snapshot_of: supports_tool_use=false is an answer
+        -- and must survive an apply -> profiles_list -> apply cycle untouched.
+        if profile.default_effort then entry.default_effort = profile.default_effort end
+        if profile.effort_map then
+            entry.effort_map = effort_pairs(profile.effort_map)
+        end
+        if profile.modalities then entry.modalities = { table.unpack(profile.modalities) } end
+        if profile.supports_tool_use ~= nil then
+            entry.supports_tool_use = profile.supports_tool_use
+        end
         if profile.context_window then entry.context_window = profile.context_window end
         out[#out + 1] = entry
     end
@@ -3203,6 +3561,9 @@ function _M.models_document()
             default_effort = nul(card and card.default_effort),
             effort_map = arr(map),
             modalities = nul(card and card.modalities),
+            -- Tri-state on the models page as well: null = unknown (fall back to what
+            -- the engine reports), false = the operator said no. Never merge the two.
+            supports_tool_use = nul(card and card.supports_tool_use),
         }
         local target = cfg.virtual_models[model]
         if target then
