@@ -1401,7 +1401,7 @@ _M.profile_bindings = profile_bindings
 ---One function because three readers have to agree: the effort ladder, the context
 ---card and the policy decision each key off a model name, and under per-candidate
 ---bindings that name is only known once a worker is chosen. If they disagreed, one
----request would get instance A's effort, instance B's max_tokens clamp and C's
+---request would get instance A's effort, instance B's ctx card and C's
 ---routing tree -- three layers describing three different engines, which is exactly
 ---what the override feature exists to prevent.
 ---
@@ -1481,11 +1481,16 @@ end
 
 _M.profile_policy_model = profile_policy_model
 
--- The two request-body edits forward() now applies per attempt. Both live further
--- down with the rest of the body-rewriting family, so their names are forward declared
--- here: a plain reference from forward() would compile to a *global* read and hand back
--- nil at run time rather than failing at boot. Their definitions below assign to these
--- names instead of declaring new locals.
+-- The per-attempt request-body edits, defined further down with the rest of the
+-- body-rewriting family. Their names are forward declared here because a plain reference
+-- from forward() would compile to a *global* read and hand back nil at run time rather
+-- than failing at boot; their definitions below assign to these names instead of
+-- declaring new locals.
+--
+-- Only apply_effort_policy still edits anything. apply_ctx_cap / entry_ctx_cap are inert
+-- shims kept alive for their _M exports (ruling 2026-10-04: the gateway no longer writes
+-- the caller's output budget) -- see their comments for the failure that removed them
+-- from the hot path.
 local apply_effort_policy, apply_ctx_cap, entry_ctx_cap
 
 
@@ -2936,14 +2941,13 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
             local key = card_key_for(profile, model, worker, bound)
             local effort_raw, requested_effort, effective_effort =
                 apply_effort_policy(payload, body, key, profile, alias)
-            -- Two clamp sources, one winner: the entry's own context_window (uniform for
-            -- the whole group, decided without looking at the pick) and, below it, the
-            -- card of the model this attempt lands on. The entry level exists because the
-            -- client must see one context budget for one service name whichever engine
-            -- answers; the card level stays because a plain request naming a real model
-            -- has no entry above it at all.
-            local entry_cap = entry_ctx_cap(profile)
-            payload = (apply_ctx_cap(effort_raw, body, key, entry_cap))
+            -- Ruling 2026-10-04: no clamp step at all. The output budget is the
+            -- caller's -- chat names it max_tokens / max_completion_tokens, responses
+            -- names it max_output_tokens -- and the gateway forwards it untouched, so
+            -- what the engine rejects is what the client asked for, never a number we
+            -- manufactured. The former apply_ctx_cap call sat here; see its comment for
+            -- why it is gone (context_window is a declared total window, not a budget).
+            payload = effort_raw
             -- The last attempt's numbers are the ones logged, because that is the
             -- exchange the client actually received.
             ngx.ctx.lr_requested_effort = requested_effort
@@ -3198,60 +3202,66 @@ apply_effort_policy = function(raw, body, model, profile, alias)
     return set_top_field(raw, "reasoning_effort", effective), requested, effective
 end
 
----The entry-level context clamp for one virtual model, or nil.
+---The output budget the gateway forwards, read from the request body.
 ---
----nil is not a missing value, it is the answer "this request has no service entry above
----it": a plain request naming a real model, or a legacy row that declared nothing. The
----store decides the precedence (explicit context_window wins, otherwise the minimum over
----the mapped group) and returns nil for a group of one, which is what keeps every
----pre-group config clamping off this path entirely.
----@param profile table|nil
----@return number|nil cap
-entry_ctx_cap = function(profile)
-    if type(profile) ~= "table" then
+---One value across the three protocol spellings: chat names it `max_tokens` /
+---`max_completion_tokens`, /v1/responses names it `max_output_tokens`. That third
+---spelling is the one the retired clamp never looked at, which is what let the gateway
+---invent a budget for every responses request -- see apply_ctx_cap below.
+---Asked in that order, first present value wins.
+---
+---Returns nil when the caller gave none: the gateway does not decide the budget on the
+---client's behalf, and the log says so honestly instead of impersonating a number with 0
+---or with a configured cap. Pure read -- it never touches the payload bytes.
+---@param body table|nil
+---@return number|nil
+local function output_budget_of(body)
+    if type(body) ~= "table" then
         return nil
     end
-    local store_mod = store()
-    if not store_mod or type(store_mod.virtual_ctx_cap) ~= "function" then
-        return nil
-    end
-    local ok, cap = pcall(store_mod.virtual_ctx_cap, profile)
-    if ok and type(cap) == "number" and cap >= 1 then
-        return cap
+    for _, field in ipairs({ "max_tokens", "max_completion_tokens", "max_output_tokens" }) do
+        local value = tonumber(body[field])
+        if value ~= nil then
+            return value
+        end
     end
     return nil
 end
 
----Rust apply_ctx_cap: clamp max_tokens and its alias to the model context cap.
----Absent fields are written too, matching `current.is_none_or(|v| v > cap)`.
+---Identity: the gateway never writes the caller's output budget.
 ---
----Two clamp sources with a fixed precedence: the virtual-model entry's own cap wins over
----the card of the model this attempt lands on, and when the entry speaks it speaks alone
----(no second, per-pick min/max afterwards) because the whole point of the entry-level
----override is that the client sees one budget for one service name. With no entry cap the
----`entry` argument is nil and the expression is the pre-feature one verbatim.
----@param entry number|nil @ entry-level uniform cap, preferred over the model card
----@return string raw, number|nil cap
-apply_ctx_cap = function(raw, body, model, entry)
-    local store_mod = store()
-    if not store_mod or type(store_mod.ctx_cap) ~= "function" then
-        return raw, nil
-    end
-    local cap = entry
-    if cap == nil then
-        local ok, model_cap = pcall(store_mod.ctx_cap, model)
-        cap = ok and model_cap or nil
-    end
-    if type(cap) ~= "number" or cap < 1 then
-        return raw, nil
-    end
-    for _, field in ipairs({ "max_tokens", "max_completion_tokens" }) do
-        local current = tonumber(body[field])
-        if current == nil or current > cap then
-            raw = set_top_field(raw, field, cap)
-        end
-    end
-    return raw, cap
+---Ruling 2026-10-04 replaces the old "clamp max_tokens to the context cap" with this.
+---The defect: the old field table was { "max_tokens", "max_completion_tokens" } only, so
+---a /v1/responses body -- whose budget field is `max_output_tokens` -- always looked like
+---"the caller asked for nothing", and the `current == nil` branch then *wrote*
+---`max_tokens = <the virtual entry's context_window>` into every such request. In
+---production that declared value was 350000 against an engine window of 524288, so
+---    524288 - 350000 = 174288
+---reproduced the exact input threshold of the three production 400s, with a `completion`
+---token count frozen at 350000 no caller asked for (the caller capped its own at 131072
+---and that cap was verified live on both entry points). Root cause is one number standing
+---in for three different quantities: `context_window` is the *declared total window*
+---(input + output) an entry advertises downstream; it is not a per-request output budget
+---and was never a legitimate ceiling for `max_tokens`.
+---
+---Now: whatever the caller sends is forwarded byte for byte, and when it sends nothing the
+---gateway does not pick a number for it. `context_window` keeps parsing, persisting,
+---round-tripping and rendering in the UI exactly as before -- it just stops participating
+---in any max_tokens arithmetic.
+---
+---Both exports (here and entry_ctx_cap) stay alive as inert shims rather than being
+---deleted: ui/admin/models.html and doc/agent-handover.md reference them by name, and
+---dropping an export would break a documented contract for no behavioural gain.
+---@return string raw, nil cap @ identity; the payload is never rewritten
+apply_ctx_cap = function(raw, _body, _model, _entry)
+    return raw, nil
+end
+
+---Inert since the 2026-10-04 ruling above: a virtual entry has no clamp left to speak
+---with, so it always answers "nothing to clamp".
+---@return nil cap
+entry_ctx_cap = function(_profile)
+    return nil
 end
 
 ---从已解码的请求体里取第一条 user 消息的前 50 个字符，供 UI 日志页的
@@ -3316,6 +3326,12 @@ local function route_inference(route, body, raw)
     -- 记录阶段（finish_request -> log_inference_request）已经拿不到请求体，
     -- 只能在这条热路径上顺手摘一次（纯读，不改任何字节）。
     ngx.ctx.lr_prompt_preview = extract_prompt_preview(body)
+    -- 同一处、同样的理由记一条「网关实际发出的输出预算」：日志阶段（finish_request ->
+    -- log_inference_request）已经拿不到请求体，只能在还握着 body 的这里摘一次。
+    -- 纯读，不改 payload 任何字节。修复后它恒等于调用方请求值（网关不再改写），
+    -- 保留它的意义正是让线上能一眼分清「调用方自己就要多了」还是「网关动过手」。
+    -- 调用方三个字段都没给时为 nil，由 cjson 省略该键，不要用 0 冒充「要了 0」。
+    ngx.ctx.lr_output_budget = output_budget_of(body)
     local requested_model
     if type(body.model) == "string" and body.model ~= "" then
         requested_model = body.model
@@ -4533,6 +4549,11 @@ local function log_inference_request(duration_s, ttft_s)
         -- 字段恒为 nil 从未出现在日志行里；没有预览时保持 nil 让 cjson 省略该键，
         -- 用空串占位会和「prompt 本来就是空」混淆。
         prompt_preview = ngx.ctx.lr_prompt_preview,
+        -- 网关转发出去的输出预算（max_tokens / max_completion_tokens /
+        -- max_output_tokens 三种写法里调用方实际给的那一个）。Ruling 2026-10-04 起
+        -- 网关不再改写它，所以此值恒等于调用方请求原值；线上据此判断 400 是调用方
+        -- 要多了还是网关动过手。没给则为 nil，交给 cjson 省略键。
+        output_budget = ngx.ctx.lr_output_budget,
         model = model,
         requested_model = ngx.ctx.lr_requested_model or model,
         requested_effort = ngx.ctx.lr_requested_effort or cjson.null,
