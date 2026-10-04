@@ -23,6 +23,11 @@ registry 的探针 + 归一化 + shdict 落盘 + router 的合成，任何一环
       在响应里**一个字都不出现**。
   S5  虚拟入口的老口径不坏：单目标 owned_by == llm-router-><名>、多目标 == llm-router +
       owned_by_models、created 恒 0；入口行的能力来自组内聚合。
+  S6  组内**有一台没给长度读数**时入口行必须删键：入口对外广告的窗口是客户端决定塞多少
+      token 的依据，而请求会被策略派给组内任意一台。一台没读数 = 网关不知道那台装得下多少
+      （不等于「那台装得下且更宽」），此时照报另一台的读数就是替不知底细的引擎担保。
+      2026-10-04 生产 235.t:8800 的 Qn 入口即由此对外广告了 1000000（组里 Q38 那一半当时
+      一个长度读数都没有）。S6 里都有读数时照报最窄的对照断言与之成对，防止修过头。
 """
 import json
 import os
@@ -463,6 +468,89 @@ def scenario_virtual_entries():
     stop(name)
 
 
+# ================================================== S6 组内缺读数必须删键
+def scenario_group_missing_reading():
+    """组里有一台没给长度读数时，入口行**整个键**都不许出现。
+
+    线上症状（2026-10-04 生产 235.t:8800）：入口 Qn 的组是 Q38-Flash-Next +
+    kimi-code/k3，kimi 报 context_length 1000000，Q38 那一半当时一个长度读数都没有，
+    对外却广告出了 1000000 —— 客户端照这个值塞 token，请求被派到 Q38 那一半就炸。
+
+    判别性（旧实现下"键不存在"那几条必红，它会报 1000000）：
+      * beta 那一半**只删两个长度读数**，其余能力照旧富形状上报，这样"键不存在"测的是
+        「这台没给窗口读数」而不是「这台整行都没被采到」——后者看起来一模一样，但不是
+        同一条纪律（S3 已经钉了整行没读数的形状）。
+      * 与"两台都有读数时报最窄"的对照断言**成对**：只留删键那一组会在"一律不报"的
+        写错下全绿（G6/S5 的聚合断言也是这条对照的兄弟，这里把它放到真 HTTP 面上）。
+    """
+    tag = "S6-halfread"
+    pa, pb, pc = free_port(), free_port(), free_port()
+    # alpha：完整富形状（context_length 1000000 / max_output_tokens 128000）。
+    start_mock_env(pa, "alpha", {"MODELS_RICH": "1"})
+    # beta：只把两个长度读数从富形状里删掉，模态与档位全部照旧。
+    start_mock_env(pb, "beta", {
+        "MODELS_RICH": "1",
+        "MODELS_CAPS_JSON": json.dumps(
+            {"capabilities": {"context_length": None, "max_output_tokens": None}}),
+    })
+    # gamma：富形状但窗口是 262144，用来做"两台都开口 -> 取最窄"的对照。
+    start_mock_env(pc, "gamma", {
+        "MODELS_RICH": "1",
+        "MODELS_CAPS_JSON": json.dumps(
+            {"capabilities": {"context_length": 262144}}),
+    })
+    port, name, gw = start_conf({}, tag)
+    urls = {}
+    for model, mp in (("alpha", pa), ("beta", pb), ("gamma", pc)):
+        urls[model] = "http://%s:%d" % (gw, mp)
+        st, _ = post_worker(port, urls[model], model)
+        check("[%s] %s registered" % (tag, model), st in (200, 202), "%s %s" % (model, st))
+    check("[%s] 三台都健康" % tag, wait_healthy(port, list(urls.values())), logs(name)[:400])
+    # 采集窗口：beta 的"键不存在"必须建立在**它确实被采到**之上，否则缺席测的是时序。
+    got = {m: wait_caps(port, m) for m in ("alpha", "beta", "gamma")}
+    check("[%s] 三台的 capabilities 都被采到（beta 只缺两个长度读数）" % tag,
+          all(got.values()), json.dumps(got))
+    st, doc = post_json(port, "/_ui/config/virtual", {"entries": [
+        {"model": "vm-half", "targets": ["alpha", "beta"]},
+        {"model": "vm-wide", "targets": ["alpha", "gamma"]}]})
+    check("[%s] 两个入口都收下" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
+    st, doc, raw = models_doc(port)
+    half = row(doc, "vm-half")
+    wide = row(doc, "vm-wide")
+    check("[%s] 两个入口都在广告里" % tag, half is not None and wide is not None, raw[:300])
+    # 前提：成员自己那行各说各话（beta 确实没长度读数，alpha 确实有）。
+    beta_caps = caps_of(row(doc, "beta"))
+    check("[%s] 前提：beta 自己那行没有 context_length（引擎没说）" % tag,
+          "context_length" not in beta_caps, json.dumps(beta_caps)[:300])
+    check("[%s] 前提：beta 自己那行仍有模态读数（不是整行没采到）" % tag,
+          beta_caps.get("input_modalities") == ["text", "image"],
+          json.dumps(beta_caps)[:300])
+    check("[%s] 前提：alpha 自己那行照报 1000000" % tag,
+          caps_of(row(doc, "alpha")).get("context_length") == 1000000,
+          json.dumps(caps_of(row(doc, "alpha")))[:300])
+    # 本次要修的：组内一台没给读数 -> 入口行两个长度键都必须不存在。
+    half_caps = caps_of(half)
+    check("[%s] 组内一台有读数一台没有 -> 入口行不许有 context_length" % tag,
+          "context_length" not in half_caps, json.dumps(half_caps)[:400])
+    check("[%s] 同一条入口行也不许有 max_output_tokens（同一条纪律）" % tag,
+          "max_output_tokens" not in half_caps, json.dumps(half_caps)[:400])
+    check("[%s] 删键不许顺带掉 required 四字段" % tag,
+          half is not None and all(k in half for k in REQUIRED), json.dumps(half)[:300])
+    check("[%s] 删键不许牵连其它一致口径的键（模态仍照报）" % tag,
+          half_caps.get("input_modalities") == ["text", "image"],
+          json.dumps(half_caps)[:400])
+    check("[%s] 对照：两台都开口(1000000/262144) -> 入口行报最窄 262144" % tag,
+          caps_of(wide).get("context_length") == 262144,
+          json.dumps(caps_of(wide))[:400])
+    check("[%s] 对照：两台都开口的 max_output_tokens 照报 128000" % tag,
+          caps_of(wide).get("max_output_tokens") == 128000,
+          json.dumps(caps_of(wide))[:400])
+    check("[%s] 响应里没有 JSON null（删的是键而不是写 null）" % tag,
+          "null" not in raw, raw[:300])
+    check_no_abort(tag, name)
+    stop(name)
+
+
 def main():
     print("[e2e_models_advertisement] legacy tree = %s" % (LEGACY_LUALIB or "off"))
     scenario_required_fields()
@@ -471,6 +559,7 @@ def main():
     scenario_omission()
     scenario_config_priority()
     scenario_virtual_entries()
+    scenario_group_missing_reading()
     failed = [r for r in RESULTS if not r[0]]
     print("\n=== %d checks, %d failed ===" % (len(RESULTS), len(failed)))
     for _, name, detail in failed:

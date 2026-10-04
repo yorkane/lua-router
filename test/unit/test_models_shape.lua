@@ -558,6 +558,95 @@ check("G6 入口声明的 context_window 优先于组内最窄",
       read(find(rep_cw, "grp"), "capabilities", "context_length") == 200000,
       tostring(read(find(rep_cw, "grp"), "capabilities", "context_length")))
 
+print("=== G6b 组内**缺读数**的成员必须让整键消失（2026-10-04 线上缺陷） ===")
+-- 症状（生产 235.t:8800）：入口 Qn 的组里是 Q38-Flash-Next + kimi-code/k3，kimi 报
+-- context_length 1000000，Q38 那一半当时**一个长度读数都没有**，于是对外广告出了
+-- 1000000 —— 比部分成员能承受的更大。客户端照这个值塞 token，请求被策略派到 Q38 那
+-- 一半就炸。旧实现的 narrowest_number 只比"给出读数的成员"，把未知读成了默许。
+-- 判别性纪律：这一组必须与"都有读数时照报最窄"**成对**出现——只有删键类断言的那一组
+-- 在旧实现（旧实现整行没有 capabilities）下会误绿，成对的照报断言把它抬红。
+local GA = copy_table(UPSTREAM_K3)
+GA.id = "b1"
+GA.capabilities = copy_table(UPSTREAM_K3.capabilities)
+GA.capabilities.context_length = 524288
+GA.capabilities.max_output_tokens = 65536
+local GB = copy_table(UPSTREAM_K3)
+GB.id = "b2"
+GB.capabilities = copy_table(UPSTREAM_K3.capabilities)
+GB.capabilities.context_length = 1000000
+GB.capabilities.max_output_tokens = nil
+models_list = { "b1", "b2" }
+advertise_listing(listing_of(GA, GB))
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function() return { { "grpb", "b1", "b2" } } end
+local rep_half = M.models_handler()
+local e_half = find(rep_half, "grpb")
+-- 两台都开了口：数值照旧取最窄（这条红 = 修复过头，把能报的也抹了）。
+check("G6b 组内两台都有长度读数(524288/1000000) -> 报最窄 524288（不许修过头）",
+      read(e_half, "capabilities", "context_length") == 524288,
+      tostring(read(e_half, "capabilities", "context_length")))
+-- 只有一台给了输出预算：那一键必须整体消失，而不是拿已知那份对外担保。
+check("G6b 组内一台没报 max_output_tokens -> 整个键删除（不是抄另一台）",
+      rawget(block(e_half, "capabilities") or {}, "max_output_tokens") == nil,
+      encode(block(e_half, "capabilities") or {}))
+check("G6b 键缺失的输出里没有 null / 空表冒充",
+      encode(rep_half):find("null", 1, true) == nil, encode(rep_half))
+
+-- 线上那份形状：一台有长度读数，另一台整行里没有任何长度读数（刻意保留档位读数，
+-- 这样测的是"这台没给窗口读数"，而不是"这台整行都没登记"）。
+local HA = copy_table(UPSTREAM_K3)
+HA.id = "c1"
+HA.capabilities = copy_table(UPSTREAM_K3.capabilities)
+HA.capabilities.context_length = 1000000
+HA.capabilities.max_output_tokens = 128000
+local HB = copy_table(UPSTREAM_K3)
+HB.id = "c2"
+HB.capabilities = {}
+models_list = { "c1", "c2" }
+advertise_listing(listing_of(HA, HB))
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function() return { { "grpc", "c1", "c2" } } end
+local rep_unknown = M.models_handler()
+local e_unknown = find(rep_unknown, "grpc")
+check("G6b 线上形状：一台有读数一台没有 -> context_length 必须不存在【判别本缺陷】",
+      rawget(block(e_unknown, "capabilities") or {}, "context_length") == nil,
+      encode(block(e_unknown, "capabilities") or {}))
+check("G6b 线上形状：max_output_tokens 同样必须不存在（同一条纪律）",
+      rawget(block(e_unknown, "capabilities") or {}, "max_output_tokens") == nil,
+      encode(block(e_unknown, "capabilities") or {}))
+check("G6b 删键不许顺带掉官方四字段（required 恒齐）",
+      #missing_required(e_unknown) == 0, join(missing_required(e_unknown)))
+check("G6b 删键不影响成员自己那行（c1 仍如实报自己的 1000000）",
+      read(find(rep_unknown, "c1"), "capabilities", "context_length") == 1000000,
+      encode(find(rep_unknown, "c1") or {}))
+-- 例外路径：入口自己声明的 context_window 是操作员说的话，组内不齐也必须照报，
+-- 且只救 length —— 没有任何声明可依据的 max_output_tokens 仍然走删键。
+store_tbl.profile_for = function(name)
+    if name == "grpc" then return { model = name, context_window = 65535 } end
+    return nil
+end
+local rep_decl = M.models_handler()
+local e_decl = find(rep_decl, "grpc")
+check("G6b 入口声明 context_window=65535 且组内不齐 -> 仍报 65535（例外不许被改坏）",
+      read(e_decl, "capabilities", "context_length") == 65535,
+      tostring(read(e_decl, "capabilities", "context_length")))
+check("G6b 例外只覆盖 length；max_output_tokens 无声明可依 -> 仍删键",
+      rawget(block(e_decl, "capabilities") or {}, "max_output_tokens") == nil,
+      encode(block(e_decl, "capabilities") or {}))
+-- 单成员入口（入口**就是**那台引擎）：没有"组内不齐"要仲裁，读数照报。
+models_list = { "solo" }
+advertise_listing(listing_of({
+    id = "solo", object = "model",
+    capabilities = { context_length = 262144, max_output_tokens = 32768 },
+}))
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function() return { { "solo-entry", "solo" } } end
+local rep_solo = M.models_handler()
+check("G6b 单成员入口有读数 -> 两条数值照报（没有组内仲裁可言）",
+      read(find(rep_solo, "solo-entry"), "capabilities", "context_length") == 262144
+      and read(find(rep_solo, "solo-entry"), "capabilities", "max_output_tokens") == 32768,
+      encode(find(rep_solo, "solo-entry") or {}))
+
 print("=== G7 上游原文的脏形状不许把对外读数变成假话 ===")
 -- legacy 部分红（旧实现没有任何 capabilities，"删键"类断言会误绿）：这里额外钉
 -- "四字段仍齐"，让旧实现下至少这条红，避免整组退化成恒真。

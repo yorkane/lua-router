@@ -67,7 +67,9 @@
 #                  如实带出来，同一场景用两个不同的 context_length 跑两遍证明这个数不是
 #                  网关造的；S3 缺数据=删键，不出现 null / [] / {}；S4 操作员 config 卡片
 #                  压过引擎广告（引擎那个数整份响应里不许出现）；S5 虚拟入口的 owned_by
-#                  老口径与组内聚合能力。跑盘上 lualib，判别性通道 LR_LEGACY_LUALIB=<旧树>)
+#                  老口径与组内聚合能力；S6 组内**有一台没给长度读数**时入口行必须删键
+#                  （都有读数时照报最窄的对照断言与之成对，防修过头）。跑盘上 lualib，
+#                  判别性通道 LR_LEGACY_LUALIB=<旧树>)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
 #                  18 s stability, stop/heal partition window, retire broadcast)
 #   e2e_tls_chain  integration/e2e_tls_chain.py (server-side TLS: runtime-built
