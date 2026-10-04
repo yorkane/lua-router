@@ -11,14 +11,17 @@
    已落地的两块即按此形状走：**虚拟模型是对下游的服务主入口，1 对多**（一个入口用 `targets` 映射
    一组实际模型，这些模型可以来自不同的上游实例；策略实例按**入口名**建，一入口一棵亲和树，由它在
    整组里选路，逐实例的 `candidates` 绑定名必须落在组内、否则 400，转发体的 model 用选中候选的
-   绑定名；条目级只允许 `context_window` 一个覆盖字段——对下游统一的 max_tokens 钳制，与选中哪台
-   无关），以及每服务并发/功率上限
+   绑定名；条目级只允许 `context_window` 一个覆盖字段——它是**对外声明的上下文总窗口（输入+输出）**，
+   作用只是让客户端更早触发压缩，**不参与任何 max_tokens 计算**（用户裁定 2026-10-04，见本节末），
+   网关也不做任何条目级的输出预算改写），以及每服务并发/功率上限
    （`max_concurrency` / `max_power_w` 在 `router.candidates_for` 装配候选时**硬排除**，即使 cache_aware
    亲和命中也迁走；**功率读数未知 → 不排除**）。两者都刻意做到 `policies/` 零改动，口径见
    doc/gap-worker-caps.md 与 doc/gap-virtual-models.md §1–§4。
 2. **覆盖与弥补下游请求的配置**：网关侧对请求做顶层改写与补齐（入口名解析成落点的实际模型名、
-   effort/ctx 卡片、`stream_options`、条目级 `context_window` 统一钳制），让不完美或欠配置的
+   effort 卡片、`stream_options`），让不完美或欠配置的
    客户端请求也能被正确调度——改写一律走 `set_top_field` 式顶层精确改写，不整表重编码。
+   **输出预算不在补齐之列**：`max_tokens` / `max_completion_tokens` / `max_output_tokens` 原样透传，
+   调用方给多少转发多少，没给时网关也不替它决定（用户裁定 2026-10-04）。
    别名级的 `policy` / `effort` 覆盖已停用：策略归路由页的 `policy` / `model_policies`（按**入口名**配），
    档位归模型卡片（按选中候选的绑定名查）。
 3. **UI 的配置与可视化**：`/_ui/admin/` 管理台四页按使用频度排序：**模型管理**（虚拟模型入口页，
@@ -34,6 +37,38 @@
 > 往返落盘、解析时 warn、热路径不读」是刻意的兼容行为，让老配置文档继续通过校验与回显，
 > **不要当 bug 修掉**。
 
+> ~~用户裁定 2026-10-02：条目级 `context_window` 是对下游统一的 max_tokens 钳制~~ —— **该定义已于
+> 2026-10-04 废止，由用户亲自推翻**（同一条裁定里 per-alias `policy` / `effort` 停用的部分仍然有效）。
+> 旧口径是：条目级 `context_window` 显式配置恒定生效、与策略选中哪台实例无关，未配置时取整组模型卡
+> `ctx` 的最小值，转发前用它钳制 `max_tokens`。废止的原因是它把三个不同的量当成了同一个数——
+> `context_window` 的本意是入口对外声明的**上下文总窗口（输入+输出）**，却被当作**单次输出预算**写进
+> `max_tokens`。生产 21.k:8801 的故障即由此而来：转发链上的 `apply_ctx_cap` 字段表只有
+> `{ max_tokens, max_completion_tokens }`，漏了 `/v1/responses` 用的 `max_output_tokens`，于是走 responses
+> 入口时 `body.max_tokens` 恒为 nil，命中「nil 就凭空写入 cap」那一支，网关替每一个 responses 请求造了
+> 一个 `max_tokens = 350000`（那条入口声明的 `context_window`），而服务的真实窗口只有 262144；
+> 524288 − 350000 = 174288 正好是失败阈值，故障体里「350000 tokens for the completion」恒定不变、只有
+> input 在变。这段历史刻意保留：`context_window` 这个字段名与散落各处文档的钳制话术还在，下一个人需要
+> 知道它为什么长这样、以及哪些说法已经作废。转发链上作废的实现是 `router.apply_ctx_cap`
+> （`router.lua:3256`）与 `entry_ctx_cap`（`router.lua:3263`），两者现为恒「无改写」的空壳导出，只为
+> 保住 `_M` 导出契约而留；`config_store._M.ctx_cap`（`config_store.lua:1937`）与
+> `_M.virtual_ctx_cap`（`config_store.lua:1970`）实现原样保留但**热路径无调用者**，
+> `ctx_cap` 的唯一生产读者是 `/_ui/props` 的 `props.with_ctx`（`props.lua:133`），作用只是把回显的
+> `n_ctx` / `n_ctx_train` 换成操作员声明的值，不影响任何转发字节）。
+
+> **用户裁定 2026-10-04（现行，推翻上一条对 `context_window` 的定义）**：
+> 1. **网关不再改写调用方的输出预算**：`max_tokens` / `max_completion_tokens` / `max_output_tokens`
+>    一律原样透传，调用方给多少转发多少；调用方没给时网关也不替它填一个数。
+> 2. **`context_window` 回归本义**：入口**对外声明的上下文总窗口（输入+输出）**，作用是让客户端更早
+>    触发压缩；不参与任何 max_tokens 计算，只保留解析 / 落盘 / 往返 / UI 展示。
+> 3. **新增模型卡片字段 `context_limit`**＝**服务实际能承受的上下文限制**（引擎真实能力，操作员按引擎
+>    启动参数抄录）；平铺写法 `model_context_limit`、env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层。
+> 4. **配置期校验**：条目的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则
+>    拒绝保存；组内没有任何卡片声明读数 = 不知道引擎能力 = 不校验也不报错。实现
+>    `config_store.validate_declared_context_windows`（只挂在 `apply_profiles` / `apply_document` 两条入口
+>    写入路径上：磁盘快照的读路径不判，否则一份已落盘的配置会在下次 reload 整体退回 env 默认；
+>    单卡写入的 `apply_model_config` 也不判，那正是操作员登记引擎读数的动作）。口径见
+>    doc/gap-virtual-models.md §4。
+
 与 Rust 版的行为对拍是护住既有行为的手段，不是目标；排期与新功能优先对齐以上四点。
 
 以下是不可违反的硬规则：
@@ -48,7 +83,9 @@
    **21.k:8801 是生产，未经用户明确要求不得更新**——改动只在 21.k:8802（测试）上验证，用户确认后才推 8801；
    `authz`、`searxng-*`、`qdrant-faces`、`face-*`、`va-*`、`pg18-video`、`n8nc`、`resdown-*`、
    `wx-liushi-monitor` 及一切名字不带 lr- 的容器不许碰。已退役的 `llm-watcher`（Exited）不要重启。
-4. **设计红线**：推理体字节透传（顶层精确改写，不整表重编码）；流式不缓冲；跨请求状态只走 shdict；
+4. **设计红线**：推理体字节透传（顶层精确改写，不整表重编码）；**调用方的输出预算永远原样透传**
+   ——`max_tokens` / `max_completion_tokens` / `max_output_tokens` 网关一个都不改写、缺失时也不代填
+   （用户裁定 2026-10-04，见上面的裁定块）；流式不缓冲；跨请求状态只走 shdict；
    新开关缺省零行为变化；**探针失败按分档定性，后果不同**——转发路径上的探测（hb 健康巡检、gpu_load 抓
    `/metrics` 与远程 Prom）失败只损失精度，绝不摘 worker；watcher 严格探针按用户裁定（2026-10-01）分档
    摘除：确定性否定（对方答了 HTTP 却读不出 `/v1/models` 的 `data[].id`、命中 router 自指纹、超

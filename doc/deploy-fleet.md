@@ -218,7 +218,10 @@ env**（功率通道仍未在 235.t 启用）。回滚：把 compose 镜像改�
 
 - **1 对多组内选路**：6 个请求全部 200，落点在两个**不同上游的不同实际模型**之间调度
   （4 次 Q38-Flash-Next、2 次 q38fn），正是「虚拟名是主入口、策略在组内选」的语义。
-- **context_window 对下游统一**（决定性证据）：把入口的 context_window 改成 8，再用
+- **context_window 对下游统一**（决定性证据）【**历史记录，该行为已于 2026-10-04 废止**——
+  当时网关会把 `context_window` 写进 `max_tokens` 钳制下游；现行口径是 `context_window` 仅为对外声明的
+  上下文总窗口，网关不改写任何输出预算，详见 [gap-virtual-models.md](gap-virtual-models.md) §4】：
+  把入口的 context_window 改成 8，再用
   max_tokens=999999 请求，三次全部 `finish_reason=length` 且恰好输出 8 token
   —— 无论落到组内哪台实例，钳制都是 8。这就是「对下游保持统一」：同一个入口、同一个
   上限，与选中哪个实际模型无关。改回 32000 后恢复正常。
@@ -265,4 +268,3 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 
 **踩过的坑**：/_ui/logs 被 conf/ui.conf 的 location 接管，调用的是 observability.handle_logs()，
 不是 router.lua 的 ui_logs_handler。改 handler 没用，必须改 handle_logs()。
-

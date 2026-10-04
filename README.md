@@ -3,8 +3,10 @@
 LLM 推理网关的 OpenResty/Lua 实现：**多 GPU 服务的服务发现与请求调度器**。上游是任意
 OpenAI 兼容实例（llama.cpp / vLLM / SGLang），只接受 `http://` 与 `https://`。它只做转发：
 不加载模型、不做推理、不存会话；流式响应零缓冲透传，推理体只做顶层精确改写（model /
-stream_options / effort 与上下文钳制），不整表重编码。虚拟模型入口是对下游的服务主入口，
-一个入口用 `targets` 1 对多映射一组实际模型，由调度策略在整组内选路。
+stream_options / effort），不整表重编码。调用方给的输出预算（`max_tokens` /
+`max_completion_tokens` / 以及 `/v1/responses` 用的 `max_output_tokens`）原样透传，网关既不改写
+也不替它决定（用户裁定 2026-10-04）。虚拟模型入口是对下游的服务主入口，一个入口用 `targets`
+1 对多映射一组实际模型，由调度策略在整组内选路。
 
 与 Rust 版 `smg` 网关（llm-router 仓库 `gateway/`）的关系是**行为对拍**（同请求 → 同状态码 /
 同错误体形状 / 同策略指标），对拍报告见 doc/parity-*.md 与 doc/real-eval.md。2026-10-01 按用户
@@ -21,6 +23,11 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 全量门禁权威日志：`/data/tmp/lr-gates/gates-20261003-034756.log`（串行独占，**21 passed /
 0 failed / 0 skipped**）。代码基线：Lua 24 417 行 / 15 个模块 + policies/ 6 文件、单测 10 文件。
 
+> 锚点取在 2026-10-03 的代码上。2026-10-04 的三笔改动（网关不再改写输出预算 `75ecc37`、模型卡片
+> 新增 `context_limit` 与配置期校验 `aa9f7a3`、管理台口径同步 `e2ba8ba`）之后全量门禁**尚未重跑**，
+> 所以下表计数与本仓各文档的模块行数都仍停在 10-03 锚点上。同时 `test/integration/_lib.py` 的两条
+> `[ctx cap]` 断言（夹断、缺失补齐）随裁定失效，测试侧更新后需要重新取锚。
+
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
@@ -28,7 +35,7 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | contract | **653 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
 | e2e_stateful | 91 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
-| e2e_policies | 65 / 0 | 各策略真流量 + `LMR_MODEL_CTX` clamp |
+| e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入（该套件自述的 ctx cap 一项随 2026-10-04 裁定失效，见下方 `LMR_MODEL_CTX`） |
 | e2e_ui_bridge | 25 / 0 | `/v1` 与 `/_ui` 两条路径改写一致 |
 | e2e_errors / e2e_effort | 10 / 4 | `/_ui` 的 503/502/上游 4xx 契约；effort 强制与 per-model 卡片 |
 | head_routes | 108 / 0 | HEAD 镜像每个 GET 路由 |
@@ -126,7 +133,7 @@ docker run -d --name lua-router --network host \
 | 面 | 路由 | 回答 |
 |---|---|---|
 | 公开面 | `/health` `/liveness` `/readiness` `/v1/models` `/model_info` `/server_info`（各有 GET 与 HEAD 别名）、`/metrics`、`/engine_metrics`、`/health_generate` | 200；`/readiness`、`/v1/models`、`/health_generate`、`/engine_metrics` 在无可用 worker 时分别回 503 / 503 / 503 / 500（`/engine_metrics` 的 500 是契约钉住的 worker-free 形态）。`/v1/models` 会把虚拟服务入口一起广告出去（`created: 0`、单模型入口 `owned_by: llm-router-><model>`、多模型入口 `owned_by: llm-router` + `owned_by_models`、按 id 升序、不覆盖真实 id） |
-| 推理面 | `/v1/chat/completions` `/v1/completions` `/v1/embeddings` `/v1/rerank` `/v1/classify` `/v1/responses` `/generate` | 字节透传 + 顶层 `model` 定点改写（虚拟入口转发的是选中候选的绑定名，不是入口名）；受 `SMG_MAX_CONCURRENT_REQUESTS` 限流（拒绝回 **429 空体**）。请求日志行的 `model` 是入口代表值，**实际落点模型看 `forwarded_model`**；组入口（显式写过 `targets`）被健康引擎一致拒绝整组模型名时，503 message 是「No available workers (N healthy engines serve none of the mapped models)」，与「全部熔断或不健康」分开定性。`/v1/responses` 是纯透传路由：非流式 2xx 时对响应顶层回填请求侧元数据六字段（`previous_response_id` / `instructions` / `metadata` / `store` / `model` / `safety_identifier`；`conversation` 不回显，它只对已删除的存储平面有意义），只做出站改写、不入库；流式只透传 |
+| 推理面 | `/v1/chat/completions` `/v1/completions` `/v1/embeddings` `/v1/rerank` `/v1/classify` `/v1/responses` `/generate` | 字节透传 + 顶层 `model` 定点改写（虚拟入口转发的是选中候选的绑定名，不是入口名）；**输出预算三写法一律原样透传**——`max_tokens` / `max_completion_tokens` / `/v1/responses` 用的 `max_output_tokens` 都由调用方决定，网关既不改小也不在缺失时代填（用户裁定 2026-10-04），所以引擎拒的一定是调用方自己要的数；受 `SMG_MAX_CONCURRENT_REQUESTS` 限流（拒绝回 **429 空体**）。请求日志行的 `model` 是入口代表值，**实际落点模型看 `forwarded_model`**，调用方给的那个输出预算记在日志行的 `output_budget`（修复后恒等于请求原值）；组入口（显式写过 `targets`）被健康引擎一致拒绝整组模型名时，503 message 是「No available workers (N healthy engines serve none of the mapped models)」，与「全部熔断或不健康」分开定性。`/v1/responses` 是纯透传路由：非流式 2xx 时对响应顶层回填请求侧元数据六字段（`previous_response_id` / `instructions` / `metadata` / `store` / `model` / `safety_identifier`；`conversation` 不回显，它只对已删除的存储平面有意义），只做出站改写、不入库；流式只透传 |
 | 控制面 | `POST /workers`（202 + Location）、`PUT /workers/{id}`（202，三键 `{status,worker_id,message}`）、`GET /workers[/{id}]`、`DELETE /workers/{id}`、`POST /flush_cache`、`GET /v1/loads` | `PUT` 可改 priority / cost / labels（合并）/ api_key / 健康旋钮 / **每服务上限 `max_concurrency` 与 `max_power_w`**，身份字段忽略；非 UUID → 400、未知 → 404、坏 JSON → 400。`GET /workers` 每条带 `models`（该实例真实广告过的模型，主模型恒居首）、`inflight_requests`（纯在飞数，并发上限的比较对象）、`power_w`（新鲜瓦特读数，**缺席=未知**）与两个已归一的上限；未声明的上限字段**缺席而不是 0**。`worker_type` 与 `connection_mode` 收成单值：只有 `regular` 与 `http`（或其 serde 对象拼写、缺省）被接受，其它值一律 400。`/flush_cache` 向全部 worker POST `{}`（5s 超时），回 `{results:[{worker,status,result}], success, all_failed}`；`/v1/loads` 回 `{workers:[{worker,load}], total_workers, successful, failed}`（worker 侧非 2xx / 超时 / 缺字段记 -1）——两者与 Rust 形状不同，有意偏差 |
 | mesh / HA 面 | `/ha/{status,health,workers[/id],policies[/id],config[/key],rate-limit,rate-limit/stats,stats,shutdown}` + `/_mesh/internal/{ping,sync,apply,state}` | `SMG_ENABLE_MESH` 未设（缺省）→ `/ha/*` 全部固定 503 `{"error":"mesh not enabled"}`；开启后委托 `mesh.dispatch`，未知的深路径回 404 `{"error":"unknown ha route: <METHOD> <path>"}`。`/_mesh/internal/*` 无鉴权无 loopback 围栏，**信任边界就是网络本身** |
 | `/_ui` | 别名全家 + 静态 SPA + `/_ui/admin/` 管理台（模型管理 / 服务池 / 路由策略 / 日志监控四页，按使用频度排序） | **无鉴权**；已注册路径的错误方法按 404 sink 回答 |
@@ -206,9 +213,10 @@ docker run -d --name lua-router --network host \
 | `SMG_ENABLE_IGW` | 按 `model` 查表路由；开启后未知 model → 503 `no_available_workers` |
 | `SMG_WORKER_URLS` | 逗号分隔的启动播种 worker 列表 |
 | `LMR_DEFAULT_EFFORT` / `LMR_EFFORT_MAP` | 八档 effort 阶梯的默认值与改写表（`low:medium,high:xhigh`） |
-| `LMR_MODEL_CTX` | 每模型上下文上限，转发前 clamp `max_tokens` / `max_completion_tokens`。虚拟服务入口另有**条目级统一钳制**：`/_ui/config` 的 `virtual_models[].context_window`（写了即以它为准、与选中哪台无关；未写时只有操作员显式写过 `targets` 且组内 ≥2 个模型才取整组模型卡 ctx 的最小值，其余一律不钳制） |
+| `LMR_MODEL_CTX` | 每模型上下文上限，模型卡片 `model_configs[].ctx` 的平铺写法（同一份文档里叫 `model_ctx`）。**只用于展示，不参与转发改写**（用户裁定 2026-10-04，见下一行与 doc/gap-virtual-models.md §4）：网关不再拿它去动 `max_tokens` / `max_completion_tokens`。它现在唯一的读者是 `/_ui/props`——`props.with_ctx` 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口 |
+| `LMR_MODEL_CONTEXT_LIMIT` | 每模型**服务实际上下文限制**＝引擎真实能力（操作员按引擎启动参数抄录）。`model=value` 形状，与上一项同一解析口径；卡片写法是 `model_configs[].context_limit`，卡片优先于这一平铺层。**唯一用途是配置期校验**：虚拟入口声明的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则 `/_ui/config` 拒绝保存（`config_store.validate_declared_context_windows`，挂在 `apply_profiles` / `apply_document` 两条写入路径）。组内没有任何卡片声明读数 = 不知道引擎能力 = 不校验不报错。同样**不参与**转发改写与任何 max_tokens 计算；新 env 必须进 `config_store.ENV_NAMES`，否则 nginx 把它从 worker 环境里剥掉 |
 | `LMR_MODEL_EFFORT` / `LMR_MODEL_EFFORT_MAP` | 每模型覆盖，优先级高于上两项 |
-| `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/_ui/config` 写 |
+| `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/_ui/config` 写。条目级 `context_window` 是**对外声明的上下文总窗口（输入+输出）**，作用只是让客户端更早触发压缩；它不是输出预算，也不参与 max_tokens 计算，且必须严格小于组内 `context_limit` 的最小值 |
 | `LMR_MODEL_MODALITIES` | `/_ui/props` 广告的能力位（`text,image`） |
 | `LMR_CONFIG_FILE` | RuntimeConfig 原子落盘路径，reload/重建后恢复；未设 = 内存态 |
 | `LMR_UI_DIR` / `LMR_UI_ROUTER_MODE` | 静态 SPA 目录（默认 `/usr/local/share/llama-ui`）/ 路由模式开关。`SMG_UI_DIR` 由入口脚本映射到 `LMR_UI_DIR`（两者同时给出时 `LMR_` 优先），裸 conf 直跑只认 `LMR_UI_DIR` |
@@ -397,7 +405,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-inflight-age.md](doc/gap-inflight-age.md) | 在途请求年龄采样：槽表、TTL 与 Rust 语义偏差 |
 | [doc/gap-metrics-final.md](doc/gap-metrics-final.md) | Prometheus 家族覆盖率口径基线 + `smg_worker_pool_size` 修复 |
 | [doc/gap-tls-chain.md](doc/gap-tls-chain.md) | 证书链 / SNI / 握手负例门与入口预检缺口 |
-| [doc/gap-virtual-models.md](doc/gap-virtual-models.md) | 虚拟模型服务主入口（1 对多 `targets` + 条目级 `context_window` 统一口径）与 upstreams 持久化接入 |
+| [doc/gap-virtual-models.md](doc/gap-virtual-models.md) | 虚拟模型服务主入口（1 对多 `targets` + 条目级 `context_window`＝对外声明的上下文总窗口 + 卡片 `context_limit` 配置期校验）与 upstreams 持久化接入 |
 | [doc/gap-pool-merge.md](doc/gap-pool-merge.md) | 服务池页：运行态与声明态的统一视图、归属徽章、上限的事实来源 |
 | [doc/gap-worker-caps.md](doc/gap-worker-caps.md) | 每服务并发/功率上限：候选集硬排除、最热卡功率口径、功率通道与残余缺口 |
 | [doc/parity-cpu-ablation.md](doc/parity-cpu-ablation.md) | 1.54x CPU 回退定责与消融实验计划 |
