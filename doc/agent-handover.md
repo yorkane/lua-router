@@ -17,7 +17,7 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-01）：**21 门禁全绿**（含契约 650/23 段）、Lua 24 417 行 / 15 个模块 + policies/6 文件、
+基线（2026-10-01）：**22 门禁全绿**（含契约 650/23 段）、Lua 24 417 行 / 15 个模块 + policies/6 文件、
 单测 10 文件、文档 20 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
@@ -90,14 +90,20 @@ docker-entrypoint.sh env 校验→envsubst→openresty -t→exec；cache_aware/m
 ```bash
 cd /home/aigc/ChatGPT/lua-router
 bash test/final_gates.sh                     # 快速档（缺省 5 门，约 3 分钟）——普通修改够用
-GATE_TIER=full bash test/final_gates.sh      # 全量 21 门（串行 12–17 分钟）——发版/计数/生产替换
+GATE_TIER=full bash test/final_gates.sh      # 全量 22 门（串行 13–14 分钟）——发版/计数/生产替换
 GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 TEST_ONLY=inflight_age bash test/test_lua_router.sh   # 契约单段
 ```
 
-**21 门**：build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge e2e_errors
+**22 门**：build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge e2e_errors
 e2e_effort head_routes mesh_http e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
-e2e_routing_dyn e2e_profiles e2e_caps mesh_two e2e_tls_chain。
+e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_chain。
+
+门与门之间**已支持并行**：`GATE_TIER=full GATE_JOBS=6 bash test/final_gates.sh` 实测 6.5 分钟
+（串行 13.7 分钟，2.12 倍）；**不设 `GATE_JOBS` 时行为与原来逐字节一致**。`GATE_DRY_RUN=1` 只打印
+分组计划。新增门若未归入 pool-1 / pool-2 / serial-only，脚本 fail-closed 直接 `exit 2`——
+`e2e_watcher`（拍 docker 端口快照再拼排除表）、`mesh_two`（名册跨 18s 稳定窗）、`e2e_tls_chain`
+（硬编码 `SMG_PORT=31337`）这三门必须留串行，理由见 README〈测试〉。
 
 **已知 flake/坑**：
 

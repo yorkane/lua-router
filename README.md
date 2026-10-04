@@ -65,10 +65,10 @@ inflight_age 32、tls_server 19、profiles_upstreams 64。
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` 门 |
 | `lualib/resty/luarouter/` | 实现（15 模块 + policies/ 6 文件）：router / init / registry / watcher / gpu_load / policy / hb / config_store / config / observability / mesh / hash / limit / ui / props，全部接进请求路径 |
 | `ui/` | 原版 llama.cpp webui（`/_ui/`）+ `ui/admin/`（Quasar UMD 管理台四页：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`） |
-| `test/final_gates.sh` | 21 门串行硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING`） |
+| `test/final_gates.sh` | 22 门硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING` / `GATE_JOBS` / `GATE_DRY_RUN`） |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），23 段 |
 | `test/unit/` | 纯 Lua 单测 10 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径 |
-| `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps（`caps` 尚未登记进 `final_gates.sh` 的 GATE_ORDER，见文末待刷新计数） |
+| `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps / models_advertisement（`models_advertisement` 钉 `/v1/models` 的对外形状，2026-10-04 随第 22 门加入 GATE_ORDER） |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
 | `doc/` | 现状文档 23 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
 
@@ -240,6 +240,14 @@ context_window 事故——把声明的总窗口当成单次输出预算写进 `
 对外声明的 `capabilities.context_length` 优先取条目自己写的 `context_window`（作用只是让客户端更早触发
 压缩），其次才是组内各实际模型读数的最小值。
 
+**「取最窄」的前置是每台都有读数，任何一台没有就整个删键**——这与 `config_store.virtual_ctx_cap` 判的
+不是同一件事，别混用：`virtual_ctx_cap` 判的是**操作员声明之间的冲突**（每台都给了数、只是数值不一致，
+于是取最窄）；`/v1/models` 这里判的是**引擎能力未知**（不知道那台到底装得下多少），跳过它就会把已知的
+那些当成全部，广告出一个比部分成员能承受的**更大**的窗口。线上实证：235.t:8800 的 `Qn`
+（组 = `Q38-Flash-Next` + `kimi-code/k3`）曾报 `context_length: 1000000`——那是 kimi 的读数，
+`Q38-Flash-Next` 那一半当时没有读数。入口**自己显式声明**的 `context_window` 不受这条约束，
+那是操作员说的话，是权威声明。
+
 `owned_by` 的两套口径是**不能改的老契约**，有客户端在读它：真实模型恒 `"local"`（引擎自报的 owned_by 是
 各家上游的说法，不上外）；单目标入口 `"llm-router-><model>"`，多目标入口 `"llm-router"` 加整组的
 `owned_by_models`。`data[].id` 的取值集合、排序与别名遮蔽规则同样不变——registry 的 worker 判定、
@@ -402,7 +410,9 @@ engine 仍是单条 base 记录。关时逐字节不变。
 ```bash
 cd /path/to/lua-router
 bash test/final_gates.sh                     # 快速档（缺省）：build/conf/unit/contract/probes，约 3 分钟
-GATE_TIER=full bash test/final_gates.sh      # 全量 21 门（串行 12–17 分钟）
+GATE_TIER=full bash test/final_gates.sh      # 全量 22 门（串行 13–14 分钟）
+GATE_TIER=full GATE_JOBS=6 bash test/final_gates.sh   # 全量并行（实测 6.5 分钟，2.12 倍）
+GATE_DRY_RUN=1 GATE_JOBS=6 bash test/final_gates.sh  # 只打印分组计划，不执行
 GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 KEEP_GOING=1 bash test/final_gates.sh        # 跑完并计数
 
@@ -410,11 +420,22 @@ bash test/test_lua_router.sh                 # 契约套件单独调试（独占
 TEST_ONLY=workers bash test/test_lua_router.sh   # 单段调试
 ```
 
-**门禁不可并发**：所有套件都是 host 网络 + 固定容器名前缀，两套房同跑会端口/容器名争用出假失败。
-跑之前 `ps` 查一遍；测试容器名带 `lr-` 前缀，收尾 `docker ps -a | grep lr-` 清零。已知 flake：
-`e2e_policy_parity` 的 random χ² 检验约 5% 假阳率（临界 5.991），失败先单独重跑该门。生产机上
-proc 扫描会把门禁轮的 mock 短暂注册进生产池，跑完清一次（`GET /workers` 找 unhealthy 测试模型名
-→ `DELETE /workers/{id}`）。
+**两套门禁脚本不能同时跑**（`flock` 锁写死在 `/data/tmp/lr-gates/.gates.lock`，第二份直接 `exit 3`）。
+单份内部的**门与门**已经可以并行：各门的容器名、端口台账、临时目录与日志都按 RUN 隔离，
+`GATE_JOBS=N` 即可。跑之前 `ps` 查一遍；测试容器名带 `lr-` 前缀，收尾 `docker ps -a | grep lr-` 清零。
+
+分组是**写死在脚本里的表，不是旋钮**——新增门若未归类，脚本 fail-closed 直接 `exit 2`，
+所以加门时必须同时决定它进 pool-1 / pool-2 / serial-only。**这三门必须留串行**，理由各不相同，
+是下一个人加门时的判断依据：
+
+| 门 | 为什么不能并行 |
+|---|---|
+| `e2e_watcher` | 先拍 `docker ps` 端口快照再拼排除表并挂 docker.sock；快照之后别人起的容器是没被排除的发布口，「恰好一个 worker」会因无关原因红 |
+| `mesh_two` | 18 秒稳定窗 + stop/heal 分区窗内验名册；机器上有别的 router 应答时，名册和收敛时间都没有意义 |
+| `e2e_tls_chain` | 硬编码 `SMG_PORT=31337` 并在该口上验 SNI |
+
+生产机上 proc 扫描会把门禁轮的 mock 短暂注册进生产池，跑完清一次（`GET /workers` 找 unhealthy
+测试模型名 → `DELETE /workers/{id}`）。
 
 快速档绿只证明核心面（语法、单测、wire 契约、探针）；README/交接文档的计数更新、发版与生产
 镜像替换必须以 `GATE_TIER=full` 的全绿日志为锚点。
