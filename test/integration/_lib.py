@@ -245,7 +245,8 @@ def main():
     ha, hb = mock_lines(pa, "/v1/chat/completions") - base_a, mock_lines(pb, "/v1/chat/completions") - base_b
     check("[cache_aware] 10 shared-prefix requests hit one mock (%d/%d)" % (ha, hb),
           max(ha, hb) == 10, "a=%d b=%d" % (ha, hb))
-    # effort injection + ctx cap + alias resolve, all visible through echo_body
+    # effort injection + output-budget pass-through + alias resolve, all visible
+    # through echo_body
     st, body, _ = http("GET", "http://127.0.0.1:%d/workers" % port)
     worker_ids = [w["id"] for w in json.loads(body).get("workers", [])]
     st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
@@ -297,15 +298,26 @@ def main():
         echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
         check("[alias] LMR_EFFORT_MAP low->medium", echo.get("reasoning_effort") == "medium",
               json.dumps(echo)[:300])
-        # ctx cap
-        st, body, _ = chat(port, "alpha", "cap probe", extra={"max_tokens": 99999})
+        # Output budget: the gateway does not touch it (ruling 2026-10-04, commit
+        # 75ecc37). LMR_MODEL_CTX=alpha:128 stays configured on purpose -- it is the
+        # number the retired clamp used to read, so these two checks only discriminate
+        # when a cap really exists and really is ignored. Without the env row both
+        # assertions would pass on any build that simply never had the feature.
+        st, body, _ = chat(port, "alpha", "budget probe", extra={"max_tokens": 99999})
         echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
-        check("[ctx cap] LMR_MODEL_CTX=alpha:128 clamps max_tokens",
-              echo.get("max_tokens") == 128, json.dumps(echo)[:300])
-        st, body, _ = chat(port, "alpha", "cap probe absent", extra=None)
+        check("[budget] a configured context cap leaves the caller's max_tokens alone",
+              st == 200 and echo.get("max_tokens") == 99999,
+              "%s %s" % (st, json.dumps(echo)[:300]))
+        # "the caller gave nothing" and "the field was filled with a number" are two
+        # different facts, so the second check tests absence of the KEY rather than a
+        # value. A sentinel like 0 or 128 would satisfy either reading and could not
+        # tell a re-introduced clamp apart from a plain missing field.
+        st, body, _ = chat(port, "alpha", "budget probe absent", extra=None)
         echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
-        check("[ctx cap] absent max_tokens filled with cap", echo.get("max_tokens") == 128,
-              json.dumps(echo)[:300])
+        check("[budget] no budget in, none manufactured out",
+              st == 200 and "max_tokens" not in echo
+              and "max_completion_tokens" not in echo,
+              "%s %s" % (st, json.dumps(echo)[:300]))
         # ui pipeline keeps the alias in the log but forwards the real id
         st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
                            {"model": "alias-a", "messages": [{"role": "user", "content": "ui alias probe"}]})

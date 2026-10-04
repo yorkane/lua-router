@@ -568,8 +568,10 @@ class Handler(BaseHTTPRequestHandler):
                 "finish_reason": "stop",
             }],
             "usage": self._usage(),
-            # What the router actually forwarded: proves model rewrites,
-            # reasoning_effort injection and ctx clamps without a /identity probe.
+            # What the router actually forwarded: proves model rewrites and
+            # reasoning_effort injection without a /identity probe, and (ruling
+            # 2026-10-04) that the caller's output budget reaches the engine
+            # untouched -- there is no ctx clamp left to prove the other way.
             "echo_body": body,
             "echo_headers": self._echo_headers(),
         }

@@ -1735,7 +1735,11 @@ end
 -- 11c. 虚拟模型 = 服务主入口（1 对多）的契约（root ruling 2026-10-02）
 --
 -- 语义反转后一个条目说的是"这个入口对外提供**哪一组**实际模型"，选路在组内做；条目上
--- 唯一允许的覆盖是 context_window（对下游统一的 max_tokens 钳制）。本节按六组钉住：
+-- 唯一允许的覆盖是 context_window（2026-10-04 裁定后它是**对外声明的上下文总窗口**，
+-- 不再参与任何 max_tokens 计算；热路径的钳制已整体删除，见 router.lua 的
+-- apply_ctx_cap 恒等空壳）。本组钉的是 config_store 仍保留 ctx_cap /
+-- virtual_ctx_cap 两个读数（UI 与 doc 按名字引用），不是热路径拿它改写请求体。
+-- 本节按六组钉住：
 --   (1) 新形状解析：targets 多值 + context_window；target 单值是"长度为 1 的组"，
 --       只在读侧归一，磁盘上不许凭空长出 targets；
 --   (2) 向后兼容：纯 {model,target}、candidates-only、LMR_VIRTUAL_MODELS env 种子三条

@@ -82,12 +82,34 @@ check("[parity] healthy", wait_ready(port, 1), logs(name))
 st1, b1, _ = chat(port, "alpha", "parity probe", extra={"max_tokens": 4096})
 st2, b2, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
                   {"model": "alpha", "messages": [{"role": "user", "content": "parity probe"}],
-                   "max_tokens": 4096})
+                   "stream": False, "max_tokens": 4096})
 e1 = json.loads(b1).get("echo_body", {}) if st1 == 200 else {}
 e2 = json.loads(b2).get("echo_body", {}) if st2 == 200 else {}
-check("[parity] /v1 and /_ui forward identical clamps", st1 == 200 and st2 == 200
-      and e1.get("max_tokens") == 256 == e2.get("max_tokens"),
+# Ruling 2026-10-04 (commit 75ecc37): the gateway forwards the caller's output budget
+# verbatim, so both entries must hand the mock the 4096 that was sent -- not the 256
+# that LMR_MODEL_CTX=alpha:256 used to clamp it to. The env row stays configured on
+# purpose: it is the number a re-introduced clamp would read, which is what makes the
+# 4096 assertion discriminate instead of passing vacuously.
+check("[parity] /v1 and /_ui forward the caller's max_tokens untouched",
+      st1 == 200 and st2 == 200 and e1.get("max_tokens") == 4096
+      and e2.get("max_tokens") == 4096,
       "%s/%s %s %s" % (st1, st2, json.dumps(e1)[:160], json.dumps(e2)[:160]))
+# Stronger than "both landed on the same number": the two forwarded bodies must be
+# IDENTICAL. Two clamps that agree say nothing about the gateway staying out of the
+# body; byte equality says the whole pipeline (model rewrite, effort ladder, usage
+# injection) made the same -- or more precisely, no -- difference.
+#
+# Fields deliberately excluded from the comparison: none. echo_body is the request
+# body as the mock received it, so it carries no id/created_at/request-id of its own
+# (those live in the response envelope, not in echo_body), and both requests name the
+# same single worker, so the model rewrite lands on the same "alpha". stream rides
+# explicitly on the /_ui body because chat() always sends it -- that is the one shape
+# difference the two entry points would otherwise show for reasons unrelated to the
+# gateway. Nothing else may differ, and if a future gateway starts stamping a
+# per-request field into the body, this check is where it gets caught.
+check("[parity] both entries hand the worker the same bytes",
+      st1 == 200 and st2 == 200 and e1 == e2 and bool(e1),
+      "e1=%s e2=%s" % (json.dumps(e1)[:220], json.dumps(e2)[:220]))
 rows = json.loads(http("GET", "http://127.0.0.1:%d/_ui/logs" % port)[1]).get("requests", [])
 check("[parity] both paths land in the request log",
       len([r for r in rows if r.get("endpoint") == "chat"]) >= 2, json.dumps(rows[-2:])[:400])

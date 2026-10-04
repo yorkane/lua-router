@@ -329,6 +329,12 @@ class RespHandler(BaseHTTPRequestHandler):
             # model absent entirely: exercises the model default branch too
             doc = resp_doc(rid)
             doc.pop("model", None)
+            if (body.get("metadata") or {}).get("echo") is True:
+                # Opt-in echo for the output-budget probes (5.7): the Responses answer
+                # has no room for the request, and those probes must observe the bytes
+                # the GATEWAY sent, not the bytes the client meant to send. Gated on a
+                # marker so every pre-existing case here keeps the exact shape it had.
+                doc["echo_body"] = body
             self._json(200, doc)
             return
         self.send_response(200)
@@ -497,6 +503,116 @@ check("[responses C4] empty conversation stores nothing", st == 404, st)
 check("[responses] no lua errors", "lua entry thread aborted" not in logs(name),
       logs(name)[-500:])
 stop_router(name)
+
+# ---------- 5.7 the output budget on the /v1/responses entry point ----------
+# The production defect of 2026-10-04 (commit 75ecc37). This entry point had NO output
+# budget coverage at all, which is precisely where the retired clamp hid: its field
+# table was { max_tokens, max_completion_tokens }, so a responses body -- whose budget
+# field is max_output_tokens -- always read as "the caller asked for nothing", and the
+# nil branch then *wrote* max_tokens = <the virtual entry's declared context_window>.
+# Production declared 350000 against a 524288 engine, so every request above 174288
+# input tokens got a 400 nobody asked for (524288-350000=174288 is the observed
+# threshold, with the completion count frozen at a number no caller named).
+#
+# Ruling 2026-10-04: the gateway forwards the caller's budget verbatim and never picks
+# one for it. These probes read the bytes the GATEWAY sent (metadata.echo makes the
+# worker echo its request) rather than the bytes the client meant to send, and they
+# reproduce BOTH clamp sources of the old code: the entry's context_window, and the
+# model card behind LMR_MODEL_CTX. Every check below fails on the pre-75ecc37 build and
+# must pass on the current one -- that is what makes them worth keeping.
+#
+# Own container (bud_* names): the C1-C4 shapes above must stay byte-identical, and the
+# worker above is reused here so nothing about the SSE shapes changes.
+bud_name = "lr-respbud-" + RUN
+bud_port = start_router({"SMG_POLICY": "round_robin",
+                         "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                         "LMR_MODEL_CTX": "alpha:128"}, bud_name)
+st, body = register(bud_port, "http://127.0.0.1:%d" % resp_up)
+check("[responses budget] worker registered", st == 202, "%s %s" % (st, str(body)[:120]))
+check("[responses budget] worker healthy", wait_ready(bud_port, 1), logs(bud_name))
+# The entry the operator wrote in production: one virtual name over the responses
+# worker, declaring the same 350000. No card declares a context_limit anywhere in this
+# container, so the configuration-time window validator (aa9f7a3) deliberately stays
+# out of the way -- this section is about forwarding bytes, not about validation.
+st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/config/virtual" % bud_port,
+                   {"entries": [{"model": "vm-bud", "target": "alpha",
+                                  "context_window": 350000}]})
+check("[responses budget] entry with context_window=350000 accepted", st == 200,
+      "%s %s" % (st, str(body)[:250]))
+time.sleep(0.6)  # past the store's SNAPSHOT_TTL memo, so the pick sees the new entry
+
+BUDGET_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+def resp_budget_probe(bud_port, model, rid, **extra):
+    """One non-stream /v1/responses whose answer carries the forwarded body back."""
+    doc = {"model": model, "input": "budget probe " + rid,
+           "metadata": {"rid": rid, "echo": True}}
+    doc.update(extra)
+    st, body, _ = resp_post(bud_port, doc)
+    doc = json.loads(body) if st == 200 else {}
+    return st, doc.get("echo_body", {})
+
+
+def resp_log_row(bud_port, worker_needle):
+    """The newest responses row of the request log (output_budget lives there)."""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs?limit=200" % bud_port)
+    rows = json.loads(body).get("requests", []) if st == 200 else []
+    rows = [r for r in rows if worker_needle in (r.get("worker") or "")
+            and r.get("endpoint") == "responses"]
+    return rows[-1] if rows else {}
+
+
+resp_worker_needle = "127.0.0.1:%d" % resp_up
+
+# (a) the caller named its budget with the responses spelling: it must go out verbatim
+#     and the two chat spellings must NOT appear -- the old code wrote both of them, at
+#     350000 each, on top of a body that already said what it wanted.
+st, echo = resp_budget_probe(bud_port, "vm-bud", "resp_bud_1", max_output_tokens=4096)
+check("[responses budget] max_output_tokens survives the entry's declared window",
+      st == 200 and echo.get("max_output_tokens") == 4096
+      and "max_tokens" not in echo and "max_completion_tokens" not in echo,
+      "%s %s" % (st, json.dumps(echo)[:300]))
+# (The forwarded MODEL name for an entry is pinned by e2e_caps/e2e_profiles, where the
+ # bindings are explicit; asserting it here would additionally depend on when model-id
+ # discovery first lands, which is not what this section is about.)
+row = resp_log_row(bud_port, resp_worker_needle)
+check("[responses budget] the log records the caller's number, not the cap",
+      row.get("output_budget") == 4096, json.dumps(row)[:300])
+
+# (b) the caller named nothing, so the gateway must name nothing either. Absence of the
+#     KEYS is the assertion: 0 and 350000 both satisfy "a number is present", so only
+#     "the key was never written" separates "no budget" from "budget manufactured for
+#     the client" -- the exact mistake that shipped 350000 to a 524288 engine.
+st, echo = resp_budget_probe(bud_port, "vm-bud", "resp_bud_2")
+check("[responses budget] no budget in, none manufactured out",
+      st == 200 and not [f for f in BUDGET_FIELDS if f in echo],
+      "%s %s" % (st, json.dumps(echo)[:300]))
+row = resp_log_row(bud_port, resp_worker_needle)
+check("[responses budget] the log omits output_budget when the caller named none",
+      "output_budget" not in row, json.dumps(row)[:300])
+
+# (c) the other clamp source, on the same entry shape: a request naming a real model has
+#     no entry above it, so the old code fell back to the LMR_MODEL_CTX card (128) and
+#     wrote max_tokens = max_completion_tokens = 128 into a responses body.
+st, echo = resp_budget_probe(bud_port, "alpha", "resp_bud_3", max_output_tokens=2048)
+check("[responses budget] max_output_tokens survives the model card too",
+      st == 200 and echo.get("max_output_tokens") == 2048
+      and "max_tokens" not in echo and "max_completion_tokens" not in echo,
+      "%s %s" % (st, json.dumps(echo)[:300]))
+
+# (d) the chat spelling that the old table DID know, still on the responses entry (this
+#     worker answers 404 for anything else, and the budget edit never looked at the
+#     route): max_completion_tokens must survive the card verbatim instead of being
+#     pulled down to 128, and max_tokens -- absent from the request -- must stay absent
+#     rather than appear at the cap. The old code rewrote BOTH fields to 128 here.
+st, echo = resp_budget_probe(bud_port, "alpha", "resp_bud_4", max_completion_tokens=6144)
+check("[responses budget] max_completion_tokens survives the model card",
+      st == 200 and echo.get("max_completion_tokens") == 6144
+      and "max_tokens" not in echo, "%s %s" % (st, json.dumps(echo)[:300]))
+check("[responses budget] no lua errors",
+      "lua entry thread aborted" not in logs(bud_name), logs(bud_name)[-500:])
+stop_router(bud_name)
 resp_server.shutdown()
 resp_server.server_close()
 
