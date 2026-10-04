@@ -568,7 +568,21 @@ gate_unit() {
     # 它钉输出层的纪律，e2e_models_advertisement 钉采集链路过真 HTTP；两者覆盖面不同
     # （单测能造"上游只说了一半""脏读数""组内口径不一致"这些真 HTTP 里造不出来的形状，
     # e2e 才能证明探针真的调了归一化层）。
-    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing test_models_shape; do
+    # test_models_advertise：/v1/models「只广告虚拟入口」开关判定层的纯 luajit 单测
+    # （无端口，与其余 luajit 组同档）。e2e_models_advertisement 只能从 HTTP 外面看「广告了
+    # 哪几行」，证不了开关内部三条纪律：truthy 是「认识才算开」（写错的字符串要退回缺省全量
+    # 广告，而不是把硬规则 9 第三条的老契约整页翻掉）、磁盘读数与 env 读数是优先级而不是 OR
+    # （nil 与 false 必须分家，否则 env 层永远读不到）、only_data 拿不到入口时返回 nil（退回
+    # 全量）而不是空表（交空列表）。后两条在 HTTP 面上长得一模一样，只有把源码切出来才分得开；
+    # 返回形状写反 = 静默清空整个广告面。
+    # test_effort_layers：effort 三层继承（模型卡片 -> 虚拟条目 -> 全局）语义与接线的纯
+    # luajit 单测（切 router.lua 真实现配桩、config_store 用盘上真模块，无端口）。这条链的
+    # 错误形状是静默的——操作员在全局页填的映射被一张只管 ctx 的卡片悄悄屏蔽，转发体只是少改
+    # 一个键，没有任何日志会喊，所以 e2e_effort 那份过真 HTTP 的门禁也不足以替代它（它钉的是
+    # 「逐 from 问三层、第一个给值的层赢」这条查表口径本身，以及条目层读数确实被喂进了转发链）。
+    # 两份的判别性通道（LR_MODELS_TEST_LEGACY_SRC / LR_EFFORT_LEGACY_LUALIB）刻意不在门禁里
+    # 设：那是手工核实「断言真会红」的反证手段，需要外挂改动前的旧源码树，门禁只跑 HEAD。
+    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing test_models_shape test_models_advertise test_effort_layers; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done
