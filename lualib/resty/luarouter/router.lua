@@ -238,7 +238,7 @@ end
 -- call store(), so they are defined next to it further below; the names are
 -- forward declared here because policy_for already consults them.
 local profile_for_alias, profile_worker_list, profile_policy_name, profile_effort_value,
-    profile_model_group
+    profile_model_group, profile_entry_fallback
 -- Called from policy_for, which sits a thousand lines above their definitions: without
 -- this forward declaration the reference compiles to a global read and the select path
 -- dies on a nil call at the first group request.
@@ -841,6 +841,51 @@ profile_effort_value = function(profile, alias, resolved)
     -- because a row nobody deleted must not keep enforcing a rule the design retired.
     -- Both layers go: the profile field *and* the store reader below, which would
     -- otherwise resolve the same alias from the live snapshot.
+    return nil
+end
+
+--- 虚拟模型条目那一层的档位声明，装配成 request_effort_for 的 entry_fallback。
+---
+--- 三层继承（用户裁定 2026-10-04：模型卡片 -> 虚拟条目 -> 全局）的中间一层在 router
+--- 侧的装配点。读数只从 config_store.entry_declaration 取：它返回新表（改不坏存储），
+--- 且刻意把 false / nil 分家，这里要的正是那份三态。
+---
+--- 只取档位两个字段（default_effort / effort_map）。条目的 supports_tool_use 与
+--- modalities 是对外形状的聚合口径，不是转发体的改写位，不能从这里漏进转发链。
+---
+--- 没有任何条目声明时返回 nil，request_effort_for 于是只查卡片与全局两层，
+--- 与改动前逐字节一致（缺省零行为变化）。
+---@param profile table|nil
+---@param alias string|nil
+---@param model string|nil
+---@return table|nil entry_fallback
+profile_entry_fallback = function(profile, alias, model)
+    local store_mod = store()
+    if not store_mod or type(store_mod.entry_declaration) ~= "function" then
+        return nil
+    end
+    -- 先按客户端给的名字查（条目的主键），查不到再按解析后的落点名：与
+    -- profile_effort_value 一样的两次机会，legacy 别名（条目名不等于落点名）不漏。
+    local names = {}
+    if type(alias) == "string" and alias ~= "" then names[1] = alias end
+    if type(model) == "string" and model ~= "" then names[#names + 1] = model end
+    for i = 1, #names do
+        local ok, declared = pcall(store_mod.entry_declaration, names[i])
+        if ok and type(declared) == "table" then
+            local out
+            if type(declared.default_effort) == "string" and declared.default_effort ~= "" then
+                out = out or {}
+                out.default_effort = declared.default_effort
+            end
+            if type(declared.effort_map) == "table" and next(declared.effort_map) ~= nil then
+                out = out or {}
+                local map = {}
+                for from, to in pairs(declared.effort_map) do map[from] = to end
+                out.effort_map = map
+            end
+            if out then return out end
+        end
+    end
     return nil
 end
 
@@ -3190,7 +3235,17 @@ apply_effort_policy = function(raw, body, model, profile, alias)
             return set_top_field(raw, "reasoning_effort", pe), requested, pe
         end
     end
-    local ok, effective = pcall(store_mod.request_effort_for, model, requested)
+    -- 三层继承（用户裁定 2026-10-04）的中间一层在这里接上：卡片由 request_effort_for
+    -- 自己按落点名查，全局层在它手上，条目层只有 router 有（profile 是按**客户端给名**
+    -- 查回来的，store 那侧的按名回查拿不到这一份）。装配失败/没有任何条目声明时
+    -- profile_entry_fallback 返回 nil，request_effort_for 于是只走卡片与全局两层，
+    -- 转发的字节与本次接线前完全一致（AGENTS.md 硬规则「新开关缺省零行为变化」）。
+    --
+    -- 刻意放在上面两条早退支路**之后**：强制层与 legacy 支路命中时根本走不到这里，
+    -- 不该为它们多付一次 entry_declaration 的快照读。
+    local entry_fallback = profile_entry_fallback(profile, alias, model)
+    local ok, effective = pcall(store_mod.request_effort_for, model, requested,
+        entry_fallback)
     if not ok or type(effective) ~= "string" or effective == "" then
         -- Nothing configured and nothing requested: leave the field alone, which
         -- lets the engine default apply (as in Rust).
@@ -3774,7 +3829,25 @@ local function resolve_model_caps(store_mod, cfg, model, caps)
 
     local supports = type(caps) == "table" and caps.supports or nil
     supports = type(supports) == "table" and supports or {}
-    row.tool_use = boolean_or_nil(supports.tool_use)
+    -- tool use 的源优先级补齐成与旁边两个维度同一条链：操作员声明 > 引擎自报 > 整个键
+    -- 省略（硬规则 9 第 2 条）。在此之前它只有引擎自报一个来源，等于把「操作员说不支持」
+    -- 这一格整个让给了引擎：引擎的 supports_tool_use 是按它自己的 chat template 报的，
+    -- 挂了工具模板的引擎恒报 true，操作员没有任何办法否掉它。
+    --
+    -- 三态要逐分支判，不能写成 declared or engine：Lua 里 false or engine 取的是
+    -- engine，操作员明确说的不支持会被引擎的 true 顶掉，正是这次要修的缺陷。
+    -- nil 才是没说话，只有那一支才让位给引擎；两边都没说话则保持 nil，
+    -- 由 fill_model_fields 把整个键删掉（不写 false、不写 null 冒充结论）。
+    local declared_tool_use
+    if store_mod and type(store_mod.card_supports_tool_use) == "function" then
+        local ok_tool, tool_value = pcall(store_mod.card_supports_tool_use, model)
+        if ok_tool then declared_tool_use = boolean_or_nil(tool_value) end
+    end
+    if declared_tool_use ~= nil then
+        row.tool_use = declared_tool_use
+    else
+        row.tool_use = boolean_or_nil(supports.tool_use)
+    end
     row.streaming = boolean_or_nil(supports.streaming)
     row.reasoning = boolean_or_nil(supports.reasoning)
     row.vision = boolean_or_nil(supports.vision)
@@ -4073,6 +4146,174 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
     return entry
 end
 
+-- ------------------------------------------------ /v1/models 的广告面开关
+--
+-- 用户诉求（2026-10-04）：这台网关对外只暴露虚拟入口，不要把本地真实模型直接透出。
+-- 做成配置开关且缺省关：data[].id 的取值集合是 AGENTS.md 硬规则 9 第三条钉住的老契约
+-- （registry 的 worker 判定、watcher 的覆盖探针、客户端的模型选择全按 id 建），改缺省
+-- 会直接打断按真实模型名直连的客户端。要只透出入口由操作员在配置里打开。
+--
+-- 语义严格限定为「只广告虚拟入口」这一件事：真实模型仍然可路由、仍在 /workers 里、
+-- 仍然是入口 targets 的被调度对象。推理路径与 /workers 一个字节都不因它改变。
+--
+-- 读数两层，与 config_store 的优先级一致：磁盘快照（LMR_CONFIG_FILE）里的
+-- models_virtual_only 优先，其次环境变量 LMR_MODELS_VIRTUAL_ONLY，两边都没说过
+-- 才是关（= 改动前的输出逐字节一致）。
+--
+-- 为什么这里自己读磁盘原文而不是走 config_store.current()：那个键它不认识，
+-- snapshot_of 的字段表是封闭的，走 current() 只会永远读到 nil，操作员在配置文件里
+-- 写什么都没用。代价如实写在这里：从 /_ui/config 保存一次会把它抹掉（apply_document
+-- 重生成快照时不留未知键），所以这个开关的正式落点是 config_store 的三条线
+-- （ENV_NAMES 加名、cfg_from_document 认这个键、snapshot_of 回写它）加管理台一个
+-- 开关位，那三处由改 config_store 与 UI 的人一并收掉。
+--
+-- 整块收进一个表：本文件的主函数局部槽位离 LuaJIT 的 200 上限只剩 2 个（实测加第 3
+-- 个顶层 local 就编不过），所以这里的常量、缓存与函数一律做成表字段，整块只占一个
+-- 槽位。想在这一节加第二个顶层 local 的人请先把它塞回本表。
+local models_advertise = {
+    env_key = "LMR_MODELS_VIRTUAL_ONLY",
+    doc_key = "models_virtual_only",
+    ttl_s = 0.5,      -- 与 config_store 的 SNAPSHOT_TTL 同一档：热配置允许的陈旧度
+    on = false,       -- 缓存的读数
+    at = 0,           -- 上次读盘时刻（仅在有毫秒时钟时使用）
+}
+
+--- 真值判定，与 props.router_mode 同一族：认 true/1/yes/on，其余一律 false。
+--- 刻意「不认识即关」而不是「非假即真」：一个写错的字符串该退回缺省行为，
+--- 而不是把硬规则 9 第三条的老契约整页翻掉。
+function models_advertise.truthy(value)
+    if value == true then return true end
+    if type(value) ~= "string" then return false end
+    local v = value:match("^%s*(.-)%s*$"):lower()
+    return v == "true" or v == "1" or v == "yes" or v == "on"
+end
+
+--- cjson 的 null 与 Lua nil 分家。走 type(cjson) 守卫而不是裸索引：本块会被
+--- test/unit/test_models_shape.lua 连同 models_handler 一起切出去配桩加载，
+--- 那个受限环境里没有 cjson 这个 local。
+function models_advertise.nullish(value)
+    if value == nil then return true end
+    if type(cjson) == "table" and value == cjson.null then return true end
+    return false
+end
+
+--- 环境层读数：先 config_store.env（它会查 init_by_lua 抓的进程级快照），
+--- 再 os.getenv（裸跑单测，以及 conf 的 env 白名单还没放行时的兜底）。
+function models_advertise.from_env(store_mod)
+    local raw
+    if store_mod and type(store_mod.env) == "function" then
+        local ok_env, value = pcall(store_mod.env, models_advertise.env_key)
+        if ok_env then raw = value end
+    end
+    if raw == nil and type(os) == "table" and type(os.getenv) == "function" then
+        raw = os.getenv(models_advertise.env_key)
+    end
+    return models_advertise.truthy(raw)
+end
+
+--- 磁盘快照里操作员声明的那一份。任何一步不成立都答 nil = 「他没说」，于是让给
+--- 环境层。nil 与 false 必须分家：false 是「说了要全量广告」，是压过 env 的结论，
+--- nil 只是沉默（与硬规则 9 第二条同一套三态纪律）。
+---@param store_mod table|nil
+---@return boolean|nil
+function models_advertise.from_disk(store_mod)
+    local path
+    if store_mod and type(store_mod.env) == "function" then
+        local ok_env, value = pcall(store_mod.env, "LMR_CONFIG_FILE")
+        if ok_env and type(value) == "string" and value ~= "" then path = value end
+    end
+    if path == nil and type(os) == "table" and type(os.getenv) == "function" then
+        local value = os.getenv("LMR_CONFIG_FILE")
+        if type(value) == "string" and value ~= "" then path = value end
+    end
+    if path == nil then return nil end
+    if type(io) ~= "table" or type(io.open) ~= "function" then return nil end
+    local handle = io.open(path, "rb")
+    if not handle then return nil end
+    local text = handle:read("*a")
+    handle:close()
+    if type(text) ~= "string" or text == "" then return nil end
+    -- json_decode 是文件顶上的 local，切片单测把它连同本节一起切出去配桩加载时它不在
+    -- 环境表里（那里给的是 type/pcall/string/table 这一族），于是它在这里是全局 nil。
+    -- 与上面的 io 同纪律：先验可用，不可用就当「磁盘层没说」，让判定退回环境层。
+    if type(json_decode) ~= "function" then return nil end
+    local ok_json, doc = pcall(json_decode, text)
+    if not ok_json or type(doc) ~= "table" then return nil end
+    local raw = rawget(doc, models_advertise.doc_key)
+    if models_advertise.nullish(raw) then return nil end
+    return models_advertise.truthy(raw)
+end
+
+--- 开关读数。缓存只在有毫秒时钟（ngx.now）时启用：缺了它只能退回秒级 os.time，
+--- 于是「同一秒内改了配置」会读到上一秒的值，在单测里那会让判定自我怀疑（改了开关
+--- 却看不出变化，还被当成开关不生效）。宁可不缓存也不给判定掺陈旧值——这条路径只有
+--- /v1/models 一处读者，量级上撑不起缓存的收益。
+---@param store_mod table|nil
+---@return boolean
+function models_advertise.enabled(store_mod)
+    local now
+    if type(ngx) == "table" and type(ngx.now) == "function" then
+        now = ngx.now()
+    end
+    if now ~= nil then
+        if models_advertise.at > 0
+            and (now - models_advertise.at) < models_advertise.ttl_s then
+            return models_advertise.on
+        end
+    end
+    local decided = models_advertise.from_disk(store_mod)
+    if decided == nil then decided = models_advertise.from_env(store_mod) end
+    decided = decided and true or false
+    if now ~= nil then
+        models_advertise.at = now
+        models_advertise.on = decided
+    end
+    return decided
+end
+
+--- 只有入口的那份 data[]。一个入口一行，绝不静默少一条（少一条等于让客户端以为
+--- 这个服务不存在）：开关关掉真实模型那一半之后，原来「真实 worker 抢了入口的名字，
+--- 于是入口被丢弃」那条遮蔽规则已经没有对手，所以这里刻意不做遮蔽判定，配了几条
+--- 入口就出几条。重复别名照样去重（同一个 id 出两行会打断按 id 建索引的客户端），
+--- 保留的是列表里第一条——store 侧按别名排序，哪条在前是确定的。
+--- 返回 nil = 一份入口都拿不到（store 缺席 / reader 没落地 / 配置里根本没有入口），
+--- 调用方据此退回全量广告并如实报一行日志。
+--- capabilities 的聚合口径完全走 advertise_virtual_entry 原样，开关不参与。
+---@param store_mod table|nil
+---@param cfg table|nil
+---@param caps_by_model table|nil
+---@return table[]|nil data
+function models_advertise.only_data(store_mod, cfg, caps_by_model)
+    if not store_mod or type(store_mod.virtual_models_list) ~= "function" then
+        return nil
+    end
+    local ok_list, aliases = pcall(store_mod.virtual_models_list)
+    if not ok_list or type(aliases) ~= "table" or #aliases == 0 then
+        return nil
+    end
+    local data, seen = {}, {}
+    for i = 1, #aliases do
+        local row = aliases[i]
+        if type(row) == "table" then
+            local alias = row[1]
+            if type(alias) == "string" and alias ~= "" and not seen[alias] then
+                seen[alias] = true
+                local tail = {}
+                for j = 2, #row do
+                    tail[#tail + 1] = tostring(row[j])
+                end
+                data[#data + 1] = advertise_virtual_entry(store_mod, cfg,
+                    caps_by_model, alias, tail)
+            end
+        end
+    end
+    if #data == 0 then return nil end
+    table.sort(data, function(a, b)
+        return tostring(a.id) < tostring(b.id)
+    end)
+    return data
+end
+
 ---Advertise the runtime virtual-model aliases next to the real ones, the way
 ---inject_virtual_models (gateway/src/server.rs:831) does: an alias whose name a
 ---real worker already serves is skipped, the synthetic entries carry created 0
@@ -4127,6 +4368,21 @@ end
 
 local function models_handler()
     local models = registry.models()
+    local store_mod = store()
+    if models_advertise.enabled(store_mod) then
+        local data = models_advertise.only_data(store_mod, config_snapshot(),
+            model_caps_table())
+        if data then
+            return { object = "list", data = data }
+        end
+        -- 开关打开却一条入口都装配不出来：这不是「对外只暴露入口」，而是整个服务
+        -- 看起来消失了。按用户的纪律如实报出来（WARN 一行）并退回全量广告，让操作员
+        -- 从日志和面板上都能看见配置没生效，而不是让客户端猜。
+        if type(ngx) == "table" and type(ngx.log) == "function" then
+            pcall(ngx.log, ngx.WARN, "lua-router: models_virtual_only is on but no ",
+                "virtual entry is available; advertising real models instead")
+        end
+    end
     if #models == 0 then
         -- Rust only rewrites responses that carry a "data" array, so the
         -- no-worker text answer is returned untouched.
@@ -4134,7 +4390,6 @@ local function models_handler()
     end
     -- 配置快照与引擎广告表**只取一次**往下传：current() 会解码整份快照，
     -- 一个请求读两遍纯属白付（列表里 N 个模型也共享同一份读数）。
-    local store_mod = store()
     local cfg = config_snapshot()
     local caps_by_model = model_caps_table()
     local data = {}
@@ -4146,6 +4401,7 @@ local function models_handler()
     })
     return { object = "list", data = data }
 end
+
 
 ---The Rust gateway answers this from router_manager with routers/workers counts;
 ---the Lua router has exactly one router, so it reports the same keys plus its own
@@ -5308,6 +5564,11 @@ _M.build = build
 _M.health_handler = health_handler
 _M.readiness_handler = readiness_handler
 _M.models_handler = models_handler
+-- 导出开关状态表：单测与 /_ui 侧要能问「这个开关现在是什么状态」，否则操作员改了
+-- 配置只能靠 data[] 的条数反推。刻意放在底部导出区而不是本节内——test/unit/
+-- test_models_shape.lua 会把本节连 models_handler 一起切出去配桩加载，那个受限
+-- 环境里没有 _M，写在节内会让切片编译成对全局 _M 的索引。
+_M.models_advertise = models_advertise
 _M.server_info_handler = server_info_handler
 _M.create_worker_handler = create_worker_handler
 _M.list_workers_handler = list_workers_handler
