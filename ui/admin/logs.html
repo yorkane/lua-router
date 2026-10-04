@@ -27,6 +27,13 @@
     .agg-table tbody tr:hover td { background: rgba(255, 255, 255, .018); }
     .agg-table td.ellipsis { max-width: 34ch; }
     .agg-empty td { color: var(--muted); text-align: center; padding: 18px 12px; }
+    /* 吞吐卡：三个数各带自己的标签，不靠位置猜哪个是输入哪个是输出。
+       允许换行是因为窄屏下三项挤一行会断行错位；字号比 stat-value 单行紧一档。 */
+    .tok-lines { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-top: 7px; }
+    .tok-item { display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+    .tok-item > i { color: var(--muted); font-size: 11.5px; font-style: normal; letter-spacing: .02em; }
+    .tok-item > b { font-size: 21px; font-weight: 520; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+    .tok-item.fresh > b { color: #4dd0b0; }
   </style>
 </head>
 <body>
@@ -76,9 +83,21 @@
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
-              <div class="stat-label">{{ t.summaryOut }} · {{ t.summaryIn }} {{ t.summaryWindow60 }}</div>
-              <div class="stat-value">{{ fmtThousands(stats.output_tok_s) }} <span class="muted" style="font-size:15px">/ {{ fmtThousands(stats.input_tok_s) }}</span></div>
-              <div class="stat-note">{{ t.summaryTokOut }} {{ fmtK(stats.completion_tokens_window) }} / {{ t.summaryTokIn }} {{ fmtK(stats.input_tokens_window) }} · {{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}</div>
+              <!-- 输入侧拆成两个数并排：含缓存的原始 prompt 是计费/传输量，新读入才是引擎真正
+                   prefill 的量。此前只显示前者，而真实流量 cache 命中 p50 98.3%，让「输入 tok/s」
+                   比实际 prefill 高出十几倍，容量规划照它读会得出完全错误的结论。
+                   三个数各带标签（不再用「A / B」靠位置区分），副行给出 cache 命中占比作为
+                   解释两个数差多少倍的上下文。文案走页内 AGG_DICT（i18n.js 他人并行维护）。 -->
+              <div class="stat-label">{{ ta('tokCardLabel') }} {{ t.summaryWindow60 }}</div>
+              <div class="tok-lines">
+                <span class="tok-item"><i>{{ ta('tokInCached') }}</i><b>{{ fmtThousands(stats.input_tok_s) }}</b></span>
+                <span class="tok-item fresh"><i>{{ ta('tokInFresh') }}</i><b>{{ fmtThousands(stats.input_fresh_tok_s) }}</b></span>
+                <span class="tok-item"><i>{{ ta('tokOut') }}</i><b>{{ fmtThousands(stats.output_tok_s) }}</b></span>
+              </div>
+              <!-- cache_hit_pct 在首帧（stats 还是空对象）是 undefined，用 || 一并兜成 —，
+                   否则 ta 的占位符替换会把 "{pct}" 原样印在卡上 -->
+              <div class="stat-note">{{ ta('tokCacheHit', { pct: stats.cache_hit_pct || ta('dash') }) }} · {{ ta('tokTotals', { raw: fmtK(stats.input_tokens_window), fresh: fmtK(stats.input_fresh_tokens_window), out: fmtK(stats.completion_tokens_window) }) }}</div>
+              <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }} · {{ ta('tokWindowBasis') }}<template v-if="stats.estimated_excluded"> · {{ ta('tokEstExcluded', { n: stats.estimated_excluded }) }}</template></div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-database-sync" class="stat-icon red"></q-icon>
@@ -327,6 +346,110 @@
     const LOCAL_CAP = 4000          // 本地列表上限，超出丢弃最旧
     const STATS_POLL_MS = 5000
 
+    // ── BEGIN token-window-stats（纯算术，无 Date / 无随机 / 无顺序依赖）──
+    // 探针按字节切这一段（见 /data/tmp/probe_tok_stats.js），所以这段里不许引用
+    // Vue、window、locale 等任何外部标识符，也不许依赖函数提升去调外面的东西。
+    const STATS_WINDOW_MS = 60000
+
+    // 完成时刻 = ts_ms + duration_ms。ts_ms 是 lr_started（router.lua 的入站时刻），
+    // 按它切窗口会把「60 秒前开始、刚在这 60 秒里结束」的长请求整条漏掉。
+    // duration_ms 缺失/非法时退回 ts_ms，即对那一行保持旧的按开始时刻语义——
+    // 宁可少算 0 秒偏移，也不要把未知时长当成无穷大把它永久挤出窗口。
+    function completionMs (row) {
+      const ts = Number(row && row.ts_ms)
+      if (!Number.isFinite(ts)) return null
+      const dur = Number(row && row.duration_ms)
+      if (!Number.isFinite(dur) || dur < 0) return ts
+      return ts + dur
+    }
+
+    function tokenInt (value) {
+      const n = Number(value)
+      if (!Number.isFinite(n) || n < 0) return 0
+      return n
+    }
+
+    // 单行口径：cached 是 prompt 的子集，越界（引擎报 cached > prompt）按 prompt 钳住，
+    // 否则「新读入」会变成负数、把整卡的 tok/s 拖成负值。
+    function rowTokens (row) {
+      const prompt = tokenInt(row && row.prompt_tokens)
+      const cached = Math.min(prompt, tokenInt(row && row.cached_tokens))
+      return { prompt: prompt, cached: cached, fresh: prompt - cached, completion: tokenInt(row && row.completion_tokens) }
+    }
+
+    // 汇总：token 类总量只统计引擎自报 usage 的行（tokens_estimated 为真值时剔除——那种行的
+    // prompt 是估算出来的，混进分母会让两个 tok/s 一起失真）；请求数/错误数仍算全部行，
+    // 因为那是真实发生的请求，只是它的 token 读数不可信。
+    function summarizeWindow (list, now, windowMs) {
+      const span = Number(windowMs) > 0 ? Number(windowMs) : STATS_WINDOW_MS
+      const seconds = span / 1000
+      let n = 0
+      let errors = 0
+      let estimatedRows = 0
+      let prompt = 0
+      let cached = 0
+      let completion = 0
+      const durations = []
+      const ttfts = []
+      for (let i = 0; i < list.length; i++) {
+        const row = list[i]
+        const done = completionMs(row)
+        if (done === null) continue
+        const age = Number(now) - done
+        if (!(age >= 0) || !(age <= span)) continue
+        n += 1
+        const status = Number(row.status)
+        if (Number.isFinite(status) && status >= 400) errors += 1
+        const dur = Number(row.duration_ms)
+        if (Number.isFinite(dur) && dur >= 0) durations.push(dur)
+        const ttft = Number(row.ttft_ms)
+        if (Number.isFinite(ttft) && ttft >= 0) ttfts.push(ttft)
+        if (row.tokens_estimated) { estimatedRows += 1; continue }
+        const tk = rowTokens(row)
+        prompt += tk.prompt
+        cached += tk.cached
+        completion += tk.completion
+      }
+      const fresh = prompt - cached
+      return {
+        n: n,
+        errors: errors,
+        estimatedRows: estimatedRows,
+        promptTokens: prompt,
+        cachedTokens: cached,
+        freshTokens: fresh,
+        completionTokens: completion,
+        inputTokS: Math.round(prompt / seconds),
+        inputFreshTokS: Math.round(fresh / seconds),
+        outputTokS: Math.round(completion / seconds),
+        cacheHitPct: prompt > 0 ? cached / prompt * 100 : null,
+        avgDurationMs: durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null,
+        avgTtftMs: ttfts.length ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null,
+        windowS: seconds
+      }
+    }
+    // 旧口径（按开始时刻切 + 盲加 prompt）留在文件里给探针复现用，热路径不再调它。
+    function summarizeWindowLegacy (list, now, windowMs) {
+      const span = Number(windowMs) > 0 ? Number(windowMs) : STATS_WINDOW_MS
+      const win = list.filter(row => {
+        const ts = Number(row && row.ts_ms)
+        return Number.isFinite(ts) && (Number(now) - ts) < span
+      })
+      let prompt = 0
+      let completion = 0
+      for (let i = 0; i < win.length; i++) {
+        prompt += tokenInt(win[i] && win[i].prompt_tokens)
+        completion += tokenInt(win[i] && win[i].completion_tokens)
+      }
+      return {
+        n: win.length,
+        promptTokens: prompt,
+        inputTokS: Math.round(prompt / (span / 1000)),
+        outputTokS: Math.round(completion / (span / 1000))
+      }
+    }
+    // ── END token-window-stats ──
+
     const app = Vue.createApp({
       setup () {
         const rows = ref([])
@@ -429,7 +552,17 @@
             thEffort: 'effort（生效档位）', thRewrites: '被改写次数', thRewriteExample: '改写示例',
             aggEmptyLogs: '暂无请求记录', aggEmptyBackends: '暂无已路由到后端的请求',
             aggEmptyEffort: '暂无带推理强度的请求',
-            effortDefault: '(默认)', dash: '—', unknownModel: '(未知模型)'
+            effortDefault: '(默认)', dash: '—', unknownModel: '(未知模型)',
+            // 吞吐卡（原「输出 tok/s · 输入 tok/s」单值卡）：输入侧两个数必须各自带标签，
+            // 否则没人分得清哪个是含缓存的计费量、哪个是引擎真读的量。
+            tokCardLabel: '输入 / 输出 tok/s',
+            tokInCached: '入 tok/s（含缓存）',
+            tokInFresh: '入 tok/s（新读入）',
+            tokOut: '出 tok/s',
+            tokCacheHit: 'cache 命中 {pct}',
+            tokTotals: '入 总/新 {raw} / {fresh} · 出 {out}',
+            tokWindowBasis: '窗口按请求完成时刻切',
+            tokEstExcluded: '已剔除 {n} 条估算 token'
           },
           'en-US': {
             aggTitle: 'Aggregates', aggExpand: 'Expand aggregates', aggCollapse: 'Collapse aggregates',
@@ -442,9 +575,18 @@
             thEffort: 'Effort (effective)', thRewrites: 'Rewritten', thRewriteExample: 'Rewrite example',
             aggEmptyLogs: 'No request records', aggEmptyBackends: 'No requests routed to a backend',
             aggEmptyEffort: 'No requests with an effort level',
-            effortDefault: '(default)', dash: '—', unknownModel: '(unknown model)'
+            effortDefault: '(default)', dash: '—', unknownModel: '(unknown model)',
+            tokCardLabel: 'in / out tok/s',
+            tokInCached: 'in tok/s (with cache)',
+            tokInFresh: 'in tok/s (newly read)',
+            tokOut: 'out tok/s',
+            tokCacheHit: 'cache hit {pct}',
+            tokTotals: 'in total/new {raw} / {fresh} · out {out}',
+            tokWindowBasis: 'window sliced by request completion time',
+            tokEstExcluded: '{n} estimated-token row(s) excluded'
           }
         }
+
         const EFFORT_DEFAULT_KEY = String(AGG_DICT['zh-CN'].effortDefault)
         const EFFORT_ORDER = (window.lmrApi && window.lmrApi.effortLevels) || []
         const aggOpen = ref(false)
@@ -793,30 +935,34 @@
             // 采样桶数当分母，稀疏流量时 elapsed 极小，外推出夸张的瞬时值。
             // inflight/buffered/uptime 仍从后端取（它们是实时计数器不是窗口统计）。
             const now = Date.now()
-            const win = rows.value.filter(r => now - (r.ts_ms || 0) < 60000)
-            const errs = win.filter(r => (r.status || 0) >= 400).length
-            // 吞吐口径：窗口内 token 总量 ÷ 窗口秒数（60），即窗口平均吞吐。
-            // 输出 tok/s 与副行的「Tok 出」总量同源，操作员用 总量/60 就能验算，
-            // 也不再有"中位数速率×条数"那种把请求条数当并发乘出来的虚高值。
-            const outTokSum = win.reduce((a, r) => a + (r.completion_tokens || 0), 0)
-            const inTok = win.reduce((a, r) => a + (r.prompt_tokens || 0), 0)
-            const outTok = Math.round(outTokSum / 60)
-            const inTokPerS = Math.round(inTok / 60)
-            const durs = win.filter(r => r.duration_ms != null).map(r => r.duration_ms)
-            const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
-            const ttfts = win.filter(r => r.ttft_ms != null).map(r => r.ttft_ms)
-            const avgTtft = ttfts.length ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null
+            // 口径（本轮修复，逐条对应生产实测）：
+            // 1) 窗口按「完成时刻」ts_ms + duration_ms 切，而不是 ts_ms（= lr_started 开始时刻）。
+            //    旧切法把开始于 60 秒前、刚结束于窗口内的长请求整条漏掉，实测同一时刻 36 条 vs 43 条、
+            //    少算 22% 的 prompt token（其中一条 duration 150 秒）。
+            // 2) 输入侧同时给「含缓存」与「新读入」两个数：cached_tokens 是 prompt_tokens 的子集，
+            //    只报前者在真实流量（cache 命中 p50 98.3%）下会把输入吞吐夸到 16 倍。
+            // 3) tokens_estimated 的行不进 token 总量（读数非引擎自报），但仍计入请求数与错误数。
+            // 连带影响（已确认接受）：窗口请求数/错误数/平均耗时/平均 TTFT 一并改成完成时刻口径，
+            // 第二张卡的 n 会比原来略大——这是同一份 win 集合的产物，两套口径不能混用。
+            const agg = summarizeWindow(rows.value, now, STATS_WINDOW_MS)
+            const avgDur = agg.avgDurationMs
+            const avgTtft = agg.avgTtftMs
             stats.value = {
               ...raw,
-              requests_window: win.length,
-              errors_window: errs,
-              output_tok_s: outTok,
-              input_tok_s: inTokPerS,
+              requests_window: agg.n,
+              errors_window: agg.errors,
+              output_tok_s: agg.outputTokS,
+              input_tok_s: agg.inputTokS,
+              input_fresh_tok_s: agg.inputFreshTokS,
+              cache_hit_pct: agg.cacheHitPct === null ? null : agg.cacheHitPct.toFixed(1) + '%',
               avg_duration_ms: avgDur,
               avg_ttft_ms: avgTtft,
-              input_tokens_window: inTok,
-              completion_tokens_window: outTokSum,
-              window_s: 60,
+              input_tokens_window: agg.promptTokens,
+              input_fresh_tokens_window: agg.freshTokens,
+              cached_tokens_window: agg.cachedTokens,
+              completion_tokens_window: agg.completionTokens,
+              estimated_excluded: agg.estimatedRows,
+              window_s: agg.windowS,
             }
           } catch (error) {
             // 日志关闭或瞬时故障：摘要保持上一次的值
