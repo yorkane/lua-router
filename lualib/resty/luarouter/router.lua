@@ -42,6 +42,9 @@ local registry = require "resty.luarouter.registry"
 -- the tokenize/parse proxies went with it (doc/scope-trim.md): /v1/responses
 -- stays as a pure inference route and that proxy family is not routed.
 local mesh_mod = require "resty.luarouter.mesh"
+-- UTF-8 码点级截断（prompt 预览用）：复用 policies 侧已有的 utils.utf8_head，
+-- 不自造第二套 UTF-8 实现。纯 Lua、无 ngx 依赖，加载安全。
+local policy_utils = require "resty.luarouter.policies.utils"
 -- Worker marks written by the streaming usage injection (see forward()): the
 -- registry keeps its own copy of this dict name because it owns the keys that
 -- belong to it, and sharing one module constant across the boundary would make
@@ -3257,7 +3260,9 @@ end
 ---都汇合到 route_inference，且 body 到那里必定已经是解码好的 table，
 ---所以只在这一个点提取一次即可覆盖全部入口。
 ---必须从已解码的 table 里读，绝不重新编码请求体（AGENTS.md 红线：推理体字节透传）；
----本函数纯读、O(消息数) 且只做到 sub(1,50)。
+---本函数纯读、O(消息数) 且只做到前 50 字符。截断必须按 UTF-8 码点计（复用
+---policies/utils.utf8_head），LuaJIT 的 string.sub 按字节切，直接从多字节汉字中间
+---切断会在 UI 日志页渲染出一个 U+FFFD 替换字符。
 ---@param body table|nil
 ---@return string|nil
 local function extract_prompt_preview(body)
@@ -3272,7 +3277,7 @@ local function extract_prompt_preview(body)
         if m and m.role == "user" then
             local c = m.content
             if type(c) == "string" then
-                return c:sub(1, 50)
+                return policy_utils.utf8_head(c, 50)
             elseif type(c) == "table" then
                 for _, part in ipairs(c) do
                     if type(part) == "table" then
@@ -3281,7 +3286,7 @@ local function extract_prompt_preview(body)
                         if part.type == "text" or part.type == "input_text" then
                             local t = part.text
                             if type(t) == "string" then
-                                return t:sub(1, 50)
+                                return policy_utils.utf8_head(t, 50)
                             end
                         end
                     end
