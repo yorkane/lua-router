@@ -720,6 +720,73 @@ function _M.card_key(host, gpu)
     return tostring(host or "") .. CARD_SEP .. tostring(gpu)
 end
 
+---url -> (host, port) identity key, with the scheme's default port made explicit.
+---
+---Why the lookup needs a second key beyond the url text: the hint is written under
+---the *watcher's* canonical url (watcher.normalize_url lower-cases the host and drops
+---a default :80/:443) but read with the *registry's* record.url (registry
+---normalize_url only adds a scheme and trims trailing slashes -- it keeps ":80" and
+---the original case). The two normalizers disagree, so an exact-string hint table
+---misses whenever an operator seeds SMG_WORKER_URLS as
+---"http://GPU-Box:8012" and the watcher discovers "http://gpu-box:8012". A miss is
+---not harmless any more: with per-card attribution in force, "no card resolved" means
+---"no watt written", so a pure spelling difference would switch a worker's power cap
+---off. split_host() is the one function both paths already agree on semantically
+---(assign() matches series to workers through it), so the identity goes through it
+---too, and the port is defaulted per scheme so :80 and the bare form meet.
+---@param url string|nil
+---@return string|nil key @ "host:port", or nil when the url cannot be named
+function _M.host_port_key(url)
+    if type(url) ~= "string" or url == "" then
+        return nil
+    end
+    local host, port = _M.split_host(url)
+    if not host then
+        return nil
+    end
+    if not port then
+        port = (string.match(string.lower(url), "^https://") ~= nil) and 443 or 80
+    end
+    return host .. ":" .. tostring(port)
+end
+
+---Compile the watcher's url -> gpu snapshot into a lookup index.
+---
+---Two levels: the exact url (the common case, and the only one that can distinguish
+---two containers that share a host but were registered with different spellings) and
+---the host:port identity for the normalizer-mismatch case. An ambiguous bucket is
+---**dropped** rather than resolved by whoever wrote last: two candidate urls that
+---collapse to the same identity yet name different cards mean the gateway does not
+---know which card lives at that address, and guessing there is how a watt reading
+---ends up on the wrong worker. Dropping is also order-independent, which is what
+---keeps a pass reproducible across runs (see the determinism probe).
+---@param hints table|nil @ url -> gpu id (raw snapshot)
+---@return table @ index accepted by worker_card()
+function _M.hint_index(hints)
+    local exact, buckets, seen = {}, {}, {}
+    if type(hints) == "table" then
+        for url, gpu in pairs(hints) do
+            local card = _M.worker_gpu({ labels = { gpu = gpu } })
+            if type(url) == "string" and url ~= "" and card ~= nil then
+                exact[url] = card
+                local key = _M.host_port_key(url)
+                if key then
+                    local prior = seen[key]
+                    if prior == nil or prior == card then
+                        seen[key] = card
+                        buckets[key] = card
+                    else
+                        -- two different cards claim one address: keep neither
+                        seen[key] = false
+                        buckets[key] = nil
+                    end
+                end
+            end
+        end
+    end
+    return { __card_index = true, exact = exact, buckets = buckets }
+end
+
 ---The card id to attribute one worker's power reading to, or nil for "unknown".
 ---
 ---Two sources, checked in this order, and the order matters in production:
@@ -737,7 +804,8 @@ end
 ---feature inside gpu_load.lua + watcher.lua: no registry change is required, and
 ---nothing here depends on labels ever arriving.
 ---@param record table|nil
----@param hints table|nil @ url -> gpu id (watcher ledger snapshot)
+---@param hints table|nil @ a hint_index() (preferred; compiled once per pass) or a raw
+---                        url -> gpu id table (test seams, probes)
 ---@return string|nil gpu
 function _M.worker_card(record, hints)
     if type(record) ~= "table" then
@@ -745,12 +813,16 @@ function _M.worker_card(record, hints)
     end
     local url = record.url
     if type(url) == "string" and type(hints) == "table" then
-        local hint = hints[url]
-        if type(hint) == "string" or type(hint) == "number" then
-            local text = string.match(tostring(hint), "^%s*(.-)%s*$")
-            if text and string.match(text, "^%d+$") then
-                return text
-            end
+        local index = hints.__card_index and hints or _M.hint_index(hints)
+        local card = index.exact[url]
+        if card == nil then
+            -- The hint was written under the watcher's canonical url and we are
+            -- reading with the registry's, so a spelling difference (:80, host case)
+            -- has to fall through to the host:port identity rather than miss.
+            card = index.buckets[_M.host_port_key(url) or ""]
+        end
+        if card ~= nil then
+            return card
         end
     end
     return _M.worker_gpu(record)
@@ -798,11 +870,18 @@ end
 ---was produced, so power_unmatched keeps its current meaning ("this host's series
 ---matched no pooled worker") and a missing card cannot inflate it into a bogus label
 ---mismatch.
+---`source_has_cards` accepts a boolean (the metrics path: one /metrics body, so the
+---whole question is about that one machine) or a host -> true set (the prom path,
+---where one pass can span several machines and even several *kinds* of source). The
+---set form is what power_fold already answers as `card_hosts`: if box A reports DCGM
+---per-card series and box B only has node_exporter, B's workers must keep the
+---whole-machine reading (their source really is not per-card) instead of being
+---starved by a global flag A happens to have set.
 ---@param workers table[]|nil
 ---@param by_host table|nil @ host -> whole-machine watts
 ---@param cards table|nil @ card_key(host, gpu) -> watts
----@param source_has_cards boolean|nil
----@param hints table|nil @ url -> gpu id
+---@param source_has_cards boolean|table|nil @ boolean, or host -> true
+---@param hints table|nil @ hint_index or raw url -> gpu id
 ---@return table @ worker id -> watts
 ---@return number @ unmatched host count
 function _M.assign_power(workers, by_host, cards, source_has_cards, hints)
@@ -817,7 +896,11 @@ function _M.assign_power(workers, by_host, cards, source_has_cards, hints)
         if host and type(by_host) == "table" and by_host[host] ~= nil then
             claimed[host] = true
             local watts
-            if source_has_cards then
+            local per_card = source_has_cards
+            if type(per_card) == "table" then
+                per_card = per_card[host] == true
+            end
+            if per_card then
                 local gpu = _M.worker_card(worker, hints)
                 -- 认不出卡 或 该卡无 series -> 什么都不写（不是整机 max）。见上方
                 -- 四路口径：源已经是逐卡的了，整机 max 就是**别人那张卡**的瓦特，
@@ -1655,6 +1738,8 @@ function _M.run_pass(cfg, opts)
         if hints == nil then
             hints = default_gpu_hints()
         end
+        -- 编成查找索引一次（exact + host:port 两级），worker 循环里只查不编。
+        hints = _M.hint_index(hints)
         if power.query then
             -- 配了功率 PromQL 却把负载源设成 metrics：这条查询永远不会被执行。
             -- metrics 路没有 Prometheus 可问，只能扫 worker 自己的 /metrics。与其
@@ -1866,11 +1951,14 @@ function _M.run_pass(cfg, opts)
 --- exporter 上一直齐全（/data/tmp/dcgm-metrics-9400.txt 有 gpu="0"…"7" 八条），
 --- 所以口径是「查询别聚合掉 gpu，网关按 worker 自己的卡分发」。
         local by_power = {}
-        -- 逐卡表与「数据源到底认不认得卡」：后者是**整源**属性而不是逐 worker 判定，
-        -- 因为它决定的是「这个数据源有没有逐卡形状」，用它区分「老数据源 → 整机 max
-        -- （今天的行为）」与「有逐卡数据但这个 worker 认不出卡」。
+        -- 逐卡表，与「这一台机器的数据源到底是不是逐卡的」。后者取自 power_fold 自己
+        -- 给出的 card_hosts（按 host 记），刻意**不是**一个全局布尔：prom 路一轮可以跨
+        -- 多台机器，而一个 fleet 里「A 机跑 dcgm-exporter、B 机只有 node_exporter」是
+        -- 常态。用全局标志的话，A 机有逐卡 series 会把 B 机一起拖进逐卡口径，于是 B 机
+        -- 那些「本来就认不出卡」的 worker 一个读数都拿不到 —— 一台机器的监控形状把
+        -- 另一台机器的功率通道关掉。
         local by_card_power = {}
-        local source_has_cards = false
+        local card_hosts = {}
         local function one_power(query, target)
             local ok_call, status, body, err = pcall(post, endpoint, timeout_ms,
                 headers, _M.query_body(query))
@@ -1897,7 +1985,7 @@ function _M.run_pass(cfg, opts)
             end
             -- 逐卡展开（= host_powers 的展开版；expose_cards=false 时两者逐字节同值，
             -- 所以只有 prom 路受益，且缺 gpu 标签时不会比今天少一个读数）。
-            local folded, cards, _, have_cards = _M.host_card_powers(rows)
+            local folded, cards, card_hosts_of_query = _M.host_card_powers(rows)
             for host, watts in pairs(folded) do
                 if by_power[host] == nil or watts > by_power[host] then
                     by_power[host] = watts
@@ -1910,8 +1998,8 @@ function _M.run_pass(cfg, opts)
                     by_card_power[key] = watts
                 end
             end
-            if have_cards then
-                source_has_cards = true
+            for host in pairs(card_hosts_of_query) do
+                card_hosts[host] = true
             end
             stats.power_probed = stats.power_probed + 1
             return true
@@ -1952,23 +2040,23 @@ function _M.run_pass(cfg, opts)
             if hints == nil then
                 hints = default_gpu_hints()
             end
-            -- 按 worker 各自的卡分发（四路口径见 assign_power 上方注释：源无逐卡
-            -- 标签 → 整机 max；认不出卡 → 整机 max；认得出且有该卡 series → 本卡
-            -- 瓦特；认得出却没有该卡 series → 什么都不写，绝不拿邻居卡冒充）。
+            hints = _M.hint_index(hints)
+            -- 按 worker 各自的卡分发（四路口径见 assign_power 上方注释：源无逐卡标签
+            -- → 整机 max；认得出且有该卡 series → 本卡瓦特；认不出卡 / 该卡无 series
+            -- → 什么都不写，绝不拿邻居卡的整机 max 冒充）。
             local p_assigned, p_unmatched = _M.assign_power(workers, by_power,
-                by_card_power, source_has_cards, hints)
+                by_card_power, card_hosts, hints)
             stats.power_unmatched = p_unmatched
             -- 「本 pass 里有多少 worker 真的按自己那张卡拿到读数」。没有这个计数，
             -- 「全部逐卡成功」与「全部悄悄退回整机 max」在 /metrics 上长得一模一样，
             -- 而后者正是 342.371 故障能一直活着的原因。
             local card_hits = 0
-            if source_has_cards then
-                for i = 1, #workers do
-                    local w = workers[i]
-                    if w and p_assigned[w.id] ~= nil
-                        and _M.worker_card(w, hints) ~= nil then
-                        card_hits = card_hits + 1
-                    end
+            for i = 1, #workers do
+                local w = workers[i]
+                local host = w and _M.split_host(w.url)
+                if w and host and card_hosts[host] and p_assigned[w.id] ~= nil
+                    and _M.worker_card(w, hints) ~= nil then
+                    card_hits = card_hits + 1
                 end
             end
             stats.power_per_card = card_hits
