@@ -17,14 +17,28 @@
 -- 但走 registry 的独立键（pw:，毫瓦）而不是负载归一化那一路：
 --   * 功率是**绝对瓦特**，不是 0..1 打分，所以绝不进 _M.normalize()（那会把 90 W
 --     当成 90 % 折成满载），也不写进 load()/K_XLOAD。
---   * 一台 worker 对应整台机器的多张卡时取**所有卡的最大值**：上限判定要避免把请求
---     打到已经最热的那张卡上，取和会让「一张满载七张空闲」看起来仍然很闲。
+--   * 读数优先按**卡**归属：worker 认得出自己那张卡（watcher 台账的 g|<url> 键，由
+--     watcher 从容器名 pennyroyal-gpu7 → "7" 解析而来；registry 记录的 labels.gpu 只作
+--     第二来源，理由见 worker_card() 上方）且数据源给了逐卡 series 时，写的是
+--     **它自己那张卡**的瓦特。「认不出卡」与「该卡没有 series」两种情形**都不写键**，
+--     不拿整机 max 顶替：源已经是逐卡的时候，整机 max 是邻居那张卡的瓦特，写进来就等于
+--     让一张空闲 worker 因为邻居满载而被排除出候选集——那正是下面「绝不写 0、绝不沿用
+--     旧值」要防的同一类事故（监控的一个缺口吃掉容量）。代价如实说明：认不出卡的 worker
+--     不受功率上限约束，与 exporter 掉线时一模一样；要把它纳进上限判定，就把容器登记成
+--     带 gpuN 的名字，并看 lr_gpu_load_power_per_card_workers 覆盖了几台。
+--     只有「数据源根本没有逐卡标签」这一种才回落整机 max（node_exporter、operator 写
+--     by(Hostname)、或引擎只报一个整机 gauge 的场景——那也是改动前的唯一口径，逐字节
+--     保持不变，否则一直在用的数据源会在逐卡落地当天变黑）。两条通道在意的那条边界
+--     始终一致：整机口径取 max 而不是取和/取平均（取和会让「一张满载七张空闲」
+--     看起来仍然很闲）。
 --     口径（router/文档/UI 必须按这一句写，运维按它配阈值）：per-worker 功率上限
---     max_power_w 比较的是**本机最热那张卡的绝对瓦特**，不是该 worker 独占那张卡的
---     瓦特。一台 8 卡机上的每个实例都看得见全部卡，所以同机 worker 拿到同一个读数；
---     多卡共机上据此排除会比「只按自己那张卡」保守，这是有意的（宁可少打一份流量，
---     也不把请求塞给一张已经顶到 TDP 的卡）。想按单卡 TDP 配的运维要先把 worker 与卡
---     一一对上，否则阈值会提前触发。
+--     max_power_w 比较的是「该 worker 自己那张卡的绝对瓦特」；数据源没有逐卡标签时是
+--     「本机最热那张卡的绝对瓦特」；认不出卡或该卡无 series 时**没有读数**（不排除）。
+--     21.k 生产上 8 个 worker 曾全部读到同一个数（245/246 的
+--     max by (Hostname,instance) 把 8 张卡折成 1 条 series，逐卡标签在 Prometheus 侧就
+--     丢了），power_of_two 与 max_power_w 因此零区分度；逐卡数据本身在 exporter 上一直
+--     齐全（DCGM_FI_DEV_POWER_USAGE{gpu="6",...} 93.111），要的是查询别把它聚合掉，
+--     默认查询串见 host_card_powers() 上方注释。
 --   * 采不到就什么都不写，让 TTL 自然过期回到 registry.power_w() == nil，router 侧
 --     「未知 -> 不排除」。写 0 或沿用上一次的旧值都会让一个坏掉的 exporter 把 worker
 --     永久顶在功率上限之外，那是监控系统故障吃掉容量。
@@ -371,7 +385,11 @@ local function split_sample(line)
     end
     local rest = string.sub(line, split_at + 1)
     local value = string.match(rest, "^%s*([^%s]+)")
-    return identity, value
+    -- Third return: the identity *with* its label section, which is what the
+    -- per-card power channel needs (split_sample()'s first return drops the
+    -- braces, and the max-gauge readers never wanted them). Existing callers
+    -- take two values, so this is additive.
+    return identity, value, string.sub(line, 1, split_at - 1)
 end
 _M.split_sample = split_sample
 
@@ -511,43 +529,371 @@ function _M.max_power_watts(text, names)
     return best
 end
 
----Fold a result vector down to one **watt** reading per host (hottest card wins).
+---Per-card watt readings for one /metrics exposition (the metrics path's power scan).
 ---
----host_values() 的功率版：唯一的区别是不走 normalize()。那是本模块最容易写错的
----一行——照抄 host_values() 会把 96 W 折成 1.0（96/100 夹到上限），于是功率通道
----输出的「1」既不是瓦特也不是负载，上限判定拿它去比 max_power_w 就永远不成立。
----多卡取最大而非取和/取平均：一台 worker 往往看得见整机所有卡，路由要避免把请求
----打到已经最热的那张卡上，取和会让「一张满载七张空闲」看起来仍然很闲。
----
---- 标签匹配比 host_values() 宽一档，而且要解决一个 host_values() 从来不需要面对的
---- 歧义：dcgm-exporter 的机器名标签是**大写** Hostname（见 /data/tmp/dcgm-metrics-9400.txt），
---- host_of() 只认小写键，所以先把标签键小写化；但小写化之后 Hostname 仍然排在
---- HOST_LABELS 里 instance 的**后面**，而 dcgm 的每条 series 都同时带
---- instance="127.0.0.1:9400"——那是 exporter 被抓取的地址，不是机器身份。照抄
---- host_of() 的优先级会让两台机器各自的 dcgm-exporter 因为 instance 相同被折成同一个
---- 键，A 机器最热的卡把 B 机器的 worker 顶出自己的功率上限，而 unmatched 仍是 0、
---- 日志一声不响（跨机串瓦数）。反过来，若 operator 按注释里的建议写
---- max by (Hostname)(...)，结果只剩 Hostname，而 worker url 是 http://127.0.0.1:80xx
---- （21.k 生产实例的八个 worker 全这样），按机器名匹配又会全部 unmatched。两个方向都
---- 要能落地，所以这里自己定优先级并**同时**登记两把键：
----   * 机器名标签（Hostname / hostname / nodename / host / node / pod / name）→
----     键 = 机器名，覆盖「operator 只 by(Hostname)」与「url 用可解析主机名」两种写法；
----   * instance → 键 = 它的主机部分，但只有它是非环回地址（真·机器地址），或共享这个
----     环回 instance 的整批 series 只属于**一台**机器时才采纳。后者正是本 fleet 的常态：
----     21.k 的八个 worker 全注册成 http://127.0.0.1:80xx，dcgm 的 instance 是
----     127.0.0.1:9400，两边在 "127.0.0.1" 这个键上相遇。一旦同一个环回 instance 背后
----     出现两个不同 Hostname，说明这台 Prometheus 抓了多台机器的本机 exporter，此时环回
----     键没有资格代表其中任何一台，整个不采纳（→ 采不到 → 什么都不写，绝不猜）。
---- 只作用于功率通道，负载那一路的匹配语义保持原样（改动它会影响既有 e2e 的断言）。
----@param rows table[]|nil @ parse_prom_response() rows
----@return table @ host -> watts (only usable readings)
-function _M.host_powers(rows)
-    local by_host = {}
-    if type(rows) ~= "table" then
-        return by_host
+---The metrics path dials a worker's *own* /metrics, so every series in the body
+---belongs to that machine: no host matching is involved (that is the prom path's
+---problem, and host_powers() owns it). Two reductions come out of one pass:
+---  * whole -> the max over every usable series: byte-for-byte what
+---    max_power_watts() answers today, and the fallback whenever the card cannot be
+---    named (a worker whose record carries no labels.gpu, or an exporter that
+---    exposes no gpu label at all — node_exporter, a machine-level gauge).
+---  * by_card[gpu] -> max over the series naming that card, only for series whose
+---    gpu label is a pure digit.
+---Both go through power_watt(), so a mis-fed energy counter is screened out before
+---either reduction, exactly as in max_power_watts().
+---@param text string|nil @ the exposition body
+---@param names table[]|string|nil @ gauge names to keep (default DEFAULT_POWER_METRIC_KEYS)
+---@return number|nil whole @ hottest card on the machine
+---@return table @ by_card @ gpu id -> watts
+---@return boolean @ have_cards @ any usable series named a card
+function _M.power_watts_by_card(text, names)
+    local whole, by_card, have_cards = nil, {}, false
+    if type(text) ~= "string" or text == "" then
+        return whole, by_card, have_cards
     end
-    -- pass 1：折叠机器名读数，同时记录「每个 instance 键背后出现过哪些机器名」。
-    local inst_watts, inst_machines = {}, {}
+    local wanted = {}
+    local list = _M.metric_key_list(names)
+    if #list == 0 then
+        list = _M.metric_key_list(DEFAULT_POWER_METRIC_KEYS)
+    end
+    for i = 1, #list do
+        wanted[list[i]] = true
+    end
+    for line in string.gmatch(text, "[^\r\n]+") do
+        if string.byte(line, 1) ~= 35 then
+            local identity, value_text, labelled = split_sample(line)
+            local name = canon(identity)
+            if name and wanted[name] then
+                local watts = _M.power_watt(value_text)
+                if watts then
+                    if whole == nil or watts > whole then
+                        whole = watts
+                    end
+                    local labels = _M.parse_labels(labelled)
+                    local raw = labels and labels.gpu
+                    local gpu = nil
+                    if type(raw) == "string" or type(raw) == "number" then
+                        local t = string.match(tostring(raw), "^%s*(.-)%s*$")
+                        if t and string.match(t, "^%d+$") then
+                            gpu = t
+                        end
+                    end
+                    if gpu then
+                        have_cards = true
+                        if by_card[gpu] == nil or watts > by_card[gpu] then
+                            by_card[gpu] = watts
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return whole, by_card, have_cards
+end
+
+---Split the label portion out of one sample identity ("name{k=\"v\"}").
+---
+---split_sample() drops the braces (max_gauge only needs the metric name), but the
+---per-card power channel needs gpu="6", so the name is returned together with the
+---label set parsed here. A malformed label section answers nil, which makes the row
+---behave exactly like an unlabelled one (→ whole-machine reduction), never a guess.
+---@param identity string @ text before the value, braces included
+---@return table|nil labels @ keys lower-cased; nil when there is no usable pair
+function _M.parse_labels(identity)
+    if type(identity) ~= "string" then
+        return nil
+    end
+    local open = string.find(identity, "{", 1, true)
+    if not open then
+        return nil
+    end
+    local body = string.sub(identity, open + 1)
+    local close = #body + 1
+    local quoted = false
+    local i = 1
+    while i <= #body do
+        local c = string.sub(body, i, i)
+        if quoted then
+            if c == "\\" then
+                i = i + 2
+            else
+                if c == '"' then
+                    quoted = false
+                end
+                i = i + 1
+            end
+        elseif c == "\\" then
+            i = i + 2
+        elseif c == '"' then
+            quoted = true
+            i = i + 1
+        elseif c == "}" then
+            close = i
+            break
+        else
+            i = i + 1
+        end
+    end
+    local inner = string.sub(body, 1, close - 1)
+    if inner == "" then
+        return nil
+    end
+    local out = {}
+    local pos = 1
+    local n = #inner
+    while pos <= n do
+        local j = pos
+        local q = false
+        while j <= n do
+            local c = string.sub(inner, j, j)
+            if q then
+                if c == "\\" then
+                    j = j + 2
+                else
+                    if c == '"' then
+                        q = false
+                    end
+                    j = j + 1
+                end
+            elseif c == "\\" then
+                j = j + 2
+            elseif c == '"' then
+                q = true
+                j = j + 1
+            elseif c == "," then
+                break
+            else
+                j = j + 1
+            end
+        end
+        local pair = string.sub(inner, pos, j - 1)
+        pos = j + 1
+        local key, value = string.match(pair, "^%s*([%w_]+)%s*=%s*\"(.-)\"%s*$")
+        if not key then
+            key, value = string.match(pair, "^%s*([%w_]+)%s*=%s*([^%s,]+)%s*$")
+        end
+        if key and value ~= nil then
+            out[string.lower(key)] = value
+        end
+    end
+    if next(out) == nil then
+        return nil
+    end
+    return out
+end
+
+---The card id a worker record carries, or nil.
+---
+---The registry keeps it at labels.gpu, written by the watcher out of the container
+---name (pennyroyal-gpu7 -> "7"). A hand-rolled POST /workers body can put a number
+---there, so it is stringified; only a pure-digit id counts as a card, because
+---anything else ("all", "nvidia0", a UUID) can never match a DCGM gpu label and
+---would turn "we know the card" into a lookup that silently always misses.
+---@param record table|nil
+---@return string|nil gpu
+function _M.worker_gpu(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local raw = type(record.labels) == "table" and record.labels.gpu or nil
+    if raw == nil or raw == false or raw == cjson.null then
+        return nil
+    end
+    local text = string.match(tostring(raw), "^%s*(.-)%s*$")
+    if text == nil or not string.match(text, "^%d+$") then
+        return nil
+    end
+    return text
+end
+
+---Separator for per-card keys: a control byte appears in neither a Prometheus label
+---value (exporters escape it) nor a host key, so host..SEP..gpu cannot collide with
+---either half, and a key can never be forged from ordinary text.
+local CARD_SEP = "\001"
+_M.CARD_SEP = CARD_SEP
+
+---@param host string|nil
+---@param gpu string|number
+---@return string
+function _M.card_key(host, gpu)
+    return tostring(host or "") .. CARD_SEP .. tostring(gpu)
+end
+
+---The card id to attribute one worker's power reading to, or nil for "unknown".
+---
+---Two sources, checked in this order, and the order matters in production:
+---  * the watcher ledger's g|<url> hint, which the watcher writes for **every**
+---    candidate it discovers (reconcile), independent of whether that worker is a
+---    protected pre-existing row;
+---  * registry's labels.gpu, which only carries a value for workers the watcher
+---    actually registered.
+---The ledger first because 21.k:8801's eight workers are all seeded from
+---SMG_WORKER_URLS (bootstrap -> registry.add({url=...}), no labels) and then
+---permanently protected by the watcher's guard 3, so their record.labels stays
+---empty forever -- registry.add's idempotent branch (registry.lua:1476) answers a
+---duplicate url with a failed job and *does not touch the record*, so a later add
+---can never back-fill labels either. Reading the ledger is what keeps this whole
+---feature inside gpu_load.lua + watcher.lua: no registry change is required, and
+---nothing here depends on labels ever arriving.
+---@param record table|nil
+---@param hints table|nil @ url -> gpu id (watcher ledger snapshot)
+---@return string|nil gpu
+function _M.worker_card(record, hints)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local url = record.url
+    if type(url) == "string" and type(hints) == "table" then
+        local hint = hints[url]
+        if type(hint) == "string" or type(hint) == "number" then
+            local text = string.match(tostring(hint), "^%s*(.-)%s*$")
+            if text and string.match(text, "^%d+$") then
+                return text
+            end
+        end
+    end
+    return _M.worker_gpu(record)
+end
+
+---Map the power vector onto workers, preferring each worker's **own card**.
+---
+---The four-way rule, and why each branch is what it is:
+---  * source exposes no gpu label at all (`source_has_cards` false) -> whole-machine
+---    max for every worker. This is the legacy shape (node_exporter, or an operator's
+---    `by (Hostname)` query, or the metrics path against an engine that reports one
+---    machine-level gauge) and it must stay byte-for-byte today's behaviour, or a
+---    data source that has always worked would go dark the day per-card attribution
+---    ships. The test for "legacy source" is the **source**, never the worker: if it
+---    were decided per worker, a cardless exporter would read as "this worker cannot
+---    name its card" and all three failure modes below would collapse into one
+---    indistinguishable log line.
+---  * worker names a card and the vector has it -> that card's watts. This is the
+---    342.371 fix: eight workers on one machine stop sharing one number.
+---  * worker names **no** card -> write nothing. Not the machine max. Once the
+---    source has proved it is per-card, the machine max is somebody *else's* card,
+---    and spending it here would exclude an idle worker because its neighbour runs
+---    hot -- a monitoring gap eating capacity, the same failure mode that makes this
+---    channel refuse to write 0 or repeat a stale sample. The consequence is stated
+---    plainly for whoever configures this: a worker whose card cannot be resolved is
+---    not power-capped at all, exactly as if the exporter were down. Register the
+---    container with a gpu<N> name (or the equivalent label) to bring it under the
+---    cap; watch lr_gpu_load_power_per_card_workers to see how many are covered.
+---  * worker names a card and the vector does **not** have it -> write nothing, same
+---    reasoning (exporter dropped the card, the card passed through to another
+---    container, a stale hint after a rename).
+---  Both "write nothing" branches land on registry.power_w() == nil once the old pw:
+---  sample TTLs out, and registry.capacity_exclusion reads nil as unknown -> keep.
+---  用户裁定 2026-10-04 的降级纪律即此三条：解析不出 gpu / 没有该卡 series / series
+---  缺失 -> 不写键，回落「未知 -> 不排除」，绝不摘 worker。
+---  * worker names a card and the vector does **not** have it -> write nothing.
+---    Deliberately *not* a fallback to the machine max: we know which card this is,
+---    the source simply has no series for it (exporter dropped the card, a card
+---    passed through to another container, a stale hint after a rename). Reporting
+---    another card's watts as this card's reading would exclude an idle worker
+---    because its neighbour is hot -- a monitoring gap eating capacity, which is the
+---    exact failure this channel is built to avoid. Nothing written -> pw: TTLs ->
+---    registry.power_w() == nil -> router's "unknown -> do not exclude".
+---`claimed[host]` is set from host-level reachability, not from whether a watt value
+---was produced, so power_unmatched keeps its current meaning ("this host's series
+---matched no pooled worker") and a missing card cannot inflate it into a bogus label
+---mismatch.
+---@param workers table[]|nil
+---@param by_host table|nil @ host -> whole-machine watts
+---@param cards table|nil @ card_key(host, gpu) -> watts
+---@param source_has_cards boolean|nil
+---@param hints table|nil @ url -> gpu id
+---@return table @ worker id -> watts
+---@return number @ unmatched host count
+function _M.assign_power(workers, by_host, cards, source_has_cards, hints)
+    local out, unmatched = {}, 0
+    if type(workers) ~= "table" then
+        return out, unmatched
+    end
+    local claimed = {}
+    for i = 1, #workers do
+        local worker = workers[i]
+        local host = worker and _M.split_host(worker.url)
+        if host and type(by_host) == "table" and by_host[host] ~= nil then
+            claimed[host] = true
+            local watts
+            if source_has_cards then
+                local gpu = _M.worker_card(worker, hints)
+                -- 认不出卡 或 该卡无 series -> 什么都不写（不是整机 max）。见上方
+                -- 四路口径：源已经是逐卡的了，整机 max 就是**别人那张卡**的瓦特，
+                -- 用它顶替会让一张空闲 worker 因为邻居发热而被排除。
+                if gpu ~= nil and type(cards) == "table" then
+                    watts = cards[_M.card_key(host, gpu)]
+                end
+            else
+                watts = by_host[host]
+            end
+            if watts ~= nil and worker.id ~= nil then
+                out[worker.id] = watts
+            end
+        end
+    end
+    if type(by_host) == "table" then
+        for host in pairs(by_host) do
+            if not claimed[host] then
+                unmatched = unmatched + 1
+            end
+        end
+    end
+    return out, unmatched
+end
+
+---The watt identity rules, shared by both sources (prom rows and one /metrics body).
+---
+---Why this shape and not a plain group-by: the machine identity of a DCGM series is
+---ambiguous by construction, and each of the two wrong answers has been paid for.
+---  * dcgm-exporter's machine label is the **capitalised** Hostname, and host_of()
+---    only reads lower-case keys, so labels are case-folded first. After folding,
+---    Hostname sorts *behind* instance in HOST_LABELS, and every DCGM series carries
+---    instance="127.0.0.1:9400" — the scrape address, not the machine. Copying
+---    host_of()'s precedence would fold two machines' exporters onto that one value,
+---    so A's hottest card pushes B's workers over their cap while unmatched stays 0
+---    and no line is logged (cross-machine watt bleed).
+---  * Aggregating by (Hostname) alone leaves only the machine name, while 21.k's
+---    eight workers are all registered as http://127.0.0.1:80xx, so nothing matches.
+---So both keys are registered at once:
+---  * a machine-name label (Hostname / hostname / nodename / host / node / pod /
+---    name) -> key = machine name;
+---  * instance -> key = its host part, adopted only when it is a non-loopback address
+---    (a real machine address), or when every series sharing that loopback instance
+---    belongs to **one** machine. The latter is this fleet's normal shape (eight
+---    workers on 127.0.0.1:80xx meeting DCGM's 127.0.0.1:9400 on the key
+---    "127.0.0.1"); once two Hostnames appear behind one loopback instance, that
+---    Prometheus scrapes several machines' local exporters and the loopback key has
+---    no right to represent any of them -> nothing is adopted, and nothing is guessed.
+---Only the power channel uses this; the load channel keeps host_of()'s semantics
+---(changing it would move existing e2e assertions).
+---@param rows table[]|nil @ parse_prom_response() rows (labels + value)
+---@param expose_cards boolean|nil @ also fold per-card keys
+---@return table @ host -> watts (whole-machine hottest, only usable readings)
+---@return table @ host..CARD_SEP..gpu -> watts (empty unless expose_cards)
+---@return table|nil @ host -> true for hosts with at least one card series
+---@return boolean @ any usable series carried a numeric gpu label
+function _M.power_fold(rows, expose_cards)
+    local by_host, cards, card_hosts = {}, {}, {}
+    local groups = {}
+    local have_cards = false
+    if type(rows) ~= "table" then
+        return by_host, cards, card_hosts, have_cards
+    end
+    local function group(gpu)
+        local g = groups[gpu]
+        if not g then
+            g = { host = {}, inst = {}, inst_machines = {} }
+            groups[gpu] = g
+        end
+        return g
+    end
+    local function remember(target, key, watts)
+        if target[key] == nil or watts > target[key] then
+            target[key] = watts
+        end
+    end
     for i = 1, #rows do
         local row = rows[i]
         local watts = row and _M.power_watt(row.value)
@@ -563,69 +909,141 @@ function _M.host_powers(rows)
                 node = lowered.node, pod = lowered.pod, name = lowered.name,
             })
             local inst = _M.host_from_label(lowered.instance)
-            if machine then
-                if by_host[machine] == nil or watts > by_host[machine] then
-                    by_host[machine] = watts
+            -- "" = this series does not name a card. Those rows only feed the
+            -- whole-machine map, and they are what keeps a machine-level source
+            -- (node_exporter, an operator's by(Hostname) query) working exactly as
+            -- it does today.
+            local gpu = ""
+            if expose_cards then
+                local raw = lowered.gpu or lowered.devicename or lowered.gpu_id
+                if type(raw) == "string" or type(raw) == "number" then
+                    local text = string.match(tostring(raw), "^%s*(.-)%s*$")
+                    if text and string.match(text, "^%d+$") then
+                        gpu = text
+                    end
                 end
             end
+            if gpu ~= "" then
+                have_cards = true
+            end
+            local g = group(gpu)
+            if machine then
+                remember(g.host, machine, watts)
+            end
             if inst then
-                if inst_watts[inst] == nil or watts > inst_watts[inst] then
-                    inst_watts[inst] = watts
-                end
-                local seen = inst_machines[inst]
+                remember(g.inst, inst, watts)
+                local seen = g.inst_machines[inst]
                 if not seen then
                     seen = {}
-                    inst_machines[inst] = seen
+                    g.inst_machines[inst] = seen
                 end
-                -- 没有机器名标签的 series 无法自证身份，用空串占位表示「归属存疑」。
+                -- A series with no machine label cannot prove whose it is; the
+                -- empty-string placeholder marks "attribution uncertain".
                 seen[machine or ""] = true
             end
         end
     end
-    -- pass 2：环回 instance 只有在「整批 series 同属一台机器」时才有资格当键。
-    -- adopted 记下哪些 instance 键真的被采纳，pass 3 要用它判断机器名键是否多余。
-    local adopted = {}
-    for inst, watts in pairs(inst_watts) do
-        local distinct = 0
-        for machine in pairs(inst_machines[inst] or {}) do
-            distinct = distinct + 1
-        end
-        local loopback = (inst == "localhost" or inst == "::1"
-            or string.sub(inst, 1, 4) == "127.")
-        if (not loopback) or distinct <= 1 then
-            if by_host[inst] == nil or watts > by_host[inst] then
-                by_host[inst] = watts
+    for gpu, g in pairs(groups) do
+        local adopted = {}
+        for inst, watts in pairs(g.inst) do
+            local distinct = 0
+            for _ in pairs(g.inst_machines[inst] or {}) do
+                distinct = distinct + 1
             end
-            adopted[inst] = watts
+            local loopback = (inst == "localhost" or inst == "::1"
+                or string.sub(inst, 1, 4) == "127.")
+            if (not loopback) or distinct <= 1 then
+                adopted[inst] = watts
+            end
         end
-    end
-    -- pass 3：删掉被 instance 键完全代表的机器名键。
-    --
-    -- 同一台机器往往同时被两把键代表：Hostname="gpu-pro6000-1" 与
-    -- instance="10.252.25.217:9400"。裸查或 by (Hostname, instance) 时两者都会出现，
-    -- 而 worker url 只能命中其中一把——另一把必然落进 unmatched，于是「明明采到了、
-    -- 功率上限也在生效」的实例上，lr_gpu_load_power_unmatched_total 会随机器数稳定
-    -- 增长，排障的人就会被指向「标签口径对不上」这个根本不存在的原因（17c 就是这个
-    -- 形状）。因为 instance 键的 max 覆盖了该机器全部 series，只要它被采纳且
-    -- 值不小于机器名键，机器名键就没有携带任何额外信息：删掉不丢读数。
-    -- 反过来，机器名键被单独保留（17d 的 by (Hostname) 场景）正是 operator 需要看到
-    -- 的「采得到却配不上 worker」信号，绝不能一起删掉。
-    for machine, watts in pairs(by_host) do
-        if adopted[machine] == nil and machine ~= "" then
-            local redundant
-            for inst, inst_watts in pairs(adopted) do
-                local seen = inst_machines[inst]
-                if seen and seen[machine] and inst_watts >= watts then
-                    redundant = true
-                    break
+        -- Drop machine-name keys fully represented by an adopted instance key: the
+        -- instance max already covers that machine's whole series set, so the
+        -- machine-name key carries no extra reading and would only inflate
+        -- power_unmatched_total (pointing the operator at a label mismatch that does
+        -- not exist). A machine-name key kept on its own (by(Hostname)) *is* the
+        -- "reachable but unassignable" signal the operator needs, so it stays.
+        local kept = {}
+        for machine, watts in pairs(g.host) do
+            if adopted[machine] ~= nil or machine == "" then
+                kept[machine] = watts
+            else
+                local redundant
+                for inst, inst_watts in pairs(adopted) do
+                    local seen = g.inst_machines[inst]
+                    if seen and seen[machine] and inst_watts >= watts then
+                        redundant = true
+                        break
+                    end
+                end
+                if not redundant then
+                    kept[machine] = watts
                 end
             end
-            if redundant then
-                by_host[machine] = nil
+        end
+        for machine, watts in pairs(adopted) do
+            remember(kept, machine, watts)
+        end
+        if gpu ~= "" then
+            for host, watts in pairs(kept) do
+                cards[_M.card_key(host, gpu)] = watts
+                card_hosts[host] = true
             end
         end
+        -- Whole-machine max: this is today's number, folded over *every* series of
+        -- the machine regardless of card, so the fallback cannot drift from the
+        -- behaviour that shipped before per-card attribution existed.
+        for host, watts in pairs(kept) do
+            remember(by_host, host, watts)
+        end
     end
+    return by_host, cards, card_hosts, have_cards
+end
+
+---Fold a result vector down to one **watt** reading per host (hottest card wins).
+---
+---host_values() 的功率版：唯一的区别是不走 normalize()。那是本模块最容易写错的
+---一行——照抄 host_values() 会把 96 W 折成 1.0（96/100 夹到上限），于是功率通道
+---输出的「1」既不是瓦特也不是负载，上限判定拿它去比 max_power_w 就永远不成立。
+---多卡取最大而非取和/取平均：一台 worker 往往看得见整机所有卡，路由要避免把请求
+---打到已经最热的那张卡上，取和会让「一张满载七张空闲」看起来仍然很闲。
+---
+---机器身份的判定规则（含环回 instance 的归属检查）整体在 _M.power_fold() 上说明；
+---本函数保持改动前的对外契约（host -> 整机最热瓦特），逐卡展开请用
+---_M.host_card_powers()。
+---@param rows table[]|nil @ parse_prom_response() rows
+---@return table @ host -> watts (only usable readings)
+function _M.host_powers(rows)
+    local by_host = _M.power_fold(rows, false)
     return by_host
+end
+
+---Fold a result vector into **per-card** watt readings as well as per-host.
+---
+---21.k 生产实况（2026-10-04）：8 个 worker 的 power_w 全是同一个 342.371，因为 compose
+---里那条 SMG_LOAD_POWER_QUERY 写的是 max by (Hostname,instance) (DCGM_FI_DEV_POWER_USAGE)
+---——Prometheus 侧就已经把 8 张卡折成 1 条 series，逐卡标签根本没能到达网关。逐卡读数
+---在 exporter 上一直齐全（/data/tmp/dcgm-metrics-9400.txt：
+---DCGM_FI_DEV_POWER_USAGE{gpu="0",...,Hostname="gpu-pro6000-1"} 96.161 … gpu="7" 309.834），
+---所以这一路按 gpu 标签建 host+gpu 键，配 registry 记录的 labels.gpu（watcher 从容器名
+---解析）把瓦数交回**它自己那张卡**。
+---
+---默认查询串（部署侧改 compose 的 SMG_LOAD_POWER_QUERY，本仓不改部署）：
+---    max by (Hostname, instance, gpu) (DCGM_FI_DEV_POWER_USAGE)
+---  * gpu 必须留在 by 里：把它聚合掉 = 回到 342.371 那个故障。
+---  * Hostname 也留在 by 里：让 power_fold 能在「一台 Prometheus 抓了多台机器的本机
+---    exporter」时识破归属冲突（环回 instance 键只在同批 series 只属一台机器时才采纳），
+---    宁可整台不采纳也不会把 A 机最热的卡挂到 B 机头上。
+---  * instance 留在 by 里：worker 全注册成 http://127.0.0.1:80xx，机器名与 IP 之间没有
+---    可用映射，只有 exporter 的抓取地址能把读数交回本机 worker。
+---  * 用 max 而不是 sum：sum 会把同一张卡的多次抓取/多标签副本相加；本模块的口径是
+---    「取最热」，不是「取总和」。
+---@param rows table[]|nil @ parse_prom_response() rows
+---@return table @ host -> watts (whole-machine hottest)
+---@return table @ host..CARD_SEP..gpu -> watts
+---@return table @ host -> true (hosts exposing at least one card series)
+---@return boolean @ any series carried a numeric gpu label
+function _M.host_card_powers(rows)
+    return _M.power_fold(rows, true)
 end
 
 --- Power knobs for this pass, read straight from the environment.
@@ -980,6 +1398,30 @@ local function default_workers()
     return out
 end
 
+---Per-card power reads the worker->gpu hint table off the watcher's ledger.
+---
+---Lazy pcall(require) like registry_mod()/hb_mod(): gpu_load must not require the
+---watcher at load time (a require cycle watcher -> ... -> gpu_load would deadlock
+---the first request that loads either), and outside nginx there is no lr_watch
+---dict to read anyway. When the watcher is absent or its dict is not declared, the
+---snapshot is empty and the per-card channel simply falls back to labels.gpu and
+---then to the whole-machine max -- i.e. exactly the pre-feature behaviour. That is
+---why this is a *hint* channel and not the source of truth: it can be entirely
+---missing and the power cap stays as honest as it was before per-card attribution.
+---@return table @ url -> gpu id
+local function default_gpu_hints()
+    local ok, watcher = pcall(require, "resty.luarouter.watcher")
+    if not ok or type(watcher) ~= "table"
+        or type(watcher.gpu_hint_snapshot) ~= "function" then
+        return {}
+    end
+    local ok2, hints = pcall(watcher.gpu_hint_snapshot)
+    if ok2 and type(hints) == "table" then
+        return hints
+    end
+    return {}
+end
+
 local function default_get(url, timeout_ms, headers)
     local hb = hb_mod()
     if not hb then
@@ -1137,6 +1579,11 @@ function _M.run_pass(cfg, opts)
         power_enabled = false, power_probed = 0, power_matched = 0,
         power_failed = 0, power_rejected = 0, power_errors = 0,
         power_unmatched = 0, power_skipped = 0,
+        -- 本 pass 里**真正按自己那张卡**拿到瓦特的 worker 数（逐卡归属命中数）。它和
+        -- power_matched 的差就是「悄悄退回整机 max」的台数；只有 matched 一个数的话，
+        -- 「八张卡各归各」与「八张卡共用一个数」在 /metrics 上完全同形，而后者正是
+        -- 21.k 的 342.371 能长期无人察觉的原因。
+        power_per_card = 0,
     }
     if stats.source == "none" then
         stats.skipped = 1
@@ -1202,6 +1649,12 @@ function _M.run_pass(cfg, opts)
     if stats.source == "metrics" then
         local names = _M.metric_key_list(cfg.load_metrics_keys)
         local power_names = _M.metric_key_list(power.keys)
+        -- 逐卡归属用的卡号快照（watcher 台账 g| 键，见 default_gpu_hints）。一次 pass
+        -- 读一次，不在 worker 循环里摸共享字典。opts.gpu_hints 是测试注入面。
+        local hints = opts.gpu_hints
+        if hints == nil then
+            hints = default_gpu_hints()
+        end
         if power.query then
             -- 配了功率 PromQL 却把负载源设成 metrics：这条查询永远不会被执行。
             -- metrics 路没有 Prometheus 可问，只能扫 worker 自己的 /metrics。与其
@@ -1258,15 +1711,61 @@ function _M.run_pass(cfg, opts)
                     -- 再记一次 failure 会把同一个故障数成两遍。
                     if power.on then
                         stats.power_probed = stats.power_probed + 1
-                        local watts = _M.max_power_watts(body, power_names)
+                        -- 一次正文扫出「整机最热」与「逐卡」两张表；取哪张由这个 worker
+                        -- 认不认得自己的卡决定（四路口径见 assign_power 上方注释）。
+                        -- power_watts_by_card 的 whole 与 max_power_watts 逐字节同值
+                        -- （同一套 power_watt 筛、同样对全部可用 series 取 max），所以
+                        -- 认不出卡的老数据源不会因为这次改动少一个读数。
+                        local whole, by_card, have_cards = _M.power_watts_by_card(
+                            body, power_names)
+                        -- 四路口径与 prom 路完全一致（见 assign_power 上方注释）：
+                        -- 源没有逐卡标签 → 整机 max（老数据源一个读数不少）；源是逐卡
+                        -- 的 → 只认这个 worker 自己那张卡，认不出卡或该卡没有 series
+                        -- 都**不写键**，绝不拿整机 max 冒充——那时整机 max 是邻居卡的
+                        -- 瓦特，用它会让一张空闲 worker 因为邻居发热而被排除。
+                        local watts, miss_kind = whole, nil
+                        if whole ~= nil and have_cards then
+                            local gpu = _M.worker_card(record, hints)
+                            if gpu == nil then
+                                watts = nil
+                                miss_kind = "identity"
+                            else
+                                watts = by_card[gpu]
+                                if watts == nil then
+                                    miss_kind = "series"
+                                else
+                                    stats.power_per_card = (stats.power_per_card or 0) + 1
+                                end
+                            end
+                        end
                         if watts == nil then
                             -- 采不到：什么都不写。旧的 pw: 键会在自己的 TTL 后消失，
                             -- registry.power_w() 回到 nil，router 侧按「未知 → 不排除」
                             -- 处理。写 0 或沿用上一次的旧值都会让坏 exporter 把这台
                             -- worker 永久顶在功率上限之外。
                             stats.power_failed = stats.power_failed + 1
-                            _M.warn_dedup("power-nogauge", record.url,
-                                "no power gauge in " .. #body .. "B", stamp())
+                            -- 三种「采不到」在排障上是三个不同的地方，必须分开说：
+                            -- 整份正文没有功率 gauge（exporter 没起 / gauge 名单写错）、
+                            -- 有 gauge 但这个 worker 认不出自己的卡（容器名不带 gpuN，
+                            -- 台账没有 g| 提示）、卡认得出却没有对应 series（卡被直通给
+                            -- 别的容器 / 改名后的残留卡号）。全都报 "no power gauge" 的
+                            -- 话，运维会被送去查 exporter，而真相在容器命名上。
+                            if whole == nil then
+                                _M.warn_dedup("power-nogauge", record.url,
+                                    "no power gauge in " .. #body .. "B", stamp())
+                            elseif miss_kind == "identity" then
+                                _M.warn_dedup("power-noident", record.url,
+                                    "per-card power available but this worker names no card;"
+                                    .. " left uncapped (machine max "
+                                    .. string.format("%.1f", whole)
+                                    .. " W is another card's reading)", stamp())
+                            else
+                                _M.warn_dedup("power-nocard", record.url,
+                                    "per-card power available but no series for this worker's"
+                                    .. " card; left uncapped (machine max "
+                                    .. string.format("%.1f", whole)
+                                    .. " W not used as a substitute)", stamp())
+                            end
                         else
                             local stored, why = write_power(record.id, watts, stamp(),
                                 ttl_secs, record.url)
@@ -1356,9 +1855,22 @@ function _M.run_pass(cfg, opts)
 --- DCGM_FI_DEV_POWER_USAGE）：本 fleet 的 worker 全部注册成 http://127.0.0.1:80xx，
 --- 而机器名标签（Hostname）与 IP 之间没有任何映射可用，只有 exporter 的抓取地址
 --- 127.0.0.1:9400 能把读数交回本机 worker。聚合时把 Hostname 一起 by 上，是为了让
---- host_powers() 在「同一台 Prometheus 抓了多台机器的本机 exporter」时仍能识破归属
+--- host_card_powers() 在「同一台 Prometheus 抓了多台机器的本机 exporter」时仍能识破归属
 --- 冲突、宁可整台不采纳，也不会把 A 机最热的卡挂到 B 机头上。
+---
+--- 而且必须把 gpu 留在 by 里（缺省查询串：
+---     max by (Hostname, instance, gpu) (DCGM_FI_DEV_POWER_USAGE)
+--- ）：245/246 那份 compose 写的 max by (Hostname,instance) 正是 21.k:8801 八个
+--- worker 全部读到 342.371 的直接原因——聚合发生在 Prometheus 侧，逐卡标签根本没
+--- 能到达网关，网关再怎么改也只是在一条已折平的 series 上做文章。逐卡读数在
+--- exporter 上一直齐全（/data/tmp/dcgm-metrics-9400.txt 有 gpu="0"…"7" 八条），
+--- 所以口径是「查询别聚合掉 gpu，网关按 worker 自己的卡分发」。
         local by_power = {}
+        -- 逐卡表与「数据源到底认不认得卡」：后者是**整源**属性而不是逐 worker 判定，
+        -- 因为它决定的是「这个数据源有没有逐卡形状」，用它区分「老数据源 → 整机 max
+        -- （今天的行为）」与「有逐卡数据但这个 worker 认不出卡」。
+        local by_card_power = {}
+        local source_has_cards = false
         local function one_power(query, target)
             local ok_call, status, body, err = pcall(post, endpoint, timeout_ms,
                 headers, _M.query_body(query))
@@ -1383,11 +1895,23 @@ function _M.run_pass(cfg, opts)
                 _M.warn_dedup("power-prom", target, perr, stamp())
                 return false
             end
-            local folded = _M.host_powers(rows)
+            -- 逐卡展开（= host_powers 的展开版；expose_cards=false 时两者逐字节同值，
+            -- 所以只有 prom 路受益，且缺 gpu 标签时不会比今天少一个读数）。
+            local folded, cards, _, have_cards = _M.host_card_powers(rows)
             for host, watts in pairs(folded) do
                 if by_power[host] == nil or watts > by_power[host] then
                     by_power[host] = watts
                 end
+            end
+            for key, watts in pairs(cards) do
+                -- {host} 模板会发多条查询，同一个 host+gpu 键取最大：与 host 键同
+                -- 做法，也保证结果与查询到达顺序无关（同一份输入跑两遍必须逐字节相同）。
+                if by_card_power[key] == nil or watts > by_card_power[key] then
+                    by_card_power[key] = watts
+                end
+            end
+            if have_cards then
+                source_has_cards = true
             end
             stats.power_probed = stats.power_probed + 1
             return true
@@ -1424,8 +1948,30 @@ function _M.run_pass(cfg, opts)
             for i = 1, #workers do
                 url_for_power[workers[i].id] = workers[i].url
             end
-            local p_assigned, p_unmatched = _M.assign(by_power, workers)
+            local hints = opts.gpu_hints
+            if hints == nil then
+                hints = default_gpu_hints()
+            end
+            -- 按 worker 各自的卡分发（四路口径见 assign_power 上方注释：源无逐卡
+            -- 标签 → 整机 max；认不出卡 → 整机 max；认得出且有该卡 series → 本卡
+            -- 瓦特；认得出却没有该卡 series → 什么都不写，绝不拿邻居卡冒充）。
+            local p_assigned, p_unmatched = _M.assign_power(workers, by_power,
+                by_card_power, source_has_cards, hints)
             stats.power_unmatched = p_unmatched
+            -- 「本 pass 里有多少 worker 真的按自己那张卡拿到读数」。没有这个计数，
+            -- 「全部逐卡成功」与「全部悄悄退回整机 max」在 /metrics 上长得一模一样，
+            -- 而后者正是 342.371 故障能一直活着的原因。
+            local card_hits = 0
+            if source_has_cards then
+                for i = 1, #workers do
+                    local w = workers[i]
+                    if w and p_assigned[w.id] ~= nil
+                        and _M.worker_card(w, hints) ~= nil then
+                        card_hits = card_hits + 1
+                    end
+                end
+            end
+            stats.power_per_card = card_hits
             -- 查询本身成功却一个可用读数都没有（gauge 名写错、那批机器没起 dcgm、
             -- 整表都是 NaN）：与 metrics 路的 no-gauge 同义，记一次 failed 并留一条
             -- 去重 WARN。放在这里而不是 one_power 内，是因为按 host 展开时会有多次
@@ -1561,6 +2107,12 @@ function _M.publish_metrics(stats)
         end
         pcall(observability.gauge, "lr_gpu_load_power_workers", {},
             stats.power_matched or 0)
+        -- 逐卡归属命中数（见 stats.power_per_card 的口径）。看板拿它和
+        -- lr_gpu_load_power_workers 一比就知道有多少 worker 还骑在整机 max 上：
+        -- 前者为 0 而后者非 0 = 逐卡归属一台都没接上（卡号没解析出来，或查询把
+        -- gpu 聚合掉了），这正是需要在生产上直接看见的那件事。
+        pcall(observability.gauge, "lr_gpu_load_power_per_card_workers", {},
+            stats.power_per_card or 0)
     end
     return true
 end

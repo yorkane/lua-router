@@ -944,6 +944,13 @@ function _M.docker_candidates_from(containers, include_container_ips)
                             cands[#cands + 1] = {
                                 url = _M.normalize_url("http://" .. ip .. ":" .. cport),
                                 source = "docker-net", label = name, instance_key = ctr.Id,
+                                -- 卡是**容器**的属性，不是「这个地址被哪种方式发现」的属性，
+                                -- 所以容器 IP 这一路照抄发布端口那一路的解析。这里以前不填
+                                -- gpu，是 bridge 网络里的 worker 丢掉自己逐卡读数的第一道断点：
+                                -- 同一个容器同时贡献 docker 与 docker-net 两条候选，而
+                                -- unique_candidates 的旧写法按 source 择优后整条替换，输的那条
+                                -- 会把 gpu 一起带走。
+                                gpu = _M.gpu_from_name(name),
                             }
                         end
                     end
@@ -992,7 +999,32 @@ end
 local SOURCE_ORDER = { docker = 1, cli = 2, ["docker-net"] = 3, proc = 4,
                        ["allow-list"] = 5 }
 
+---把 src 的卡号/容器名补进 dst（只在 dst 自己缺失时，已有值绝不被覆盖）。
+---就地改写：候选表每轮都由 docker_candidates_from / local_candidates 现造，改写它不
+---影响任何调用方持有的数据，重复调用同样幂等。
+---@param dst table
+---@param src table
+---@return table dst
+local function carry_identity(dst, src)
+    if (dst.gpu == nil or dst.gpu == false)
+        and src.gpu ~= nil and src.gpu ~= false then
+        dst.gpu = src.gpu
+    end
+    if (dst.label == nil or dst.label == false)
+        and src.label ~= nil and src.label ~= false then
+        dst.label = src.label
+    end
+    return dst
+end
+
 ---Merge candidate lists into unique URLs with their owning label (collect()).
+---
+---择优仍按 source（docker 胜过 proc 胜过 allow-list），但 gpu / label 改成「取第一个
+---非 nil 的」而不是跟着胜者整条替换。理由：这两个字段描述的是**端口背后的那个容器**，
+---不是「这个 url 由哪一路扫到」。21.k 的形状正是 bridge 容器 + 发布端口——同一个容器
+---同时贡献 docker（127.0.0.1:public）与 docker-net（172.x:container）两条候选，旧写法
+---择优后把败者整条丢弃，于是存活那条不带 gpu，make_register 的 labels.gpu 恒 nil，
+---逐卡功率就永远接不上。字段只在胜者自己缺失时才补，绝不会覆盖一条本来就写了卡号的候选。
 ---@param lists table[]
 ---@return table[]
 function _M.unique_candidates(lists)
@@ -1001,10 +1033,13 @@ function _M.unique_candidates(lists)
         for _, cand in ipairs(lists[i] or {}) do
             if cand.url then
                 local existing = by_url[cand.url]
-                if not existing
-                    or (SOURCE_ORDER[cand.source] or 9)
-                        < (SOURCE_ORDER[existing.source] or 9) then
+                if not existing then
                     by_url[cand.url] = cand
+                elseif (SOURCE_ORDER[cand.source] or 9)
+                    < (SOURCE_ORDER[existing.source] or 9) then
+                    by_url[cand.url] = carry_identity(cand, existing)
+                else
+                    carry_identity(existing, cand)
                 end
             end
         end
@@ -1023,6 +1058,8 @@ end
 
 -- ------------------------------------------------------------------ ledger
 
+local GPU_HINT_PREFIX = "g|"
+
 ---The ledger is the memory of what this watcher owns and what it must never
 ---touch. The daemon keeps it in a JSON file; here it lives in lr_watch so every
 ---nginx process (and a reload) sees one copy. A container restart clears it,
@@ -1036,6 +1073,7 @@ end
 ---   q|<url>   pending add   {queued_at, worker_id}
 ---   f|<url>   add back-off  {n, until}
 ---   map       the whole rename map as one JSON object
+---   g|<url>   卡号提示：这个 url 背后的容器是哪张卡（gpu_load 的逐卡功率用它接地址）
 ---@param d table ngx.shared.Dict (or a test double with get/set/delete/get_keys)
 local function new_ledger(d)
     local self = { dict = d }
@@ -1110,6 +1148,52 @@ local function new_ledger(d)
 
     function self.get_pending(url)
         return decode(d:get(url_key("q|", url)))
+    end
+
+    ---记下「这个 url 背后的容器是哪张卡」（g| 键）。
+    ---
+    ---为什么放在台账里而不是只靠 make_register 写 labels.gpu：registry.add 遇到已存在的
+    ---url 走幂等分支（registry.lua:1476 起）——它回一条 failed job 然后直接 return，**不碰
+    ---记录**，所以「让 watcher 再 add 一次把 labels 补上」这条链在盘上不成立。21.k 生产
+    ---正是这种形状：八个 worker 由 SMG_WORKER_URLS 播种（bootstrap → registry.add({url=…})，
+    ---不带 labels），watcher 首轮又把池里已有的行整排 protect 掉（guard 3），register 对
+    ---它们永远不会被调用，于是 labels 恒为 null、逐卡功率永远接不上。
+    ---卡号是 watcher 从容器名解析出来的知识，就存在 watcher 自己的 lr_watch 里；gpu_load
+    ---在写某个 worker 的功率读数时读一次，接不上就回落整机 max。全程不需要 registry.lua 配合。
+    ---@param url string
+    ---@param gpu string|nil @ nil / "" = 这一轮不再认得它（容器改名），删键
+    ---@return boolean stored
+    function self.set_gpu_hint(url, gpu)
+        local key = GPU_HINT_PREFIX .. tostring(url or "")
+        if url == nil or url == "" then
+            return false
+        end
+        local wanted = (type(gpu) == "string" and gpu ~= "") and gpu or nil
+        if wanted == nil then
+            if d:get(key) ~= nil then
+                d:delete(key)
+            end
+            return false
+        end
+        if d:get(key) == wanted then
+            return true
+        end
+        return d:set(key, wanted, 0) and true or false
+    end
+
+    ---台账里现存的卡号提示，一次读全（功率 pass 每 tick 读一次，不在 worker 循环里摸 shdict）。
+    ---@return table @ url -> gpu id
+    function self.gpu_hints()
+        local out = {}
+        for _, key in ipairs(d:get_keys(0)) do
+            if string.sub(key, 1, 2) == GPU_HINT_PREFIX then
+                local value = d:get(key)
+                if type(value) == "string" and value ~= "" then
+                    out[string.sub(key, 3)] = value
+                end
+            end
+        end
+        return out
     end
 
     function self.pending_urls()
@@ -1362,6 +1446,12 @@ function _M.reconcile(state)
                 info.label = cand.label or info.engine
                 info.source = cand.source
                 info.gpu = cand.gpu
+                -- 卡号进台账：g| 键与 register/protect 无关，所以保护行（bootstrap 播种的
+                -- SMG_WORKER_URLS 那八个）也拿得到。认不出卡时同样调用一次 —— 传 nil 是
+                -- 删键，免得上一轮容器改名后留下过期卡号，把好端端的读数接到别的卡上。
+                if ledger.set_gpu_hint then
+                    ledger.set_gpu_hint(cand.url, cand.gpu)
+                end
                 discovered[#discovered + 1] = info
             else
                 local verdict = _M.probe_verdict(reason)
@@ -1768,6 +1858,24 @@ local captured_config
 _M.config = function()
     return captured_config
 end
+
+---卡号提示的只读快照，给 gpu_load 的逐卡功率通道用。台账是共享字典上的闭包、不是单例，
+---所以这里每次现造一个读；字典不在（nginx 外、或 conf 没声明 lr_watch）时回 {}，功率那
+---一路就退回 labels.gpu 与整机 max —— 也就是逐卡归属落地之前的行为。
+---@return table @ url -> gpu id
+function _M.gpu_hint_snapshot()
+    local d = dict()
+    if not d then
+        return {}
+    end
+    local ok, hints = pcall(new_ledger(d).gpu_hints)
+    if ok and type(hints) == "table" then
+        return hints
+    end
+    return {}
+end
+
+_M.gpu_hint_store = { read_all = _M.gpu_hint_snapshot }
 
 -- -------------------------------------------------------------- probe transport
 
