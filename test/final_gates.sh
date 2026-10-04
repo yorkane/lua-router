@@ -16,6 +16,18 @@
 #   GATE_ONLY=unit bash test/final_gates.sh     # single gate (any tier)
 #   KEEP_GOING=1 bash test/final_gates.sh       # run all selected, count fails
 #   LR_GATE_LOG=/path/log bash ...              # log location
+#   GATE_JOBS=4 bash test/final_gates.sh        # run the safe gates in parallel
+#   GATE_DRY_RUN=1 GATE_TIER=full bash ...      # print the plan, run nothing
+#
+# Concurrency (GATE_JOBS, default 1 = the historical serial run):
+#   GATE_JOBS>1 only parallelises gates that passed the machine-state audit in the
+#   PHASE comments below. Membership is not a knob: GATE_JOBS=8 cannot promote a
+#   gate that reads machine-wide state into the pool.
+#   A parallel run implies keep-going: every selected gate runs, the exit code is
+#   1 if any one of them is red, and each red gate prints its own 25 tail lines.
+#   Two gate RUNS at once are refused by an flock, so a parallel run can never
+#   overlap another run whether that one is parallel or serial.
+#
 #
 # Gate ids, in run order (SKIP_ENV takes a comma/space separated list of these):
 #   build          docker build lua-router:integration (the e2e suites boot it)
@@ -119,8 +131,11 @@
 # Requirements: docker (+ authz:latest, apache/apisix:3.11.0-debian, and the
 # built lua-router:integration), curl, jq and python3. test/local.env is still
 # sourced for local overrides (none are required by the shipped gates).
-# Concurrency with other container-heavy suites is allowed but roughly doubles
-# the wall time.
+# Only ever run one copy at a time: a second invocation exits 3 while the first
+# holds /data/tmp/lr-gates/.gates.lock. GATE_JOBS parallelises gates INSIDE one
+# run; it is not a licence to start two runs, and it does not make the suites
+# cheaper to share the box with -- each container suite still wants docker and
+# CPU, so a very large GATE_JOBS buys nothing past the point of saturation.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -137,6 +152,119 @@ LOG=${LR_GATE_LOG:-$LOG_DIR/gates-$STAMP.log}
 KEEP_GOING=${KEEP_GOING:-0}
 GATE_ONLY=${GATE_ONLY:-}
 mkdir -p "$LOG_DIR"
+# LR_GATE_LOG may name a path outside LOG_DIR (the original script derived the
+# default log from LR_GATE_LOG_DIR, so the two could disagree). Create the
+# directory of the file actually used, or every gate dies on the redirect.
+mkdir -p "$(dirname "$LOG")"
+
+# ------------------------------------------------------------------ concurrency
+# GATE_JOBS>1 turns the serial run into a worker pool over PARALLEL_GATES, with
+# WAVE_PRE before it and WAVE_TAIL strictly after it. Only the pool is concurrent;
+# the split is what keeps the machine-wide readers (the docker.sock port snapshot,
+# the mesh roster, a fixed listener) from observing another gate containers.
+GATE_JOBS=${GATE_JOBS:-1}
+GATE_DRY_RUN=${GATE_DRY_RUN:-0}
+if ! [[ "$GATE_JOBS" =~ ^[0-9]+$ ]] || [[ "$GATE_JOBS" -lt 1 ]]; then
+    printf "GATE_JOBS must be a positive integer (got: %s)\n" "$GATE_JOBS" >&2
+    exit 2
+fi
+
+# The run is split into three phases; only phases 1 and 2 are pools, and
+# membership is decided by what a gate reads from the machine, never by how
+# long it takes.
+#
+# PHASE 1 (pool) -- these four may share the pool because between them only
+# contract ever binds a host port:
+#   build            writes lua-router:integration; the other three read only
+#                    the two pre-existing images (authz:latest, apisix), so no
+#                    tag is produced and consumed inside the same phase. It
+#                    sits here, not in phase 2, because every e2e suite boots
+#                    the image it writes.
+#   conf             docker run --rm, no --network host, no published port.
+#   unit             luajit/resty --rm runs, no network at all.
+#   contract         carries the caveat that shapes phase 1: it publishes host
+#                    ports picked by its OWN free_port() (test_lua_router.sh:194,
+#                    a plain bind(0)) which does not consult the shared reserve
+#                    file. It is safe only beside gates that bind no host port,
+#                    and these three do. Put any phase-2 gate next to it and the
+#                    suite dies on "container failed to start" for a reason that
+#                    has nothing to do with the code under test.
+#
+# PHASE 2 (pool) -- every gate here takes its host port from
+# _lib.free_port(), which reserves numbers across processes through a shared
+# file, and pins SMG_METRICS_PORT=0 so the 29000 scrape listener never competes.
+#
+# PHASE 3 (serial, one at a time) -- each of these reads state that belongs to
+# the whole machine, so they may not even overlap each other:
+#   e2e_watcher      snapshots "docker ps --format {{.Ports}}" to build its
+#                    SMG_WATCHER_EXCLUDE list (e2e_watcher.py:501 and :732) and
+#                    mounts /var/run/docker.sock. A container another gate
+#                    starts after that snapshot is an unaccounted published port,
+#                    so its "exactly one worker" assertions fail for an unrelated
+#                    reason.
+#   mesh_two         asserts the mesh roster across an 18 s stability window and
+#                    a stop/heal partition window (test_mesh_two.py:132-137);
+#                    roster timing only means anything with no other router
+#                    answering on the box LAN address.
+#   e2e_tls_chain    names one fixed listener (31337, e2e_tls_chain.py:942) and
+#                    checks SNI selection on it, so nothing else may be binding
+#                    near that range while it runs.
+WAVE_PRE=(build conf unit contract)
+WAVE_TAIL=(e2e_watcher mesh_two e2e_tls_chain)
+
+# Parallel-safe pool (phase 2).
+# Every gate below takes its host port from _lib.free_port(), which now reserves
+# numbers across processes through the shared $RESULT_DIR/ports.reserved file, and
+# pins SMG_METRICS_PORT=0 so the 29000 scrape listener never competes. The mock
+# workers bind ports the same way, and their logs live under $TMP keyed by port.
+PARALLEL_GATES=(probes e2e_stateful e2e_policies e2e_ui_bridge
+                e2e_errors e2e_effort head_routes mesh_http e2e_policy_parity
+                e2e_token_accounting e2e_gpu_load e2e_routing_dyn e2e_profiles
+                e2e_caps e2e_models_advertisement)
+
+# Fail closed, and only sound because it runs after GATE_ORDER is defined (see
+# the call site below): an
+# unclassified gate is a hard error rather than a silent fall-through to serial.
+check_gate_classification() {
+    local _g _h _seen
+    for _g in "${GATE_ORDER[@]}"; do
+        _seen=0
+        for _h in "${WAVE_PRE[@]}" "${PARALLEL_GATES[@]}" "${WAVE_TAIL[@]}"; do
+            [[ "$_h" == "$_g" ]] && _seen=1
+        done
+        if [[ "$_seen" != "1" ]]; then
+            printf "gate %s is not classified as parallel or exclusive\n" "$_g" >&2
+            exit 2
+        fi
+    done
+}
+
+parallel_active() {
+    if [[ "$GATE_JOBS" -gt 1 && -z "$GATE_ONLY" ]]; then return 0; fi
+    return 1
+}
+
+# A pool has no "first failure" to stop at, so the parallel run always keeps
+# going and lets summary decide the exit code. Set here, before the log header,
+# so the recorded KEEP_GOING line matches what actually happened.
+if parallel_active; then KEEP_GOING=1; fi
+
+# One gate run at a time: an flock held for the life of the process, so a second
+# run (parallel or serial) is refused instead of overlapping the first.
+# The lock path is FIXED, deliberately not $LOG_DIR: LR_GATE_LOG_DIR lets a caller
+# move the log anywhere, and if the lock moved with it, two runs pointed at
+# different log dirs would each find their own lock free and both start -- the
+# exact overlap this exists to prevent. A dry run takes no lock: it prints the
+# plan and touches nothing.
+if [[ "$GATE_DRY_RUN" != "1" ]]; then
+    mkdir -p /data/tmp/lr-gates
+    exec 9>/data/tmp/lr-gates/.gates.lock
+    if ! flock -n 9; then
+        printf "another final_gates run holds the gates lock; refusing to start a\n" >&2
+        printf "second one (hard rule: only one gate run at a time)\n" >&2
+        exit 3
+    fi
+fi
 
 # gate order; keep in sync with the SKIP_ENV table in the header
 GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
@@ -160,6 +288,11 @@ in_tier() {
     for want in "${QUICK_GATES[@]}"; do [[ "$want" == "$g" ]] && return 0; done
     return 1
 }
+
+# Runs here rather than where the wave tables are declared: it walks GATE_ORDER,
+# which is defined above this point and not below it. An unclassified gate is a
+# hard error, so adding a gate without classifying it cannot silently serialise.
+check_gate_classification
 
 declare -A SKIP=()
 raw_skips=${SKIP_ENV:-}
@@ -213,7 +346,7 @@ gate() {
         "$@" >>"$LOG" 2>&1
         rc=$?
     else
-        "gate_$name" >>"$LOG" 2>&1
+        run_gate_body "$name" "$LOG"
         rc=$?
     fi
     local took=$((SECONDS - started))
@@ -233,6 +366,119 @@ gate() {
         exit 1
     fi
     return 0
+}
+
+# run_gate_body NAME LOGFILE NAMESPACE — the single place a gate body is
+# executed. NAMESPACE=1 (parallel only) also hands the suite a gate-scoped tag,
+# which _lib.py folds into every container name, every mock log path and every
+# per-run temp file, plus the one reserve file the pool shares so two suites
+# cannot be handed the same loopback port. With NAMESPACE=0 nothing is exported,
+# so the default serial run is the historical byte-for-byte behaviour.
+run_gate_body() {
+    local name=$1 logfile=$2 namespace=${3:-0}
+    if [[ "$namespace" == "1" ]]; then
+        export LR_GATE_TAG="$name"
+        # One reserve file for the whole pool: a per-gate file would let two
+        # suites be handed the same port, which is the race this closes.
+        export LR_PORT_RESERVE="$RESULT_DIR/ports.reserved"
+    fi
+    # 9>&- drops the run-wide lock before the gate body runs. It is inherited by
+    # every child otherwise, so one gate that leaks a stray background process --
+    # an orphaned mock worker, say -- would keep the lock alive after this script
+    # exits and block every later run. The parent still holds it, so the run
+    # remains exclusive; only the descendants stop advertising that they hold it.
+    "gate_$name" >>"$logfile" 2>&1 9>&-
+}
+
+# Parallel bookkeeping. Jobs report through $RESULT_DIR/<gate>.rc (rc, seconds,
+# start stamp) and never touch the shared counters, which stay parent-only.
+declare -A JOB_PID=()
+
+start_gate_job() {
+    local name=$1
+    local plog="$PER_GATE_DIR/$name.log"
+    : >"$plog"
+    rm -f "$RESULT_DIR/$name.rc"
+    # 9>&- so a gate that leaks a stray background process cannot keep the
+    # run-wide flock alive after this script exits and wedge every later run.
+    (
+        local started=$SECONDS rc
+        run_gate_body "$name" "$plog" 1
+        rc=$?
+        # write-then-rename so the parent never reads a half-written result
+        printf "%s %s %s\n" "$rc" "$((SECONDS - started))" "$(date -u +%H:%M:%S)" \
+            >"$RESULT_DIR/$name.rc.part"
+        mv -f "$RESULT_DIR/$name.rc.part" "$RESULT_DIR/$name.rc"
+    ) 9>&- &
+    JOB_PID["$name"]=$!
+}
+
+# collect_finished — print + count every job that reported, in completion order
+# so a red gate shows its own context the moment it lands.
+collect_finished() {
+    local name rc took
+    for name in "${!JOB_PID[@]}"; do
+        [[ -f "$RESULT_DIR/$name.rc" ]] || continue
+        read -r rc took <<<"$(cut -d" " -f1,2 "$RESULT_DIR/$name.rc")" || continue
+        [[ -n "$rc" && -n "$took" ]] || continue
+        unset "JOB_PID[$name]"
+        if [[ "$rc" == "0" ]]; then
+            PASSED_GATES=$((PASSED_GATES + 1))
+            printf '\n== gate: %-14s PASS  (%3ss)\n' "$name" "$took"
+        else
+            FAILED_GATES=$((FAILED_GATES + 1))
+            FAILURES+=("$name (rc=$rc, ${took}s)")
+            printf '\n== gate: %-14s FAIL  (%3ss, rc=%s)\n' "$name" "$took" "$rc"
+        fi
+        if [[ "$rc" != "0" ]]; then
+            printf '   last lines of %s:\n' "$PER_GATE_DIR/$name.log"
+            tail -n 25 "$PER_GATE_DIR/$name.log" | sed 's/^/   | /'
+        fi
+    done
+}
+
+# run_wave — the pool over the gates named in the arguments; blocks are
+# appended to $LOG in GATE_ORDER afterwards, so the log keeps the serial shape
+# (one ===== gate: NAME HH:MM:SS ===== block per gate, in run order).
+run_wave() {
+    local -a queue=("$@")
+    local -a requested=("$@")
+    local name; local -a finished=()
+    while [[ ${#queue[@]} -gt 0 || ${#JOB_PID[@]} -gt 0 ]]; do
+        while [[ ${#JOB_PID[@]} -lt "$GATE_JOBS" && ${#queue[@]} -gt 0 ]]; do
+            name=${queue[0]}
+            queue=("${queue[@]:1}")
+            if [[ -n "${SKIP[$name]:-}" ]]; then
+                SKIPPED_GATES=$((SKIPPED_GATES + 1))
+                printf '\n== gate: %-14s SKIPPED (SKIP_ENV) ==\n' "$name"
+                printf '   see the header comment for what this skip leaves unverified\n'
+                finished+=("$name")
+                continue
+            fi
+            if ! is_selected "$name"; then
+                continue
+            fi
+            start_gate_job "$name"
+        done
+        [[ ${#JOB_PID[@]} -gt 0 ]] || break
+        collect_finished
+        [[ ${#JOB_PID[@]} -gt 0 ]] && sleep 0.5
+    done
+    collect_finished
+    for name in "${finished[@]}"; do
+        { echo; echo "===== gate: $name  SKIPPED by SKIP_ENV ====="; } >>"$LOG"
+    done
+    # Only the gates this wave actually ran, in GATE_ORDER. A second wave must
+    # not re-append the first wave blocks, which is why the queue itself (not the
+    # whole result dir) decides what to merge.
+    for name in "${GATE_ORDER[@]}"; do
+        # merge only this wave gates, and only those that really ran
+        local hit=0
+        for _r in "${requested[@]}"; do [[ "$_r" == "$name" ]] && hit=1; done
+        [[ "$hit" == "1" ]] || continue
+        [[ -f "$RESULT_DIR/$name.rc" ]] || continue
+        { echo; echo "===== gate: $name  parallel ====="; cat "$PER_GATE_DIR/$name.log"; } >>"$LOG"
+    done
 }
 
 summary() {
@@ -370,28 +616,68 @@ preflight
     echo "KEEP_GOING=$KEEP_GOING GATE_ONLY=${GATE_ONLY:-none} SKIP_ENV=${raw_skips:-none}"
 } >>"$LOG"
 
-gate build
-gate conf
-gate unit
-gate contract
-gate probes
-gate e2e_stateful
-gate e2e_policies
-gate e2e_ui_bridge
-gate e2e_errors
-gate e2e_effort
-gate head_routes
-gate mesh_http
-gate e2e_policy_parity
-gate e2e_watcher
-gate e2e_profiles
-gate e2e_caps
-gate e2e_models_advertisement
-gate e2e_token_accounting
-gate e2e_gpu_load
-gate e2e_routing_dyn
-gate mesh_two
-gate e2e_tls_chain
+
+run_all_gates() {
+    if ! parallel_active; then
+        # Default: the historical serial run, one shared $LOG, first failure stops.
+        gate build; gate conf; gate unit; gate contract; gate probes
+        gate e2e_stateful; gate e2e_policies; gate e2e_ui_bridge; gate e2e_errors
+        gate e2e_effort; gate head_routes; gate mesh_http; gate e2e_policy_parity
+        gate e2e_watcher; gate e2e_profiles; gate e2e_caps
+        gate e2e_models_advertisement; gate e2e_token_accounting; gate e2e_gpu_load
+        gate e2e_routing_dyn; gate mesh_two; gate e2e_tls_chain
+        return 0
+    fi
+    PER_GATE_DIR="$LOG_DIR/per-gate-$STAMP"
+    RESULT_DIR="$LOG_DIR/results-$STAMP"
+    rm -rf "$PER_GATE_DIR" "$RESULT_DIR"
+    mkdir -p "$PER_GATE_DIR" "$RESULT_DIR"
+    export LR_PORT_RESERVE="$RESULT_DIR/ports.reserved"
+    : >"$LR_PORT_RESERVE"
+    # Phase 1: the portless four. build writes the image every e2e suite boots,
+    # and contract is the only member that publishes a host port (an unreserved
+    # bind(0) of its own), which is safe only because the other three bind none.
+    run_wave "${WAVE_PRE[@]}"
+    # If build is red, the 15 suites that boot its image would all fail for the
+    # same unrelated reason, so stop there. A red contract does not stop the run:
+    # it is independent of the container suites, and seeing all of them in one
+    # pass is the point of running them together.
+    if [[ -f "$RESULT_DIR/build.rc" && "$(cut -d" " -f1 "$RESULT_DIR/build.rc")" != "0" ]]; then
+        printf "\nstopping: the build gate is red, the e2e pool cannot be trusted\n"
+        summary
+    fi
+    printf "\n== phase 2 (pool, %s at a time, %s gates eligible)\n" \
+        "$GATE_JOBS" "${#PARALLEL_GATES[@]}"
+    run_wave "${PARALLEL_GATES[@]}"
+    # Phase 3 uses gate(), never the pool: these read machine-wide state, so
+    # they must not even overlap each other. gate() appends to $LOG directly,
+    # which is why no merge step is needed for them.
+    for _name in "${WAVE_TAIL[@]}"; do
+        gate "$_name"
+    done
+    printf "\nper-gate logs: %s\n" "$PER_GATE_DIR"
+}
+
+if [[ "$GATE_DRY_RUN" == "1" ]]; then
+    printf "lua-router final gates — plan only (nothing executed)\n"
+    printf "tier=%s  GATE_JOBS=%s  selected tier gates:\n" "$GATE_TIER" "$GATE_JOBS"
+    for g in "${GATE_ORDER[@]}"; do
+        if is_selected "$g"; then tag="run"; else tag="off"; fi
+        # Which pool the gate belongs to, so the plan reads like the scheduler.
+        mode=serial-only
+        for _p in "${WAVE_PRE[@]}"; do [[ "$_p" == "$g" ]] && mode=pool-1; done
+        for _p in "${PARALLEL_GATES[@]}"; do [[ "$_p" == "$g" ]] && mode=pool-2; done
+        for _p in "${WAVE_TAIL[@]}"; do [[ "$_p" == "$g" ]] && mode=serial-only; done
+        if [[ -n "${SKIP[$g]:-}" ]]; then tag="skip"; fi
+        printf "  %-24s %-6s %s\n" "$g" "$tag" "$mode"
+    done
+    printf "\nphase 1 (pool, %s at a time): %s\n" "$GATE_JOBS" "${WAVE_PRE[*]}"
+    printf "phase 2 (pool, %s at a time): %s\n" "$GATE_JOBS" "${PARALLEL_GATES[*]}"
+    printf "phase 3 (serial, one at a time): %s\n" "${WAVE_TAIL[*]}"
+    exit 0
+fi
+
+run_all_gates
 
 if [[ "$KEEP_GOING" == "1" && "$FAILED_GATES" != "0" ]]; then
     summary

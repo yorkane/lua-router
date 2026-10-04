@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Integration e2e for lua-router: real openresty container + mock workers."""
-import json, os, re, socket, subprocess, sys, time, urllib.error, urllib.request
+import fcntl, json, os, random, re, socket, subprocess, sys, time
+import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))          # .../test/integration
 REPO = os.path.dirname(os.path.dirname(HERE))  # repo root
@@ -9,18 +10,120 @@ CONF_TEST = REPO + "/test/conf/nginx-lua-router.conf"
 CONF_UI = REPO + "/conf/ui.conf"
 TMP = os.environ.get("LR_TEST_TMP", "/data/tmp/lr")
 os.makedirs(TMP, exist_ok=True)
-RUN = str(os.getpid())[-5:]
+# LR_GATE_TAG is set by test/final_gates.sh when GATE_JOBS>1: it puts the gate name
+# into every container name and every per-run temp path, so two gates that happen to
+# get PIDs congruent mod 100000 can no longer write each other's files. Unset (the
+# default, and every manual single-suite run) leaves RUN exactly as it was.
+GATE_TAG = re.sub(r"[^a-z0-9_-]", "", os.environ.get("LR_GATE_TAG", "").lower())[:14]
+RUN = (GATE_TAG + "-" if GATE_TAG else "") + (str(os.getpid()) if GATE_TAG
+                                                else str(os.getpid())[-5:])
 RESULTS = []
 PIDS = []
 CONTAINERS = []
 
 
+# Ports that are NOT handed out by free_port(): 29000 is the Rust gateway's scrape
+# listener on this box, 30000 is the in-container SMG_PORT the contract suite
+# publishes, and 31337 is the fixed listener e2e_tls_chain names in one scenario.
+# Without this list a parallel gate could reserve one of those numbers microseconds
+# before the suite that hardcodes it tries to bind it.
+_AVOID_PORTS = {29000, 30000, 31337}
+# Reservations are drawn only from this band, deliberately BELOW
+# net.ipv4.ip_local_port_range (32768-60999 here). Two allocators share a gate
+# run: free_port() picks the router listeners and the mocks, and the docker
+# daemon picks on its own for every "-p 127.0.0.1::8080" publish (that is how
+# probe_container exposes the router). The ledger below synchronises only the
+# first of the two, so if both drew from the ephemeral range, a docker publish
+# could be handed a number that free_port() had reserved and not yet bound.
+# Staying out of that range makes them disjoint by construction.
+_PORT_BAND = range(20001, 32000)
+
+
+def _reserve_file():
+    """The shared ledger path, or None meaning "serial mode".
+
+    Only the parallel branch of test/final_gates.sh exports LR_PORT_RESERVE.
+    Unset -- the default, and every manual single-suite run -- free_port() keeps
+    its original shape exactly: bind(0), read the port, close, return. That is
+    what keeps GATE_JOBS=1 behaviourally identical to the pre-pool script.
+    """
+    return os.environ.get("LR_PORT_RESERVE")
+
+
+def _claim(ledger, p):
+    """Take port p in the shared ledger; False if a live process already holds it.
+
+    Rows are tagged with the owner pid and rewritten under one exclusive flock, so
+    a run killed mid-flight stops reserving its ports rather than leaking them.
+    An unreadable ledger degrades to the pre-pool behaviour instead of failing
+    the gate on plumbing.
+    """
+    try:
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        with open(ledger, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            keep, taken = [], set()
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    owner, port = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                try:
+                    os.kill(owner, 0)
+                except OSError:
+                    continue              # dead owner -> its port is public again
+                keep.append("%d %d\n" % (owner, port))
+                taken.add(port)
+            if p in taken:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                return False
+            keep.append("%d %d\n" % (os.getpid(), p))
+            fh.seek(0)
+            fh.truncate()
+            fh.writelines(keep)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        return True
+    return True
+
+
 def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    """Pick a free loopback port; under GATE_JOBS>1, reserve it across processes.
+
+    Serial mode is the untouched original: bind(0), read, close, return. The
+    parallel branch adds the two things a bare bind(0) cannot give when gates
+    share the box -- the number survives the window between close() and the
+    docker/python bind that finally uses it, and candidates come from a band the
+    docker daemon never allocates from. Every candidate still has to bind, so a
+    port already held by a real service is skipped.
+    """
+    ledger = _reserve_file()
+    if not ledger:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+    order = list(_PORT_BAND)
+    random.shuffle(order)
+    for p in order:
+        if p in _AVOID_PORTS:
+            continue
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", p))
+        except OSError:
+            continue                      # held by a service or a docker proxy
+        finally:
+            probe.close()
+        if _claim(ledger, p):
+            return p
+    raise RuntimeError("could not reserve a free loopback port in %d-%d"
+                     % (_PORT_BAND.start, _PORT_BAND.stop))
 
 
 def http(method, url, body=None, headers=None, timeout=15):
