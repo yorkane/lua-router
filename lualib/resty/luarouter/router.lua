@@ -3251,6 +3251,47 @@ apply_ctx_cap = function(raw, body, model, entry)
     return raw, cap
 end
 
+---从已解码的请求体里取第一条 user 消息的前 50 个字符，供 UI 日志页的
+---「记录详情 / prompt 预览」定位用。
+---位置选在 route_inference 之前：两条推理入口（inference_handler 与 ui_pipeline）
+---都汇合到 route_inference，且 body 到那里必定已经是解码好的 table，
+---所以只在这一个点提取一次即可覆盖全部入口。
+---必须从已解码的 table 里读，绝不重新编码请求体（AGENTS.md 红线：推理体字节透传）；
+---本函数纯读、O(消息数) 且只做到 sub(1,50)。
+---@param body table|nil
+---@return string|nil
+local function extract_prompt_preview(body)
+    if type(body) ~= "table" then
+        return nil
+    end
+    local msgs = body.messages
+    if type(msgs) ~= "table" then
+        return nil
+    end
+    for _, m in ipairs(msgs) do
+        if m and m.role == "user" then
+            local c = m.content
+            if type(c) == "string" then
+                return c:sub(1, 50)
+            elseif type(c) == "table" then
+                for _, part in ipairs(c) do
+                    if type(part) == "table" then
+                        -- chat 协议的 {type="text"} 与 responses 风格的
+                        -- {type="input_text"} 两种形态都取 part.text。
+                        if part.type == "text" or part.type == "input_text" then
+                            local t = part.text
+                            if type(t) == "string" then
+                                return t:sub(1, 50)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 ---Shared pipeline for every inference route: pick a worker, rewrite the payload,
 ---forward, write the response. Returns the status and (for buffered responses)
 ---the upstream bytes; streaming responses are already on the wire.
@@ -3266,6 +3307,10 @@ local function route_inference(route, body, raw)
         return send_error(400, "invalid_json",
             "request field \"model\" must be a string")
     end
+    -- 给 log_inference_request 留一份 prompt 预览：两处入口的 body 都在这里汇合，
+    -- 记录阶段（finish_request -> log_inference_request）已经拿不到请求体，
+    -- 只能在这条热路径上顺手摘一次（纯读，不改任何字节）。
+    ngx.ctx.lr_prompt_preview = extract_prompt_preview(body)
     local requested_model
     if type(body.model) == "string" and body.model ~= "" then
         requested_model = body.model
@@ -4478,26 +4523,11 @@ local function log_inference_request(duration_s, ttft_s)
         endpoint = endpoint,
         status = status,
         stream = ngx.ctx.lr_stream == true,
-        prompt_preview = (function()
-            -- 提取第一个 user 消息的前 50 字符，给 UI 日志页快速定位用
-            local msgs = type(body) == "table" and body.messages
-            if type(msgs) ~= "table" then return nil end
-            for _, m in ipairs(msgs) do
-                if m and m.role == "user" then
-                    local c = m.content
-                    if type(c) == "string" then
-                        return c:sub(1, 50)
-                    elseif type(c) == "table" then
-                        for _, part in ipairs(c) do
-                            if type(part) == "table" and part.type == "text" and type(part.text) == "string" then
-                                return part.text:sub(1, 50)
-                            end
-                        end
-                    end
-                end
-            end
-            return nil
-        end)(),
+        -- 路由阶段由 route_inference 存进 ngx.ctx 的 prompt 预览（前 50 个字符）。
+        -- 之前这里是就地提取的 IIFE，但它引用的 body 是本文件的顶格全局（nil），
+        -- 字段恒为 nil 从未出现在日志行里；没有预览时保持 nil 让 cjson 省略该键，
+        -- 用空串占位会和「prompt 本来就是空」混淆。
+        prompt_preview = ngx.ctx.lr_prompt_preview,
         model = model,
         requested_model = ngx.ctx.lr_requested_model or model,
         requested_effort = ngx.ctx.lr_requested_effort or cjson.null,
