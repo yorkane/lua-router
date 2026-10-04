@@ -1036,7 +1036,7 @@
         // 组内各卡片 context_limit 的最小值：一组由该入口不控制的引擎提供服务，
         // 只有按最窄的那台才算安全口径（与后端校验取最小值同一个理由）。
         function narrowestLimitOfGroup (group) {
-          let narrowest = null
+          let narrowest = null;
           (group || []).forEach(model => {
             const one = contextLimitOf(model)
             if (one !== null && (narrowest === null || one < narrowest)) narrowest = one
@@ -1046,7 +1046,7 @@
         // 条目未声明 context_window 时对外展示的「整组统一声明窗口」：组内各卡片 ctx 的最小值。
         // 只是展示口径（后端不再据此钳制任何东西），单模型组就等于该模型自己卡片的声明。
         function groupDeclaredWindow (group) {
-          let out = null
+          let out = null;
           (group || []).forEach(model => {
             const one = previewCtx(model)
             if (typeof one === 'number' && one >= 1 && (out === null || one < out)) out = one
