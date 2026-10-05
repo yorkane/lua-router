@@ -160,6 +160,33 @@
                 <div v-if="!virtualRows.length" class="muted">{{ t.rowsEmpty }}</div>
                 <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualAdd')" @click="addVirtualRow"></q-btn></div>
               </div>
+              <q-separator dark class="q-mt-md"></q-separator>
+              <!-- 对外广告范围：整表顶层键 models_virtual_only 的唯一编辑位（AGENTS.md 项目定位
+                   第 3 条：新增配置面必须落到可视化，不能只给 env）。
+                   三态下拉而不是勾选框：后端把「键不存在」（让给 env LMR_MODELS_VIRTUAL_ONLY）
+                   与「显式 false」（说了要全量广告，必须压过 env 的 true）分家，合并成一个布尔
+                   就丢了一半语义 —— 与 supports_tool_use 同一套三态纪律。
+                   位置放在入口表底部而不是独立一张卡：这个开关的全部意义是「上面这批入口行对外
+                   可见、其余名字不可见」，与入口表同屏才看得见因果关系，空入口告警读的也正是
+                   上面这张表；放页面顶部会把最常用的入口编辑区往下挤。 -->
+              <div class="q-mt-md">
+                <div class="rows-head q-mb-xs">{{ advertiseText('advertiseSection') }}</div>
+                <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+                  <q-select v-model="advertiseChoice" dense outlined dark :options="advertiseOptions" map-options emit-value
+                            style="min-width:min(330px,100%)" :label="advertiseText('advertiseField')"
+                            :hint="advertiseText('advertiseHint')"></q-select>
+                  <q-badge outline :color="advertiseDiskColor" class="chip-soft">{{ advertiseDiskText }}</q-badge>
+                  <q-badge v-if="advertiseDirty" outline color="orange-4" class="chip-soft">{{ advertisePendingText }}</q-badge>
+                  <span style="flex:1 1 auto"></span>
+                  <q-btn unelevated no-caps color="primary" class="primary-button" :disable="!advertiseDirty"
+                         :loading="saving" :label="advertiseText('advertiseSave')" @click="saveAdvertiseSwitch"></q-btn>
+                </div>
+                <div class="muted" style="font-size:11.5px;margin-top:6px">{{ advertiseText('advertiseCopy') }}</div>
+                <div class="muted" style="font-size:11.5px;margin-top:3px">{{ advertiseText('advertiseContract') }}</div>
+                <div class="muted" style="font-size:11.5px;margin-top:3px">{{ advertiseText('advertiseEnvRisk') }}</div>
+                <div v-if="advertiseEmptyWarning" class="warn-banner"
+                     style="font-size:11.5px;margin-top:6px;padding:6px 9px;border-radius:8px">{{ advertiseEmptyWarning }}</div>
+              </div>
             </q-card-section>
           </q-card>
 
@@ -331,6 +358,7 @@
                 <div class="dialog-copy">{{ cj.jsonCopy }}</div>
                 <div class="dialog-copy muted" style="margin-top:8px">{{ cj.jsonCopyVirtual }}</div>
                 <div class="dialog-copy muted" style="margin-top:8px">{{ cj.jsonCopyKeys }}</div>
+                <div class="dialog-copy muted" style="margin-top:8px">{{ cj.jsonCopyAdvertise }}</div>
               </q-card-section>
               <q-card-section>
                 <textarea
@@ -403,6 +431,28 @@
         jsonConfirmVirtualLabel: '虚拟入口',
         jsonConfirmUpstreamsLabel: '实例声明',
         jsonConfirmWatch: '本次提交会把 model_map 缩到 {after} 条（当前 {before} 条）：apply 会把缩掉的名字交给进程内 watcher 落地删除。',
+        // /v1/models 广告面开关（models_virtual_only）：新文案先进页内字典（本文件 21-22 行先例，
+        // i18n.js 由他人并行维护），键并进 i18n.js 的 models 块后可删这一段。JSON 对话框里那条
+        // 说明（jsonCopyAdvertise）也放这里而不是 JSON_LOCAL：JSON_LOCAL 由 JSON 面的人维护，
+        // 本任务只拥有这个开关的文案，各管各的键可以避免两个人改同一个对象。
+        jsonCopyAdvertise: '顶层键 models_virtual_only 控制 /v1/models 对外广告哪些模型：true=只广告虚拟入口，false=入口与真实模型都广告，键缺席=交还环境变量 LMR_MODELS_VIRTUAL_ONLY。它只改对外广告，不改转发、不改 /workers、不改选路。注意：这个键不在下面这份可编辑 JSON 里（编辑器只覆盖段键），它由上方「对外广告范围」那一个控件维护；从这里保存会把它原样带回、不会被抹掉。要清空声明请在上方选「未声明」。',
+        advertiseSection: '对外广告范围',
+        advertiseField: '/v1/models 广告哪些模型',
+        advertiseHint: '只影响 GET /v1/models 对外列出哪些模型；不改变转发、不改 /workers、不改变调度选路。',
+        advertiseCopy: '关（缺省）：/v1/models 同时列出虚拟入口与真实模型，这是既有老契约，按真实模型名直连的客户端照常工作。开：只列虚拟入口，一条真实模型都不出现。',
+        advertiseContract: '重要：开这个开关只是不对外「广告」真实模型，不是禁用它们 —— 真实模型仍可被路由、仍在 /workers 里、仍是虚拟入口 targets 的被调度对象；推理转发与 /workers 不因它改变一个字节。',
+        advertiseEnvRisk: '优先级：配置文件里的这个键 > 环境变量 LMR_MODELS_VIRTUAL_ONLY > 关。选「未声明」= 把这个决定交还给环境变量；本页只改配置文件那一层。读数只反映配置文件：若该开关只在容器 env 里设过，这里仍显示「未声明」。',
+        advertiseSave: '应用广告范围',
+        advertisePending: '未保存',
+        advertiseDiskAuto: '配置文件：未声明',
+        advertiseDiskOn: '配置文件：只广告入口',
+        advertiseDiskOff: '配置文件：全量广告',
+        advertiseEmptyWarn: '已选「只广告虚拟入口」，但当前没有任何虚拟入口：后端会退回全量广告并在日志写一条 WARN，而不是让服务看起来消失。先在上方添加至少一个入口再开。',
+        advertiseOptAuto: '未声明（跟随环境变量）',
+        advertiseOptOn: '开：只广告虚拟入口',
+        advertiseOptOff: '关：入口与真实模型都广告',
+        advertiseSaved: '广告范围已应用',
+        advertiseBusy: '请先关闭或放弃「配置 JSON」对话框，再应用广告范围：两处都写整份文档，同时编辑会互相覆盖。',
       },
       'en-US': {
         jsonButton: 'Config JSON',
@@ -446,6 +496,25 @@
         jsonConfirmVirtualLabel: 'virtual entries',
         jsonConfirmUpstreamsLabel: 'upstream declarations',
         jsonConfirmWatch: 'This submit shrinks model_map to {after} row(s) (currently {before}): apply hands the dropped names to the in-process watcher so the renames are deleted.'
+        ,
+        jsonCopyAdvertise: 'The top-level key models_virtual_only decides what /v1/models advertises: true = only the virtual entries, false = entries and real models, key absent = hand the decision back to env LMR_MODELS_VIRTUAL_ONLY. It only changes the advertisement: forwarding, /workers and routing stay untouched. Note: this key is not part of the editable JSON below (that editor covers the section keys only); it is owned by the single "Advertisement scope" control above, and saving from here carries it through unchanged. To clear the declaration choose "Not declared" above.',
+        advertiseSection: 'Advertisement scope',
+        advertiseField: 'Which models /v1/models advertises',
+        advertiseHint: 'Only changes which models GET /v1/models lists; it does not touch forwarding, /workers, or routing.',
+        advertiseCopy: 'Off (default): /v1/models lists both virtual entries and real models — the existing contract, so clients that connect by real model name keep working. On: only virtual entries are listed, no real model appears.',
+        advertiseContract: 'Important: turning this on only stops advertising real models, it does not disable them — real models stay routable, stay in /workers, and stay the scheduled targets of the entries; forwarding and /workers do not change by a single byte.',
+        advertiseEnvRisk: 'Precedence: this key in the config file > env LMR_MODELS_VIRTUAL_ONLY > off. "Not declared" hands the decision back to the env var; this page only edits the config-file layer. The reading reflects the file only: if the switch was set only in the container env, this still shows "not declared".',
+        advertiseSave: 'Apply scope',
+        advertisePending: 'Unsaved',
+        advertiseDiskAuto: 'Config file: not declared',
+        advertiseDiskOn: 'Config file: entries only',
+        advertiseDiskOff: 'Config file: advertise all',
+        advertiseEmptyWarn: 'Set to "entries only", but there is no virtual entry yet: the backend falls back to advertising all models and writes one WARN to the log rather than making the service look empty. Add at least one entry above first.',
+        advertiseOptAuto: 'Not declared (follow env)',
+        advertiseOptOn: 'On: advertise virtual entries only',
+        advertiseOptOff: 'Off: advertise entries and real models',
+        advertiseSaved: 'Advertisement scope applied',
+        advertiseBusy: 'Close or discard the Config JSON dialog before applying the advertisement scope: both write the whole document, so editing them at the same time would overwrite each other.'
       }
     }
 
@@ -856,6 +925,9 @@
           // 「操作员是否真的编辑过这一行」：没编辑过的行提交时连 targets 都不写，
           // 于是 legacy {model,target} 条目在磁盘上保持字节不变，不会长出新字段。
           virtualRows.value = (document_.virtual_models || []).map(row => virtualRowFromEntry(row))
+          // 广告范围开关随文档一起回显：服务端那份就是「磁盘上写了什么」，表单不保留旧选择，
+          // 否则保存成功后下拉还停在改之前的值，操作员会以为没生效
+          advertiseChoice.value = advertiseNorm(document_.models_virtual_only)
           if (!preview.model) preview.model = models.value.length ? models.value[0].model : (previewModelOptions.value[0] || '')
           filteredModelOptions.value = previewModelOptions.value
         }
@@ -1599,6 +1671,119 @@
           await applyConfigJson(body)
         }
 
+        // ── /v1/models 对外广告范围（整表顶层键 models_virtual_only）────────────────
+        //
+        // 三态而不是勾选框：后端把「键不存在」（= 让给环境变量 LMR_MODELS_VIRTUAL_ONLY）与
+        // 「显式 false」（= 说了要全量广告，必须压过 env 的 true）分家
+        // （config_store._M.models_virtual_only 的两层读数）。UI 一旦把 undefined 塌缩成 false，
+        // 操作员就永远回不到「跟随环境变量」那一档，而且一份从没碰过这个开关的配置文件会凭空
+        // 多出一个没人声明过的键（本仓「可选字段缺席而非 null」的往返约定，与 targets /
+        // caps / supports_tool_use 同一条纪律）。
+        //
+        // 这个开关只改 GET /v1/models 对外列哪些模型；转发体、/workers、策略选路一个字节都不
+        // 因它改变（router.lua 的 models_advertise 只作用于广告面）。文案必须把这句说明白：
+        // 操作员最容易把它读成「关掉内部模型」。
+        const ADV_AUTO = 'auto'
+        const ADV_ON = 'on'
+        const ADV_OFF = 'off'
+        const advertiseChoice = ref(ADV_AUTO)
+
+        // 磁盘读数的规范化，必须与后端同一张真值表：router.lua 的 models_advertise.truthy
+        // 认 true / "true" / "1" / "yes" / "on"（去空白、大小写不敏感），其余一律 false。
+        // 字符串只可能来自手改磁盘或老配置（apply_document 会拒绝非布尔），它们仍是「文件里
+        // 说过话」，所以照真值表显示成 on/off 而不是 auto —— 显示成 auto 会让操作员以为删掉了
+        // 声明、实际开关还开着，正是本仓最怕的「磁盘一套、机器一套」。键不存在与 JSON null
+        // 才是「没说」。
+        const ADV_TRUTHY = { 'true': true, '1': true, 'yes': true, 'on': true }
+        function advertiseNorm (raw) {
+          if (raw === true) return ADV_ON
+          if (raw === false) return ADV_OFF
+          if (typeof raw === 'string') {
+            const v = raw.trim().toLowerCase()
+            if (v === '') return ADV_AUTO
+            return ADV_TRUTHY[v] ? ADV_ON : ADV_OFF
+          }
+          return ADV_AUTO
+        }
+        function advertiseValue (choice) {
+          if (choice === ADV_ON) return true
+          if (choice === ADV_OFF) return false
+          return null
+        }
+        const advertiseDisk = computed(() => advertiseNorm(doc.value && doc.value.models_virtual_only))
+        // 「未保存」判定用与服务端读数比对，而不是额外记一个 touched 标志：hydrate 会在每次
+        // load 后重写 advertiseChoice，标志位那条路要么在回显时误报脏、要么漏复位。
+        const advertiseDirty = computed(() => advertiseChoice.value !== advertiseDisk.value)
+        const advertiseOptions = computed(() => [
+          { label: advertiseText('advertiseOptAuto'), value: ADV_AUTO },
+          { label: advertiseText('advertiseOptOn'), value: ADV_ON },
+          { label: advertiseText('advertiseOptOff'), value: ADV_OFF }
+        ])
+        const advertiseDiskText = computed(() => {
+          if (advertiseDisk.value === ADV_ON) return advertiseText('advertiseDiskOn')
+          if (advertiseDisk.value === ADV_OFF) return advertiseText('advertiseDiskOff')
+          return advertiseText('advertiseDiskAuto')
+        })
+        const advertiseDiskColor = computed(() => (advertiseDisk.value === ADV_AUTO ? 'grey-6' : 'teal-4'))
+        const advertisePendingText = computed(() => advertiseText('advertisePending'))
+        // 开了开关却一条入口都没有：后端的处置是「退回全量广告 + 日志一行 WARN」（router.lua
+        // models_handler 里那句 only_data 返回 nil 的分支），不是把服务交成空列表。这里同口径
+        // 提前提示：否则操作员会以为已经生效，而实际对外形状一点没变 —— 那正是本仓最讨厌的
+        // 「磁盘写的是一套、机器跑的是另一套」。判定时同时看已落盘条目与本页尚未保存的行，
+        // 因为「先加入口再开开关」是常见顺序，只查服务端会误报。
+        const advertiseEmptyWarning = computed(() => {
+          if (advertiseChoice.value !== ADV_ON) return ''
+          const serverCount = ((doc.value && doc.value.virtual_models) || []).length
+          const pending = virtualRows.value.some(row => Boolean(cleanModelName(row.model)))
+          if (serverCount > 0 || pending) return ''
+          return advertiseText('advertiseEmptyWarn')
+        })
+        // 文案取值：与 cjText 同一张本地字典（键并进 i18n.js 的 models 块后可切回 tv）
+        function advertiseText (key, values) { return localText(locale.value, key, values) }
+
+        async function saveAdvertiseSwitch () {
+          // JSON 面与本页写的是同一份文档：textarea 里有未应用的草稿时从这里保存，会用基线覆盖
+          // 掉操作员刚敲的东西，而那看起来像是「JSON 编辑器把我的编辑吃了」。先挡住。
+          if (jsonOpen.value || configJsonDirty()) {
+            Quasar.Notify.create({ message: advertiseText('advertiseBusy'), type: 'warning', position: 'top-right', timeout: 4600 })
+            return
+          }
+          if (!advertiseDirty.value) return
+          // 基线一律走 configJsonBaseline + configJsonBody：段过滤、model_map 三态、以及
+          // policy / model_policies 等「本页画不出但整表替换会清空」的段补回，全部复用 JSON 面
+          // 那套已验证过的无损组装。自己另写一份 body 组装 = 两个地方各记一遍「哪些段必须补回」，
+          // 漂移的代价是开一次开关就把路由策略页的配置抹平。
+          let baseline
+          try {
+            baseline = JSON.parse(configJsonBaseline())
+          } catch (error) {
+            Quasar.Notify.create({ message: (error && error.message) || String(error), type: 'negative', position: 'top-right', timeout: 5200 })
+            return
+          }
+          const body = configJsonBody(baseline)
+          const next = advertiseValue(advertiseChoice.value)
+          // 「未声明」= 从配置文件里删掉这个键（让给 env），而不是写 null：后端把缺席与 null
+          // 都当「没说」，但删键才是磁盘上本来该有的形状，也让没碰过开关的部署字节不变。
+          if (next === null) delete body.models_virtual_only
+          else body.models_virtual_only = next
+          saving.value = true
+          try {
+            const result = await window.lmrApi.configApply(body)
+            Quasar.Notify.create({ message: advertiseText('advertiseSaved'), type: 'positive', position: 'top-right', timeout: 2400 })
+            if (result && typeof result === 'object' && !Array.isArray(result)
+                && (Array.isArray(result.models) || Array.isArray(result.effort_map))) {
+              hydrate(result)
+            } else {
+              await load()
+            }
+            warningMessage.value = (result && typeof result.warning === 'string') ? result.warning : ''
+          } catch (error) {
+            Quasar.Notify.create({ message: error.message || String(error), type: 'negative', position: 'top-right', timeout: 5200 })
+          } finally {
+            saving.value = false
+          }
+        }
+
         function applyLocale (nextLocale) {
           locale.value = nextLocale
           document.documentElement.lang = nextLocale
@@ -1637,6 +1822,12 @@
           addTarget, removeTarget, addVirtualRow, displayTargets, groupOfRow, legacyChips, touchRow,
           targetModelOptions, normWorker, poolWorkers, workerOptionsFor,
           previewServing,
+          // /v1/models 对外广告范围开关：模板引用 advertiseText / advertiseChoice / advertiseOptions /
+          // advertiseDiskText / advertiseDiskColor / advertisePendingText / advertiseDirty /
+          // advertiseEmptyWarning / saveAdvertiseSwitch —— 漏一项就是整块静默消失（本项目踩过两次），
+          // 下面这一组必须与模板里的标识符逐项对齐
+          advertiseText, advertiseChoice, advertiseOptions, advertiseDiskText, advertiseDiskColor,
+          advertisePendingText, advertiseDirty, advertiseEmptyWarning, saveAdvertiseSwitch,
           warningMessage
         }
       }
