@@ -58,11 +58,69 @@ local DICT_KEY = "runtime_config"
 -- Cheap cross-worker invalidation token for the policy readers (policy.lua calls
 -- this on the hot path; it is a plain shdict get with no JSON decode).
 local REV_KEY = "policy_revision"
+-- The revision the durable layer answered with when it accepted the snapshot now
+-- sitting in DICT_KEY. It rides the dict for one reason: _store_rev is per-process,
+-- so a worker whose read was served from the dict never learned that somebody else
+-- bumped the counter, and its next compare-and-set went out with a base from process
+-- start (see write_snapshot / refresh_store_rev).
+local STORE_REV_KEY = "store_revision"
 -- Cross-process token for the upstreams reconcile self-heal (contract 3.1):
 -- written after every successful reconcile, read by init.lua's 30s timer. Same
 -- unprefixed style as DICT_KEY / REV_KEY.
 local UPS_REV_KEY = "upstreams_rev"
 local SNAPSHOT_TTL = 0.5  -- seconds a worker may reuse a snapshot read from disk
+
+-- All three backends spell a lost compare-and-set with this marker; the write path
+-- uses it to tell "the store refused my CAS" (a conflict the operator must see and
+-- retry) from "the store is unreachable" (degrade to the file, keep serving).
+local CONFLICT_MARK = "revision conflict"
+
+local function is_conflict_error(err)
+    return type(err) == "string" and err:find(CONFLICT_MARK, 1, true) ~= nil
+end
+
+--- An empty snapshot is not an answer. cjson decodes {} to a table with no keys, and
+--- that is exactly the shape a first deployment leaves behind when the JSON file was
+--- {} and got imported into the database: snapshot_of() never produces it (it always
+--- emits the ten section keys), so nothing that came through the gateway can look
+--- like it. Treating it as "the store did not speak" is what keeps the env layer
+--- reachable after such an import -- current() merges two whole layers, never field
+--- by field, so one vacuous layer silences the other forever.
+---
+--- The section-key test is what keeps this from becoming a different bug: "the
+--- operator emptied everything" is a real answer (a snapshot whose ten arrays are all
+--- empty must still win over the env seed layer, or deleting the last upstream would
+--- resurrect the LMR_UPSTREAMS_FILE rows). So a document that carries any section key
+--- at all counts as an answer no matter how empty its contents are; only a table with
+--- no section keys *and* nothing but empty containers / nulls in it -- what a hand
+--- dropped {} or a wiped pre-store config looks like -- is silence.
+local SNAPSHOT_SECTIONS = {
+    "default_effort", "effort_map", "model_ctx", "model_context_limit",
+    "model_effort", "model_configs", "virtual_models", "policy",
+    "model_policies", "upstreams", "models_virtual_only",
+}
+
+local function value_says_nothing(value)
+    if value == nil or value == JSON_NULL then return true end
+    if type(value) == "table" then return next(value) == nil end
+    return false
+end
+
+local function snapshot_is_empty(snap)
+    if type(snap) ~= "table" then return true end
+    if next(snap) == nil then return true end
+    for _, key in ipairs(SNAPSHOT_SECTIONS) do
+        if rawget(snap, key) ~= nil then return false end
+    end
+    for _, value in pairs(snap) do
+        if not value_says_nothing(value) then return false end
+    end
+    return true
+end
+
+local function snapshot_is_hollow(snap)
+    return type(snap) ~= "table" or snapshot_is_empty(snap)
+end
 
 -- ------------------------------------------------------------------ helpers
 
@@ -2159,6 +2217,25 @@ local function store()
         -- you go looking for the database.
         return nil
     end
+    -- init_by_lua needs its own guard, and the shape of the one above is why it was
+    -- easy to miss: in that phase ngx.worker is a perfectly good table and
+    -- ngx.worker.id() answers 0, so "is this a worker?" is not a question the
+    -- module presence can answer. It is the *phase* that decides. Opening the store
+    -- in the master hands every worker the same sqlite3* handle by fork inheritance,
+    -- and store_sqlite's "the connection belongs to somebody else" guard cannot see
+    -- it, because opened_path was inherited along with the handle. Measured on NW=8
+    -- with a fresh database: 6 of 8 workers came up "database is locked" and degraded
+    -- to the file for the rest of the process, so half of one container wrote sqlite
+    -- and half wrote the file. init is also the phase where a write is impossible by
+    -- definition -- the answer here is nil, so init only ever capture_env()s.
+    if ngx.get_phase then
+        local ok_phase, phase = pcall(ngx.get_phase)
+        if ok_phase and phase == "init" then return nil end
+    end
+    if ngx.process_type then
+        local ok_type, kind = pcall(ngx.process_type)
+        if ok_type and kind == "no" then return nil end
+    end
     local ok, mod = pcall(require, "resty.luarouter.store_dispatcher")
     if not ok or type(mod) ~= "table" or type(mod.load) ~= "function" then
         return nil
@@ -2168,6 +2245,48 @@ local function store()
 end
 
 _M.store = store
+
+--- Repoint this process's CAS base at the revision the durable layer answered with
+--- for the snapshot that is currently in view.
+---
+--- This exists because _store_rev is per-process: a worker whose read was served
+--- from the shdict never reached the store branch below, so it went on signing every
+--- compare-and-set with the base it happened to hold when the process started -- and
+--- in a two-writer race that is exactly the stale value that makes the CAS meaningless.
+--- The shdict now carries the committed revision next to the snapshot (STORE_REV_KEY),
+--- which a reader can pick up for the price of one shared-dict get. Only when that
+--- companion token is absent -- an entry written before the key existed, or by a
+--- worker whose store was unreachable -- does it fall back to asking the backend, and
+--- that question is throttled to one per SNAPSHOT_TTL window per worker so the read
+--- path never turns into a per-request database hit.
+---
+--- The base is deliberately *not* re-read at write time. A compare-and-set only means
+--- something when its expected value is the one the caller actually built its change
+--- on; refreshing it inside the write would quietly convert "lost the race, retry" into
+--- "overwrite whatever the other writer committed".
+local function refresh_store_rev(shared)
+    if shared then
+        local cached = shared:get(STORE_REV_KEY)
+        local number = (type(cached) == "number") and cached or tonumber(cached)
+        if number ~= nil then
+            _M._store_rev = number
+            return number
+        end
+    end
+    local now = (ngx and ngx.now) and ngx.now() or os.time()
+    if _M._store_rev_at and (now - _M._store_rev_at) < SNAPSHOT_TTL then
+        return _M._store_rev
+    end
+    _M._store_rev_at = now
+    local d = store()
+    if d then
+        local ok, current = pcall(d.revision)
+        if ok then _M._store_rev = current end
+    end
+    return _M._store_rev
+end
+
+_M.refresh_store_rev = refresh_store_rev
 
 -- Would a snapshot sitting in LMR_CONFIG_FILE be somebody's own edit rather
 -- than our own (now stale) mirror? Two signals, because the revision counter
@@ -2197,7 +2316,10 @@ local function read_snapshot()
         local raw = shared:get(DICT_KEY)
         if raw then
             local snap = cjson.decode(raw)
-            if snap then return snap end
+            if snap and not snapshot_is_empty(snap) then
+                refresh_store_rev(shared)
+                return snap
+            end
         end
     end
 
@@ -2208,7 +2330,13 @@ local function read_snapshot()
     local d = store()
     if d then
         local ok, snap, rev = pcall(d.load)
-        if ok and snap then
+        -- An empty snapshot is the store saying "nothing here", not "the config is
+        -- empty". A {} can be in there because an earlier build imported one (see
+        -- migrate_once / legacy_snapshot_is_empty), and current() merges whole layers
+        -- rather than fields, so letting it answer would silence the env layer for
+        -- the life of the deployment -- including after the operator deletes the
+        -- file, which used to be the documented way back to env defaults.
+        if ok and snap and not snapshot_is_empty(snap) then
             local edited, why = file_was_edited_outside(rev)
             if edited then
                 -- Read the FILE, not the store: the whole point of noticing an
@@ -2252,8 +2380,12 @@ local function read_snapshot()
     if path then
         local now = (ngx and ngx.now) and ngx.now() or os.time()
         _M._file_cache_at = _M._file_cache_at or 0
-        if _M._file_cache and (now - _M._file_cache_at) < SNAPSHOT_TTL then
-            return _M._file_cache
+        -- nil means "not looked yet"; false is the memoised "looked, no answer" (the
+        -- file is missing, unreadable, or empty). Both answers and both non-answers
+        -- are held for one TTL window, so a deployment with no LMR_CONFIG_FILE costs
+        -- exactly the same one stat per window it did before this branch existed.
+        if _M._file_cache ~= nil and (now - _M._file_cache_at) < SNAPSHOT_TTL then
+            return _M._file_cache or nil
         end
         _M._file_cache_at = now
         local f = io.open(path, "r")
@@ -2261,31 +2393,51 @@ local function read_snapshot()
             local text = f:read("*a")
             f:close()
             local snap = cjson.decode(text or "")
-            _M._file_cache = snap
-            if snap then return snap end
+            -- Same rule as the store branch above: an empty file has not answered, and
+            -- handing {} to current() would take the whole env layer down with it.
+            if snapshot_is_hollow(snap) then
+                _M._file_cache = false
+            else
+                _M._file_cache = snap
+                return snap
+            end
         else
-            _M._file_cache = nil
+            _M._file_cache = false
         end
     end
     return nil
 end
 
 --- Write the snapshot into every available layer (dict first, then disk).
+---
+--- Returns (true) when the durable layer accepted the write (or there is no durable
+--- layer to disagree), and (false, err, current_revision) when the store *refused* it
+--- for a revision conflict. The distinction is the whole point: a refused
+--- compare-and-set used to fall through into the plain file write below, so the
+--- losing value landed on disk -- and then got adopted into the database on the next
+--- cold start, which is the reverse of what CAS is for. The refused value now goes
+--- nowhere at all, and the caller answers the operator with an error carrying the
+--- current revision instead of a 200 holding a document the database has never seen.
+---
+--- A store that is merely unreachable is still the documented degraded path: it warns
+--- and persists to the file, because "the database is down" must not take the config
+--- plane down with it. Only a refusal -- the store answered and disagreed -- is
+--- propagated.
 local function write_snapshot(snap)
     local shared = dict()
-    if shared then
-        local ok, err = shared:set(DICT_KEY, cjson.encode(snap))
-        if not ok then
-            ngx.log(ngx.WARN, "luarouter config dict write failed: ", err or "?")
-        end
-    end
 
-    -- Durable first, mirror second. The mirror is for humans (readable JSON,
-    -- git-diffable) and for the rollback path, not a second source of truth, so
-    -- a failure there is a warning and never a failed save.
+    -- Durable first, then the in-process and human-readable layers. The store commits
+    -- before anything publishes this snapshot, because a refused compare-and-set now
+    -- aborts the write: had the dict been filled first, every worker and every reader
+    -- would have served -- and the UI confirmed to the operator -- a value the
+    -- database turned down, which is the half of the bug that made two sources of
+    -- truth contradict each other.
     local d = store()
     local committed_rev = _M._store_rev
     if d then
+        -- The base comes from the read path; the store layer answers nil during a
+        -- bootstrap replay (store_dispatcher.replaying), so a migration write can
+        -- never be refused here.
         local ok, err, cur = d.save(snap, _M._store_rev)
         if ok then
             committed_rev = cur
@@ -2294,11 +2446,58 @@ local function write_snapshot(snap)
             if ngx and ngx.log then
                 pcall(ngx.log, ngx.WARN, "luarouter config: store save failed: ", tostring(err))
             end
+            if is_conflict_error(err) then
+                -- The base really was stale. Adopt the revision the store just gave so
+                -- the next attempt is signed correctly, drop this worker's file memo,
+                -- and hand the caller an error carrying that revision -- "retry" has to
+                -- be one action, not a guess. A replay (bootstrap / migration) is
+                -- exempt: those are unconditional writes that must never fail startup.
+                if cur ~= nil then _M._store_rev = cur end
+                _M._file_cache = nil
+                -- The shared snapshot is now provably behind the durable layer -- the
+                -- store just said its own revision is not the one this copy was written
+                -- with. Leaving it in place would be worse than merely untidy: every
+                -- read short-circuits on the dict and re-pins the CAS base from the
+                -- companion token, so the conflict would never clear and the gateway
+                -- would reject every later save for the life of the process. Dropping
+                -- both keys sends the next reader to the store, which is the only party
+                -- that can say what the current document is.
+                if shared then
+                    shared:delete(DICT_KEY)
+                    shared:delete(STORE_REV_KEY)
+                end
+                _M._policy_view_dirty = true
+                return false, err, cur
+            end
+            -- Unreachable rather than refusing: keep serving off the file, which is
+            -- the documented degradation (a dead database must not take the router
+            -- down), and forget a base we can no longer trust.
             committed_rev = nil
+        end
+    end
+
+    if shared then
+        local ok, err = shared:set(DICT_KEY, cjson.encode(snap))
+        if not ok then
+            ngx.log(ngx.WARN, "luarouter config dict write failed: ", err or "?")
+        end
+        if d and committed_rev ~= nil then
+            -- The companion token: whatever reads this snapshot also learns the
+            -- revision it was committed with, which is what keeps a second worker's
+            -- CAS base honest (refresh_store_rev).
+            local set_ok, set_err = shared:set(STORE_REV_KEY, tostring(committed_rev))
+            if not set_ok then
+                ngx.log(ngx.WARN, "luarouter config store revision write failed: ",
+                    set_err or "?")
+            end
         end
     end
     local path = env("LMR_CONFIG_FILE")
     if path then
+        -- No store at all (unit runs, degraded boot) is the legacy path: the file is
+        -- then the only durable layer and keeps writing without a sidecar bump. A
+        -- store that answered with a revision, on the other hand, owns the counter,
+        -- so the file goes down the mirror path and stays digest-consistent with it.
         if d and committed_rev ~= nil then
             local fok, ferr = pcall(require, "resty.luarouter.store_file")
             local mok, merr
@@ -2332,6 +2531,40 @@ local function write_snapshot(snap)
         end
     end
     return true
+end
+
+--- One refusal, worded for the operator. The backends already name the revision they
+--- expected and the one they hold ("revision conflict: expected 3, current 4"); this
+--- repeats the live number and the action, so a 409 is actionable from the message
+--- alone instead of requiring a second GET to find out what to sign with.
+---
+--- CONFLICT_TAG is the stable marker the handlers match on to answer 409 rather than
+--- 400. It is matched with plain substring finds and never derived from a backend's
+--- own text, so a driver that rewords its error cannot silently turn a conflict into
+--- a "your body was invalid" 400.
+local CONFLICT_TAG = "config revision conflict:"
+
+local function store_conflict_message(err, cur)
+    return string.format("%s %s (current revision %s: re-read the document and retry)",
+        CONFLICT_TAG,
+        tostring(err or CONFLICT_MARK),
+        cur == nil and "unknown" or tostring(cur))
+end
+
+--- True when a mutator's error came from the durable layer refusing a compare-and-set
+--- (as opposed to a body that never should have been accepted).
+function _M.is_store_conflict(err)
+    return type(err) == "string" and err:find(CONFLICT_TAG, 1, true) ~= nil
+end
+
+--- Persist-then-echo for every mutator below: the durable layers have to answer
+--- before a caller can honestly show a document. On a refused compare-and-set the
+--- mutator returns (nil, error) like any other validation failure, so no handler ever
+--- responds 200 with a document that exists only in this worker's shdict.
+local function commit_snapshot(cfg)
+    local saved, err, cur = write_snapshot(snapshot_of(cfg))
+    if not saved then return nil, store_conflict_message(err, cur) end
+    return snapshot_of(_M.current()), nil
 end
 
 --- Atomic write (tmp + rename), same as the Rust persist(). A missing parent
@@ -2377,9 +2610,37 @@ end
 local _migrated = false
 function _M.migrate_once()
     if _migrated then return end
-    _migrated = true
     local d = store()
+    -- The flag is set only once a store is actually in hand. Setting it up front looks
+    -- harmless but is not: config_store is first loaded in init_by_lua, where store()
+    -- now answers nil on purpose (the store must not be opened before the fork). A
+    -- migration attempt made there would mark the master as migrated and every worker
+    -- would inherit that by fork, so the legacy file would never be imported for the
+    -- life of the deployment -- the file keeps serving, and nobody goes looking for
+    -- the database until long after it matters. Retrying is cheap: store() short
+    -- circuits on the phase check before it does anything else.
     if not d then return end
+    _migrated = true
+    -- Importing {} is how a deployment loses its env layer forever. The dispatcher
+    -- only asks "is the table still empty?" (mod.revision() ~= nil) and then copies
+    -- whatever the file says, so on the common first-deployment shape -- the database
+    -- opens fine, the JSON file is {} -- a vacuous document becomes the stored truth.
+    -- current() then answers from that one layer and never consults env again, and the
+    -- usual escape hatch stops working too: deleting runtime.json and its .rev leaves
+    -- the {} in the database answering every read. Skipping the import is safe in both
+    -- directions, because a file with nothing in it has nothing to migrate.
+    local fok, fmod = pcall(require, "resty.luarouter.store_file")
+    if fok and type(fmod) == "table" and type(fmod.load) == "function" then
+        local lok, legacy = pcall(fmod.load)
+        if lok and snapshot_is_hollow(legacy) then
+            if ngx and ngx.log then
+                pcall(ngx.log, ngx.NOTICE,
+                    "luarouter config: LMR_CONFIG_FILE carries no snapshot; the store ",
+                    "stays empty and the env layer keeps answering")
+            end
+            return
+        end
+    end
     if type(d.begin_replay) == "function" then d.begin_replay() end
     local ok, imported, err = pcall(d.migrate_from_file)
     if type(d.end_replay) == "function" then d.end_replay() end
@@ -2975,8 +3236,7 @@ function _M.apply_effort(patch)
         cfg.model_effort = next_map
     end
 
-    write_snapshot(snapshot_of(cfg))
-    return snapshot_of(_M.current()), nil
+    return commit_snapshot(cfg)
 end
 
 --- Apply one context cap; ctx nil/JSON_NULL removes it.
@@ -2991,8 +3251,7 @@ function _M.apply_ctx(model, ctx)
         if not cap then return nil, "ctx must be greater than zero" end
         cfg.model_ctx[model] = cap
     end
-    write_snapshot(snapshot_of(cfg))
-    return snapshot_of(_M.current()), nil
+    return commit_snapshot(cfg)
 end
 
 --- One model-card patch. remove:true drops the card plus legacy rows.
@@ -3005,8 +3264,7 @@ function _M.apply_model_config(patch)
         cfg.model_configs[model] = nil
         cfg.model_ctx[model] = nil
         cfg.model_effort[model] = nil
-        write_snapshot(snapshot_of(cfg))
-        return snapshot_of(_M.current()), nil
+        return commit_snapshot(cfg)
     end
     local card = cfg.model_configs[model] or new_card()
     local ok, err = merge_model_patch(card, patch)
@@ -3019,8 +3277,7 @@ function _M.apply_model_config(patch)
     -- 131072 的配置根本没法向操作员解释）。
     if rawget(patch, "context_limit") ~= nil then cfg.model_context_limit[model] = nil end
     cfg.model_configs[model] = card
-    write_snapshot(snapshot_of(cfg))
-    return snapshot_of(_M.current()), nil
+    return commit_snapshot(cfg)
 end
 
 --- Whole-list replace for the virtual model table (profiles shape). Kept as the
@@ -3047,8 +3304,7 @@ function _M.apply_profiles(entries)
     -- 本批条目，也看得见磁盘上已有的卡片读数；被拒的批次绝不落盘。
     local ok_ctx, ctx_err = validate_declared_context_windows(cfg)
     if not ok_ctx then return nil, ctx_err end
-    write_snapshot(snapshot_of(cfg))
-    return snapshot_of(_M.current()), nil
+    return commit_snapshot(cfg)
 end
 
 -- ------------------------------------------------------- profile readers
@@ -3542,7 +3798,8 @@ function _M.apply_upstreams(entries)
     if not rows then return nil, err end
     local cfg = _M.current()
     cfg.upstreams = rows
-    write_snapshot(snapshot_of(cfg))
+    local saved, serr, scur = write_snapshot(snapshot_of(cfg))
+    if not saved then return nil, store_conflict_message(serr, scur) end
     local summary = _M.reconcile_upstreams()
     return summary, nil
 end
@@ -3653,8 +3910,7 @@ function _M.apply_policy(patch)
         cfg.policy = next_global
     end
     if next_rows ~= nil then cfg.model_policies = next_rows end
-    write_snapshot(snapshot_of(cfg))
-    return snapshot_of(_M.current()), nil
+    return commit_snapshot(cfg)
 end
 
 --- Whole-document replace (JSON editor). Validate first: nothing half-applies.
@@ -3669,7 +3925,8 @@ function _M.apply_document(doc)
     -- 的条目与真实能力读数的文档不能整表落盘。
     local ok_ctx, ctx_err = validate_declared_context_windows(cfg)
     if not ok_ctx then return nil, ctx_err end
-    write_snapshot(snapshot_of(cfg))
+    local saved, serr, scur = write_snapshot(snapshot_of(cfg))
+    if not saved then return nil, store_conflict_message(serr, scur) end
     local summary
     if type(doc) == "table"
         and (rawget(doc, "upstreams") ~= nil or rawget(doc, "virtual_models") ~= nil) then
@@ -4035,12 +4292,32 @@ end
 
 _M.read_json_body = read_json_body
 
+--- A mutator's refusal, with the status the operator deserves. The durable layer
+--- turning down a compare-and-set is 409 -- the submitted document was fine, the base
+--- underneath it moved -- and stays distinct from the 400 an invalid body has always
+--- drawn, so "retry" is a thing a client can recognise instead of a failed validation.
+--- The body keeps the {error = "..."} shape the admin pages already render
+--- (ui/admin/api.js reads payload.error and response.status for any !ok response), so
+--- nothing in ui/ needs to learn the new status.
+---
+--- 409 is what closes the second half of the stale-CAS bug: a refused write used to
+--- come back as 200 carrying a document read out of this worker's shdict, i.e. the UI
+--- confirmed a configuration the database had just rejected.
+local function respond_apply_error(err)
+    if _M.is_store_conflict(err) then
+        return respond_json((ngx and ngx.HTTP_CONFLICT) or 409, { error = err })
+    end
+    return respond_json(ngx.HTTP_BAD_REQUEST, { error = err })
+end
+
+_M.respond_apply_error = respond_apply_error
+
 --- POST /_ui/config 和 /_ui/config/effort
 function _M.handle_config_effort()
     local body, err = read_json_body()
     if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
     local _, apply_err = _M.apply_effort(body)
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     return respond_json(ngx.HTTP_OK, _M.document())
 end
 
@@ -4049,7 +4326,7 @@ function _M.handle_config_ctx()
     local body, err = read_json_body()
     if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
     local _, apply_err = _M.apply_ctx(body.model, rawget(body, "ctx"))
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     return respond_json(ngx.HTTP_OK, _M.document())
 end
 
@@ -4058,7 +4335,7 @@ function _M.handle_config_model()
     local body, err = read_json_body()
     if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
     local _, apply_err = _M.apply_model_config(body)
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     local doc = _M.document()
     doc.models = _M.models_document()
     return respond_json(ngx.HTTP_OK, doc)
@@ -4074,7 +4351,7 @@ function _M.handle_config_virtual()
     local entries = rawget(body, "entries")
     if entries == nil then entries = setmetatable({}, EMPTY_ARRAY_MT) end
     local _, apply_err = _M.apply_virtual_models(entries)
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     return respond_json(ngx.HTTP_OK, _M.document())
 end
 
@@ -4094,7 +4371,7 @@ function _M.handle_config_upstreams()
     local entries = rawget(body, "entries")
     if entries == nil then entries = setmetatable({}, EMPTY_ARRAY_MT) end
     local summary, apply_err = _M.apply_upstreams(entries)
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     local doc = _M.document()
     doc.reconcile = summary
     return respond_json(ngx.HTTP_OK, doc)
@@ -4111,7 +4388,7 @@ function _M.handle_config_policy()
     local body, err = read_json_body()
     if body == nil then return respond_json(ngx.HTTP_BAD_REQUEST, { error = err }) end
     local _, apply_err = _M.apply_policy(body)
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     return respond_json(ngx.HTTP_OK, _M.policy_document())
 end
 
@@ -4150,7 +4427,7 @@ function _M.handle_config_apply()
         patch.model_map = nil
     end
     local _, apply_err, reconcile = _M.apply_document(patch)
-    if apply_err then return respond_json(ngx.HTTP_BAD_REQUEST, { error = apply_err }) end
+    if apply_err then return respond_apply_error(apply_err) end
     local doc = _M.document()
     if reconcile then doc.reconcile = reconcile end
     local warning

@@ -159,7 +159,12 @@ function _M.save(snap, expect_revision)
     local base = path()
     if not base then return false, "no LMR_CONFIG_FILE" end
     local cur = _M.revision()
-    local prev_digest = read_sidecar(base)
+    -- read_sidecar answers (rev, digest): destructuring it into one name bound the
+    -- *revision* to prev_digest, so the rollback below wrote "1" into the digest
+    -- slot. A single failed save was then enough to make the sidecar disagree with
+    -- its own file forever -- that config counted as an external edit on every cold
+    -- start, and the adoption branch would push the file over the database.
+    local _, prev_digest = read_sidecar(base)
     if expect_revision ~= nil and cur ~= nil and cur ~= expect_revision then
         return false, string.format("revision conflict: expected %s, current %s",
             tostring(expect_revision), tostring(cur)), cur
@@ -194,15 +199,26 @@ end
 --- than bumped, so the mirror and the authoritative store stay on one counter
 --- and `edited_externally()` still answers honestly afterwards. Used by
 --- config_store after it has already committed to the database.
+---
+--- Body first, sidecar second -- deliberately the opposite order from save(). The
+--- sidecar is the only evidence edited_externally() has, so it must never be left
+--- describing bytes that are not there: a sidecar written ahead of the file records
+--- the digest of the *new* text while the file still holds the old one, which reads
+--- exactly like "the operator replaced runtime.json". The next cold start then takes
+--- the adoption branch and writes that stale file into the database, overwriting
+--- what the database just committed. Half-failing the other way (file new, sidecar
+--- old) leaves a sidecar that still matches the bytes it points at -- no false
+--- external edit -- and the file body is the value the database already committed,
+--- so even an adoption of it is a no-op.
 function _M.mirror(snap, rev)
     local base = path()
     if not base then return false, "no LMR_CONFIG_FILE" end
     local text, enc_err = cjson.encode(snap)
     if not text then return false, "encode: " .. tostring(enc_err) end
-    local ok, err = write_sidecar(base, rev or 0, digest(text))
-    if not ok then return false, "write revision: " .. tostring(err) end
-    ok, err = atomic(base, text)
+    local ok, err = atomic(base, text)
     if not ok then return false, "write snapshot: " .. tostring(err) end
+    ok, err = write_sidecar(base, rev or 0, digest(text))
+    if not ok then return false, "write revision: " .. tostring(err) end
     return true, nil, rev
 end
 
