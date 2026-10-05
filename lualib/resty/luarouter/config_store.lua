@@ -2139,14 +2139,17 @@ local registered_models
 -- path it has always used: the store is invisible there.
 local _store_mod
 local function store()
-    if _store_mod ~= nil then return _store_mod or nil end
+    if _store_mod ~= nil then return _store_mod end
     if not (ngx and ngx.config and ngx.worker) then
-        _store_mod = false
+        -- Deliberately NOT cached: config_store is first loaded in init_by_lua,
+        -- where ngx.worker does not exist yet. Caching this miss would make the
+        -- store unreachable for the rest of the process and silently send every
+        -- write down the legacy file path -- which keeps working, right up until
+        -- you go looking for the database.
         return nil
     end
     local ok, mod = pcall(require, "resty.luarouter.store_dispatcher")
     if not ok or type(mod) ~= "table" or type(mod.load) ~= "function" then
-        _store_mod = false
         return nil
     end
     _store_mod = mod
