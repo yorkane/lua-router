@@ -312,6 +312,15 @@ Rust 侧没有每服务上限这个能力，`smg_worker_capacity_excluded_total`
 4. 手工 `POST /workers` 与 `SMG_WORKER_URLS` 种子进来的行属 protected（`discovery ~= config`），
    watcher 不摘；严格探针的确定性否定对它们同样不生效——这是「手填配置不能凭它判死一个健康
    实例」这条红线的延伸。
+   **但红线保护的对象是「身份与健康判定」——discovery、is_healthy、探活结论、判死逻辑，
+   以及 `model_id` / `models` 这两份引擎读数，声明层一个字都改不动。**
+   **它不覆盖调度旋钮**：`max_concurrency` / `max_power_w` 现在**允许**投影到 protected 行
+   （`config_store` 的 `reconcile_upstreams` else 分支，2026-10-05 提交 `3728821`）。
+   理由是 caps 从不判死、只在超限时把请求迁走，下发它们不触碰「不能凭配置判死健康实例」这件事；
+   而在此之前 protected 行整行不许碰的落地口径，会让操作员**没有任何能活过重启的上限配法**
+   （上限只进内存 shdict，重启即蒸发）。
+   注意 caps **只下发不清除**：从声明里删掉不会立刻摘掉存量上限（下次重启自然消失），
+   要当场摘用 `PUT /workers/{id}` 写 0。
 5. `registry.all_models()`（`registry.lua:1853`）/ `worker_models()`（`registry.lua:1873`）/
    `record_models()`（`registry.lua:1885`）目前**暂无消费者**。写了但没接线这件事要登记在这里，
    别让人以为已经有读者。两条模型列表链各自用的是：对外 `GET /v1/models` 走 `registry.models()`

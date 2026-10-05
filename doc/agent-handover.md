@@ -252,13 +252,17 @@ curl -s http://127.0.0.1:8800/_ui/config/policy            # 生效链 JSON
       `{worker_id, model_id, url, health, load}`，`models` / 两个上限 / 组与入口信息都不过去，
       入口与上限因此都是**每网关独立**，多网关下同一入口的可见性不一致。
 
-## 7. 文档地图（doc/，22 份）
+## 7. 文档地图（doc/，25 份）
 
 **现行权威**：README（入口）、architect.md（架构总览）、scope-trim.md（裁剪判定书+执行记录）、
 agent-handover.md（本文）、todo-deferred.md（TODO 口径）、gap-mesh.md、gap-mesh-final.md、
 gap-watcher-merge.md、gap-gpu-load.md、gap-routing-dyn.md、gap-token-accounting.md、
 gap-inflight-age.md、gap-metrics-final.md、gap-tls-chain.md、gap-virtual-models.md、
 gap-worker-caps.md（每服务并发/功率上限：候选集硬排除、最热卡口径、功率通道）、
+gap-config-store.md（配置持久化：sqlite/postgres/file 三态后端、CAS、镜像与采纳）、
+gap-session-2026-10-04.md（上下文窗口语义翻转、/v1/models 形状、effort 三层继承、per-GPU 功率、
+以及这一轮踩过的坑——**接手前建议先读这一份**）、
+deploy-state.md（三实例部署现状、生效后端怎么查、已知配置漂移与死代码清单）、
 parity-cpu-ablation.md。
 
 **对拍与真实评测（数据留档，引用前注意树龄）**：parity-contract/routing/policy-extra/perf-v2、

@@ -85,7 +85,7 @@ compose 追加了功率通道（DCGM exporter 在本机 9400，Prometheus 在 90
 SMG_LOAD_SOURCE: "prom"
 SMG_LOAD_PROM_URL: "http://127.0.0.1:9092"
 SMG_LOAD_PROM_QUERY: "max by (Hostname) (DCGM_FI_DEV_GPU_UTIL)"
-SMG_LOAD_POWER_QUERY: "max by (Hostname,instance) (DCGM_FI_DEV_POWER_USAGE)"
+SMG_LOAD_POWER_QUERY: "max by (Hostname,instance,gpu) (DCGM_FI_DEV_POWER_USAGE)"
 SMG_LOAD_INTERVAL_SECS: "10"
 SMG_LOAD_STALE_SECS: "30"
 ```
