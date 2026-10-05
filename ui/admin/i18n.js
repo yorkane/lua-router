@@ -235,6 +235,20 @@
         previewServingUnverified: '实例列表未经探针验证，暂按可路由处理', previewServingNone: '服务池里没有该模型的实例',
         previewServingGroupGap: '{models} 没有已验证实例，选中它的请求会被拒', previewChainCard: '模型卡片', previewChainEntry: '虚拟条目', previewChainGlobal: '全局',
         previewChainLegacy: '旧版强制档位', previewChainNone: '无（引擎默认）', globalSave: '保存全局策略',
+        // ── 虚拟模型「条目列表 + 编辑对话框」（refactor-arch 5.1，w_ui_models 2026-10-05）──
+        virtualEntriesEmpty: '还没有虚拟模型入口：点击右上角「添加服务入口」新建一条',
+        virtualEditTitle: '编辑服务入口', virtualNewTitle: '新增服务入口',
+        virtualEditCopy: '一条入口 = 一个对外名字 + 一组实际模型。没编辑过的字段保持磁盘原样；留空的声明位一律写成删键（让位卡片与引擎自报），false 是结论、留空是沉默，两者绝不合并。',
+        virtualEntrySave: '保存条目',
+        virtualSaveChainNote: '保存 = 先重取服务器整表、只替换这一条，其余条目原样带回（整表提交）',
+        virtualCtxBlockAll: '有条目的声明窗口超过了组内服务实际限制：后端会拒绝保存，请在编辑对话框里调小声明值。',
+        virtualAdvertiseEditHint: '对外广告范围在条目编辑对话框里改；卡片底部只回显配置文件里的磁盘状态与空入口告警。',
+        virtualBusyJson: '请先关闭或放弃「配置 JSON」对话框，再保存条目：两处都写整份配置，同时编辑会互相覆盖。',
+        virtualFreshFailed: '服务器配置读取失败：为避免用过期整表覆盖别人的改动，本次保存已取消',
+        virtualEntryGone: '这条入口已不在服务器上（可能被别的会话删除）：请刷新后重试',
+        virtualDeleteTitle: '删除服务入口',
+        virtualDeleteConfirm: '将把 {alias} 从虚拟入口表中删除（整表提交）：入口对外消失，按这个名字发的请求会失败；它映射的真实模型与实例不受影响。',
+        virtualEntrySaved: '已保存服务入口 {alias}', virtualEntryDeleted: '已删除服务入口 {alias}',
         globalSaved: '已保存全局档位策略', pageTitle: '模型管理'
       },
       routing: {
@@ -548,6 +562,20 @@
         previewChainCard: 'model card', previewChainEntry: 'virtual entry', previewChainGlobal: 'global',
         previewChainLegacy: 'legacy forced effort',
         previewChainNone: 'none (engine default)', globalSave: 'Save global policy',
+        // ── Virtual model entry list + edit dialog (refactor-arch 5.1, w_ui_models 2026-10-05) ──
+        virtualEntriesEmpty: 'No service entries yet: use "Add service entry" at the top right',
+        virtualEditTitle: 'Edit service entry', virtualNewTitle: 'New service entry',
+        virtualEditCopy: 'One entry = one public name plus a group of real models. Fields you never touch stay byte-identical on disk; a blank declaration field is written as a deleted key (the card and the engine get to speak), and false is a conclusion while blank is silence — never merged.',
+        virtualEntrySave: 'Save entry',
+        virtualSaveChainNote: 'Save = re-fetch the whole table from the server, replace only this entry, and carry every other entry through unchanged',
+        virtualCtxBlockAll: 'An entry declares a window above the real service limit of its group: the backend would refuse the save — lower the declared value in the edit dialog.',
+        virtualAdvertiseEditHint: 'The advertisement scope is edited inside the entry dialog; the card footer only mirrors the disk state and the empty-entry warning.',
+        virtualBusyJson: 'Close or discard the Config JSON dialog before saving the entry: both write the whole document, so editing them at the same time would overwrite each other.',
+        virtualFreshFailed: 'Could not read the server configuration: the save was cancelled so a stale whole table cannot overwrite someone else',
+        virtualEntryGone: 'This entry no longer exists on the server (another session may have deleted it): refresh and retry',
+        virtualDeleteTitle: 'Delete service entry',
+        virtualDeleteConfirm: '{alias} is removed from the virtual entry table (the whole table is submitted): the entry disappears from the advertisement and requests by that name will fail; the real models and workers it maps to are untouched.',
+        virtualEntrySaved: 'Service entry {alias} saved', virtualEntryDeleted: 'Service entry {alias} deleted',
         globalSaved: 'Global effort policy saved', pageTitle: 'Model management'
       },
       routing: {

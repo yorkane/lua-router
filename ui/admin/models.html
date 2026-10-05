@@ -10,6 +10,21 @@
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
   <link rel="stylesheet" href="./app.css?v=__UI_VERSION__">
+  <style>
+    /* 虚拟模型「条目列表 + 编辑对话框」的页面专用样式（app.css 由并行任务维护，不动它）。
+       .form-grid-3 的正式定义归 app.css（refactor-arch 5.2），这里给本页一份同定义兜底，
+       并在本页自己的 820px 段做单列回落：两边一旦漂移，窄屏行为仍然成立。 */
+    .virtual-entry-row { display: grid; gap: 4px; padding: 9px 0; border-bottom: 1px dashed rgba(139, 145, 184, .18); }
+    .virtual-entry-row:last-child { border-bottom: none; }
+    .virtual-entry-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-left: 2px; }
+    .virtual-target-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid rgba(139, 145, 184, .16); border-radius: 8px; padding: 2px 6px; }
+    .virtual-dialog { width: min(860px, calc(100vw - 28px)); max-height: 92vh; overflow: auto; }
+    .form-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    @media (max-width: 820px) {
+      .form-grid-3 { grid-template-columns: 1fr; }
+      .virtual-dialog { width: calc(100vw - 20px); }
+    }
+  </style>
 </head>
 <body>
   <div id="q-app">
@@ -54,19 +69,24 @@
                 <div class="surface-title">{{ tv('virtualSection') }}</div>
                 <div class="surface-subtitle">{{ tv('virtualCopy') }}</div>
               </div>
-              <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving" :disable="virtualCtxBlocking" :label="tv('virtualSave')" @click="saveVirtual"></q-btn>
+              <q-btn unelevated no-caps color="primary" class="primary-button" icon="mdi-plus" :label="tv('virtualAdd')" @click="openVirtualNew"></q-btn>
             </q-card-section>
             <q-separator dark></q-separator>
             <q-card-section class="surface-body">
-              <div class="rows-list" style="gap:10px">
-                <div v-for="(row, index) in virtualRows" :key="'va' + index" style="display:grid;gap:6px;padding:10px 0;border-bottom:1px dashed rgba(139, 145, 184, .18)">
-                  <!-- 展示面：虚拟名 → 它映射的每个实际模型（含绑定实例）与统一的上下文口径 -->
-                  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-left:2px">
+              <div class="rows-list">
+                <q-banner v-if="virtualCtxBlocking" rounded dense class="warn-banner q-mb-md">
+                  <template v-slot:avatar><q-icon name="mdi-alert-outline"></q-icon></template>
+                  {{ tv('virtualCtxBlockAll') }}
+                </q-banner>
+                <div v-for="(row, index) in virtualRows" :key="'va' + index" class="virtual-entry-row">
+                  <!-- 条目行是只读摘要：入口名 → 整组实际模型（含 @实例 绑定）+ 声明窗口 + 对外广告状态
+                       + 入口级声明位 chips；编辑面收进对话框（refactor-arch 5.1）。legacy chips 刻意留在
+                       行上——「不能让它们成为看不见的设置」（原注释理由不变），只挂对话框等于重新藏起它们 -->
+                  <div class="virtual-entry-line">
                     <strong class="code-pill" style="font-size:13px">{{ row.model || tv('virtualNameUnset') }}</strong>
                     <span class="muted">→</span>
                     <template v-if="groupOfRow(row).length">
-                      <span v-for="(tg, ti) in displayTargets(row)" :key="'vs' + index + '-' + ti"
-                            style="display:inline-flex;align-items:center;gap:4px;border:1px solid rgba(139,145,184,.16);border-radius:8px;padding:2px 6px">
+                      <span v-for="(tg, ti) in displayTargets(row)" :key="'vs' + index + '-' + ti" class="virtual-target-chip">
                         <span class="code-pill">{{ tg.model || tv('virtualTargetUnset') }}</span>
                         <span v-if="tg.worker" class="muted mono" style="font-size:11px">@ {{ tg.worker }}</span>
                         <span v-else class="muted" style="font-size:11px">{{ tv('virtualAnyWorker') }}</span>
@@ -75,7 +95,8 @@
                     <span v-else class="muted">{{ tv('virtualNoTargets') }}</span>
                     <q-badge outline :color="row.context_window ? 'teal-4' : 'grey-6'" class="chip-soft">
                       {{ row.context_window ? tv('virtualCtxCovered') + ' ' + row.context_window : tv('virtualCtxFollow') }}</q-badge>
-                    <!-- 入口级档位/能力位声明：同样区分「配了」与「未覆盖」，未覆盖时一个字节都不写 -->
+                    <!-- 对外广告状态：models_virtual_only 是整表顶层键，所有条目共享同一磁盘读数 -->
+                    <q-badge outline :color="rowAdvertiseState().color" class="chip-soft">{{ rowAdvertiseState().text }}</q-badge>
                     <q-badge outline :color="row.default_effort ? 'teal-4' : 'grey-6'" class="chip-soft">
                       {{ row.default_effort ? tv('virtualEffortCovered') + ' ' + row.default_effort : tv('virtualEffortFollow') }}</q-badge>
                     <q-badge v-if="(row.effort_map || []).length" outline color="teal-4" class="chip-soft">
@@ -95,118 +116,161 @@
                       {{ tv('virtualCtxOverChip') }}</q-badge>
                     <q-badge v-for="chip in legacyChips(row)" :key="'vl' + index + '-' + chip" outline color="orange-4" class="chip-soft">{{ chip }}</q-badge>
                     <span style="flex:1 1 auto"></span>
-                    <span class="muted" style="font-size:11px">{{ tv('virtualDeleteHint') }}</span>
-                    <q-btn flat round dense icon="mdi-close" color="red-4" @click="virtualRows.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
-                  </div>
-                  <!-- 编辑面：虚拟名 + 覆盖字段（上下文窗口 + 入口级档位/能力位声明） -->
-                  <div class="row-edit" style="grid-template-columns:minmax(0,1.1fr) minmax(0,1fr) minmax(0,.9fr)">
-                    <q-input v-model="row.model" dense outlined dark class="mono" :label="tv('virtualAlias')"
-                             :placeholder="tv('virtualAliasPlaceholder')" @update:model-value="touchRow(row)"></q-input>
-                    <q-input v-model="row.context_window" dense outlined dark type="number" :label="tv('virtualCtxField')"
-                             :hint="tv('virtualCtxHint')" :error="Boolean(virtualCtxOverflow(row))"
-                             :error-message="virtualCtxOverflow(row)" @update:model-value="touchRow(row)"></q-input>
-                    <span class="muted" style="font-size:11px">{{ tv('virtualCtxCopy') }}</span>
-                  </div>
-                  <div class="row-edit" style="grid-template-columns:minmax(0,1.1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr)">
-                    <q-select v-model="row.default_effort" dense outlined dark :options="effortOptions" map-options emit-value clearable
-                              :label="tv('virtualEffortField')" :hint="tv('virtualEffortHint')" @update:model-value="touchRow(row)"></q-select>
-                    <q-select v-model="row.supports_tool_use" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="tv('virtualToolField')" :placeholder="tv('virtualToolUnknown')" :hint="tv('virtualToolHint')"
-                              @update:model-value="touchRow(row)"></q-select>
-                    <!-- 条目层四个能力位：与卡片同名字段，卡片就这一位说过话时卡片赢（后端
-                         resolve_model_caps 的 declared() 一条链），留空 = 删键 = 交给引擎自报 -->
-                    <q-select v-model="row.supports_streaming" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualStreamingField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualStreamingHint')"
-                              @update:model-value="touchRow(row)"></q-select>
-                    <q-select v-model="row.supports_reasoning" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualReasoningField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualReasoningHint')"
-                              @update:model-value="touchRow(row)"></q-select>
-                    <q-select v-model="row.supports_vision" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualVisionField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualVisionHint')"
-                              @update:model-value="touchRow(row)"></q-select>
-                    <q-select v-model="row.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualEffortSupportField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualEffortSupportHint')"
-                              @update:model-value="touchRow(row)"></q-select>
-                    <q-option-group :model-value="row.modalities || []" type="checkbox" inline
-                                    :options="modalityOptions" color="purple-4" dense
-                                    @update:model-value="value => setRowModalities(row, value)"></q-option-group>
-                    <span class="muted" style="font-size:11px">{{ tv('virtualModalitiesHint') }}</span>
-                  </div>
-                  <!-- 入口档位改写：与 default_effort 独立生效（后端 request_effort_for 逐 from
-                       问 卡片 → 条目 → 全局），所以缺省档位留空时这张表照样起作用 -->
-                  <div style="padding:2px 0 0 14px">
-                    <div class="rows-head q-mb-xs">{{ tv('virtualMapTitle') }} · {{ tv('virtualMapCopy') }}</div>
-                    <div class="rows-list">
-                      <div v-for="(one, mi) in (row.effort_map || [])" :key="'vem' + index + '-' + mi" class="row-edit"
-                           style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) auto">
-                        <q-select v-model="one.from" dense outlined dark :options="effortOptions" map-options emit-value
-                                  :label="t.mapFrom" @update:model-value="touchRow(row)"></q-select>
-                        <span class="muted" style="align-self:center">→</span>
-                        <q-select v-model="one.to" dense outlined dark :options="effortOptions" map-options emit-value
-                                  :label="t.mapTo" @update:model-value="touchRow(row)"></q-select>
-                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="removeEntryEffortMapRow(row, mi)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
-                      </div>
-                      <div class="muted" style="font-size:11px">{{ tv('declarationDisclosure') }}</div>
-                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualMapAdd')" @click="addEntryEffortMapRow(row)"></q-btn></div>
-                    </div>
-                  </div>
-                  <!-- 实际模型组：每行一个模型名，可选把该行绑到某个实例 -->
-                  <div style="padding:2px 0 4px 14px">
-                    <div class="rows-head q-mb-xs">{{ tv('virtualTargetsTitle') }} · {{ tv('virtualTargetsCopy') }}</div>
-                    <div class="rows-list">
-                      <div v-for="(tg, ti) in row.targets" :key="'vt' + index + '-' + ti" class="row-edit"
-                           style="grid-template-columns:minmax(0,1.4fr) minmax(0,1.2fr) auto">
-                        <q-select v-model="tg.model" dense outlined dark use-input fill-input hide-selected
-                                  :options="targetModelOptions(tg)" :option-label="modelOptionLabel" map-options emit-value clearable
-                                  :label="tv('virtualTargetModel')" :placeholder="tv('virtualTargetModelPlaceholder')" input-debounce="120"
-                                  @update:model-value="touchRow(row)">
-                          <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
-                        </q-select>
-                        <q-select v-model="tg.worker" dense outlined dark use-input fill-input hide-selected
-                                  :options="workerOptionsFor(tg)" map-options emit-value clearable
-                                  :label="tv('virtualTargetWorker')" :placeholder="t.virtualWorkerPlaceholder" input-debounce="120"
-                                  @update:model-value="touchRow(row)">
-                          <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
-                        </q-select>
-                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="removeTarget(row, ti)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
-                      </div>
-                      <div v-if="!row.targets.length" class="muted">{{ tv('virtualNoTargets') }}</div>
-                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualTargetAdd')" @click="addTarget(row)"></q-btn></div>
+                    <div class="row-actions">
+                      <q-btn flat round dense icon="mdi-pencil-outline" @click="openVirtualEdit(row)"><q-tooltip>{{ c.edit }}</q-tooltip></q-btn>
+                      <q-btn flat round dense icon="mdi-delete-outline" color="red-4" @click="deleteVirtualEntry(row, index)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
                     </div>
                   </div>
                 </div>
-                <div v-if="!virtualRows.length" class="muted">{{ t.rowsEmpty }}</div>
-                <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualAdd')" @click="addVirtualRow"></q-btn></div>
+                <div v-if="!virtualRows.length" class="empty-state">
+                  <q-icon name="mdi-call-split"></q-icon>
+                  <span>{{ tv('virtualEntriesEmpty') }}</span>
+                </div>
               </div>
               <q-separator dark class="q-mt-md"></q-separator>
-              <!-- 对外广告范围：整表顶层键 models_virtual_only 的唯一编辑位（AGENTS.md 项目定位
-                   第 3 条：新增配置面必须落到可视化，不能只给 env）。
-                   三态下拉而不是勾选框：后端把「键不存在」（让给 env LMR_MODELS_VIRTUAL_ONLY）
-                   与「显式 false」（说了要全量广告，必须压过 env 的 true）分家，合并成一个布尔
-                   就丢了一半语义 —— 与 supports_tool_use 同一套三态纪律。
-                   位置放在入口表底部而不是独立一张卡：这个开关的全部意义是「上面这批入口行对外
-                   可见、其余名字不可见」，与入口表同屏才看得见因果关系，空入口告警读的也正是
-                   上面这张表；放页面顶部会把最常用的入口编辑区往下挤。 -->
+              <!-- 对外广告范围（整表顶层键 models_virtual_only）：卡片底部只留磁盘态回显与空入口
+                   告警，可编辑控件随条目编辑面进了对话框（refactor-arch 5.1），两处共用
+                   advertiseChoice 单一状态。「应用」仍走 saveAdvertiseSwitch 的无损组装链路
+                   （基线复用 configJsonBaseline + configJsonBody——测绘 §3.3「不许拆散这组耦合」
+                   说的是这条链路，不是控件的物理位置）。
+                   三态纪律不变：键不存在 = 让给环境变量 LMR_MODELS_VIRTUAL_ONLY，显式 false =
+                   压过 env 的 true，合并成一个布尔就丢了一半语义（与 supports_tool_use 同族）。
+                   空入口告警读的还是上面这张表：与入口列表同屏才看得见因果关系。 -->
               <div class="q-mt-md">
                 <div class="rows-head q-mb-xs">{{ advertiseText('advertiseSection') }}</div>
                 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
-                  <q-select v-model="advertiseChoice" dense outlined dark :options="advertiseOptions" map-options emit-value
-                            style="min-width:min(330px,100%)" :label="advertiseText('advertiseField')"
-                            :hint="advertiseText('advertiseHint')"></q-select>
                   <q-badge outline :color="advertiseDiskColor" class="chip-soft">{{ advertiseDiskText }}</q-badge>
                   <q-badge v-if="advertiseDirty" outline color="orange-4" class="chip-soft">{{ advertisePendingText }}</q-badge>
-                  <span style="flex:1 1 auto"></span>
-                  <q-btn unelevated no-caps color="primary" class="primary-button" :disable="!advertiseDirty"
-                         :loading="saving" :label="advertiseText('advertiseSave')" @click="saveAdvertiseSwitch"></q-btn>
+                  <span class="muted" style="font-size:11.5px">{{ tv('virtualAdvertiseEditHint') }}</span>
                 </div>
-                <div class="muted" style="font-size:11.5px;margin-top:6px">{{ advertiseText('advertiseCopy') }}</div>
-                <div class="muted" style="font-size:11.5px;margin-top:3px">{{ advertiseText('advertiseContract') }}</div>
-                <div class="muted" style="font-size:11.5px;margin-top:3px">{{ advertiseText('advertiseEnvRisk') }}</div>
                 <div v-if="advertiseEmptyWarning" class="warn-banner"
                      style="font-size:11.5px;margin-top:6px;padding:6px 9px;border-radius:8px">{{ advertiseEmptyWarning }}</div>
               </div>
             </q-card-section>
           </q-card>
+
+          <!-- 虚拟模型条目编辑对话框：形状照本页模型卡片对话框（q-dialog + dialog-fields +
+               form-grid-2）与 workers.html saveDecls 的整表保存链路。两个子表（档位改写 /
+               实际模型组）保持行内直改——它们本身就是条目式，不再套一层弹窗。控件密度：
+               身份 2 列，缺省档位 + 五个三态位 + 四个能力位 3 列；三态位保持 clearable 下拉
+               而不是 radio（塌缩成 2 项就画不出「不知道」那一档，见本页三态纪律注释）。 -->
+          <q-dialog v-model="virtualOpen" persistent>
+            <q-card class="dialog-card virtual-dialog">
+              <q-card-section>
+                <div class="dialog-title">{{ virtualDialogTitle }}</div>
+                <div class="dialog-copy">{{ tv('virtualEditCopy') }}</div>
+              </q-card-section>
+              <q-card-section>
+                <div class="dialog-fields">
+                  <div class="form-grid-2">
+                    <q-input v-model="virtualForm.model" dense outlined dark class="mono" :label="tv('virtualAlias')"
+                             :placeholder="tv('virtualAliasPlaceholder')" @update:model-value="touchRow(virtualForm)"></q-input>
+                    <q-input v-model="virtualForm.context_window" dense outlined dark type="number" :label="tv('virtualCtxField')"
+                             :hint="tv('virtualCtxHint')" :error="Boolean(virtualCtxOverflow(virtualForm))"
+                             :error-message="virtualCtxOverflow(virtualForm)" @update:model-value="touchRow(virtualForm)"></q-input>
+                  </div>
+                  <div class="muted" style="font-size:11px">{{ tv('virtualCtxCopy') }}</div>
+                  <div class="form-grid-3">
+                    <q-select v-model="virtualForm.default_effort" dense outlined dark :options="effortOptions" map-options emit-value clearable
+                              :label="tv('virtualEffortField')" :hint="tv('virtualEffortHint')" @update:model-value="touchRow(virtualForm)"></q-select>
+                    <q-select v-model="virtualForm.supports_tool_use" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="tv('virtualToolField')" :placeholder="tv('virtualToolUnknown')" :hint="tv('virtualToolHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                    <!-- 条目层四个能力位：与卡片同名字段，卡片就这一位说过话时卡片赢（后端
+                         resolve_model_caps 的 declared() 一条链），留空 = 删键 = 交给引擎自报 -->
+                    <q-select v-model="virtualForm.supports_streaming" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualStreamingField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualStreamingHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                    <q-select v-model="virtualForm.supports_reasoning" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualReasoningField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualReasoningHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                    <q-select v-model="virtualForm.supports_vision" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualVisionField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualVisionHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                    <q-select v-model="virtualForm.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualEffortSupportField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualEffortSupportHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                  </div>
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ tv('virtualModalitiesTitle') }}</div>
+                    <q-option-group :model-value="virtualForm.modalities || []" type="checkbox" inline
+                                    :options="modalityOptions" color="purple-4" dense
+                                    @update:model-value="value => setRowModalities(virtualForm, value)"></q-option-group>
+                    <div class="muted" style="font-size:11px">{{ tv('virtualModalitiesHint') }}</div>
+                    <div class="muted" style="font-size:11px;margin-top:4px">{{ tv('declarationDisclosure') }}</div>
+                  </div>
+                  <!-- 入口档位改写：与 default_effort 独立生效（后端 request_effort_for 逐 from
+                       问 卡片 → 条目 → 全局），所以缺省档位留空时这张表照样起作用 -->
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ tv('virtualMapTitle') }} · {{ tv('virtualMapCopy') }}</div>
+                    <div class="rows-list">
+                      <div v-for="(one, mi) in (virtualForm.effort_map || [])" :key="'vem' + mi" class="row-edit"
+                           style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) auto">
+                        <q-select v-model="one.from" dense outlined dark :options="effortOptions" map-options emit-value
+                                  :label="t.mapFrom" @update:model-value="touchRow(virtualForm)"></q-select>
+                        <span class="muted" style="align-self:center">→</span>
+                        <q-select v-model="one.to" dense outlined dark :options="effortOptions" map-options emit-value
+                                  :label="t.mapTo" @update:model-value="touchRow(virtualForm)"></q-select>
+                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="removeEntryEffortMapRow(virtualForm, mi)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                      </div>
+                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualMapAdd')" @click="addEntryEffortMapRow(virtualForm)"></q-btn></div>
+                    </div>
+                  </div>
+                  <!-- 实际模型组：每行一个模型名，可选把该行绑到某个实例 -->
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ tv('virtualTargetsTitle') }} · {{ tv('virtualTargetsCopy') }}</div>
+                    <div class="rows-list">
+                      <div v-for="(tg, ti) in virtualForm.targets" :key="'vt' + ti" class="row-edit"
+                           style="grid-template-columns:minmax(0,1.4fr) minmax(0,1.2fr) auto">
+                        <q-select v-model="tg.model" dense outlined dark use-input fill-input hide-selected
+                                  :options="targetModelOptions(tg)" :option-label="modelOptionLabel" map-options emit-value clearable
+                                  :label="tv('virtualTargetModel')" :placeholder="tv('virtualTargetModelPlaceholder')" input-debounce="120"
+                                  @update:model-value="touchRow(virtualForm)">
+                          <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
+                        </q-select>
+                        <q-select v-model="tg.worker" dense outlined dark use-input fill-input hide-selected
+                                  :options="workerOptionsFor(tg)" map-options emit-value clearable
+                                  :label="tv('virtualTargetWorker')" :placeholder="t.virtualWorkerPlaceholder" input-debounce="120"
+                                  @update:model-value="touchRow(virtualForm)">
+                          <template v-slot:no-option><q-item dense><q-item-section class="muted">{{ c.empty }}</q-item-section></q-item></template>
+                        </q-select>
+                        <q-btn flat round dense icon="mdi-close" color="red-4" @click="removeTarget(virtualForm, ti)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                      </div>
+                      <div v-if="!virtualForm.targets.length" class="muted">{{ tv('virtualNoTargets') }}</div>
+                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualTargetAdd')" @click="addTarget(virtualForm)"></q-btn></div>
+                    </div>
+                  </div>
+                  <!-- 对外广告范围：整表顶层键 models_virtual_only 的可编辑控件（与卡片底部的
+                       只读回显共用 advertiseChoice 状态）。「应用」仍走 saveAdvertiseSwitch
+                       自己的整文档链路，不与条目保存混路；三态纪律与空入口告警原样保留。 -->
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ advertiseText('advertiseSection') }}</div>
+                    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+                      <q-select v-model="advertiseChoice" dense outlined dark :options="advertiseOptions" map-options emit-value
+                                style="min-width:min(330px,100%)" :label="advertiseText('advertiseField')"
+                                :hint="advertiseText('advertiseHint')"></q-select>
+                      <q-badge outline :color="advertiseDiskColor" class="chip-soft">{{ advertiseDiskText }}</q-badge>
+                      <q-badge v-if="advertiseDirty" outline color="orange-4" class="chip-soft">{{ advertisePendingText }}</q-badge>
+                      <span style="flex:1 1 auto"></span>
+                      <q-btn unelevated no-caps color="primary" class="primary-button" :disable="!advertiseDirty"
+                             :loading="saving" :label="advertiseText('advertiseSave')" @click="saveAdvertiseSwitch"></q-btn>
+                    </div>
+                    <div class="muted" style="font-size:11.5px;margin-top:6px">{{ advertiseText('advertiseCopy') }}</div>
+                    <div class="muted" style="font-size:11.5px;margin-top:3px">{{ advertiseText('advertiseContract') }}</div>
+                    <div class="muted" style="font-size:11.5px;margin-top:3px">{{ advertiseText('advertiseEnvRisk') }}</div>
+                    <div v-if="advertiseEmptyWarning" class="warn-banner"
+                         style="font-size:11.5px;margin-top:6px;padding:6px 9px;border-radius:8px">{{ advertiseEmptyWarning }}</div>
+                  </div>
+                </div>
+              </q-card-section>
+              <q-card-actions align="right">
+                <span class="muted" style="margin-right:auto;font-size:11px">{{ tv('virtualSaveChainNote') }}</span>
+                <q-btn flat no-caps :label="c.cancel" :disable="saving" @click="virtualOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving"
+                       :disable="Boolean(virtualCtxOverflow(virtualForm))" :label="tv('virtualEntrySave')" @click="submitVirtualForm"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
 
           <!-- 生效预览：本地静态推算，不发请求 -->
           <q-card flat class="surface-card preview-card">
@@ -482,7 +546,7 @@
         // i18n.js 由他人并行维护），键并进 i18n.js 的 models 块后可删这一段。JSON 对话框里那条
         // 说明（jsonCopyAdvertise）也放这里而不是 JSON_LOCAL：JSON_LOCAL 由 JSON 面的人维护，
         // 本任务只拥有这个开关的文案，各管各的键可以避免两个人改同一个对象。
-        jsonCopyAdvertise: '顶层键 models_virtual_only 控制 /v1/models 对外广告哪些模型：true=只广告虚拟入口，false=入口与真实模型都广告，键缺席=交还环境变量 LMR_MODELS_VIRTUAL_ONLY。它只改对外广告，不改转发、不改 /workers、不改选路。注意：这个键不在下面这份可编辑 JSON 里（编辑器只覆盖段键），它由上方「对外广告范围」那一个控件维护；从这里保存会把它原样带回、不会被抹掉。要清空声明请在上方选「未声明」。',
+        jsonCopyAdvertise: '顶层键 models_virtual_only 控制 /v1/models 对外广告哪些模型：true=只广告虚拟入口，false=入口与真实模型都广告，键缺席=交还环境变量 LMR_MODELS_VIRTUAL_ONLY。它只改对外广告，不改转发、不改 /workers、不改选路。注意：这个键不在下面这份可编辑 JSON 里（编辑器只覆盖段键），它由条目编辑对话框里的「对外广告范围」下拉维护（入口卡片底部只回显磁盘状态）；从这里保存会把它原样带回、不会被抹掉。要清空声明请在对话框里选「未声明」。',
         advertiseSection: '对外广告范围',
         advertiseField: '/v1/models 广告哪些模型',
         advertiseHint: '只影响 GET /v1/models 对外列出哪些模型；不改变转发、不改 /workers、不改变调度选路。',
@@ -573,7 +637,7 @@
         jsonConfirmUpstreamsLabel: 'upstream declarations',
         jsonConfirmWatch: 'This submit shrinks model_map to {after} row(s) (currently {before}): apply hands the dropped names to the in-process watcher so the renames are deleted.'
         ,
-        jsonCopyAdvertise: 'The top-level key models_virtual_only decides what /v1/models advertises: true = only the virtual entries, false = entries and real models, key absent = hand the decision back to env LMR_MODELS_VIRTUAL_ONLY. It only changes the advertisement: forwarding, /workers and routing stay untouched. Note: this key is not part of the editable JSON below (that editor covers the section keys only); it is owned by the single "Advertisement scope" control above, and saving from here carries it through unchanged. To clear the declaration choose "Not declared" above.',
+        jsonCopyAdvertise: 'The top-level key models_virtual_only decides what /v1/models advertises: true = only the virtual entries, false = entries and real models, key absent = hand the decision back to env LMR_MODELS_VIRTUAL_ONLY. It only changes the advertisement: forwarding, /workers and routing stay untouched. Note: this key is not part of the editable JSON below (that editor covers the section keys only); it is owned by the "Advertisement scope" select inside the entry edit dialog (the entry card footer only mirrors the disk state), and saving from here carries it through unchanged. To clear the declaration choose "Not declared" in that dialog.',
         advertiseSection: 'Advertisement scope',
         advertiseField: 'Which models /v1/models advertises',
         advertiseHint: 'Only changes which models GET /v1/models lists; it does not touch forwarding, /workers, or routing.',
@@ -637,6 +701,18 @@
         const cardFilter = ref('')
         const cardOpen = ref(false)
         const virtualRows = ref([])
+        // 条目编辑对话框（refactor-arch 5.1）：打开时快照条目名做自键定位（改名场景），
+        // 提交前先重新拉新鲜 virtual 整表、只替换目标条目、整表 POST /_ui/config/virtual
+        // ——workers.html saveDecls 的同一条链路。virtualForm 的字段形状与列表行完全一致
+        // （virtualRowFromEntry / virtualEntryFromRow 与全部校验函数原样复用，数据形状不变）。
+        const virtualOpen = ref(false)
+        const virtualSelfKey = ref('')
+        const virtualForm = reactive({
+          model: '', targets: [], context_window: '', default_effort: null, effort_map: [], modalities: [],
+          supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
+          supports_vision: null, supports_reasoning_effort: null,
+          raw: null, dirty: false
+        })
         // 池成员的实时形状（url / model_id / models / models_verified）：给候选下拉用，
         // 拉取失败时退化为「只能手填 url」，不阻塞本页其它编辑
         const poolWorkers = ref([])
@@ -1234,14 +1310,53 @@
 
         function touchRow (row) { row.dirty = true }
 
-        function addVirtualRow () {
-          virtualRows.value.push({
+        function openVirtualNew () {
+          // 新增 = 空表单 + raw:null + dirty:true（原 addVirtualRow push 的行形状），保存时才落表
+          virtualSelfKey.value = ''
+          Object.assign(virtualForm, {
             model: '', targets: [{ model: '', worker: '' }], context_window: '',
             default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
             supports_streaming: null, supports_reasoning: null,
             supports_vision: null, supports_reasoning_effort: null,
             raw: null, dirty: true
           })
+          virtualOpen.value = true
+        }
+        function openVirtualEdit (row) {
+          // 「打开对话框那一刻」的条目名是后续定位/删除的唯一自键（workers.html declSelfKey
+          // 同法）：改名场景里输入框的值已经是新名字，按它查会查不到原条目
+          virtualSelfKey.value = cleanModelName(row.model)
+          Object.assign(virtualForm, {
+            model: row.model,
+            // 深拷贝：半途取消不许把编辑漏在列表行上；raw 绝不重建（legacy 字节不变纪律）
+            targets: (row.targets || []).map(tg => ({ model: tg.model, worker: tg.worker })),
+            context_window: row.context_window,
+            default_effort: row.default_effort || null,
+            effort_map: (row.effort_map || []).map(one => ({ from: one.from, to: one.to })),
+            modalities: (row.modalities || []).slice(),
+            // 三态回显照 openCard 的纪律：只有真布尔回填，null/脏值一律落「不知道」
+            supports_tool_use: typeof row.supports_tool_use === 'boolean' ? row.supports_tool_use : null,
+            supports_streaming: typeof row.supports_streaming === 'boolean' ? row.supports_streaming : null,
+            supports_reasoning: typeof row.supports_reasoning === 'boolean' ? row.supports_reasoning : null,
+            supports_vision: typeof row.supports_vision === 'boolean' ? row.supports_vision : null,
+            supports_reasoning_effort: typeof row.supports_reasoning_effort === 'boolean'
+              ? row.supports_reasoning_effort : null,
+            raw: row.raw ? JSON.parse(JSON.stringify(row.raw)) : null,
+            // 打开即「未编辑」：没碰过任何字段的条目提交时逐字节回传 raw（dirty 决定改写面）
+            dirty: false
+          })
+          virtualOpen.value = true
+        }
+        const virtualDialogTitle = computed(() => {
+          const alias = cleanModelName(virtualForm.model) || tv('virtualNameUnset')
+          const head = virtualSelfKey.value ? tv('virtualEditTitle') : tv('virtualNewTitle')
+          return head + ' \u00b7 ' + alias
+        })
+        // 行上的「对外广告状态」：models_virtual_only 是整表顶层键，读数与磁盘态徽章同源
+        function rowAdvertiseState () {
+          if (advertiseDisk.value === ADV_ON) return { color: 'teal-4', text: advertiseText('advertiseDiskOn') }
+          if (advertiseDisk.value === ADV_OFF) return { color: 'teal-4', text: advertiseText('advertiseDiskOff') }
+          return { color: 'grey-6', text: advertiseText('advertiseDiskAuto') }
         }
         function addTarget (row) {
           if (!Array.isArray(row.targets)) row.targets = []
@@ -1324,7 +1439,7 @@
         // 别名不等于组内任何模型、每条绑定要么有 worker、绑定模型必须落在组里（否则后端 400）、
         // 同一实例不得绑两个不同模型、context_window 要么是空要么是 >0 整数。
         // 服务端仍是最终裁判，这里只把 400 提前到点保存之前，并给可操作的中文说明。
-        function validateVirtualRow (row) {
+        function validateVirtualRow (row, selfKey) {
           const alias = cleanModelName(row.model)
           if (!alias) return tv('virtualRuleAlias')
           const group = groupOfRow(row)
@@ -1362,7 +1477,11 @@
           const overflow = virtualCtxOverflow(row)
           if (overflow) return overflow
           // 重复的虚拟名在后端是「后者覆盖前者」而不是报错：不提前拦住就等于悄悄丢一份配置
-          if (virtualRows.value.some(other => other !== row && cleanModelName(other.model) === alias)) {
+          // 对话框编辑时 row 不在 virtualRows 里：按打开时快照的旧名豁免自己（改名不算重复）；
+          // selfKey 缺省 '' 时与全表直编时代逐字节同判
+          const excludeKey = cleanModelName(selfKey)
+          if (virtualRows.value.some(other => other !== row && cleanModelName(other.model) === alias
+              && cleanModelName(other.model) !== excludeKey)) {
             return tv('virtualDupAlias', { alias })
           }
           // 组里的名字如果本身是另一个虚拟名，转发出去就是一个没人认识的别名（root ruling 4）
@@ -1432,48 +1551,97 @@
           return entry
         }
 
-        async function saveVirtual () {
-          // 整表替换语义：什么都没填的行（包括手滑多点一次「添加服务入口」）静默丢弃。
-          // 这里刻意不看 dirty：新行的 dirty 是天生的，把它算进「有内容」会让一次误点
-          // 卡住整张表的保存，而操作员真正想删的东西另有删除按钮。
-          // 四个新声明位同样算「这行有内容」：只填了入口档位/能力位的行如果按原条件被当空行
-          // 丢弃，操作员会看到「填了没落盘」——与 context_window 同一条理由
-          const kept = virtualRows.value.filter(row =>
-            Boolean(cleanModelName(row.model)
-              || (row.targets || []).some(tg => cleanModelName(tg.model) || normWorker(tg.worker))
-              || String(row.context_window || '').trim()
-              || normalizeEffort(row.default_effort)
-              || (row.supports_tool_use === true || row.supports_tool_use === false)
-              || CAP_FIELDS.some(field => row[field] === true || row[field] === false)
-              || (Array.isArray(row.modalities) && row.modalities.length)
-              || (Array.isArray(row.effort_map) && row.effort_map.some(one =>
-                normalizeEffort(one && one.from) || normalizeEffort(one && one.to)))))
-          const warnings = []
-          for (const row of kept) {
-            const error = validateVirtualRow(row)
-            if (error) {
-              Quasar.Notify.create({ message: (cleanModelName(row.model) || '(<no name>)') + ' — ' + error, type: 'negative', position: 'top-right', timeout: 6200 })
-              return
-            }
-            // 隐藏的 legacy target 已经不在组里：后端会把它当代表值，转发的名字与组的
-            // 口径不一致，这属于「UI 画不出但会影响路由」的状态，必须在保存前说清楚。
-            const legacyTarget = cleanModelName((row.raw || {}).target)
-            if (row.dirty && legacyTarget && !groupOfRow(row).includes(legacyTarget)) {
-              warnings.push(tv('virtualStaleTarget', { alias: cleanModelName(row.model), target: legacyTarget }))
-            }
+        // JSON 面与条目对话框写的是同一份配置：textarea 里有未应用草稿时从对话框保存，
+        // 会用基线覆盖掉操作员刚敲的东西（saveAdvertiseSwitch 的互斥检查同款，refactor-arch
+        // 5.1 明说这条检查同样适用于新对话框）。
+        function jsonBusy () {
+          if (jsonOpen.value || configJsonDirty()) {
+            Quasar.Notify.create({ message: tv('virtualBusyJson'), type: 'warning', position: 'top-right', timeout: 4600 })
+            return true
           }
-          // 一张都填不出来而且磁盘上本来就没有条目时不发请求：整表替换的空表对空表是
-          // 无意义的往返。「本来有」才需要发（那才是删除操作，见用例：删光行必须提交空表）
-          const hadEntries = (((doc.value && doc.value.virtual_models) || []).length) > 0
-          if (!kept.length && !hadEntries) {
-            Quasar.Notify.create({ message: tv('virtualNothingToSave'), type: 'info', position: 'top-right', timeout: 2600 })
+          return false
+        }
+
+        // 条目对话框的保存：先重新拉新鲜 virtual 整表（防并发覆盖——workers.html saveDecls 的
+        // 安全闸同法），按打开时快照的自键定位目标条目、只替换它，整表 POST /_ui/config/virtual
+        // （请求形状逐字节不变，e2e_profiles 钉着）。校验（validateVirtualRow → 内部含
+        // virtualCtxOverflow / contextLimitOf 组口径）原样保留，只是从「保存前逐行」挪进
+        // 对话框提交流程；后端 validate_declared_context_windows 仍是权威，UI 只做前置提示。
+        async function submitVirtualForm () {
+          if (jsonBusy()) return
+          const error = validateVirtualRow(virtualForm, virtualSelfKey.value)
+          if (error) {
+            Quasar.Notify.create({
+              message: (cleanModelName(virtualForm.model) || '(<no name>)') + ' \u2014 ' + error,
+              type: 'negative', position: 'top-right', timeout: 6200
+            })
             return
           }
-          const entries = kept.map(virtualEntryFromRow)
-          const ok = await mutate(() => window.lmrApi.configVirtual(entries), 'virtualSaved')
-          if (ok && warnings.length) {
-            warningMessage.value = warnings.join(' / ')
+          // 隐藏的 legacy target 已经不在组里：后端会把它当代表值，转发的名字与组的
+          // 口径不一致，这属于「UI 画不出但会影响路由」的状态，必须在保存前说清楚。
+          const warnings = []
+          const legacyTarget = cleanModelName((virtualForm.raw || {}).target)
+          if (virtualForm.dirty && legacyTarget && !groupOfRow(virtualForm).includes(legacyTarget)) {
+            warnings.push(tv('virtualStaleTarget', { alias: cleanModelName(virtualForm.model), target: legacyTarget }))
           }
+          const alias = cleanModelName(virtualForm.model)
+          const ok = await mutate(async () => {
+            // 安全闸（saveDecls 同法）：整表替换的前提是「手里的整表是真的」。拿不到新鲜
+            // document 就明确拒绝这次保存，而不是用可能过期的表覆盖别的会话刚写的条目。
+            const fresh = await window.lmrApi.config()
+            const list = fresh && Array.isArray(fresh.virtual_models) ? fresh.virtual_models.slice() : null
+            if (!list) throw new Error(tv('virtualFreshFailed'))
+            const selfKey = virtualSelfKey.value
+            let index = -1
+            if (selfKey) {
+              index = list.findIndex(item => item && cleanModelName(item.model) === selfKey)
+              // 对话框打开后这条被别人删了：拒绝提交，不许凭空新增一条操作员以为在编辑的条目
+              if (index === -1) throw new Error(tv('virtualEntryGone'))
+            }
+            const entry = virtualEntryFromRow(virtualForm)
+            const clash = list.findIndex((item, i) => i !== index && item && cleanModelName(item.model) === alias)
+            // 新名字撞上别的条目（并发新增，本机的重复校验看不到）：拒绝而不是并进那一条——
+            // 条目 raw 来自被编辑的那条，合并会把另一条的未知键连根拔掉
+            if (clash !== -1) throw new Error(tv('virtualDupAlias', { alias }))
+            if (index === -1) list.push(entry)
+            else list.splice(index, 1, entry)
+            await window.lmrApi.configVirtual(list)
+          }, 'virtualEntrySaved', { alias })
+          if (ok) {
+            virtualOpen.value = false
+            if (warnings.length) warningMessage.value = warnings.join(' / ')
+          }
+        }
+
+        // 删除 = Quasar.Dialog 确认 + 重新拉新鲜整表 + 只剔目标条目、其余按服务器最新内容
+        // 原样带回；删光最后一条时提交空表——那正是删除操作本身（原 saveVirtual
+        // 「本来有条目才发空表」的语义在这里天然成立，无需再看「本来有没有」）。
+        function deleteVirtualEntry (row, index) {
+          const alias = cleanModelName(row.model)
+          if (!alias) {
+            // 对话框模型下列表只由服务端数据回显，未命名行只可能是没填完的本地残留：
+            // 服务端不可能有它（后端拒绝空 model），本地剔除即可
+            virtualRows.value.splice(index, 1)
+            return
+          }
+          Quasar.Dialog.create({
+            title: tv('virtualDeleteTitle'),
+            message: tv('virtualDeleteConfirm', { alias: alias }),
+            cancel: true, persistent: true,
+            ok: { label: c.value.del, color: 'negative', flat: true }
+          }).onOk(async () => {
+            if (jsonBusy()) return
+            const ok = await mutate(async () => {
+              const fresh = await window.lmrApi.config()
+              const list = fresh && Array.isArray(fresh.virtual_models) ? fresh.virtual_models.slice() : null
+              if (!list) throw new Error(tv('virtualFreshFailed'))
+              const removeIndex = list.findIndex(item => item && cleanModelName(item.model) === alias)
+              if (removeIndex === -1) throw new Error(tv('virtualEntryGone'))
+              list.splice(removeIndex, 1)
+              await window.lmrApi.configVirtual(list)
+            }, 'virtualEntryDeleted', { alias })
+            if (ok && virtualOpen.value && virtualSelfKey.value === alias) virtualOpen.value = false
+          })
         }
 
         // ── 服务实际上下文限制（context_limit）：引擎真实能力，只用于配置期校验 ──
@@ -1914,6 +2082,8 @@
           if (advertiseChoice.value !== ADV_ON) return ''
           const serverCount = ((doc.value && doc.value.virtual_models) || []).length
           const pending = virtualRows.value.some(row => Boolean(cleanModelName(row.model)))
+            // 对话框里正在填的新入口也算「已有」：先加入口再开开关是常见顺序，只查服务端会误报
+            || (virtualOpen.value && Boolean(cleanModelName(virtualForm.model)))
           if (serverCount > 0 || pending) return ''
           return advertiseText('advertiseEmptyWarn')
         })
@@ -1996,13 +2166,17 @@
           // 编译期不会报错（之前就是这个原因让过滤形同虚设）
           filteredModelOptions,
           modalitiesText, mutate, openCard, pagination, persistNote, preview, previewResult, saving, saveCard,
-          saveVirtual, t, tv, pageTitle, virtualRows,
+          t, tv, pageTitle, virtualRows,
+          // 条目编辑对话框：模板引用的每一项都必须在这里导出（漏一项 = 那块 UI 静默消失，
+          // 本页这个坑踩过三次——模板用 with(_ctx) 解析，编译期不报错）
+          virtualOpen, virtualForm, virtualDialogTitle, openVirtualNew, openVirtualEdit,
+          submitVirtualForm, deleteVirtualEntry, rowAdvertiseState,
           // 条目编辑区的实时告警与保存禁用：同样必须在 return 里
           virtualCtxOverflow, virtualCtxBlocking,
           // 配置 JSON 对话框：漏一项就是运行期 undefined（模板用 with(_ctx) 解析，编译期不报错）
           cj, openConfigJson, closeConfigJson, resetConfigJson, copyConfigJson, saveConfigJson,
           jsonOpen, jsonText, jsonError,
-          addTarget, removeTarget, addVirtualRow, displayTargets, groupOfRow, legacyChips, touchRow,
+          addTarget, removeTarget, displayTargets, groupOfRow, legacyChips, touchRow,
           targetModelOptions, normWorker, poolWorkers, workerOptionsFor,
           previewServing,
           // /v1/models 对外广告范围开关：模板引用 advertiseText / advertiseChoice / advertiseOptions /
