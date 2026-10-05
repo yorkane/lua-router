@@ -221,7 +221,7 @@ _M.ENV_NAMES = {
     -- 靠 capture_env 在 init_by_lua（fork 之前）抓进 _G.LMR_ENV_CACHE，所以这里加名就是
     -- 全部要做的事，不需要也不应该去 conf 里再加一行 env 指令。
     "LMR_MODELS_VIRTUAL_ONLY",
-    "LMR_CONFIG_FILE", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
+    "LMR_CONFIG_FILE", "LMR_CONFIG_STORE_BACKEND", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
     "LMR_LOGS_BUFFER", "LMR_UPSTREAMS_FILE",
 }
 
@@ -2133,6 +2133,49 @@ end
 -- further down, and policy_document needs it from earlier in the file.
 local registered_models
 
+-- Persistent store layer (sqlite / postgres / file), resolved lazily and only
+-- inside a real nginx worker. The unit suite has neither ngx.config nor
+-- ngx.worker, so gating on those keeps every no-port test on exactly the file
+-- path it has always used: the store is invisible there.
+local _store_mod
+local function store()
+    if _store_mod ~= nil then return _store_mod or nil end
+    if not (ngx and ngx.config and ngx.worker) then
+        _store_mod = false
+        return nil
+    end
+    local ok, mod = pcall(require, "resty.luarouter.store_dispatcher")
+    if not ok or type(mod) ~= "table" or type(mod.load) ~= "function" then
+        _store_mod = false
+        return nil
+    end
+    _store_mod = mod
+    return mod
+end
+
+_M.store = store
+
+-- Would a snapshot sitting in LMR_CONFIG_FILE be somebody's own edit rather
+-- than our own (now stale) mirror? Two signals, because the revision counter
+-- alone cannot tell them apart: a harness or operator replacing runtime.json
+-- leaves the sidecar's digest pointing at bytes that are no longer there, and a
+-- file written by another instance lands with a higher counter. When neither
+-- holds the store is the answer, so a section deleted through the gateway must
+-- NOT come back from the mirror.
+local function file_was_edited_outside(db_rev)
+    local ok, fmod = pcall(require, "resty.luarouter.store_file")
+    if not ok or type(fmod) ~= "table" then return false end
+    if type(fmod.edited_externally) == "function" and fmod.edited_externally() then
+        return true, "LMR_CONFIG_FILE replaced outside the gateway"
+    end
+    local f_rev = nil
+    if type(fmod.revision) == "function" then f_rev = fmod.revision() end
+    if type(f_rev) == "number" and type(db_rev) == "number" and f_rev > db_rev then
+        return true, "LMR_CONFIG_FILE revision ahead of the store"
+    end
+    return false
+end
+
 --- Layered read of the current snapshot (array form). Returns table or nil.
 local function read_snapshot()
     local shared = dict()
@@ -2141,6 +2184,36 @@ local function read_snapshot()
         if raw then
             local snap = cjson.decode(raw)
             if snap then return snap end
+        end
+    end
+
+    -- The store sits between the in-process shdict and the legacy file: it is
+    -- the durable, shareable source of truth. Whatever it cannot answer falls
+    -- through to the file below, so a dead database degrades the store instead
+    -- of taking the router down with it.
+    local d = store()
+    if d then
+        local ok, snap, rev = pcall(d.load)
+        if ok and snap then
+            local edited, why = file_was_edited_outside(rev)
+            if edited then
+                local saved, serr = d.save(snap, nil)
+                if not saved then
+                    if ngx and ngx.log then
+                        pcall(ngx.log, ngx.WARN,
+                            "luarouter config: adopting ", tostring(why),
+                            " failed (", tostring(serr), "); the store keeps serving")
+                    end
+                elseif ngx and ngx.log then
+                    pcall(ngx.log, ngx.NOTICE, "luarouter config: adopted ", why)
+                end
+            end
+            local rok, cur = pcall(d.revision)
+            _M._store_rev = (rok and cur) or nil
+            return snap
+        end
+        if not ok and ngx and ngx.log then
+            pcall(ngx.log, ngx.WARN, "luarouter config: store load failed (", tostring(snap), ")")
         end
     end
     local path = env("LMR_CONFIG_FILE")
@@ -2174,11 +2247,42 @@ local function write_snapshot(snap)
             ngx.log(ngx.WARN, "luarouter config dict write failed: ", err or "?")
         end
     end
+
+    -- Durable first, mirror second. The mirror is for humans (readable JSON,
+    -- git-diffable) and for the rollback path, not a second source of truth, so
+    -- a failure there is a warning and never a failed save.
+    local d = store()
+    local committed_rev = _M._store_rev
+    if d then
+        local ok, err, cur = d.save(snap, _M._store_rev)
+        if ok then
+            committed_rev = cur
+            _M._store_rev = cur
+        else
+            if ngx and ngx.log then
+                pcall(ngx.log, ngx.WARN, "luarouter config: store save failed: ", tostring(err))
+            end
+            committed_rev = nil
+        end
+    end
     local path = env("LMR_CONFIG_FILE")
     if path then
-        local ok, err = _M.persist(path, snap)
-        if not ok then
-            ngx.log(ngx.WARN, "luarouter config persist to ", path, " failed: ", err)
+        if d and committed_rev ~= nil then
+            local fok, ferr = pcall(require, "resty.luarouter.store_file")
+            local mok, merr
+            if fok and type(ferr) == "table" and type(ferr.mirror) == "function" then
+                mok, merr = ferr.mirror(snap, committed_rev)
+            else
+                mok, merr = _M.persist(path, snap)
+            end
+            if not mok and ngx and ngx.log then
+                pcall(ngx.log, ngx.WARN, "luarouter config mirror to ", path, " failed: ", tostring(merr))
+            end
+        else
+            local ok, err = _M.persist(path, snap)
+            if not ok and ngx and ngx.log then
+                pcall(ngx.log, ngx.WARN, "luarouter config persist to ", path, " failed: ", tostring(err))
+            end
         end
     end
     _M._file_cache = nil  -- force a re-read on next miss
@@ -2232,7 +2336,35 @@ end
 --- Current config as internal map form: env baseline overlaid with the
 --- persisted/shared snapshot (same precedence as Rust: file wins when present
 --- and valid; invalid file falls back to env).
+-- One import of the legacy JSON snapshot into a fresh store, per process.
+-- `migrate_from_file` is itself idempotent (a non-empty store is left alone),
+-- so the guard here is about not re-stat-ing the file on every request.
+--
+-- Replay exemption matters here: a migration is a bootstrap write, and a
+-- briefly unreachable store must degrade to the file, never fail startup.
+local _migrated = false
+function _M.migrate_once()
+    if _migrated then return end
+    _migrated = true
+    local d = store()
+    if not d then return end
+    if type(d.begin_replay) == "function" then d.begin_replay() end
+    local ok, imported, err = pcall(d.migrate_from_file)
+    if type(d.end_replay) == "function" then d.end_replay() end
+    if not ok then
+        if ngx and ngx.log then
+            pcall(ngx.log, ngx.WARN, "luarouter config: store migration errored (", tostring(imported), ")")
+        end
+        return
+    end
+    if imported and ngx and ngx.log then
+        pcall(ngx.log, ngx.NOTICE, "luarouter config: imported LMR_CONFIG_FILE into the store",
+            d.last_backup and (" (backup " .. d.last_backup .. ")") or "")
+    end
+end
+
 function _M.current()
+    _M.migrate_once()
     local snap = read_snapshot()
     if snap then
         local cfg, err = cfg_from_document(snap)
