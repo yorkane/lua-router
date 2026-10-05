@@ -86,6 +86,10 @@
                          只有真写了 true/false 才上色，避免「灰底却按已声明着色」 -->
                     <q-badge outline :color="toolUseDeclared(row) ? 'teal-4' : 'grey-6'" class="chip-soft">
                       {{ toolUseText(row.supports_tool_use) }}</q-badge>
+                    <!-- 四个能力位各一枚 chip：灰 = 未声明（让位引擎自报），只有真布尔上色 -->
+                    <q-badge v-for="cap in capSummary(row)" :key="'vc' + index + '-' + cap.key" outline
+                             :color="cap.value ? 'teal-4' : 'orange-4'" class="chip-soft">
+                      {{ cap.label }}: {{ cap.value ? cjText('capDeclaredYes') : cjText('capDeclaredNo') }}</q-badge>
                     <!-- 声明窗口 ≥ 组内服务实际限制：后端会拒绝，这里提前在行上标出来 -->
                     <q-badge v-if="virtualCtxOverflow(row)" outline color="orange-4" class="chip-soft">
                       {{ tv('virtualCtxOverChip') }}</q-badge>
@@ -108,6 +112,20 @@
                               :label="tv('virtualEffortField')" :hint="tv('virtualEffortHint')" @update:model-value="touchRow(row)"></q-select>
                     <q-select v-model="row.supports_tool_use" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
                               :label="tv('virtualToolField')" :placeholder="tv('virtualToolUnknown')" :hint="tv('virtualToolHint')"
+                              @update:model-value="touchRow(row)"></q-select>
+                    <!-- 条目层四个能力位：与卡片同名字段，卡片就这一位说过话时卡片赢（后端
+                         resolve_model_caps 的 declared() 一条链），留空 = 删键 = 交给引擎自报 -->
+                    <q-select v-model="row.supports_streaming" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualStreamingField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualStreamingHint')"
+                              @update:model-value="touchRow(row)"></q-select>
+                    <q-select v-model="row.supports_reasoning" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualReasoningField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualReasoningHint')"
+                              @update:model-value="touchRow(row)"></q-select>
+                    <q-select v-model="row.supports_vision" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualVisionField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualVisionHint')"
+                              @update:model-value="touchRow(row)"></q-select>
+                    <q-select v-model="row.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('virtualEffortSupportField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualEffortSupportHint')"
                               @update:model-value="touchRow(row)"></q-select>
                     <q-option-group :model-value="row.modalities || []" type="checkbox" inline
                                     :options="modalityOptions" color="purple-4" dense
@@ -290,6 +308,21 @@
                   <span class="code-pill" :class="{ muted: toolUseText(props.row.supports_tool_use) === t.toolUseUnknown }">{{ toolUseText(props.row.supports_tool_use) }}</span>
                 </q-td>
               </template>
+              <!-- 四个能力位一列：只画声明过的位（灰底 = 该位沉默 = 退回引擎自报），
+                   一个都没声明时整列写「未声明」，与「这张卡片不存在」区分开 -->
+              <template v-slot:body-cell-caps="props">
+                <q-td :props="props">
+                  <div v-if="!capSummaryEmpty(props.row)" style="display:flex;flex-wrap:wrap;gap:4px">
+                    <!-- 与入口行那批 chip 同一形状（outline + 上色 = 声明过，灰 = 沉默）：
+                         这里刻意用 q-badge 而不是 q-chip :color，后者会刷一块实心底色，
+                         在本页的暗色面板上把字吃掉 -->
+                    <q-badge v-for="cap in capSummary(props.row)" :key="cap.key" outline
+                             :color="cap.value ? 'teal-4' : 'orange-4'" class="chip-soft">
+                      {{ cap.label }}: {{ cap.value ? cjText('capDeclaredYes') : cjText('capDeclaredNo') }}</q-badge>
+                  </div>
+                  <span v-else class="muted">{{ cjText('capDeclaredUnknown') }}</span>
+                </q-td>
+              </template>
               <template v-slot:body-cell-actions="props">
                 <q-td :props="props">
                   <div class="row-actions">
@@ -318,6 +351,17 @@
                     <!-- 三态：true=支持 / false=不支持 / 留空=不知道（nil 与 false 在往返里绝不合并） -->
                     <q-select v-model="cardForm.supports_tool_use" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
                               :label="t.cardToolUseField" :placeholder="t.toolUseUnknown" :hint="t.cardToolUseHint"></q-select>
+                    <!-- 四个能力位同一条链（卡片 → 条目 → 引擎自报 → 整键省略），控件与文案
+                         形状照抄上面那一个：三态下拉而不是勾选框（勾选框的 false 与未填同值，
+                         画不出「不知道」那一档），留空一律写成删键而不是 false -->
+                    <q-select v-model="cardForm.supports_streaming" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('cardStreamingField')" :placeholder="t.toolUseUnknown" :hint="cjText('cardStreamingHint')"></q-select>
+                    <q-select v-model="cardForm.supports_reasoning" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('cardReasoningField')" :placeholder="t.toolUseUnknown" :hint="cjText('cardReasoningHint')"></q-select>
+                    <q-select v-model="cardForm.supports_vision" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('cardVisionField')" :placeholder="t.toolUseUnknown" :hint="cjText('cardVisionHint')"></q-select>
+                    <q-select v-model="cardForm.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="cjText('cardEffortSupportField')" :placeholder="t.toolUseUnknown" :hint="cjText('cardEffortSupportHint')"></q-select>
                   </div>
                   <div>
                     <div class="rows-head q-mb-xs">{{ t.cardEffortMapTitle }}</div>
@@ -405,10 +449,13 @@
           + 'workers（规范化 url 白名单）与 context_window（正整数，该入口对下游统一声明的上下文总窗口'
           + '（输入+输出），供客户端决定何时压缩；网关不改写任何输出预算字段，声明值必须严格小于组内各卡片的 '
           + 'context_limit，后端会拒绝保存违反的配置；不想声明就把整个键删掉，写 null 或空数组会被旧 build 误判）。'
-          + 'target 是旧形状的代表值，写了 targets 时可省。条目另有四个声明位：default_effort（入口缺省档位，留空=完全不覆盖）、'
+          + 'target 是旧形状的代表值，写了 targets 时可省。条目另有八个声明位：default_effort（入口缺省档位，留空=完全不覆盖）、'
           + 'effort_map（[{from,to}]，无论 default_effort 填没填都生效）、modalities（text/image/video/audio 数组）、'
-          + 'supports_tool_use（true|false，缺键=不知道）；档位按 卡片→条目→全局 逐字段逐 from 继承，'
-          + '能力位与 tool 只影响对外声明、网关不拦截。调度策略不在这里配（在路由策略页）。'
+          + 'supports_tool_use（true|false，缺键=不知道），以及同样三态的四个能力位 '
+          + 'supports_streaming / supports_reasoning / supports_vision / supports_reasoning_effort'
+          + '（都是 true|false，缺键=不知道，写非布尔会被拒绝）；档位按 卡片→条目→全局 逐字段逐 from 继承，'
+          + '能力位按 卡片→条目→引擎自报→整键省略 取值（卡片压过条目），与 tool 一样只影响对外声明、'
+          + '网关不拦截、不改写任何输出预算。调度策略不在这里配（在路由策略页）。'
           + '本对话框无损读写：读到的 candidates 与任何未识别的键都原样写回，只过滤顶层段键，绝不过滤行内字段。',
         jsonCopyKeys: 'upstreams 的 api_key 回显恒 null（脱敏）：提交时保持 null 或删掉该键 = 不动已存密钥，'
           + '填 "" = 清除，填值 = 设置。',
@@ -453,6 +500,32 @@
         advertiseOptOff: '关：入口与真实模型都广告',
         advertiseSaved: '广告范围已应用',
         advertiseBusy: '请先关闭或放弃「配置 JSON」对话框，再应用广告范围：两处都写整份文档，同时编辑会互相覆盖。',
+        // ── 四个能力位（supports_streaming / supports_reasoning / supports_vision /
+        //    supports_reasoning_effort）的可配开关 ──
+        // 三态一律用下拉而不是勾选框：勾选框的 false 与「未填」是同一个值，表达不出
+        // 「不知道」这一档（后端 nil 与 false 在往返里绝不合并，models_virtual_only 同此理由）。
+        // 新文案只进页内字典（本文件 21-22 行先例：i18n.js 由他人并行维护）。
+        cardStreamingField: '流式输出（streaming）',
+        cardStreamingHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明 supports_streaming。留空 = 不知道，退回引擎自报，两边都没读数时整个键省略。只影响 /v1/models 的声明，不影响转发：配了不支持，stream:true 的请求照样转出去。',
+        cardReasoningField: '推理（reasoning）',
+        cardReasoningHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明 supports_reasoning。留空 = 不知道，退回引擎自报，两边都没读数时整个键省略。只影响 /v1/models 的声明，不影响转发：配了不支持，带推理意图的请求照样转出去。',
+        cardVisionField: '视觉（vision）',
+        cardVisionHint: '填了就以本卡片为准，压过入口、也压过下面模态勾选的推断；对外声明 supports_vision。留空 = 不知道，退回引擎自报，其次由本卡片模态里有没有 image/video 推断（模态是穷尽声明，所以能正反推；引擎自报的模态只允许推正向）。只影响 /v1/models 的声明，不影响转发：配了不支持，带图的请求照样转出去。',
+        cardEffortSupportField: '档位支持（reasoning effort）',
+        cardEffortSupportHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明顶层 supports_reasoning_effort。留空 = 不知道，退回原有派生（有任一份档位读数就是 true，否则整个键省略）。只影响 /v1/models 的声明，不影响转发，也不改任何档位改写。',
+        // 卡片表只加**一列**而不是四列：五个能力位挤成四列会把模型名挤到看不见，
+        // 而这一列要回答的只是「这张卡片到底声明过没有」，具体值在卡片对话框里逐个改
+        colCaps: '能力声明',
+        capStreaming: '流式', capReasoning: '推理', capVision: '视觉', capEffortSupport: '档位',
+        capDeclaredYes: '支持', capDeclaredNo: '不支持', capDeclaredUnknown: '未声明',
+        virtualStreamingField: '流式（streaming）',
+        virtualReasoningField: '推理（reasoning）',
+        virtualVisionField: '视觉（vision）',
+        virtualEffortSupportField: '档位支持（effort）',
+        virtualStreamingHint: '三态：支持 / 不支持 / 不声明。卡片就这一位说过话时卡片赢，卡片沉默才轮到这一条；两边都不说才让给引擎自报，都没有时整个键省略。只影响 /v1/models 的对外声明，网关不据此拦截任何请求。',
+        virtualReasoningHint: '三态：支持 / 不支持 / 不声明。卡片就这一位说过话时卡片赢，卡片沉默才轮到这一条；两边都不说才让给引擎自报，都没有时整个键省略。只影响 /v1/models 的对外声明，网关不据此拦截任何请求。',
+        virtualVisionHint: '三态：支持 / 不支持 / 不声明。卡片就这一位说过话时卡片赢，卡片沉默才轮到这一条（上面模态勾选的推断也一起让位给它）；两边都不说才让给引擎自报，都没有时整个键省略。只影响 /v1/models 的对外声明，网关不据此拦截任何请求。',
+        virtualEffortSupportHint: '三态：支持 / 不支持 / 不声明，落在顶层 supports_reasoning_effort。卡片先说，卡片沉默才轮到这一条；两边都不说就退回原有派生（组内有档位读数才是 true）。填「不支持」时组内其它成员也不能把它抬回 true。只影响 /v1/models 的对外声明，不改任何档位改写。',
       },
       'en-US': {
         jsonButton: 'Config JSON',
@@ -467,12 +540,15 @@
           + 'know when to compress; the gateway rewrites no output budget field, and the declared value must stay '
           + 'strictly below every card context_limit in the group — the backend refuses a violating save; delete the '
           + 'whole key to drop the declaration — null or [] is misread by older builds). target is the '
-          + 'representative value of the old shape and can be omitted once targets is set. An entry also carries four '
+          + 'representative value of the old shape and can be omitted once targets is set. An entry also carries eight '
           + 'declaration fields: default_effort (entry default effort; blank = no override at all), effort_map '
           + '([{from,to}], applies whether or not default_effort is set), modalities (text/image/video/audio array) and '
-          + 'supports_tool_use (true|false; an absent key means unknown). Effort is inherited card -> entry -> global, '
-          + 'field by field and per from; the capability fields only change the advertisement and the gateway blocks '
-          + 'nothing on them. Scheduling policy lives on the routing page. This dialog reads and writes losslessly: '
+          + 'supports_tool_use (true|false; an absent key means unknown) plus the four same-shaped flags '
+          + 'supports_streaming / supports_reasoning / supports_vision / supports_reasoning_effort '
+          + '(all true|false, an absent key means unknown, a non-boolean is rejected). Effort is inherited card -> entry -> global, '
+          + 'field by field and per from; each capability flag resolves card -> entry -> engine report -> key omitted, '
+          + 'with the card winning over the entry, and like tool use it only changes the advertisement: the gateway blocks '
+          + 'nothing on it and rewrites no output budget. Scheduling policy lives on the routing page. This dialog reads and writes losslessly: '
           + 'only top-level sections are filtered, candidates and any unrecognised key are written back verbatim, '
           + 'and inline row fields are never filtered.',
         jsonCopyKeys: 'upstreams.api_key is always shown as null (masked): keep it null or delete the key to leave '
@@ -514,7 +590,26 @@
         advertiseOptOn: 'On: advertise virtual entries only',
         advertiseOptOff: 'Off: advertise entries and real models',
         advertiseSaved: 'Advertisement scope applied',
-        advertiseBusy: 'Close or discard the Config JSON dialog before applying the advertisement scope: both write the whole document, so editing them at the same time would overwrite each other.'
+        advertiseBusy: 'Close or discard the Config JSON dialog before applying the advertisement scope: both write the whole document, so editing them at the same time would overwrite each other.',
+        cardStreamingField: 'Streaming',
+        cardStreamingHint: 'When set, this card wins over the entry and the engine report, and advertises supports_streaming. Blank = unknown, so it falls back to what the engine reports and the key is dropped when neither has a reading. Changes only the /v1/models advertisement, never forwarding: a stream:true request still goes out when this says unsupported.',
+        cardReasoningField: 'Reasoning',
+        cardReasoningHint: 'When set, this card wins over the entry and the engine report, and advertises supports_reasoning. Blank = unknown, so it falls back to what the engine reports and the key is dropped when neither has a reading. Changes only the /v1/models advertisement, never forwarding: a reasoning request still goes out when this says unsupported.',
+        cardVisionField: 'Vision',
+        cardVisionHint: 'When set, this card wins over the entry and over the modality ticks below, and advertises supports_vision. Blank = unknown, so it falls back to the engine report and then to whether the card modalities list image/video (modalities are an exhaustive declaration, so they infer both ways; the engine list only infers positively). Changes only the /v1/models advertisement, never forwarding: an image request still goes out when this says unsupported.',
+        cardEffortSupportField: 'Effort support',
+        cardEffortSupportHint: 'When set, this card wins over the entry and the engine report, and advertises the top-level supports_reasoning_effort. Blank = unknown, so the existing derivation stays (true when any effort reading exists, otherwise the key is dropped). Changes only the /v1/models advertisement: it rewrites neither forwarding nor any effort mapping.',
+        colCaps: 'Capabilities',
+        capStreaming: 'stream', capReasoning: 'reason', capVision: 'vision', capEffortSupport: 'effort',
+        capDeclaredYes: 'supported', capDeclaredNo: 'unsupported', capDeclaredUnknown: 'not declared',
+        virtualStreamingField: 'Streaming',
+        virtualReasoningField: 'Reasoning',
+        virtualVisionField: 'Vision',
+        virtualEffortSupportField: 'Effort support',
+        virtualStreamingHint: 'Tri-state: supported / unsupported / not declared. The card wins when it spoke about this flag; this row only answers when the card stayed silent, and the engine report only fills what neither declared — with nothing from any side the key is dropped. Changes only the /v1/models advertisement; the gateway blocks nothing on it.',
+        virtualReasoningHint: 'Tri-state: supported / unsupported / not declared. The card wins when it spoke about this flag; this row only answers when the card stayed silent, and the engine report only fills what neither declared — with nothing from any side the key is dropped. Changes only the /v1/models advertisement; the gateway blocks nothing on it.',
+        virtualVisionHint: 'Tri-state: supported / unsupported / not declared. The card wins when it spoke about this flag; this row only answers when the card stayed silent (it also overrides the modality ticks above), and the engine report fills only what neither declared — with nothing from any side the key is dropped. Changes only the /v1/models advertisement; the gateway blocks nothing on it.',
+        virtualEffortSupportHint: 'Tri-state: supported / unsupported / not declared, landed on the top-level supports_reasoning_effort. The card speaks first; this row only answers when the card stayed silent, and with nothing declared the existing derivation stays (true when the group has any effort reading). Choosing "unsupported" cannot be lifted back to true by another member. Changes only the /v1/models advertisement and rewrites no effort mapping.',
       }
     }
 
@@ -546,7 +641,13 @@
         // 拉取失败时退化为「只能手填 url」，不阻塞本页其它编辑
         const poolWorkers = ref([])
         // supports_tool_use 是三态：true / false / null(=不知道)。null 与 false 在往返里绝不合并
-        const cardForm = reactive({ model: '', ctx: '', context_limit: '', default_effort: null, effort_map: [], modalities: [], supports_tool_use: null })
+        // 四个能力位与 supports_tool_use 同为三态：true / false / null(=不知道)。
+        // null 与 false 在往返里绝不合并（false 是结论、null 是沉默），后端同样分家
+        const cardForm = reactive({
+          model: '', ctx: '', context_limit: '', default_effort: null, effort_map: [], modalities: [],
+          supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
+          supports_vision: null, supports_reasoning_effort: null
+        })
         const preview = reactive({ model: '', effort: null, modelFilter: '' })
         const filteredModelOptions = ref([])
         let unsubscribeLocale
@@ -589,6 +690,39 @@
           if (value === false) return t.value.toolUseNo
           return t.value.toolUseUnknown
         }
+
+        // ── 四个能力位（2026-10-05：UI 可配 → 落到 /v1/models 的对外声明）──
+        // 名字与后端 config_store / router 完全同名（扁平三态，不折进 supports:{} 子对象：
+        // 那会让已被测试钉住的 supports_tool_use 长出第二条路径）。控件一律三态下拉而不是
+        // 勾选框 —— 勾选框的 false 与未填是同一个值，表达不出「不知道」，而那正是让位给
+        // 引擎自报的那一档。选项与 tool use 共用一份（同一族 label 真布尔）。
+        const CAP_FIELDS = ['supports_streaming', 'supports_reasoning', 'supports_vision', 'supports_reasoning_effort']
+        const CAP_LABELS = {
+          supports_streaming: () => cjText('capStreaming'),
+          supports_reasoning: () => cjText('capReasoning'),
+          supports_vision: () => cjText('capVision'),
+          supports_reasoning_effort: () => cjText('capEffortSupport')
+        }
+        function capDeclared (row, field) {
+          const value = row && row[field]
+          return value === true || value === false
+        }
+        function capText (value) {
+          if (value === true) return cjText('capDeclaredYes')
+          if (value === false) return cjText('capDeclaredNo')
+          return cjText('capDeclaredUnknown')
+        }
+        // 卡片表那一列的紧凑读数：只画声明过的位，一个都没声明时给一句「未声明」，
+        // 让「这张卡片对这些位沉默」与「这张卡片不存在」仍然可分
+        function capSummary (row) {
+          const out = []
+          CAP_FIELDS.forEach(field => {
+            if (!capDeclared(row, field)) return
+            out.push({ key: field, label: CAP_LABELS[field](), value: row[field] })
+          })
+          return out
+        }
+        function capSummaryEmpty (row) { return capSummary(row).length === 0 }
 
         // 所有可引用的模型名：已注册 + 已配置 + 虚拟别名
         const modelOptions = computed(() => {
@@ -642,6 +776,9 @@
           { name: 'effort_map', label: t.value.colCardMap, field: 'effort_map', align: 'left' },
           { name: 'modalities', label: t.value.colModalities, field: 'modalities', align: 'left', style: 'width:150px' },
           { name: 'tool_use', label: t.value.colToolUse, field: 'supports_tool_use', align: 'left', style: 'width:110px' },
+          // 四个新能力位合并成**一列**：四列会把模型名挤到看不见，而这一列要回答的只是
+          // 「这张卡片对这几位到底说过没有」，逐位的值在卡片对话框里改
+          { name: 'caps', label: cjText('colCaps'), field: 'caps', align: 'left', style: 'width:190px' },
           { name: 'actions', label: '', field: 'actions', align: 'right', style: 'width:90px' }
         ])
 
@@ -686,7 +823,11 @@
             rows.push({ model: entry.model, registered: false, sources: [], virtual: true, group,
               contextWindow: Number.isFinite(cw) && cw >= 1 ? cw : null,
               default_effort: declarations.default_effort, effort_map: declarations.effort_map,
-              modalities: declarations.modalities, supports_tool_use: declarations.supports_tool_use })
+              modalities: declarations.modalities, supports_tool_use: declarations.supports_tool_use,
+              supports_streaming: declarations.supports_streaming,
+              supports_reasoning: declarations.supports_reasoning,
+              supports_vision: declarations.supports_vision,
+              supports_reasoning_effort: declarations.supports_reasoning_effort })
           })
           return rows
         })
@@ -695,7 +836,9 @@
         // false（后端 config_store 刻意把 nil 与 false 分家，UI 这边合一次就白分）。
         // effort_map 兼容后端两种形状：UI 往返的 [{from,to}] 数组与 profile 里的查表。
         function entryDeclarations (entry) {
-          const out = { default_effort: null, effort_map: [], modalities: [], supports_tool_use: null }
+          const out = { default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
+            supports_streaming: null, supports_reasoning: null,
+            supports_vision: null, supports_reasoning_effort: null }
           if (!entry || typeof entry !== 'object') return out
           out.default_effort = normalizeEffort(entry.default_effort)
           const map = entry.effort_map
@@ -718,6 +861,11 @@
             out.modalities = entry.modalities.filter(item => typeof item === 'string' && item !== 'text')
           }
           if (typeof entry.supports_tool_use === 'boolean') out.supports_tool_use = entry.supports_tool_use
+          // 四个新位同一条纪律：只有真布尔算声明，脏值（字符串 / 数字 / null）一律读成
+          // 「没说」而不是 false —— 后端把 nil 与 false 分家，UI 这边合一次就白分
+          CAP_FIELDS.forEach(field => {
+            if (typeof entry[field] === 'boolean') out[field] = entry[field]
+          })
           return out
         }
 
@@ -1073,6 +1221,11 @@
             effort_map: declared.effort_map,
             modalities: declared.modalities,
             supports_tool_use: declared.supports_tool_use,
+            // 四个能力位与 tool use 同一条读侧：读进编辑面，提交与否仍由 dirty 决定
+            supports_streaming: declared.supports_streaming,
+            supports_reasoning: declared.supports_reasoning,
+            supports_vision: declared.supports_vision,
+            supports_reasoning_effort: declared.supports_reasoning_effort,
             raw: { ...entry },
             // 只有真被编辑过的行才允许改写 targets/candidates/context_window 与四个声明位
             dirty: false
@@ -1085,6 +1238,8 @@
           virtualRows.value.push({
             model: '', targets: [{ model: '', worker: '' }], context_window: '',
             default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
+            supports_streaming: null, supports_reasoning: null,
+            supports_vision: null, supports_reasoning_effort: null,
             raw: null, dirty: true
           })
         }
@@ -1268,6 +1423,12 @@
           else delete entry.modalities
           if (row.supports_tool_use === true || row.supports_tool_use === false) entry.supports_tool_use = row.supports_tool_use
           else delete entry.supports_tool_use
+          // 四个能力位与 tool use 同一支：false 是结论、null 是沉默，两者在提交时绝不合并；
+          // 「留空」一律删键（可选字段缺席而不是 null 是本仓既有的往返约定）
+          CAP_FIELDS.forEach(field => {
+            if (row[field] === true || row[field] === false) entry[field] = row[field]
+            else delete entry[field]
+          })
           return entry
         }
 
@@ -1283,6 +1444,7 @@
               || String(row.context_window || '').trim()
               || normalizeEffort(row.default_effort)
               || (row.supports_tool_use === true || row.supports_tool_use === false)
+              || CAP_FIELDS.some(field => row[field] === true || row[field] === false)
               || (Array.isArray(row.modalities) && row.modalities.length)
               || (Array.isArray(row.effort_map) && row.effort_map.some(one =>
                 normalizeEffort(one && one.from) || normalizeEffort(one && one.to)))))
@@ -1381,7 +1543,14 @@
             modalities: (row.modalities || []).filter(item => item !== 'text'),
             // 三态回显：只有真布尔才回填，其它（null/缺键/脏值）一律落「不知道」，
             // 这样打开一张从未声明过的卡片再保存，不会把它写成「不支持」
-            supports_tool_use: typeof row.supports_tool_use === 'boolean' ? row.supports_tool_use : null
+            supports_tool_use: typeof row.supports_tool_use === 'boolean' ? row.supports_tool_use : null,
+            // 四个新位同一条回显纪律：只有真布尔才回填，其它（null / 缺键 / 脏值）一律落
+            // 「不知道」，这样打开一张从未声明过的卡片再保存不会把它写成「不支持」
+            supports_streaming: typeof row.supports_streaming === 'boolean' ? row.supports_streaming : null,
+            supports_reasoning: typeof row.supports_reasoning === 'boolean' ? row.supports_reasoning : null,
+            supports_vision: typeof row.supports_vision === 'boolean' ? row.supports_vision : null,
+            supports_reasoning_effort: typeof row.supports_reasoning_effort === 'boolean'
+              ? row.supports_reasoning_effort : null
           })
           cardOpen.value = true
         }
@@ -1415,7 +1584,17 @@
             modalities: cardForm.modalities.length ? ['text', ...cardForm.modalities] : null,
             // 三态：true/false 是结论，null 是「退回引擎自报」。绝不能把 null 写成 false。
             supports_tool_use: (cardForm.supports_tool_use === true || cardForm.supports_tool_use === false)
-              ? cardForm.supports_tool_use : null
+              ? cardForm.supports_tool_use : null,
+            // 三态：true/false 是结论，null 是「退回引擎自报」。绝不能把 null 写成 false。
+            // 后端 merge_model_patch 认 null = 清除回「不知道」，与留空同义
+            supports_streaming: (cardForm.supports_streaming === true || cardForm.supports_streaming === false)
+              ? cardForm.supports_streaming : null,
+            supports_reasoning: (cardForm.supports_reasoning === true || cardForm.supports_reasoning === false)
+              ? cardForm.supports_reasoning : null,
+            supports_vision: (cardForm.supports_vision === true || cardForm.supports_vision === false)
+              ? cardForm.supports_vision : null,
+            supports_reasoning_effort: (cardForm.supports_reasoning_effort === true || cardForm.supports_reasoning_effort === false)
+              ? cardForm.supports_reasoning_effort : null
           }
           const ok = await mutate(() => window.lmrApi.configModel(patch), 'cardSaved', { model: cardForm.model })
           if (ok) cardOpen.value = false
@@ -1807,6 +1986,10 @@
           // 三态下拉与文案用 toolUseOptions/toolUseText，能力位增删与提交走 setRowModalities，
           // 漏导出任何一项就是那一块 UI 静默消失（模板用 with(_ctx) 解析，编译期不报错）
           toolUseOptions, toolUseText, toolUseDeclared, setRowModalities, addEntryEffortMapRow, removeEntryEffortMapRow,
+          // 四个能力位（卡片对话框 + 条目编辑区 + 卡片表那一列）：模板引用 cjText 与
+          // capSummary/capSummaryEmpty，漏一项就是那块 UI 静默消失（模板用 with(_ctx) 解析，
+          // 编译期不报错；本项目这个坑踩过三次）
+          cjText, capSummary, capSummaryEmpty,
           doc, effortOptions, effortText, filterModelOptions, load,
           loading, loadError, modelOptionLabel, modelOptions, modalityOptions,
           // 预览下拉的 :options 绑到它自己：模板用 with(_ctx) 解析，漏一项就是运行期 undefined，

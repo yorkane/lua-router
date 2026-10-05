@@ -706,7 +706,22 @@ local function build_entry_supports_tool_use(alias, raw)
     return raw
 end
 
---- 四个声明字段一起装配；任何一条非法都整条入口拒绝保存（与 context_window 同纪律）。
+--- 四个能力位的三态装配（缺键 / null = nil = 「不知道」，布尔 = 结论），文案家族照抄
+--- build_entry_supports_tool_use。与它同一条纪律：**false 是操作员说的话，必须原样落盘**，
+--- 绝不在装配路上与「没说」合并。2026-10-05 起 streaming / reasoning / vision /
+--- reasoning_effort 与 tool use 一样有 config 这一层（用户诉求：UI 可配 → 落到
+--- /v1/models 的对外声明），解析侧的优先级见 router.lua 的 resolve_model_caps。
+---@return boolean|nil value, string|nil err
+local function build_entry_supports_flag(alias, field, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if type(raw) ~= "boolean" then
+        return nil, string.format(
+            "virtual model %s %s must be a boolean or null", alias, field)
+    end
+    return raw
+end
+
+--- 七个声明字段一起装配；任何一条非法都整条入口拒绝保存（与 context_window 同纪律）。
 ---@return table|nil fields, string|nil err
 local function build_entry_declarations(alias, entry)
     local out = {}
@@ -722,6 +737,16 @@ local function build_entry_declarations(alias, entry)
     local tool_use, terr = build_entry_supports_tool_use(alias, rawget(entry, "supports_tool_use"))
     if terr then return nil, terr end
     if tool_use ~= nil then out.supports_tool_use = tool_use end
+    -- 四条新能力位走同一个循环：漏一条 = 该字段被静默忽略、往返丢失，而循环让「四条
+    -- 都装配」成为结构性事实而不是逐字段的细心。名字与卡片、UI 完全同名（扁平三态，
+    -- 与已上线的 supports_tool_use 同形状；刻意不塞进 supports:{} 子对象，那会让
+    -- supports_tool_use 变成两条路径并被已钉住它的测试咬住）。
+    for _, field in ipairs({ "supports_streaming", "supports_reasoning",
+                             "supports_vision", "supports_reasoning_effort" }) do
+        local value, ferr = build_entry_supports_flag(alias, field, rawget(entry, field))
+        if ferr then return nil, ferr end
+        if value ~= nil then out[field] = value end
+    end
     if next(out) == nil then return nil end
     return out
 end
@@ -946,6 +971,11 @@ local function profile_from_entry(alias, entry)
         profile.effort_map = declarations.effort_map
         profile.modalities = declarations.modalities
         profile.supports_tool_use = declarations.supports_tool_use
+        -- 四条能力位与 tool use 同一条往返链（漏一条 = 磁盘上那一份永远读不回来）
+        profile.supports_streaming = declarations.supports_streaming
+        profile.supports_reasoning = declarations.supports_reasoning
+        profile.supports_vision = declarations.supports_vision
+        profile.supports_reasoning_effort = declarations.supports_reasoning_effort
     end
     return profile, nil
 end
@@ -1369,8 +1399,13 @@ local function new_card()
     -- not the client-facing window an entry advertises. It exists only to validate
     -- declared context_window values at configuration time; nothing on the hot path
     -- clamps with it (root ruling 2026-10-04: the gateway rewrites no output budget).
+    -- 五个能力位都是三态：nil = 操作员没说（该维度让位给引擎自报），false = 说了不支持。
+    -- 显式写成 nil 是为了把「这张卡片存在」与「这张卡片声明过能力位」分开——前者由
+    -- new_card 决定，后者只看这些键上有没有真布尔（读侧一律 type == "boolean" 判定）。
     return { ctx = nil, context_limit = nil, default_effort = nil,
-             effort_map = {}, modalities = nil, supports_tool_use = nil }
+             effort_map = {}, modalities = nil, supports_tool_use = nil,
+             supports_streaming = nil, supports_reasoning = nil,
+             supports_vision = nil, supports_reasoning_effort = nil }
 end
 
 local function cfg_from_env()
@@ -1540,7 +1575,13 @@ local function snapshot_of(cfg)
             -- Tri-state: absent/null = "unknown" (nul renders the JSON null the editor
             -- round-trips as "leave alone"), false = the operator said no. The two must
             -- never merge on the way to disk, hence nul() rather than a bare field.
+            -- 四条新能力位同一条纪律（2026-10-05）：全部走 nul，false 落 false、
+            -- 没说落 null，编辑器的「留空 = 不动」与「说不支持」因此在磁盘上仍然可分。
             supports_tool_use = nul(card.supports_tool_use),
+            supports_streaming = nul(card.supports_streaming),
+            supports_reasoning = nul(card.supports_reasoning),
+            supports_vision = nul(card.supports_vision),
+            supports_reasoning_effort = nul(card.supports_reasoning_effort),
         }
     end
     local virtual_models = {}
@@ -1583,8 +1624,13 @@ local function snapshot_of(cfg)
             entry.effort_map = effort_pairs(profile.effort_map)
         end
         if profile.modalities then entry.modalities = { table.unpack(profile.modalities) } end
-        if profile.supports_tool_use ~= nil then
-            entry.supports_tool_use = profile.supports_tool_use
+        -- 能力位 false 是结论、必须写成 false；缺席是沉默、必须整个键不出现（写 null
+        -- 会让老 build 与 JSON 编辑器把「擦掉声明」与「说了不支持」读成同一件事）。
+        -- 与卡片那五条用 nul 相反：条目层是可选字段缺席的约定（见上面 default_effort 一段）。
+        for _, field in ipairs({ "supports_tool_use", "supports_streaming",
+                                 "supports_reasoning", "supports_vision",
+                                 "supports_reasoning_effort" }) do
+            if profile[field] ~= nil then entry[field] = profile[field] end
         end
         if profile.context_window then entry.context_window = profile.context_window end
         virtual_models[#virtual_models + 1] = entry
@@ -1785,18 +1831,25 @@ local function merge_model_patch(card, patch)
         end
     end
 
-    -- tool use 能力声明：三态（nil = 不知道，false = 操作员说了不支持）。解析口径照抄
+    -- 五个能力位（tool use 加上 2026-10-05 补齐的 streaming / reasoning / vision /
+    -- reasoning_effort）：三态，nil = 不知道，false = 操作员说了不支持。解析口径照抄
     -- 其他卡片字段：absent = leave alone，null = clear 回「不知道」，布尔 = 写死。
-    -- 这条是「config 声明 > 引擎自报 > 整键省略」优先级里 config 那一层的唯一入口——
-    -- 在此之前 supports_tool_use 只有引擎自报一条来源，操作员无从声明。
-    if patch.supports_tool_use ~= nil then
-        local raw = patch.supports_tool_use
-        if raw == JSON_NULL then
-            card.supports_tool_use = nil
-        elseif type(raw) == "boolean" then
-            card.supports_tool_use = raw
-        else
-            return nil, "supports_tool_use must be a boolean or null"
+    -- 这一族是「config 声明 > 引擎自报 > 整键省略」优先级里 config 那一层的唯一入口。
+    -- 字段名与虚拟模型条目、UI 完全同名（扁平三态，与已上线的 supports_tool_use 同形状）：
+    -- 刻意不折进 supports:{} 子对象，那会让已被测试钉住的 supports_tool_use 长出第二条路径。
+    -- 五条走同一个循环，「每条都被读写」因此是结构性事实，而不是逐字段抄写的细心。
+    for _, field in ipairs({ "supports_tool_use", "supports_streaming",
+                             "supports_reasoning", "supports_vision",
+                             "supports_reasoning_effort" }) do
+        local raw = patch[field]
+        if raw ~= nil then
+            if raw == JSON_NULL then
+                card[field] = nil
+            elseif type(raw) == "boolean" then
+                card[field] = raw
+            else
+                return nil, string.format("%s must be a boolean or null", field)
+            end
         end
     end
     return true
@@ -2885,6 +2938,12 @@ function _M.profile_for(model)
     end
     if profile.modalities then out.modalities = { table.unpack(profile.modalities) } end
     out.supports_tool_use = profile.supports_tool_use
+    -- 四条能力位与 tool use 同一条热路径拷贝：/v1/models 的合成侧（router
+    -- .resolve_model_caps）每请求读它，"false 与 nil 分家"必须一路到这里都不塌缩。
+    out.supports_streaming = profile.supports_streaming
+    out.supports_reasoning = profile.supports_reasoning
+    out.supports_vision = profile.supports_vision
+    out.supports_reasoning_effort = profile.supports_reasoning_effort
     return out
 end
 
@@ -2919,8 +2978,10 @@ function _M.profiles_list()
             entry.effort_map = effort_pairs(profile.effort_map)
         end
         if profile.modalities then entry.modalities = { table.unpack(profile.modalities) } end
-        if profile.supports_tool_use ~= nil then
-            entry.supports_tool_use = profile.supports_tool_use
+        for _, field in ipairs({ "supports_tool_use", "supports_streaming",
+                                 "supports_reasoning", "supports_vision",
+                                 "supports_reasoning_effort" }) do
+            if profile[field] ~= nil then entry[field] = profile[field] end
         end
         if profile.context_window then entry.context_window = profile.context_window end
         out[#out + 1] = entry
@@ -3742,6 +3803,10 @@ function _M.models_document()
             -- Tri-state on the models page as well: null = unknown (fall back to what
             -- the engine reports), false = the operator said no. Never merge the two.
             supports_tool_use = nul(card and card.supports_tool_use),
+            supports_streaming = nul(card and card.supports_streaming),
+            supports_reasoning = nul(card and card.supports_reasoning),
+            supports_vision = nul(card and card.supports_vision),
+            supports_reasoning_effort = nul(card and card.supports_reasoning_effort),
         }
         local target = cfg.virtual_models[model]
         if target then

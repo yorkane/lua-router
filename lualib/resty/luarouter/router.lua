@@ -3796,7 +3796,8 @@ end
 
 --- 单个**实际模型**的一行能力读数：操作员声明与引擎自报按优先级合成后的样子。
 --- 每个维度独立取源，所以「操作员只声明了模态」不会连带把引擎报的上下文丢掉。
-local function resolve_model_caps(store_mod, cfg, model, caps)
+---@param entry_declared table|nil 虚拟条目那一层的声明（卡片没说的位由它接手）；真实模型那一行传 nil
+local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
     local row = {}
     local declared_ctx
     if store_mod and type(store_mod.ctx_cap) == "function" then
@@ -3829,28 +3830,75 @@ local function resolve_model_caps(store_mod, cfg, model, caps)
 
     local supports = type(caps) == "table" and caps.supports or nil
     supports = type(supports) == "table" and supports or {}
-    -- tool use 的源优先级补齐成与旁边两个维度同一条链：操作员声明 > 引擎自报 > 整个键
-    -- 省略（硬规则 9 第 2 条）。在此之前它只有引擎自报一个来源，等于把「操作员说不支持」
-    -- 这一格整个让给了引擎：引擎的 supports_tool_use 是按它自己的 chat template 报的，
-    -- 挂了工具模板的引擎恒报 true，操作员没有任何办法否掉它。
+
+    -- ── 能力位的源优先级（五个字段一条链，硬规则 9 第 2 条）──
+    -- 模型卡片声明 > 虚拟条目声明 > 引擎自报 > 整个键省略。卡片压过条目与 effort
+    -- 三层继承（卡片 → 条目 → 全局）同一条纪律：离引擎越近的读数越先说话。
+    -- tool use 早在上一轮就接了 config 这一层；streaming / reasoning / vision /
+    -- reasoning_effort 当时只剩引擎自报一条来源，等于把「操作员说不支持」这一格整个
+    -- 让给了引擎：引擎的 supports_tool_use 按它自己的 chat template 报，挂了工具模板的
+    -- 引擎恒报 true，而操作员没有任何办法否掉它（用户诉求 2026-10-05：UI 要能配，
+    -- 并且反映到 /v1/models 的对外声明）。
     --
-    -- 三态要逐分支判，不能写成 declared or engine：Lua 里 false or engine 取的是
-    -- engine，操作员明确说的不支持会被引擎的 true 顶掉，正是这次要修的缺陷。
-    -- nil 才是没说话，只有那一支才让位给引擎；两边都没说话则保持 nil，
-    -- 由 fill_model_fields 把整个键删掉（不写 false、不写 null 冒充结论）。
+    -- 三态必须逐分支判，不能写成 declared or engine：Lua 里 `false or engine` 取的是
+    -- engine，操作员明确说的「不支持」会被引擎的 true 顶掉，正是这一支要防的缺陷
+    -- （旁边 tool use 的注释把同一个坑写在了那里）。nil 才是没说话，只有那一支才让位；
+    -- 两边都没说话则保持 nil，由 fill_model_fields 把整个键删掉（不写 false、
+    -- 不写 null 冒充结论）。
+    local card = nil
+    if type(cfg) == "table" and type(cfg.model_configs) == "table" then
+        local maybe = cfg.model_configs[model]
+        if type(maybe) == "table" then card = maybe end
+    end
+
+    --- 一个能力位在这台模型上的声明层读数：卡片先说，条目随后，都没说才 nil（=沉默）。
+    --- 刻意不看 `card[field] == false` 之类的一元判定：false 是结论、nil 是沉默，
+    --- 两者在这里必须走两条不同的支路，任何「falsy 合并」都会把「不支持」降格成「不知道」。
+    ---
+    --- 条目那一层覆盖本轮补齐的四位，唯独 supports_tool_use 不在其中：它比这四位早上线，
+    --- 条目层那一份当时的口径是「只登记、不改变对外读数」（i18n 的 virtualToolHint 与
+    --- doc 都按这句钉着），本轮的诉求是那四位可配，不是重订这一位的既有条目层语义。
+    --- 写成 field ~= "supports_tool_use" 而不是一张白名单表：后者每次调用都要新分配一张表，
+    --- 而这里的判定是每模型每请求都走的。
+    local function declared(field)
+        if card ~= nil then
+            local value = boolean_or_nil(card[field])
+            if value ~= nil then return value end
+        end
+        if field ~= "supports_tool_use" and type(entry_declared) == "table" then
+            return boolean_or_nil(entry_declared[field])
+        end
+        return nil
+    end
+
+    --- 引擎自报那一档（已经洗成真布尔或 nil）。
+    local function resolve(field, engine_value)
+        local value = declared(field)
+        if value ~= nil then return value end
+        return engine_value
+    end
+
+    -- tool use 走它既有的专属 reader（先于本轮上线、读数面已被单测钉住），条目层不参与。
     local declared_tool_use
     if store_mod and type(store_mod.card_supports_tool_use) == "function" then
         local ok_tool, tool_value = pcall(store_mod.card_supports_tool_use, model)
         if ok_tool then declared_tool_use = boolean_or_nil(tool_value) end
+    end
+    if declared_tool_use == nil and card ~= nil then
+        declared_tool_use = boolean_or_nil(card.supports_tool_use)
     end
     if declared_tool_use ~= nil then
         row.tool_use = declared_tool_use
     else
         row.tool_use = boolean_or_nil(supports.tool_use)
     end
-    row.streaming = boolean_or_nil(supports.streaming)
-    row.reasoning = boolean_or_nil(supports.reasoning)
-    row.vision = boolean_or_nil(supports.vision)
+    row.streaming = resolve("supports_streaming", boolean_or_nil(supports.streaming))
+    row.reasoning = resolve("supports_reasoning", boolean_or_nil(supports.reasoning))
+    -- vision 的「引擎自报」那一档比旁边两位多一层：卡片 modalities 是**穷尽**声明，
+    -- 所以能从「列没列 image/video」正负反推；引擎自报的 input_modalities 不保证穷尽，
+    -- 只允许反推正向（registry 的规范化层同此理由，见 model_caps_from_entry）。
+    -- 显式的 supports_vision 声明压过这一切（它是操作员就这个位本身说的话）。
+    row.vision = resolve("supports_vision", boolean_or_nil(supports.vision))
     if row.vision == nil and type(input) == "table" then
         local sees_media = list_contains(input, "image") or list_contains(input, "video")
         if sees_media then
@@ -3886,6 +3934,10 @@ local function resolve_model_caps(store_mod, cfg, model, caps)
     end
     row.accepted = clean_string_list(caps and caps.reasoning_effort_values)
         or ladder_values(ladder)
+    -- 顶层 supports_reasoning_effort 的声明层读数（卡片 → 条目）。它是一位**独立**的
+    -- 对外说法，不是「有没有档位读数」那个派生的别名：派生只在两边都没说时才起作用
+    -- （见 fill_model_fields，那条派生链的行为逐字节不变，包括它什么时候省略这个键）。
+    row.declared_effort_support = declared("supports_reasoning_effort")
     return row
 end
 
@@ -4038,11 +4090,23 @@ end
 --- 把一行能力读数摊到响应条目上：顶层三个 opencodex 键 + capabilities 命名空间。
 --- 整行没有任何读数时什么都不加，条目回退成官方那四个 required 字段。
 local function fill_model_fields(entry, row)
-    if row.ladder or row.accepted or row.default_effort then
-        -- 任一份档位读数（可选项、判定面、缺省档）都足以支撑「这台接受 reasoning_effort」。
-        entry.supports_reasoning_effort = true
-        if row.default_effort then entry.reasoning_effort = row.default_effort end
+    -- 顶层 supports_reasoning_effort：操作员声明（卡片 → 条目）优先，未声明时维持**原有
+    -- 派生**——任一份档位读数（可选项、判定面、缺省档）都足以支撑「这台接受
+    -- reasoning_effort」，没有读数则整个键省略。派生这一支的行为逐字节不变（2026-10-05
+    -- 只是把三态的「明确说不支持」接到它前面），所以声明 false 时档位表与缺省档照旧
+    -- 出现在条目上：操作员否掉的是那一位对外声明，不是引擎给过的档位事实。
+    local effort_support = boolean_or_nil(row.declared_effort_support)
+    if effort_support == nil then
+        if row.ladder or row.accepted or row.default_effort then
+            effort_support = true
+        end
     end
+    if effort_support ~= nil then
+        entry.supports_reasoning_effort = effort_support
+    end
+    -- default_effort 在场时旧版必定进入上面那个 if（它是派生条件之一），所以把它挪到
+    -- 分支外是字节等价的——这个"分支外提"不改变任何未声明场景的输出。
+    if row.default_effort then entry.reasoning_effort = row.default_effort end
     if row.ladder then
         entry.reasoning_efforts = row.ladder
     end
@@ -4095,9 +4159,12 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
         if ok and type(value) == "table" then profile = value end
     end
     local rows = {}
+    -- 条目层的四个能力位声明作为声明链的中间一档传进每个成员：卡片（离引擎最近）先说，
+    -- 卡片没说才轮到条目，两边都沉默才让给引擎自报。profile_for 已经把这几位拷在 profile
+    -- 上（与 supports_tool_use 同一条热路径拷贝），所以这里不必再回 store 查一次。
     for i = 1, #tail do
         local caps = type(caps_by_model) == "table" and caps_by_model[tail[i]] or nil
-        rows[i] = resolve_model_caps(store_mod, cfg, tail[i], caps)
+        rows[i] = resolve_model_caps(store_mod, cfg, tail[i], caps, profile)
     end
     local entry = {
         id = alias,
@@ -4118,6 +4185,26 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
         entry.owned_by = "llm-router"
         entry.owned_by_models = tail
     end
+    -- 组内**声明层**的 supports_reasoning_effort 共识，与普通位用的 common_boolean 差一支：
+    -- 任何一台明确说 false 就是 false（操作员关掉了这一位，必须关得住，不能被别的成员的
+    -- 沉默拖成「没人说话」）；要给出 true 则每台都得亲口说 true（与 common_boolean 同样
+    -- 保守，绝不替沉默的成员担保）；两种都不成立才答 nil，让调用点退回**原有派生**
+    -- （组内有没有档位读数）。不能直接用 common_boolean：那里 nil 意味着「删键」，而这里
+    -- 的 nil 意味着「回到派生」，语义不同，硬套会把操作员的 false 悄悄洗掉。
+    -- 写成局部闭包而不是顶层 local：本文件的主函数局部槽位离 LuaJIT 的 200 上限只差
+    -- 一个（同 models_advertise 那节的说明），读者只在这一处需要它。
+    local function common_declared_effort_support(rows)
+        local any_false, all_true = false, #rows > 0
+        for i = 1, #rows do
+            local value = rows[i].declared_effort_support
+            if value == false then any_false = true end
+            if value ~= true then all_true = false end
+        end
+        if any_false then return false end
+        if all_true then return true end
+        return nil
+    end
+
     local ladder = common_ladder(rows)
     local default_effort
     if ladder then
@@ -4139,6 +4226,7 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
         streaming = common_boolean(rows, "streaming"),
         reasoning = common_boolean(rows, "reasoning"),
         vision = common_boolean(rows, "vision"),
+        declared_effort_support = common_declared_effort_support(rows),
         ladder = ladder,
         accepted = common_acceptance(rows, default_effort),
         default_effort = default_effort,
