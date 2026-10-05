@@ -23,17 +23,34 @@
 --     --entrypoint /usr/local/openresty/luajit/bin/luajit authz:latest \
 --     test/unit/test_caps_routing.lua
 local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
-local fh = io.open(lib .. "/resty/luarouter/router.lua")
-local src = fh and fh:read("*a")
-if type(src) ~= "string" then
-    print("FAIL: cannot read router.lua from " .. lib)
+-- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：实现搬进了
+-- lualib/resty/luarouter/router/ 子模块，逐字搬家、锚点字符串一个都不动；
+-- 搬家的只是**源码文件路径**。旧实现对照通道（LR_*_LEGACY 指向改动前的
+-- lualib 树）没有子模块文件，读不到就回退读整只 router.lua。
+local function read_src(rel)
+    local f = io.open(lib .. "/resty/luarouter/router/" .. rel)
+    if f then
+        local s = f:read("*a")
+        f:close()
+        if type(s) == "string" and s ~= "" then return s end
+    end
+    local g = io.open(lib .. "/resty/luarouter/router.lua")
+    local s = g and g:read("*a")
+    if g then g:close() end
+    return s
+end
+local src_profiles = read_src("profiles.lua")
+local src_candidates = read_src("candidates.lua")
+if type(src_profiles) ~= "string" or type(src_candidates) ~= "string" then
+    print("FAIL: cannot read router sources from " .. lib)
     os.exit(1)
 end
 
 -- 两块真源码。锚点用导出语句而不是相邻函数名：以后在两块之间插入新函数不会把切块切坏，
 -- 只会让断言照样跑在真实现上。
-local b1 = src:match("(local function is_array_table.-)_M%.profile_worker_list")
-local b2 = src:match("(local function record_in_allow_list.-)_M%.compact_url")
+-- is_array_table 一族在 router/profiles.lua，候选装配一族在 router/candidates.lua。
+local b1 = src_profiles:match("(local function is_array_table.-)_M%.profile_worker_list")
+local b2 = src_candidates:match("(local function record_in_allow_list.-)_M%.compact_url")
 if type(b1) ~= "string" or type(b2) ~= "string" then
     print("FAIL: source blocks not extracted (" .. tostring(b1 ~= nil) .. ","
         .. tostring(b2 ~= nil) .. ")")

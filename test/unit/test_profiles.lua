@@ -1550,15 +1550,34 @@ reset_env()
 --------------------------------------------------------------------------
 local function verify_hot_path_seams()
     local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
-    local rf = io.open(lib .. "/resty/luarouter/router.lua")
-    local rsrc = rf and rf:read("*a")
-    if rf then rf:close() end
-    if type(rsrc) ~= "string" then
-        failed[#failed + 1] = "cannot read router.lua for the hot-path slice"
+    -- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：热路径的七块真实现分别
+    -- 住在 router/profiles.lua 与 router/candidates.lua，锚点字符串一个都不动，只换
+    -- 源码文件；子模块不在时逐块回退整只 router.lua（旧树对照走的正是这条）。
+    local function read_src(rel)
+        local f = io.open(lib .. "/resty/luarouter/router/" .. rel)
+        if f then
+            local s = f:read("*a")
+            f:close()
+            if type(s) == "string" and s ~= "" then return s end
+        end
+        local g = io.open(lib .. "/resty/luarouter/router.lua")
+        local s = g and g:read("*a")
+        if g then g:close() end
+        return s
+    end
+    local src_profiles = read_src("profiles.lua")
+    local src_candidates = read_src("candidates.lua")
+    if type(src_profiles) ~= "string" or type(src_candidates) ~= "string" then
+        failed[#failed + 1] = "cannot read router sources for the hot-path slice"
         return
     end
     local function slice(from_pat, to_pat, name)
-        local blk = rsrc:match("(" .. from_pat .. ".-)" .. to_pat)
+        -- 家族归位：策略桶名 / 组 hint / card_key / policy_for 在 candidates，
+        -- profile 停用缝与 is_array_table 一族在 profiles；两处锚点文本各自唯一，
+        -- 切片仍逐字命中真实现。
+        local src = (name == "card_key_for" or name == "key_name" or name == "hint"
+            or name == "policy_for") and src_candidates or src_profiles
+        local blk = src:match("(" .. from_pat .. ".-)" .. to_pat)
         if type(blk) ~= "string" then
             failed[#failed + 1] = "router source slice missing: " .. name
             return "local _missing_" .. name .. " = nil"

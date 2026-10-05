@@ -45,27 +45,46 @@ local NULL = cjson.null
 --------------------------------------------------------------------------
 -- 1. 切 router.lua 的真实现（三块；锚点用导出语句/注释边界，不用相邻函数名）
 --------------------------------------------------------------------------
-local fh = io.open(lib .. "/resty/luarouter/router.lua")
-local src = fh and fh:read("*a")
-if type(src) ~= "string" then
+-- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：三块真实现分别住在
+--   router/jsonutil.lua（顶层精确改写族）、router/profiles.lua（条目层装配）、
+--   router/inference.lua（effort 决策）。锚点字符串一个都不动，只换源码文件；
+--   子模块文件不在（判别性通道 LR_EFFORT_LEGACY_LUALIB 指向改动前的旧树）时
+--   回退整只 router.lua——旧树没有子模块目录，回退恰好让同一组断言跑在旧实现上。
+local function read_src(rel)
+    local f = io.open(lib .. "/resty/luarouter/router/" .. rel)
+    if f then
+        local s = f:read("*a")
+        f:close()
+        if type(s) == "string" and s ~= "" then return s end
+    end
+    local g = io.open(lib .. "/resty/luarouter/router.lua")
+    local s = g and g:read("*a")
+    if g then g:close() end
+    return s
+end
+local src_edits = read_src("jsonutil.lua")
+local src_profile = read_src("profiles.lua")
+local src_apply = read_src("inference.lua")
+if type(src_edits) ~= "string" or type(src_profile) ~= "string"
+    or type(src_apply) ~= "string" then
     print("FAIL: cannot read router.lua from " .. lib)
     os.exit(1)
 end
 
-local function between(a_marker, b_marker)
-    local a = src:find(a_marker, 1, true)
-    local b = src:find(b_marker, a or 1, true)
+local function between_src(text, a_marker, b_marker)
+    local a = text:find(a_marker, 1, true)
+    local b = text:find(b_marker, a or 1, true)
     if not a or not b then return nil end
-    return src:sub(a, b - 1)
+    return text:sub(a, b - 1)
 end
 
 -- 顶层精确改写那一族（field_pattern / skip_string / value_end / top_member_span / set_top_field）。
-local blk_edits = between("local function field_pattern(field)", "_M.set_top_field = set_top_field")
+local blk_edits = between_src(src_edits, "local function field_pattern(field)", "_M.set_top_field = set_top_field")
 -- 条目层装配（profile_effort_value 恒 nil 的 legacy 缝 + 新实现才有的 profile_entry_fallback）。
-local blk_profile = between("---Effective per-profile effort.",
+local blk_profile = between_src(src_profile, "---Effective per-profile effort.",
                             "-- ------------------------------------------------------------------ raw JSON edits")
 -- 转发链上的 effort 决策（本次接线的落点）。
-local blk_apply = between("apply_effort_policy = function(",
+local blk_apply = between_src(src_apply, "apply_effort_policy = function(",
                           "---The output budget the gateway forwards")
 if type(blk_edits) ~= "string" or type(blk_profile) ~= "string" or type(blk_apply) ~= "string" then
     print("FAIL: source blocks not extracted (" .. tostring(blk_edits ~= nil) .. ","

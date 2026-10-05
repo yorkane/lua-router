@@ -247,8 +247,22 @@ check(true, "on_add/on_remove survive on a standalone policy")
 --    直接读文件里 set_top_field 的实现并在最小环境执行。
 --------------------------------------------------------------------------
 local function load_set_top_field()
-    local src = io.open((os.getenv("LUA_TEST_LIB") or "./lualib")
-        .. "/resty/luarouter/router.lua"):read("*a")
+    -- 2026-10-05 拆分：改写族逐字搬进 lualib/resty/luarouter/router/jsonutil.lua，
+    -- 锚点字符串不动，只换源码文件；子模块文件不在（旧树对照）时回退整只 router.lua。
+    local lib = (os.getenv("LUA_TEST_LIB") or "./lualib")
+    local function read_src(rel)
+        local f = io.open(lib .. "/resty/luarouter/router/" .. rel)
+        if f then
+            local s = f:read("*a")
+            f:close()
+            if type(s) == "string" and s ~= "" then return s end
+        end
+        local g = io.open(lib .. "/resty/luarouter/router.lua")
+        local s = g and g:read("*a")
+        if g then g:close() end
+        return s
+    end
+    local src = read_src("jsonutil.lua")
     local body = src:match("(local function field_pattern.-)\n_M%.set_top_field")
     check(type(body) == "string", "set_top_field source extracted")
     local sandbox = {
@@ -308,8 +322,24 @@ end
 --    逐字相同（从文件里按函数名切出来），所以这里断言的是真实现，不是复刻。
 --------------------------------------------------------------------------
 local function load_accounting_sandbox()
-    local src = io.open((os.getenv("LUA_TEST_LIB") or "./lualib")
-        .. "/resty/luarouter/router.lua"):read("*a")
+    -- 与第 5 节同一手法（2026-10-05 拆分后按家族换源文件）：usage / SSE 切片的实现
+    -- 在 router/jsonutil.lua，stream_options 两枚在 router/forward.lua；锚点字符串
+    -- 不动，子模块不在（旧树对照）时回退整只 router.lua。
+    local lib = (os.getenv("LUA_TEST_LIB") or "./lualib")
+    local function read_src(rel)
+        local f = io.open(lib .. "/resty/luarouter/router/" .. rel)
+        if f then
+            local s = f:read("*a")
+            f:close()
+            if type(s) == "string" and s ~= "" then return s end
+        end
+        local g = io.open(lib .. "/resty/luarouter/router.lua")
+        local s = g and g:read("*a")
+        if g then g:close() end
+        return s
+    end
+    local src = read_src("jsonutil.lua")
+    local src_stream = read_src("forward.lua")
     local blocks = {
         src:match("(local function field_pattern.-)\n_M%.set_top_field"),
         src:match("(local function merge_top_object.-)\n_M%.merge_top_object"),
@@ -317,8 +347,8 @@ local function load_accounting_sandbox()
         src:match("(local function usage_from_chunk.-\nend\n)"),
         src:match("(local function sse_event_droppable.-)\n_M%.sse_event_droppable"),
         src:match("(local function sse_split.-)\n_M%.sse_split"),
-        src:match("(local function client_wants_usage.-)\n_M%.client_wants_usage"),
-        src:match("(local function names_stream_options.-)\n_M%.names_stream_options"),
+        src_stream:match("(local function client_wants_usage.-)\n_M%.client_wants_usage"),
+        src_stream:match("(local function names_stream_options.-)\n_M%.names_stream_options"),
     }
     for i = 1, #blocks do
         if type(blocks[i]) ~= "string" then

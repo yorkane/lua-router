@@ -22,10 +22,25 @@
 local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
 local legacy_src_path = os.getenv("LR_MODELS_TEST_LEGACY_SRC")
 
-local fh = io.open(lib .. "/resty/luarouter/router.lua")
-local src = fh and fh:read("*a")
+-- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：/v1/models 合成层逐字搬进
+-- lualib/resty/luarouter/router/models_api.lua，锚点字符串一个都不动，只换源码文件。
+-- 旧实现对照（LR_MODELS_TEST_LEGACY_SRC 指向改动前的 router.lua）与旧树对照走末尾的
+-- router.lua 回退。
+local function read_src()
+    local f = io.open(lib .. "/resty/luarouter/router/models_api.lua")
+    if f then
+        local s = f:read("*a")
+        f:close()
+        if type(s) == "string" and s ~= "" then return s end
+    end
+    local g = io.open(lib .. "/resty/luarouter/router.lua")
+    local s = g and g:read("*a")
+    if g then g:close() end
+    return s
+end
+local src = read_src()
 if type(src) ~= "string" then
-    print("FAIL: cannot read router.lua from " .. lib)
+    print("FAIL: cannot read router sources from " .. lib)
     os.exit(1)
 end
 if legacy_src_path then
