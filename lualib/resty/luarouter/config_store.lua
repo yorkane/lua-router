@@ -2216,6 +2216,14 @@ local function read_snapshot()
                     end
                 elseif ngx and ngx.log then
                     pcall(ngx.log, ngx.NOTICE, "luarouter config: adopted ", why)
+                    -- Re-write the mirror so the digest the sidecar recorded
+                    -- matches the bytes again. Without this the file stays
+                    -- permanently "externally edited" and every single read
+                    -- re-adopts, re-saving the store on the request path.
+                    if fok and type(fmod) == "table" and type(fmod.mirror) == "function" then
+                        local aok, arv = pcall(d.revision)
+                        if aok then fmod.mirror(snap, arv) end
+                    end
                 end
             end
             local rok, cur = pcall(d.revision)
