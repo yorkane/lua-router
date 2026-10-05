@@ -46,8 +46,9 @@ SMG_WATCHER_DENY_PORT = 22,80,111,443,3000,5432,9080,9091,9092,9100,9180,9443,99
 - 15012 = gpustack 内嵌 istio pilot-discovery gRPC（accept 后 RST）
 - 3000/9092/9100/9912 = grafana/prometheus/node-exporter/llm-watcher-metrics
 
-SMG_WATCHER_CONTAINER_IPS=0：docker 发现分支不过 DENY_PORT（deny 只在 proc 扫描分支生效，
-watcher.lua:1729 附近），会探测容器 EXPOSE 端口；21.k 所有 LLM 服务都有宿主映射口，关掉无损。
+SMG_WATCHER_CONTAINER_IPS=0：docker 发现分支不过 DENY_PORT（deny 只在 proc 扫描分支生效，见
+`watcher/discover.lua` 的 `collect`——拆分前那是 `watcher.lua` 里的 proc 扫描分支），会探测容器
+EXPOSE 端口；21.k 所有 LLM 服务都有宿主映射口，关掉无损。
 
 ## 已知事项
 
@@ -59,10 +60,13 @@ watcher.lua:1729 附近），会探测容器 EXPOSE 端口；21.k 所有 LLM 服
 
 ## 验证记录（2026-10-01）
 
-- GET /health → OK；GET /workers → 8/8 healthy；/_ui/admin/ → 200；/_ui/config/policy → cache_aware 链正常
+- GET /health → OK；GET /workers → 8/8 healthy；/a/ → 200（管理台规范入口）；/u/ → 200
+  （原版 webui）；/_ui/config/policy → cache_aware 链正常
+  （口径 2026-10-05：页面入口是 /a/ 与 /u/；旧页面入口 /_ui/admin/、/_ui 由 conf 各 302
+  过去，/_ui/* 的精确 API 别名——config / logs / stats / props——照旧 200）
 - POST /v1/chat/completions（model=q38fn-kv8）→ 200，usage 与 smg_router_tokens_total 对账一致
   （prompt=14 / completion=16 / reasoning=17）
-- 边缘入口 https://8801-248.ai-t.wtvdev.com/_ui/admin/ → 200
+- 边缘入口 https://8801-248.ai-t.wtvdev.com/a/ → 200（再验旧入口 /_ui/admin/ 应回 302）
 
 ## 回滚
 

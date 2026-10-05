@@ -20,37 +20,42 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261003-034756.log`（串行独占，**21 passed /
-0 failed / 0 skipped**）。代码基线：Lua 24 417 行 / 15 个模块 + policies/ 6 文件、单测 10 文件。
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261005-190411.log`（tier=full、`KEEP_GOING=1`、
+`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `48b7f6a`）。代码基线：
+`lualib/` **75 个 Lua 文件 / 32 419 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
+单测 13 文件、契约 **666 项 / 23 段**、文档 28 份。
 
-> 锚点取在 2026-10-03 的代码上。2026-10-04 的三笔改动（网关不再改写输出预算 `75ecc37`、模型卡片
-> 新增 `context_limit` 与配置期校验 `aa9f7a3`、管理台口径同步 `e2ba8ba`）之后全量门禁**尚未重跑**，
-> 所以下表计数与本仓各文档的模块行数都仍停在 10-03 锚点上。同时 `test/integration/_lib.py` 的两条
-> `[ctx cap]` 断言（夹断、缺失补齐）随裁定失效，测试侧更新后需要重新取锚。
+> 锚点取在 2026-10-05 的重构树上：facade + 子模块拆分（router / config_store / registry /
+> watcher / gpu_load / mesh / observability）+ 公共传输库 `httpc.lua` + UI 入口迁移
+> （`/_ui/`→`/u/`、`/_ui/admin/`→`/a/`）全部计入同一份全绿日志，见
+> [doc/refactor-arch-2026-10-05.md](doc/refactor-arch-2026-10-05.md)。上一版锚点（2026-10-03）
+> 遗留的 `[ctx cap]` 断言失效问题也已随 2026-10-04 裁定在测试侧清干净。
 
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
-| unit | luajit 8 + resty 1 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 267 / gpu_load 274 / routing_dyn 122 / profiles 619 / caps_routing 64；resty 侧 integration 125（全部 0 failed） |
-| contract | **653 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
+| unit | luajit 12 + resty 4 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 385 / gpu_load 274 / routing_dyn 122 / profiles 797 / caps_routing 64 / models_shape 83 / models_advertise 70 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
+| contract | **666 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
-| e2e_stateful | 91 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
-| e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入（该套件自述的 ctx cap 一项随 2026-10-04 裁定失效，见下方 `LMR_MODEL_CTX`） |
-| e2e_ui_bridge | 25 / 0 | `/v1` 与 `/_ui` 两条路径改写一致 |
-| e2e_errors / e2e_effort | 10 / 4 | `/_ui` 的 503/502/上游 4xx 契约；effort 强制与 per-model 卡片 |
+| e2e_stateful | 101 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
+| e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入 |
+| e2e_ui_bridge | 26 / 0 | `/v1` 与 `/_ui` 两条路径改写一致 |
+| e2e_errors | 10 / 0 | `/_ui` 的 503/502/上游 4xx 契约 |
+| e2e_effort | 65 / 0 | effort 强制、per-model 卡片、档位三层继承与停用字段的往返 |
 | head_routes | 108 / 0 | HEAD 镜像每个 GET 路由 |
 | mesh_http / mesh_two | 47 / 37 | mesh 真实 HTTP（对端 apply/sync、worker 镜像、/ha/policies）；双真容器互 seed 收敛、docker stop 分区恢复、retire 广播 |
-| e2e_policy_parity | 47 / 0 | prefix_hash / bucket / power_of_two / random 与 Rust 的量化对拍 |
+| e2e_policy_parity | 47 / 0 | prefix_hash / bucket / power_of_two / random 与 Rust 的量化对拍（Rust 启动等待预算 240s） |
 | e2e_watcher | 108 / 0 | 内建 watcher：三源发现、九条原守卫逐条断言 + 第 10 条守卫（探针确认不可用即摘除，含滞回与单轮保险丝）、model-map 改名、容器重启重发现 |
 | e2e_profiles | 110 / 0 | 虚拟服务入口与 upstreams：白名单 / 入口名走按模型策略（`model_policies[入口名]` 是别名级 policy 停用后的替代入口）/ 停用字段仍接受、仍落盘、解析时 warn 而热路径不读 / api_key 三态与脱敏 / 30s 自愈 / apply 原子性 |
 | e2e_token_accounting | 62 / 0 | 流式 include_usage 透明注入+剥帧、四类 token 指标、400 兜底 sticky |
 | e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry |
 | e2e_routing_dyn | 51 / 0 | 路由动态变更：全局与 per-model 策略热切换免重启、非法名 400 不生效 |
-| e2e_caps | 120 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务并发/功率上限（到限即迁走、读数缺失不排除、上限不摘健康、缺省零变化） |
+| e2e_caps | 151 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务并发/功率上限（到限即迁走、读数缺失不排除、上限不摘健康、缺省零变化） |
+| e2e_models_advertisement | 190 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
-契约 653 的 23 段构成：gate 3、public 30、workers 75、inference 38、headers 13、mesh 44、
-not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 60、tls_upstream 11、
+契约 666 的 23 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
+not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 69、tls_upstream 11、
 cb_race 6、igw 7、discovery 5、prometheus 14、probes 29、cors 37、virtual_models 15、ratelimit 14、
 inflight_age 32、tls_server 19、profiles_upstreams 64。
 
@@ -60,17 +65,17 @@ inflight_age 32、tls_server 19、profiles_upstreams 64。
 |---|---|
 | `conf/nginx.conf.template` | 生产模板，由入口脚本 envsubst 渲染（listen / worker 数 / 日志 / 注入点 / `TLS_SERVER_EXTRA`） |
 | `conf/lua-router.conf` | 同一套配置的裸字面量版本，不经入口脚本直接 `openresty -c` 用于验证与最小部署 |
-| `conf/ui.conf` | 全部 `/_ui/*` location（API 别名 + 静态 SPA），由入口脚本按存在性 include 进 server{} |
+| `conf/ui.conf` | 全部 UI location：`/_ui/*` 与 `/u/*` 的精确 API 别名、`/u/` 与 `/a/` 静态、旧入口 302、原版 webui 所需端点的根挂载，由入口脚本按存在性 include 进 server{} |
 | `docker-entrypoint.sh` | env 校验 → envsubst → `openresty -t` → exec；缺省策略 `cache_aware`；cache_aware 或 mesh 开启且未显式给 `NGINX_WORKER_PROCESSES` 时把 worker 数收到 1；渲染独立 metrics 监听（缺省 `:29000`，`SMG_METRICS_PORT=0` 关闭） |
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` 门 |
-| `lualib/resty/luarouter/` | 实现（15 模块 + policies/ 6 文件）：router / init / registry / watcher / gpu_load / policy / hb / config_store / config / observability / mesh / hash / limit / ui / props，全部接进请求路径 |
-| `ui/` | 原版 llama.cpp webui（`/_ui/`）+ `ui/admin/`（Quasar UMD 管理台四页：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`） |
+| `lualib/resty/luarouter/` | 实现（75 个 .lua / 32 419 行，`wc -l` 实测）：七个域是「facade + 同名子目录」——router(364)+12 子模块、config_store(132)+10、registry(169)+7、watcher(65)+7、gpu_load(80)+6、mesh(59)+5、observability(1318)+2，另有公共传输库 httpc.lua 与未拆的单文件（policy / policies 6 文件 / hash / hb / init / config / ui / props / limit / store_*），全部接进请求路径；模块地图见 doc/architect.md §3 |
+| `ui/` | 原版 llama.cpp webui（规范入口 `/u/`）+ `ui/admin/`（Quasar UMD 管理台四页，规范入口 `/a/`：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（href 指 `/a/`；旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`）。控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField 渲染，`:hint` 不生成 `.q-field__bottom`，说明文字只能并进 `:label` |
 | `test/final_gates.sh` | 22 门硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING` / `GATE_JOBS` / `GATE_DRY_RUN`） |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），23 段 |
-| `test/unit/` | 纯 Lua 单测 10 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径 |
+| `test/unit/` | 纯 Lua 单测 13 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑） |
 | `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps / models_advertisement（`models_advertisement` 钉 `/v1/models` 的对外形状，2026-10-04 随第 22 门加入 GATE_ORDER） |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
-| `doc/` | 现状文档 23 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
+| `doc/` | 现状文档 28 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
 
 ## 快速启动
 
@@ -136,7 +141,7 @@ docker run -d --name lua-router --network host \
 | 推理面 | `/v1/chat/completions` `/v1/completions` `/v1/embeddings` `/v1/rerank` `/v1/classify` `/v1/responses` `/generate` | 字节透传 + 顶层 `model` 定点改写（虚拟入口转发的是选中候选的绑定名，不是入口名）；**输出预算三写法一律原样透传**——`max_tokens` / `max_completion_tokens` / `/v1/responses` 用的 `max_output_tokens` 都由调用方决定，网关既不改小也不在缺失时代填（用户裁定 2026-10-04），所以引擎拒的一定是调用方自己要的数；受 `SMG_MAX_CONCURRENT_REQUESTS` 限流（拒绝回 **429 空体**）。请求日志行的 `model` 是入口代表值，**实际落点模型看 `forwarded_model`**，调用方给的那个输出预算记在日志行的 `output_budget`（修复后恒等于请求原值）；组入口（显式写过 `targets`）被健康引擎一致拒绝整组模型名时，503 message 是「No available workers (N healthy engines serve none of the mapped models)」，与「全部熔断或不健康」分开定性。`/v1/responses` 是纯透传路由：非流式 2xx 时对响应顶层回填请求侧元数据六字段（`previous_response_id` / `instructions` / `metadata` / `store` / `model` / `safety_identifier`；`conversation` 不回显，它只对已删除的存储平面有意义），只做出站改写、不入库；流式只透传 |
 | 控制面 | `POST /workers`（202 + Location）、`PUT /workers/{id}`（202，三键 `{status,worker_id,message}`）、`GET /workers[/{id}]`、`DELETE /workers/{id}`、`POST /flush_cache`、`GET /v1/loads` | `PUT` 可改 priority / cost / labels（合并）/ api_key / 健康旋钮 / **每服务上限 `max_concurrency` 与 `max_power_w`**，身份字段忽略；非 UUID → 400、未知 → 404、坏 JSON → 400。`GET /workers` 每条带 `models`（该实例真实广告过的模型，主模型恒居首）、`inflight_requests`（纯在飞数，并发上限的比较对象）、`power_w`（新鲜瓦特读数，**缺席=未知**）与两个已归一的上限；未声明的上限字段**缺席而不是 0**。`worker_type` 与 `connection_mode` 收成单值：只有 `regular` 与 `http`（或其 serde 对象拼写、缺省）被接受，其它值一律 400。`/flush_cache` 向全部 worker POST `{}`（5s 超时），回 `{results:[{worker,status,result}], success, all_failed}`；`/v1/loads` 回 `{workers:[{worker,load}], total_workers, successful, failed}`（worker 侧非 2xx / 超时 / 缺字段记 -1）——两者与 Rust 形状不同，有意偏差 |
 | mesh / HA 面 | `/ha/{status,health,workers[/id],policies[/id],config[/key],rate-limit,rate-limit/stats,stats,shutdown}` + `/_mesh/internal/{ping,sync,apply,state}` | `SMG_ENABLE_MESH` 未设（缺省）→ `/ha/*` 全部固定 503 `{"error":"mesh not enabled"}`；开启后委托 `mesh.dispatch`，未知的深路径回 404 `{"error":"unknown ha route: <METHOD> <path>"}`。`/_mesh/internal/*` 无鉴权无 loopback 围栏，**信任边界就是网络本身** |
-| `/_ui` | 别名全家 + 静态 SPA + `/_ui/admin/` 管理台（模型管理 / 服务池 / 路由策略 / 日志监控四页，按使用频度排序） | **无鉴权**；已注册路径的错误方法按 404 sink 回答 |
+| `/u/` 与 `/a/` | 页面入口：`/u/` = 原版 llama.cpp webui，`/a/` = 管理台四页（模型管理 / 服务池 / 路由策略 / 日志监控，按使用频度排序）。旧入口 `/_ui` 与 `/_ui/admin/` 各 302 过来（相对引用 + no-store）；`/_ui/*` 精确 API 别名全部保留、`/_ui/` 静态双活（当前 bundle 的硬编码路径不受影响）。原版 webui 所需端点已**根挂载**：`/props` `/slots` `/tools` `/models/load` `/models/unload` `/models/sse` `/v1/stream` `/v1/streams/lookup` `/v1/chat/completions/control` `/properties`，`/u/` 与原 `/_ui/` 双活 | **无鉴权**；已注册路径的错误方法按 404 sink 回答 |
 | 404 sink | 任意未注册路径（含已删的 `/v1/conversations*`、`/v1/tokenize`、`/parse/*` 等） | `{"error":{"type":"Not Found","code":"not_found",…}}` |
 
 诚实表示「这实现没做」的路由只剩 **wasm 三条**：`POST /wasm`、`GET /wasm`、
@@ -150,20 +155,20 @@ docker run -d --name lua-router --network host \
 
 ## `/v1/models` 的模型对象形状
 
-实现是 `router.lua` 的 `models_handler`（`router.lua:4108`）→ `advertise_real_model`
-（`router.lua:3974`）/ `advertise_virtual_entry`（`router.lua:3998`）→ `fill_model_fields`
-（`router.lua:3949`）。对外列表里的模型名来自 `registry.models()`（`registry.lua:1831`）——它是 Rust 对拍钉住的那一列，
+实现是 `router/models_api.lua` 的 `models_handler` → `advertise_real_model` /
+`advertise_virtual_entry` → `fill_model_fields`。对外列表里的模型名来自 `registry/records.lua` 的
+`models()`——它是 Rust 对拍钉住的那一列，
 只取每条 worker 的**主模型** `model_id`，因此一台引擎广告多个名字时只有主模型出现在这里
-（多广告的那些走 `all_models()` / `worker_models()`，目前无人消费，见 doc/gap-worker-caps.md §8）。
-虚拟入口由 `inject_virtual_models`（`router.lua:4065`）追加：入口名与某个真实 worker 同名则丢弃别名，
+（多广告的那些走同文件的 `all_models()` / `worker_models()`，目前无人消费，见 doc/gap-worker-caps.md §8）。
+虚拟入口由同文件的 `inject_virtual_models` 追加：入口名与某个真实 worker 同名则丢弃别名，
 最后整表按 id 升序。无可用 worker 时整个响应是 503 纯文本 `No models available`（不是 JSON——Rust 侧只重写带
-`data` 数组的响应，这个文本答案原样透传，`router.lua:4111-4114`）。
+`data` 数组的响应，这个文本答案原样透传，见 `models_handler` 的 worker-free 分支）。
 
 ### 第一层：官方四字段，四个都是 required
 
 OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created` / `owned_by`，四个都 required。
 真实模型那一支以前只有三个（整个漏了 `created`），属于不合规，现在每条带齐。`created` 取上游答里的
-读数，取不到用常量 `MODEL_CREATED_UNKNOWN = 0`（`router.lua:3579`）表示「未知」，与虚拟入口一直的写法
+读数，取不到用 `router/models_api.lua` 顶部的常量 `MODEL_CREATED_UNKNOWN = 0` 表示「未知」，与虚拟入口一直的写法
 相同；**刻意不塞 `ngx.time()`**——那会让同一条目每次请求产出不同字节，把客户端缓存和前后对比全打掉。
 
 ### 第二层：`capabilities` 命名空间 + 顶层三个 effort 键（都不是官方字段）
@@ -179,7 +184,7 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
 | 顶层 | `reasoning_effort` | 缺省档位（picker 预选那一档），字符串 |
 | 顶层 | `reasoning_efforts` | 客户端 picker 的档位阶梯 `[{value,label,default}]`；`label` 只在引擎给了才写，`default` 恒唯一 |
 | `capabilities` | `context_length` | 上下文**总窗口（输入+输出）** |
-| `capabilities` | `max_output_tokens` | 单次输出预算上限，**只有引擎自报这一档**（config 层无对应声明字段，`router.lua:3753` 直取 `caps.max_output_tokens`）。它只是把上游给的数往外报，绝不构成网关改写调用方预算的依据——输出预算三写法原样透传（用户裁定 2026-10-04） |
+| `capabilities` | `max_output_tokens` | 单次输出预算上限，**只有引擎自报这一档**（config 层无对应声明字段，`router/models_api.lua` 的 `fill_model_fields` 直取 `caps.max_output_tokens`）。它只是把上游给的数往外报，绝不构成网关改写调用方预算的依据——输出预算三写法原样透传（用户裁定 2026-10-04） |
 | `capabilities` | `input_modalities` / `output_modalities` | 去重的非空字符串数组 |
 | `capabilities` | `supports_tool_use` / `supports_streaming` / `supports_reasoning` / `supports_vision` | 支持位，三态：`true` / `false` / 整个键省略 |
 | `capabilities` | `reasoning_effort` | 引擎**接受**的档位判定面，字符串数组（与顶层同名字段是两个含义，各画各的） |
@@ -187,11 +192,11 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
 
 档位在上游有两种拼写、两个含义，registry 刻意各留一份、输出面各画各位：picker 的阶梯带 label 与
 `default`，判定面是下游真正接受的集合。**不把阶梯里的档位虚构进判定面**——判定面优先用引擎亲口给的
-`reasoning_effort_values`，只有它缺席时才退到阶梯序列（`router.lua:3814`）。实测样例里两份就不一致：
+`reasoning_effort_values`，只有它缺席时才退到阶梯序列（`router/models_api.lua` 的 `fill_model_fields`）。实测样例里两份就不一致：
 阶梯 `low/medium/high/max`，判定面只有 `low/high/max`；取交集会连 `medium` 身上那个 `default=true` 一起
 丢掉，客户端反而没有缺省档可用，取并集又会报出下游可能不接受的名字，所以两份都留、各画各位。
 单目标入口透传引擎原话（含「缺省档不在判定面里」这种上游自带的自相矛盾）；多目标入口的判定面取交集，
-交集把缺省档挤掉就整个删键（`common_acceptance` `router.lua:3914`）。
+交集把缺省档挤掉就整个删键（同文件的 `common_acceptance`）。
 
 ### 填充纪律：宁可不报，不要猜
 
@@ -202,21 +207,21 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
 
 两个数据源：
 
-1. **操作员声明层**（`config_store` 快照，`router.lua` 的 `resolve_model_caps`
-   `router.lua:3744`）：模型卡片 `context_limit`＝引擎真实能力，操作员按引擎启动参数抄录，平铺写法
-   `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层（`declared_context_limit`
-   `router.lua:3649`）；卡片 `modalities`（`config_store.modalities_for`）；缺省档位由
+1. **操作员声明层**（`config_store` 快照，读数经 `router/models_api.lua` 的 `resolve_model_caps`
+   取）：模型卡片 `context_limit`＝引擎真实能力，操作员按引擎启动参数抄录，平铺写法
+   `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层（同文件的
+   `declared_context_limit`）；卡片 `modalities`（`config_store.modalities_for`）；缺省档位由
    `model_effort` 强制行 → 卡片 `default_effort` → 全局 `default_effort` 给出。`context_length` 这一维
-   还多一个来源：先问 `store_mod.ctx_cap`（卡片 `ctx` / 平铺 `model_ctx`，`router.lua:3747`），它排在
+   还多一个来源：先问 `store_mod.ctx_cap`（卡片 `ctx` / 平铺 `model_ctx`），它排在
    `context_limit` **之前**；两者都只是对外声明的读数，**不参与任何 max_tokens 计算**（用户裁定 2026-10-04）。
-2. **引擎自报层**：worker 自己 `GET /v1/models` 的回答，由 `registry.probe_advertised_entries()`
-   （`registry.lua:2913`）连覆盖探针一起采——**一次 GET 两份读数**，「探到了哪些模型」与「它们各自能干什么」
-   永远来自同一份回答。原文经 `registry.model_caps_from_listing()`（`registry.lua:1137`）→
-   `model_caps_from_entry()`（`registry.lua:1020`）归一，跨 worker 汇总走 `registry.model_caps()`
-   （`registry.lua:2966`）：字段互补则两边都留，值冲突则取信息最全的那份**整条**读数，定序只看内容与
+2. **引擎自报层**：worker 自己 `GET /v1/models` 的回答，由 `registry/discovery.lua` 的
+   `probe_advertised_entries()` 连覆盖探针一起采——**一次 GET 两份读数**，「探到了哪些模型」与「它们各自能干什么」
+   永远来自同一份回答。原文经 `registry/caps.lua` 的 `model_caps_from_listing()` →
+   `model_caps_from_entry()` 归一，跨 worker 汇总走 `registry/discovery.lua` 的 `model_caps()`：
+   字段互补则两边都留，值冲突则取信息最全的那份**整条**读数，定序只看内容与
    完整度、不看写入顺序，避免对外读数随调度抖动。SGLang 只报 `max_model_len`（映射成 `context_length`），
    opencodex 报整套 `capabilities`。能力读数只认「引擎亲口答过」那一枚印章（`models_verified`，
-   `registry.record_model_caps` `registry.lua:2937`），配置声明的名字不贡献读数。
+   同文件的 `record_model_caps`），配置声明的名字不贡献读数。
 
 `capabilities` 内部还有一层来源序（同一字段多处都有时）：`capabilities.*` > 条目顶层同名字段 >
 `max_model_len`。这个顺序是「上游说得有多明确」，不是「我更喜欢哪个」。类型不对的读数一律按「这台没说清」
@@ -226,11 +231,12 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
 总窗口，见 `doc/gap-virtual-models.md` §4），把它和引擎读数混成一个字段，就等于重犯 2026-10-04 那次
 context_window 事故——把声明的总窗口当成单次输出预算写进 `max_tokens`。
 
-`supports_vision` 的正负向不对称（`router.lua:3781-3787`）：registry 归一层**从不**反推它（引擎少写一列很常见，
-据此替上游编话不如少一个字段，`registry.lua:1016`）；输出层只允许**正向**反推——模态里列了 `image`/`video`
+`supports_vision` 的正负向不对称（`router/models_api.lua` 的 `fill_model_fields`）：registry 归一层
+**从不**反推它（引擎少写一列很常见，据此替上游编话不如少一个字段，见 `registry/caps.lua` 的归一分支）；输出层只允许**正向**反推——模态里列了 `image`/`video`
 就报 `true`，无论这份模态来自引擎还是操作员；**负向**（报 `false`）只在操作员声明时给，因为只有卡片的模态是
-穷尽列表（写入路径把 `text` 常开，显式提交空列表也落成只含 `text` 的一份，`config_store.lua:1529`）；
-「操作员没列 image」才是「不收图」这句话，引擎自报的列表缺 image 只能读作「没说」。
+穷尽列表（写入路径把 `text` 常开，显式提交空列表也落成只含 `text` 的一份）；
+「操作员没列 image」才是「不收图」这句话，引擎自报的列表缺 image 只能读作「没说」
+（卡片模态的穷尽性由 `config_store/snapshot.lua` 与 `config_store/profiles.lua` 的归一保证：`text` 常开）。
 
 ### 虚拟入口那一行
 
@@ -253,7 +259,7 @@ context_window 事故——把声明的总窗口当成单次输出预算写进 `
 `owned_by_models`。`data[].id` 的取值集合、排序与别名遮蔽规则同样不变——registry 的 worker 判定、
 watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连带影响选路。
 
-注意 `GET /_ui/v1/models`（`ui.lua` 的 `ui.models()`，`ui.lua:198`）是管理台模型选择器用的**另一份**列表，
+注意 `GET /_ui/v1/models`（`ui.lua` 的 `ui.models()`）是管理台模型选择器用的**另一份**列表，
 形状与本节无关：每条恒 `created: 0`、`owned_by: "llm-router"`，另带 `status.value`，只用来枚举候选名。
 
 ## 环境变量
@@ -321,7 +327,7 @@ watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连�
 | `SMG_ENABLE_IGW` | 按 `model` 查表路由；开启后未知 model → 503 `no_available_workers` |
 | `SMG_WORKER_URLS` | 逗号分隔的启动播种 worker 列表 |
 | `LMR_DEFAULT_EFFORT` / `LMR_EFFORT_MAP` | 八档 effort 阶梯的默认值与改写表（`low:medium,high:xhigh`） |
-| `LMR_MODEL_CTX` | 每模型上下文上限，模型卡片 `model_configs[].ctx` 的平铺写法（同一份文档里叫 `model_ctx`）。**只用于展示，不参与转发改写**（用户裁定 2026-10-04，见下一行与 doc/gap-virtual-models.md §4）：网关不再拿它去动 `max_tokens` / `max_completion_tokens`。它现在的读者只有展示面两处：`/_ui/props` 的 `props.with_ctx` 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口；另一处是 `/v1/models` 的合成层——`resolve_model_caps`（`router.lua:3744`）先问 `store_mod.ctx_cap` 拿它当 `capabilities.context_length` 的**声明层**读数（这一层里它排在卡片 `context_limit` **之前**），见〈`/v1/models` 的模型对象形状〉 |
+| `LMR_MODEL_CTX` | 每模型上下文上限，模型卡片 `model_configs[].ctx` 的平铺写法（同一份文档里叫 `model_ctx`）。**只用于展示，不参与转发改写**（用户裁定 2026-10-04，见下一行与 doc/gap-virtual-models.md §4）：网关不再拿它去动 `max_tokens` / `max_completion_tokens`。它现在的读者只有展示面两处：`/_ui/props` 的 `props.with_ctx` 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口；另一处是 `/v1/models` 的合成层——`router/models_api.lua` 的 `resolve_model_caps` 先问 `store_mod.ctx_cap` 拿它当 `capabilities.context_length` 的**声明层**读数（这一层里它排在卡片 `context_limit` **之前**），见〈`/v1/models` 的模型对象形状〉 |
 | `LMR_MODEL_CONTEXT_LIMIT` | 每模型**服务实际上下文限制**＝引擎真实能力（操作员按引擎启动参数抄录）。`model=value` 形状，与上一项同一解析口径；卡片写法是 `model_configs[].context_limit`，卡片优先于这一平铺层。**两个用途**：① 配置期校验——虚拟入口声明的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则 `/_ui/config` 拒绝保存（`config_store.validate_declared_context_windows`，挂在 `apply_profiles` / `apply_document` 两条写入路径）。② `/v1/models` 对外 `capabilities.context_length` 的**声明层**兜底读数——卡片 `context_limit` 缺席时由 `declared_context_limit` 读它，见〈`/v1/models` 的模型对象形状〉。两个用途都**不参与**转发改写与任何 max_tokens 计算；新 env 必须进 `config_store.ENV_NAMES`，否则 nginx 把它从 worker 环境里剥掉 |
 | `LMR_MODEL_EFFORT` / `LMR_MODEL_EFFORT_MAP` | 每模型覆盖，优先级高于上两项 |
 | `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/_ui/config` 写。条目级 `context_window` 是**对外声明的上下文总窗口（输入+输出）**，作用只是让客户端更早触发压缩；它不是输出预算，也不参与 max_tokens 计算，且必须严格小于组内 `context_limit` 的最小值 |
@@ -498,23 +504,30 @@ docker run --rm -v "$PWD:/repo:ro" -w /repo \
   [doc/todo-deferred.md](doc/todo-deferred.md)。引用时不要写成「在接」「排期中」：`/wasm` 三条
   路由固定 501，`smg_mcp_*` 四条家族刻意不注册。
 
-判定某个模块是否真的接进了请求路径，最快的一条命令：
+判定某个模块是否真的接进了请求路径，最快的一条命令（拆分后接线在 facade 与各子模块上，
+所以要扫整个目录）：
 
 ```bash
-grep -rn 'require "resty.luarouter.<模块>"' lualib/resty/luarouter/router.lua \
-  lualib/resty/luarouter/init.lua conf/
+grep -rn 'require *"resty\.luarouter\.<模块>"' lualib/resty/luarouter \
+  lualib/resty/luarouter/*.lua conf/
 ```
 
 ## 文档索引
 
-doc/ 现状文档 22 份。裁剪前平面的历史留档（feature-gap、verification、impl-*、fix-majors、
+doc/ 现状文档 28 份。裁剪前平面的历史留档（feature-gap、verification、impl-*、fix-majors、
 gap-{grpc,history,tokenizer,otel,discovery-watch,dp-jwt,auth-tls,http-semantics,core,integration,
 test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精简删除，需要时查 git 历史。
 
 | 文档 | 内容 |
 |---|---|
 | [doc/agent-handover.md](doc/agent-handover.md) | **agent 交接说明**：现状速览、测试纪律、设计红线、生产操作清单、缺口与文档地图（新接手先读它） |
-| [doc/architect.md](doc/architect.md) | 架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略、部署与测试框架 |
+| [doc/architect.md](doc/architect.md) | 架构总览：运行时模型、请求生命周期、模块地图（facade + 子模块树）、共享状态、策略、部署与测试框架 |
+| [doc/refactor-arch-2026-10-05.md](doc/refactor-arch-2026-10-05.md) | 本轮重构的执行契约 + 执行结果：七个域的 facade + 子模块拆分、UI 三页改造、/u/ 与 /a/ 入口迁移、实测计数表与偏离记录 |
+| [doc/gap-session-2026-10-04.md](doc/gap-session-2026-10-04.md) | 上下文窗口语义翻转、/v1/models 形状、effort 三层继承、per-GPU 功率与踩坑记录（接手前建议先读） |
+| [doc/gap-config-store.md](doc/gap-config-store.md) | 配置持久化：sqlite/postgres/file 三态后端、CAS、镜像与采纳 |
+| [doc/ui-trim-legacy-pages.md](doc/ui-trim-legacy-pages.md) | 管理台相对原版 webui 的页面差异与旧工具页移除记录 |
+| [doc/deploy-state.md](doc/deploy-state.md) | 三实例部署现状、生效后端怎么查、已知配置漂移与死代码清单 |
+| [doc/deploy-fleet.md](doc/deploy-fleet.md) | 21.k:8801 与 235.t:8800 的 fleet 部署与验证记录（含部署后验证清单） |
 | [doc/scope-trim.md](doc/scope-trim.md) | 范围收敛判定书：模块 KEEP/DELETE/TRIM、量化收益、执行记录 |
 | [doc/todo-deferred.md](doc/todo-deferred.md) | TODO 档（MCP、wasm）的唯一口径与启用时的最小方案 |
 | [doc/gap-mesh.md](doc/gap-mesh.md) | mesh / HA 的 CRDT 设计、带宽代价与围栏 |
