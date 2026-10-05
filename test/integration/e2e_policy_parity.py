@@ -895,10 +895,13 @@ class RustRouter:
                     body["labels"] = {"policy": labels_policy}
                 http("POST", self.base + "/workers", body)
 
-    def wait_listen(self, timeout=90):
+    def wait_listen(self, timeout=240):
         """The axum listener only comes up after the tokenizer warmup, so the
         control-plane POSTs have to wait for it: registering earlier just gets
-        ECONNREFUSED and no worker ever appears."""
+        ECONNREFUSED and no worker ever appears. 90s was calibrated on a serial
+        gate run; under GATE_JOBS parallel load the first health cycle + router
+        ready handshake takes 75-120s on this box, so the ceiling is 240s. The
+        assertion stays "boots at all" - the budget is not the check."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if http("GET", self.base + "/health", timeout=2)[0] == 200:
@@ -909,7 +912,7 @@ class RustRouter:
     def worker_json(self):
         return json.loads(http("GET", self.base + "/workers")[1] or "{}").get("workers", [])
 
-    def healthy(self, timeout=90):
+    def healthy(self, timeout=240):
         want = {str(self.ports[w]) for w in self.order}
         deadline = time.time() + timeout
         while time.time() < deadline:
