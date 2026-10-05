@@ -221,7 +221,18 @@ _M.ENV_NAMES = {
     -- 靠 capture_env 在 init_by_lua（fork 之前）抓进 _G.LMR_ENV_CACHE，所以这里加名就是
     -- 全部要做的事，不需要也不应该去 conf 里再加一行 env 指令。
     "LMR_MODELS_VIRTUAL_ONLY",
-    "LMR_CONFIG_FILE", "LMR_CONFIG_STORE_BACKEND", "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
+    "LMR_CONFIG_FILE", "LMR_CONFIG_STORE_BACKEND", "LMR_CONFIG_STORE_PATH",
+    -- Both spellings are live: store_postgres reads the PG_-prefixed name first and
+    -- falls back to the short one. Registering only one half leaves whichever the
+    -- operator did not type invisible to the worker (nginx drops env that is not
+    -- in this list, and capture_env only caches what is in it).
+    "LMR_CONFIG_STORE_PG_HOST", "LMR_CONFIG_STORE_HOST",
+    "LMR_CONFIG_STORE_PG_PORT", "LMR_CONFIG_STORE_PORT",
+    "LMR_CONFIG_STORE_PG_DATABASE", "LMR_CONFIG_STORE_DATABASE",
+    "LMR_CONFIG_STORE_PG_USER", "LMR_CONFIG_STORE_USER",
+    "LMR_CONFIG_STORE_PG_PASSWORD", "LMR_CONFIG_STORE_PASSWORD",
+    "LMR_CONFIG_STORE_TIMEOUT_MS",
+    "LMR_UI_DIR", "LMR_UI_ROUTER_MODE",
     "LMR_LOGS_BUFFER", "LMR_UPSTREAMS_FILE",
 }
 
