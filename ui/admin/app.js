@@ -55,7 +55,9 @@ const app = Vue.createApp({
       const dict = window.lmrI18n.messages[locale.value].shell
       return { ...dict, interval: healthInterval.value }
     })
-    const chatHref = computed(() => '/_ui/')
+    // 原版聊天界面的规范入口（doc/refactor-arch-2026-10-05.md §5.3）：旧地址 /_ui/
+    // 照旧可用，但壳里的链接统一指新入口 /u/。
+    const chatHref = computed(() => '/u/')
 
     const groups = computed(() => {
       const dict = window.lmrI18n.messages[locale.value].shell

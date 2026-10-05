@@ -1,7 +1,7 @@
 /*
   lua-router 管理控制台 · 请求层（仿 authz/admin/api.js）
 
-  所有端点都用绝对路径，页面挂在 /_ui/admin/ 下，因此：
+  所有端点都用绝对路径。页面挂在 /a/ 下（refactor-arch-2026-10-05.md §5.3 从 /_ui/admin/ 迁来），因此：
     · 网关自带 API 走 /_ui/*（conf/ui.conf 的精确 location）
     · 控制面 API 走根路径 /workers（router.lua 的 klib 路由表）
   全部无鉴权（网关鉴权层已随 doc/scope-trim.md 删除），所以不带 credentials / CSRF。

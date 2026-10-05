@@ -2110,23 +2110,36 @@ if section ui_fixed; then
     assert_eq "/_ui/v1/chat/completions bad JSON is 400" "$STATUS" "400"
     assert_contains "/_ui/v1/chat/completions bad JSON message" "$BODY" "invalid chat request"
 
-    # static bundle
-    request "$UI_BASE" GET /_ui
-    assert_eq "/_ui redirects" "$STATUS" "301"
-    assert_contains "/_ui redirect target" "$(header_of Location)" "/_ui/"
+    # static bundle and the UI entry migration (doc/refactor-arch-2026-10-05.md 5.3):
+    # /_ui redirects to the new webui entry /u/, /_ui/admin redirects to the new
+    # console entry /a/. The old /_ui/ surface keeps working (the shipped bundle
+    # hardcodes /_ui/props and /_ui/v1/*, and e2e_ui_bridge pins them).
     # Edge-safe redirects: behind a TLS-terminating edge the visible Host is the
     # upstream address, so an absolute Location would send the client to
     # http://127.0.0.1:PORT. Exact-equality is the guard -- assert_contains on
-    # "/_ui/" also passes when the bug is present (the absolute URL ends in it).
+    # "/u/" also passes when the bug is present (the absolute URL ends in it).
     request "$UI_BASE" GET /_ui
-    assert_eq "/_ui Location stays a relative reference" "$(header_of Location)" "/_ui/"
+    assert_eq "/_ui redirects to /u/" "$STATUS" "302"
+    assert_eq "/_ui Location stays a relative reference" "$(header_of Location)" "/u/"
+    request "$UI_BASE" GET /u
+    assert_eq "/u redirects to the directory" "$STATUS" "302"
+    assert_eq "/u Location stays a relative reference" "$(header_of Location)" "/u/"
+    request "$UI_BASE" GET /u/
+    assert_eq "/u/ serves the SPA" "$STATUS" "200"
+    assert_contains "/u/ is html" "$CONTENT_TYPE" "text/html"
     request "$UI_BASE" GET /_ui/admin
-    assert_eq "/_ui/admin redirects to the directory" "$STATUS" "302"
+    assert_eq "/_ui/admin redirects to /a/" "$STATUS" "302"
     assert_contains "/_ui/admin redirect is not cacheable" "$(header_of Cache-Control)" "no-store"
-    assert_eq "/_ui/admin Location stays a relative reference" "$(header_of Location)" "/_ui/admin/"
+    assert_eq "/_ui/admin Location stays a relative reference" "$(header_of Location)" "/a/"
     request "$UI_BASE" GET /_ui/admin/
-    assert_eq "/_ui/admin/ serves the console" "$STATUS" "200"
-    assert_contains "/_ui/admin/ is html" "$CONTENT_TYPE" "text/html"
+    assert_eq "/_ui/admin/ redirects to /a/" "$STATUS" "302"
+    assert_eq "/_ui/admin/ Location stays a relative reference" "$(header_of Location)" "/a/"
+    request "$UI_BASE" GET /a
+    assert_eq "/a redirects to the directory" "$STATUS" "302"
+    assert_eq "/a Location stays a relative reference" "$(header_of Location)" "/a/"
+    request "$UI_BASE" GET /a/
+    assert_eq "/a/ serves the console" "$STATUS" "200"
+    assert_contains "/a/ is html" "$CONTENT_TYPE" "text/html"
     request "$UI_BASE" GET /_ui/
     assert_eq "/_ui/ serves the SPA" "$STATUS" "200"
     assert_contains "/_ui/ is html" "$CONTENT_TYPE" "text/html"
@@ -2138,6 +2151,10 @@ if section ui_fixed; then
     done
     request "$UI_BASE" GET /_ui/definitely-missing.js
     assert_eq "/_ui/ static miss is 404" "$STATUS" "404"
+    request "$UI_BASE" GET /u/definitely-missing.js
+    assert_eq "/u/ static miss is 404" "$STATUS" "404"
+    request "$UI_BASE" GET /a/definitely-missing.js
+    assert_eq "/a/ static miss is 404" "$STATUS" "404"
 fi
 
 # ==========================================================================

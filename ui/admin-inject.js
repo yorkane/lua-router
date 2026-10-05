@@ -7,6 +7,10 @@
   /_ui/admin/ 重叠，差异记录见 doc/ui-trim-legacy-pages.md），Logs 入口随之删除，
   只保留 Admin。
 
+  入口迁移（doc/refactor-arch-2026-10-05.md §5.3）：管理台从 /_ui/admin/ 迁到 /a/，
+  webui 的规范入口是 /u/（旧 /_ui/ 照旧可用）。注入链接因此用绝对
+  路径 /a/：页面无论从 /_ui/ 还是 /u/ 打开，都落到同一个规范入口。
+
   为什么需要 MutationObserver：导航容器（aside div[class*="px-2"][class*="flex-col"][class*="gap-1"]）
   由 Svelte 持有 children 引用，点「Expand navigation」展开/折叠侧栏会触发该区域重渲染，
   注入节点会被清掉（已实测）。因此除了首次注入，还要靠 observer 在每次重渲染后补回。
@@ -37,9 +41,11 @@
       '<rect width="7" height="9" x="9" y="3" rx="1"/><rect width="7" height="5" x="14" y="16" rx="1"/>' +
       '<rect width="7" height="5" x="3" y="16" rx="1"/><path d="M21 16v-2a2 2 0 0 0-2-2h-3"/>' +
       '<path d="M7 16V8a2 2 0 0 1 2-2h7"/></svg>';
-    /* Admin（Quasar 管理控制台）新开标签页，避免丢掉当前会话状态 */
+    /* Admin（Quasar 管理控制台）新开标签页，避免丢掉当前会话状态。
+       href 用绝对路径 /a/（管理台的新入口，refactor-arch §5.3），
+       不再相对于页面落在 /_ui/admin/ 那个旧位置。 */
     var ENTRIES = [
-      { mark: 'admin', label: 'Admin', icon: SVG_ADMIN, href: 'admin/index.html', blank: true }
+      { mark: 'admin', label: 'Admin', icon: SVG_ADMIN, href: '/a/', blank: true }
     ];
 
     function findNav() {
