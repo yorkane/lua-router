@@ -215,9 +215,39 @@ tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); paddin
   .workspace-page { padding-right: 4px; padding-left: 4px; }
   .page-heading { align-items: flex-start; flex-direction: column; }
   .heading-actions { width: 100%; }
-  .stat-grid, .stat-grid.cols-4 { grid-template-columns: 1fr; }
+  /* 四卡组（日志页顶部四张统计卡、服务池页同形）在窄屏**保持一行四列**（用户裁定 2026-10-05：
+     竖排会把整屏高度吃光）。容纳方式是一路压缩卡内尺寸而不是改竖排：留 0 宽下限给 minmax，
+     padding / 字号 / 图标逐级收。三列那类 .stat-grid 维持原竖排行为不动。 */
+  .stat-grid { grid-template-columns: 1fr; gap: 8px; }
+  .stat-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+  .stat-grid.cols-4 > * { min-width: 0; }
+  .stat-grid.cols-4 .stat-card { min-height: 0; }
+  .stat-grid.cols-4 .stat-card .q-card__section { padding: 8px 7px 9px; }
+  .stat-grid.cols-4 .stat-label { font-size: 10.5px; line-height: 1.25; }
+  .stat-grid.cols-4 .stat-value { margin-top: 3px; font-size: clamp(12px, 3.4vw, 18px); overflow-wrap: anywhere; }
+  .stat-grid.cols-4 .stat-note { margin-top: 3px; font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+  /* 注脚文本限两行：.stat-card 本就 overflow:hidden，不夹的话长句子把卡撑高、四列对齐就废了 */
+  .stat-grid.cols-4 .stat-note { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
   .surface-heading { align-items: flex-start; flex-direction: column; }
   .search-input { width: 100%; }
   .form-grid-2, .preview-fields, .kv-grid { grid-template-columns: 1fr; }
   .row-edit { grid-template-columns: 1fr; }
+}
+
+/* 最窄一档（≈ 手机竖屏）：装饰图标与右上角光晕先让位，把宽度全给读数 */
+@media (max-width: 560px) {
+  .stat-grid.cols-4 { gap: 4px; }
+  .stat-grid.cols-4 .stat-card .q-card__section { padding: 7px 5px 8px; }
+  .stat-grid.cols-4 .stat-icon { display: none; }
+  .stat-grid.cols-4 .stat-card::after { display: none; }
+  /* 吞吐卡在 360px 下每列只有约 83px：三个数横排必然溢出（实测标签 113px > 卡内宽）。
+     改成标签在上、数字在下，输入/输出两块竖着叠——四张卡仍是同一行，卡内怎么排由这里定。
+     选择器多带 .stat-grid.cols-4 前缀，压过 logs.html 内联 style 里的同名规则。 */
+  .stat-grid.cols-4 .tok-lines { flex-direction: column; align-items: stretch; gap: 5px; margin-top: 4px; }
+  .stat-grid.cols-4 .tok-item { flex-wrap: wrap; gap: 0 4px; white-space: normal; }
+  .stat-grid.cols-4 .tok-item > i { display: block; flex: 0 0 100%; font-size: 9.5px; line-height: 1.2; }
+  .stat-grid.cols-4 .tok-item > b { font-size: clamp(13px, 3.6vw, 16px); }
+  /* 口径注脚与窗口总量行只在桌面展示：前者是「怎么算的」长句，后者与 tok/s 同源。
+     cache 命中、引擎实际 prefill、平均 TTFT 在任何屏宽都保留。 */
+  .stat-grid.cols-4 .tok-basis, .stat-grid.cols-4 .tok-totals { display: none; }
 }

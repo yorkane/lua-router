@@ -27,13 +27,15 @@
     .agg-table tbody tr:hover td { background: rgba(255, 255, 255, .018); }
     .agg-table td.ellipsis { max-width: 34ch; }
     .agg-empty td { color: var(--muted); text-align: center; padding: 18px 12px; }
-    /* 吞吐卡：三个数各带自己的标签，不靠位置猜哪个是输入哪个是输出。
-       允许换行是因为窄屏下三项挤一行会断行错位；字号比 stat-value 单行紧一档。 */
-    .tok-lines { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-top: 7px; }
-    .tok-item { display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+    /* 吞吐卡：输入与输出各带自己的标签，两个数都必须能在主值区站住，
+       所以不靠位置猜哪个是输入哪个是输出；允许换行是因为窄屏下两项挤一行会断行错位。
+       字号比 stat-value 单行紧一档，窄屏由 app.css 的 media 段再收一档。
+       输入主值恒为「含 cache」口径（调用方发过来的全部 prompt），见下方卡片注释。 */
+    .tok-lines { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 7px; }
+    .tok-item { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; white-space: nowrap; }
     .tok-item > i { color: var(--muted); font-size: 11.5px; font-style: normal; letter-spacing: .02em; }
-    .tok-item > b { font-size: 21px; font-weight: 520; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
-    .tok-item.fresh > b { color: #4dd0b0; }
+    .tok-item > b { font-size: 21px; font-weight: 520; letter-spacing: -.03em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .tok-item.in > b { color: #eceef7; }
   </style>
 </head>
 <body>
@@ -83,21 +85,28 @@
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
-              <!-- 输入侧拆成两个数并排：含缓存的原始 prompt 是计费/传输量，新读入才是引擎真正
-                   prefill 的量。此前只显示前者，而真实流量 cache 命中 p50 98.3%，让「输入 tok/s」
-                   比实际 prefill 高出十几倍，容量规划照它读会得出完全错误的结论。
-                   三个数各带标签（不再用「A / B」靠位置区分），副行给出 cache 命中占比作为
-                   解释两个数差多少倍的上下文。文案走页内 AGG_DICT（i18n.js 他人并行维护）。 -->
+              <!-- 输入 tok/s 恒为「含 cache」口径 = Σ(prompt_tokens) / 60：这就是调用方发过来的
+                   全部 prompt（含被前缀缓存命中的部分），是计费与客户端上下文压力的口径，
+                   也是本卡唯一对外称「输入」的数（用户裁定 2026-10-05）。
+                   「引擎实际 prefill 量」（prompt 减去 cached 命中的新读入）只在副行作补充读数，
+                   且带完整字样标注，不与主值并列——它衡量的是引擎算力，不是流量。
+                   两个数各带标签（不靠位置区分），副行另给 cache 命中占比解释二者差几倍。
+                   算术在 summarizeWindow：inTok 只加 prompt_tokens，绝不减 cached_tokens。
+                   文案走页内 AGG_DICT（i18n.js 他人并行维护）。 -->
               <div class="stat-label">{{ ta('tokCardLabel') }} {{ t.summaryWindow60 }}</div>
               <div class="tok-lines">
-                <span class="tok-item"><i>{{ ta('tokInCached') }}</i><b>{{ fmtThousands(stats.input_tok_s) }}</b></span>
-                <span class="tok-item fresh"><i>{{ ta('tokInFresh') }}</i><b>{{ fmtThousands(stats.input_fresh_tok_s) }}</b></span>
+                <span class="tok-item in"><i>{{ ta('tokIn') }}</i><b>{{ fmtThousands(stats.input_tok_s) }}</b></span>
                 <span class="tok-item"><i>{{ ta('tokOut') }}</i><b>{{ fmtThousands(stats.output_tok_s) }}</b></span>
               </div>
               <!-- cache_hit_pct 在首帧（stats 还是空对象）是 undefined，用 || 一并兜成 —，
                    否则 ta 的占位符替换会把 "{pct}" 原样印在卡上 -->
-              <div class="stat-note">{{ ta('tokCacheHit', { pct: stats.cache_hit_pct || ta('dash') }) }} · {{ ta('tokTotals', { raw: fmtK(stats.input_tokens_window), fresh: fmtK(stats.input_fresh_tokens_window), out: fmtK(stats.completion_tokens_window) }) }}</div>
-              <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }} · {{ ta('tokWindowBasis') }}<template v-if="stats.estimated_excluded"> · {{ ta('tokEstExcluded', { n: stats.estimated_excluded }) }}</template></div>
+              <div class="stat-note">{{ ta('tokCacheHit', { pct: stats.cache_hit_pct || ta('dash') }) }} · {{ ta('tokPrefill', { n: fmtThousands(stats.input_fresh_tok_s) }) }}</div>
+              <!-- 窗口 token 总量与上面的 tok/s 同源（同一窗口同一批行），窄屏由 app.css 收起 -->
+              <div class="stat-note tok-totals">{{ ta('tokTotals', { raw: fmtK(stats.input_tokens_window), out: fmtK(stats.completion_tokens_window) }) }}</div>
+              <!-- 口径说明（窗口切法 / 剔除估算条数）包在 .tok-basis 里：桌面全量展示，
+                   窄屏由 app.css 收掉，让四张卡能横向排成一行而不吃掉整屏高度。
+                   被收掉的只是「怎么算的」注脚，三个读数（输入/输出/prefill）任何屏宽都在。 -->
+              <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}<span class="tok-basis"> · {{ ta('tokWindowBasis') }}<template v-if="stats.estimated_excluded"> · {{ ta('tokEstExcluded', { n: stats.estimated_excluded }) }}</template></span></div>
             </q-card-section></q-card>
             <q-card flat class="stat-card"><q-card-section>
               <q-icon name="mdi-database-sync" class="stat-icon red"></q-icon>
@@ -370,7 +379,8 @@
     }
 
     // 单行口径：cached 是 prompt 的子集，越界（引擎报 cached > prompt）按 prompt 钳住，
-    // 否则「新读入」会变成负数、把整卡的 tok/s 拖成负值。
+    // 否则副行那个「引擎实际 prefill」（fresh = prompt - cached）会变成负数。
+    // 注意：主值「输入 tok/s」只用 prompt，与本函数的 cached / fresh 无关。
     function rowTokens (row) {
       const prompt = tokenInt(row && row.prompt_tokens)
       const cached = Math.min(prompt, tokenInt(row && row.cached_tokens))
@@ -378,7 +388,7 @@
     }
 
     // 汇总：token 类总量只统计引擎自报 usage 的行（tokens_estimated 为真值时剔除——那种行的
-    // prompt 是估算出来的，混进分母会让两个 tok/s 一起失真）；请求数/错误数仍算全部行，
+    // prompt 是估算出来的，混进分母会让输入输出两个 tok/s 一起失真）；请求数/错误数仍算全部行，
     // 因为那是真实发生的请求，只是它的 token 读数不可信。
     function summarizeWindow (list, now, windowMs) {
       const span = Number(windowMs) > 0 ? Number(windowMs) : STATS_WINDOW_MS
@@ -553,14 +563,15 @@
             aggEmptyLogs: '暂无请求记录', aggEmptyBackends: '暂无已路由到后端的请求',
             aggEmptyEffort: '暂无带推理强度的请求',
             effortDefault: '(默认)', dash: '—', unknownModel: '(未知模型)',
-            // 吞吐卡（原「输出 tok/s · 输入 tok/s」单值卡）：输入侧两个数必须各自带标签，
-            // 否则没人分得清哪个是含缓存的计费量、哪个是引擎真读的量。
+            // 吞吐卡：主值只有两个数——输入（含 cache）与输出。操作员问「输入多少」时
+            // 页面上只有唯一一个候选答案（用户裁定 2026-10-05）。
+            // prefill 量（新读入）只在副行出现，且必须自带「引擎实际 prefill」全称。
             tokCardLabel: '输入 / 输出 tok/s',
-            tokInCached: '入 tok/s（含缓存）',
-            tokInFresh: '入 tok/s（新读入）',
+            tokIn: '入 tok/s（含 cache）',
             tokOut: '出 tok/s',
             tokCacheHit: 'cache 命中 {pct}',
-            tokTotals: '入 总/新 {raw} / {fresh} · 出 {out}',
+            tokPrefill: '引擎实际 prefill {n} tok/s',
+            tokTotals: '入 {raw} · 出 {out}',
             tokWindowBasis: '窗口按请求完成时刻切',
             tokEstExcluded: '已剔除 {n} 条估算 token'
           },
@@ -577,11 +588,11 @@
             aggEmptyEffort: 'No requests with an effort level',
             effortDefault: '(default)', dash: '—', unknownModel: '(unknown model)',
             tokCardLabel: 'in / out tok/s',
-            tokInCached: 'in tok/s (with cache)',
-            tokInFresh: 'in tok/s (newly read)',
+            tokIn: 'in tok/s (incl. cache)',
             tokOut: 'out tok/s',
             tokCacheHit: 'cache hit {pct}',
-            tokTotals: 'in total/new {raw} / {fresh} · out {out}',
+            tokPrefill: 'engine prefill {n} tok/s',
+            tokTotals: 'in {raw} · out {out}',
             tokWindowBasis: 'window sliced by request completion time',
             tokEstExcluded: '{n} estimated-token row(s) excluded'
           }
@@ -939,8 +950,10 @@
             // 1) 窗口按「完成时刻」ts_ms + duration_ms 切，而不是 ts_ms（= lr_started 开始时刻）。
             //    旧切法把开始于 60 秒前、刚结束于窗口内的长请求整条漏掉，实测同一时刻 36 条 vs 43 条、
             //    少算 22% 的 prompt token（其中一条 duration 150 秒）。
-            // 2) 输入侧同时给「含缓存」与「新读入」两个数：cached_tokens 是 prompt_tokens 的子集，
-            //    只报前者在真实流量（cache 命中 p50 98.3%）下会把输入吞吐夸到 16 倍。
+            // 2) 输入侧主值只给「含 cache」一个数 = Σ(prompt_tokens) / 60（用户裁定 2026-10-05）：
+            //    输入就是调用方发过来的全部 prompt，含被前缀缓存命中的部分，这是计费与客户端
+            //    上下文压力口径。新读入（prompt - cached）只代表引擎实际 prefill 算力，退到副行，
+            //    不与主值并列——曾把它当第二个主值并排，操作员分不清哪个是「输入」。
             // 3) tokens_estimated 的行不进 token 总量（读数非引擎自报），但仍计入请求数与错误数。
             // 连带影响（已确认接受）：窗口请求数/错误数/平均耗时/平均 TTFT 一并改成完成时刻口径，
             // 第二张卡的 n 会比原来略大——这是同一份 win 集合的产物，两套口径不能混用。
