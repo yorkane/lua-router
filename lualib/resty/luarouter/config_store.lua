@@ -2197,6 +2197,16 @@ local function read_snapshot()
         if ok and snap then
             local edited, why = file_was_edited_outside(rev)
             if edited then
+                -- Read the FILE, not the store: the whole point of noticing an
+                -- external edit is to honour it, and re-adopting what the store
+                -- already had would detect the edit and then ignore it.
+                local adopted = nil
+                local fok, fmod = pcall(require, "resty.luarouter.store_file")
+                if fok and type(fmod) == "table" and type(fmod.load) == "function" then
+                    local lok, fsnap = pcall(fmod.load)
+                    if lok then adopted = fsnap end
+                end
+                if type(adopted) == "table" then snap = adopted end
                 local saved, serr = d.save(snap, nil)
                 if not saved then
                     if ngx and ngx.log then
