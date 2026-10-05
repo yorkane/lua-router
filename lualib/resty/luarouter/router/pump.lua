@@ -183,4 +183,7 @@ end
 -- 跨模块接线（拆分新增；文末；connect_target 的就近导出在原处节内）。
 _M.is_chunked = is_chunked
 _M.read_response_head = read_response_head
+_M.send_attempt = send_attempt
+_M.discard_body = discard_body
+_M.read_response_body = read_response_body
 return _M
