@@ -265,12 +265,13 @@
                     <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
                     <q-input v-model="addForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
                   </div>
-                  <q-input
-                    v-model="addForm.modelsText"
-                    dense outlined dark :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"
-                    :disable="addMode === 'runtime'"
-                  ></q-input>
-                  <q-input v-model="addForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :placeholder="t.labelsJsonPlaceholder" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
+                  <div class="form-grid-2">
+                    <q-input v-model="addForm.modelsText" dense outlined dark type="textarea" rows="2"
+                             :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"
+                             :disable="addMode === 'runtime'"></q-input>
+                    <q-input v-model="addForm.labelsText" dense outlined dark type="textarea" rows="2"
+                             :label="t.labelsField" :placeholder="t.labelsJsonPlaceholder" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
+                  </div>
                   <q-toggle v-model="addForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
                   <div class="muted">{{ t.disableHealthHint }}</div>
                 </q-form>
@@ -303,12 +304,19 @@
                     <q-input v-model="declForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
                     <q-input v-model="declForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
                   </div>
-                  <q-input v-model="declForm.modelsText" dense outlined dark :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"></q-input>
-                  <q-input v-model="declForm.labelsText" dense outlined dark type="textarea" autogrow :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
-                  <q-toggle v-model="declForm.disable_health_check" dense color="teal-4" :label="t.disableHealth"></q-toggle>
-                  <div class="muted">{{ t.disableHealthHint }}</div>
-                  <q-toggle v-model="declForm.clearKey" dense color="orange-9" :label="t.clearKey"></q-toggle>
-                  <div class="muted">{{ t.clearKeyHint }} · {{ t.apiKeyKeep }}</div>
+                  <div class="form-grid-2">
+                    <q-input v-model="declForm.modelsText" dense outlined dark type="textarea" rows="2"
+                             :label="t.modelsField" :placeholder="t.modelsPlaceholder" :hint="t.modelsHint" class="mono"></q-input>
+                    <q-input v-model="declForm.labelsText" dense outlined dark type="textarea" rows="2"
+                             :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" class="mono"></q-input>
+                  </div>
+                  <!-- 两个独立开关并排一行：说明文字并进 label 后缀，省两行竖排。
+                       不用 :hint——本 Quasar 构建（3.5.41）的 QToggle 不渲染 hint 底部区，
+                       实测 .q-field__bottom 根本不生成，说明会整条静默消失。 -->
+                  <div class="form-grid-2">
+                    <q-toggle v-model="declForm.disable_health_check" dense color="teal-4" :label="t.disableHealth + ' · ' + t.disableHealthHint"></q-toggle>
+                    <q-toggle v-model="declForm.clearKey" dense color="orange-9" :label="t.clearKey + ' · ' + t.clearKeyHint + ' · ' + t.apiKeyKeep"></q-toggle>
+                  </div>
                 </q-form>
               </q-card-section>
               <q-card-actions align="right">
@@ -336,8 +344,10 @@
                     <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]" :disable="selected.cap_owner === 'declared'"></q-input>
                     <q-input v-model="editForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]" :disable="selected.cap_owner === 'declared'"></q-input>
                   </div>
-                  <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" :disable="selected.cap_owner === 'declared'"></q-input>
-                  <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth" :disable="selected.cap_owner === 'declared'"></q-toggle>
+                  <div class="form-grid-2">
+                    <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" :disable="selected.cap_owner === 'declared'"></q-input>
+                    <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth" :disable="selected.cap_owner === 'declared'"></q-toggle>
+                  </div>
                 </div>
               </q-card-section>
               <q-card-actions align="right">

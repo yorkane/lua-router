@@ -36,25 +36,8 @@
 
           <q-spinner v-if="loading && !doc" color="purple-3" size="30px"></q-spinner>
 
-          <!-- 生效链说明 -->
-          <q-card flat class="surface-card">
-            <q-card-section class="surface-heading">
-              <div>
-                <div class="surface-title">{{ t.chainTitle }}</div>
-                <div class="surface-subtitle">{{ t.chainCopy }}</div>
-              </div>
-            </q-card-section>
-            <q-separator dark></q-separator>
-            <q-card-section class="preview-box">
-              <div class="preview-out">
-                <div><span class="k">{{ t.envLayer }}</span><span class="code-pill">{{ envPolicyText }}</span></div>
-                <div><span class="k">{{ t.effectiveDefault }}</span><span class="code-pill">{{ effectiveDefaultText }}</span></div>
-                <div class="preview-note">{{ t.workersHint }}</div>
-              </div>
-            </q-card-section>
-          </q-card>
-
-          <!-- 全局策略 -->
+          <!-- 全局策略：生效链说明（左）与全局编辑（右）同卡两列。
+               原来两张卡里「整卡只有一个 select」的独占行合掉，垂直高度省一张卡。 -->
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading">
               <div>
@@ -64,21 +47,33 @@
             </q-card-section>
             <q-separator dark></q-separator>
             <q-card-section class="surface-body">
-              <div class="dialog-fields">
-                <q-select v-model="globalForm.policy" dense outlined dark :label="t.globalField"
-                          :options="policyOptions" map-options emit-value clearable
-                          :hint="globalHint" :display-value="globalDisplayValue">
-                  <template v-slot:option="scope">
-                    <q-item v-bind="scope.itemProps">
-                      <q-item-section>
-                        <q-item-label class="mono">{{ scope.opt.value }}</q-item-label>
-                        <q-item-label caption>{{ policyDescription(scope.opt.value) }}</q-item-label>
-                      </q-item-section>
-                    </q-item>
-                  </template>
-                </q-select>
+              <div class="form-grid-2">
+                <div class="preview-box">
+                  <div class="rows-head">{{ t.chainTitle }}</div>
+                  <div class="preview-note">{{ t.chainCopy }}</div>
+                  <div class="preview-out">
+                    <div><span class="k">{{ t.envLayer }}</span><span class="code-pill">{{ envPolicyText }}</span></div>
+                    <div><span class="k">{{ t.effectiveDefault }}</span><span class="code-pill">{{ effectiveDefaultText }}</span></div>
+                    <div class="preview-note">{{ t.workersHint }}</div>
+                  </div>
+                </div>
+                <div class="dialog-fields">
+                  <!-- 8 个策略且每项带说明行，保持下拉，不 radio 化 -->
+                  <q-select v-model="globalForm.policy" dense outlined dark :label="t.globalField"
+                            :options="policyOptions" map-options emit-value clearable
+                            :hint="globalHint" :display-value="globalDisplayValue">
+                    <template v-slot:option="scope">
+                      <q-item v-bind="scope.itemProps">
+                        <q-item-section>
+                          <q-item-label class="mono">{{ scope.opt.value }}</q-item-label>
+                          <q-item-label caption>{{ policyDescription(scope.opt.value) }}</q-item-label>
+                        </q-item-section>
+                      </q-item>
+                    </template>
+                  </q-select>
+                </div>
               </div>
-              <div class="row-actions" style="justify-content:flex-end">
+              <div class="card-actions-row">
                 <q-btn unelevated no-caps color="primary" class="primary-button" :loading="saving"
                        :label="t.globalSave" @click="saveGlobal"></q-btn>
               </div>

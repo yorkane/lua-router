@@ -185,6 +185,7 @@ tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); paddin
 .dialog-copy { margin-top: 6px; font-size: 13px; line-height: 1.5; }
 .dialog-fields { display: grid; gap: 13px; }
 .form-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.form-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 
 /* 表格内的小编辑行（legacy 行、映射行、别名行） */
 .row-edit { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 3px 0; }
@@ -198,6 +199,16 @@ tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); paddin
 .preview-out { display: grid; gap: 6px; color: #cfeee8; font-size: 12.5px; }
 .preview-out .k { color: var(--muted); display: inline-block; min-width: 110px; }
 .preview-note { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+
+/* 卡片底部的右对齐动作行（并入卡身时替代独立 q-card-actions 的间距口径） */
+.card-actions-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* 日志页筛选条：原 logs.html 的行内 style 落进类里，样式只有这一份 */
+.filter-bar { align-items: center; }
+.filter-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
+.filter-label { color: var(--muted); font-size: 11.5px; letter-spacing: .04em; }
+.filter-field { min-width: 160px; }
+.status-toggle .q-btn__content { font-size: 12px; }
 
 /* 日志详情 */
 .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 5px 16px; font-size: 12px; }
@@ -230,7 +241,7 @@ tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); paddin
   .stat-grid.cols-4 .stat-note { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
   .surface-heading { align-items: flex-start; flex-direction: column; }
   .search-input { width: 100%; }
-  .form-grid-2, .preview-fields, .kv-grid { grid-template-columns: 1fr; }
+  .form-grid-2, .form-grid-3, .preview-fields, .kv-grid { grid-template-columns: 1fr; }
   .row-edit { grid-template-columns: 1fr; }
 }
 

@@ -118,11 +118,15 @@
 
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading filter-bar">
-              <div class="filter-group" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
-                <q-select v-model="filters.status" dense outlined dark options-dense :options="statusOptions"
-                          map-options emit-value :label="t.filterStatus" style="min-width:120px" popup-content-style="min-width:150px"></q-select>
+              <div class="filter-group">
+                <!-- 4 个枚举值（全部/2xx/4xx/5xx）用 btn-toggle 摊平，一次点击到位；
+                     选项顺序与 value 沿用 statusOptions，过滤口径（首字符匹配）不变。 -->
+                <span class="filter-label">{{ t.filterStatus }}</span>
+                <q-btn-toggle v-model="filters.status" dense unelevated no-caps
+                              toggle-color="primary" :options="statusOptions" class="status-toggle"></q-btn-toggle>
+                <!-- 模型是动态集合且要 use-input 搜索，保持下拉 -->
                 <q-select v-model="filters.model" dense outlined dark options-dense use-input input-debounce="120"
-                          :options="modelFilterOptions" map-options emit-value :label="t.filterModel" style="min-width:160px" @filter="modelFilter"></q-select>
+                          :options="modelFilterOptions" map-options emit-value :label="t.filterModel" class="filter-field" @filter="modelFilter"></q-select>
                 </div>
               <q-input v-model="filters.text" dense outlined dark debounce="200" :placeholder="t.filterTextPlaceholder" class="search-input">
                 <template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template>
@@ -475,7 +479,6 @@
         const streamConnected = ref(false)
         const filters = reactive({ status: '', model: '', text: '' })
         const modelSuggest = ref([])
-        const pathSuggest = ref([])
         const pagination = reactive({ rowsPerPage: 50, sortBy: 'seq', descending: true })
         let source = null
         let statsTimer
@@ -509,18 +512,14 @@
           { label: t.value.status5xx, value: '5' }
         ])
         const distinctModels = computed(() => unique(rows.value.map(row => row.model)))
-        const distinctPaths = computed(() => unique(rows.value.map(row => row.path)))
         const modelFilterOptions = computed(() => [{ label: t.value.modelAll, value: '' }].concat(
           mergeOptions(modelSuggest.value, distinctModels.value)))
-        const pathFilterOptions = computed(() => [{ label: '/ (all)', value: '' }].concat(
-          mergeOptions(pathSuggest.value, distinctPaths.value)))
 
         const visibleRows = computed(() => {
           const needle = String(filters.text || '').trim().toLowerCase()
           return rows.value.filter(row => {
             if (filters.status && String(row.status).charAt(0) !== filters.status) return false
             if (filters.model && row.model !== filters.model) return false
-            if (filters.path && row.path !== filters.path) return false
             if (needle) {
               const haystack = [row.id, row.worker, row.session, row.provider, row.model, row.selected, row.error]
                 .map(value => (value === null || value === undefined ? '' : String(value))).join(' ').toLowerCase()
@@ -799,9 +798,6 @@
         function modelFilter (value, update) {
           update(() => { modelSuggest.value = value ? distinctModels.value.filter(name => name.toLowerCase().includes(value.toLowerCase())) : [] })
         }
-        function pathFilter (value, update) {
-          update(() => { pathSuggest.value = value ? distinctPaths.value.filter(name => name.toLowerCase().includes(value.toLowerCase())) : [] })
-        }
 
         function cellText (col, row) {
           if (col.name === 'time') return formatTime(row.ts_ms)
@@ -1008,7 +1004,7 @@
           rows.value = []
         }
         function resetFilters () {
-          Object.assign(filters, { status: '', model: '', path: '', text: '' })
+          Object.assign(filters, { status: '', model: '', text: '' })
         }
         // 行展开交给 QTable：expanded 存 row-key 数组，点击详情按钮翻转
         const expandedRows = ref([])
@@ -1058,7 +1054,7 @@
           fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
           effortCell, toggleRow,
           aggOpen, aggNote, aggModelRows, aggBackendRows, aggEffortRows, ta,
-          live, modelFilterOptions, olderLoading, pagination, pathFilter, pathFilterOptions, refreshStats,
+          live, modelFilterOptions, olderLoading, pagination, refreshStats,
           reload, resetFilters, rows, stats, statusClass, statusOptions, streamConnected, streamLabel, t,
           visibleRows, windowNote
         }
