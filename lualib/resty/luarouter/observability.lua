@@ -218,6 +218,91 @@ function _M.gauge(metric, pairs, value)
     statsdict():set("g|" .. metric .. "|" .. label_pairs(pairs), value)
 end
 
+---------------------------------------------------------- config-store gauges
+--
+-- The one thing that has to be answerable from a scrape is "which backend is
+-- this process actually writing to". Before these families existed a gateway
+-- that silently fell back to the file backend looked exactly like a healthy
+-- one from the outside: /health is a constant 200, and the only signal was
+-- store_dispatcher.warn_once, which speaks once per process and then stays
+-- quiet forever -- so a fallback at 03:00 was invisible unless somebody
+-- happened to be grepping the boot minute of the log, and Prometheus had
+-- nothing to alert on at all.
+--
+-- The cache behind publish_config_backend is per *process*. gauge() writes
+-- lr_stats, which is shared by the workers of one instance only, so a second
+-- gateway instance keeps its own series and the two can be compared in one
+-- PromQL without overwriting each other. Cross-instance disagreement is the
+-- failure worth alerting on: one replica on sqlite and its twin on file means
+-- the authoritative snapshot has been split in two.
+
+-- Fixed alphabets. Anything outside them collapses to "unknown" instead of
+-- reaching the scrape as a raw string: backend reasons are derived from error
+-- text, and an error message -- a path, a host, a driver's whole complaint --
+-- is precisely what a Prometheus label must never be.
+local CONFIG_BACKENDS = { sqlite = true, postgres = true, file = true }
+local CONFIG_SAVE_RESULTS = {
+    ok = true, conflict = true, unavailable = true, mirror_failed = true,
+}
+local CONFIG_DEGRADATION_REASONS = {
+    driver_missing = true, probe_failed = true, unavailable = true,
+    runtime_error = true, unknown_name = true,
+}
+
+local function config_label(value, allowed)
+    return (type(value) == "string" and allowed[value]) and value or "unknown"
+end
+
+-- Which backend name this process last published, so re-resolving onto the
+-- same backend costs zero shared-dict writes. Nil until the first publish,
+-- which is what makes that first call always write.
+local config_backend_published
+
+---Publish the backend this process actually writes its config snapshot to.
+---
+---One series per known backend, the live one at 1 and the others at 0, so a
+---scrape always answers the question with a number rather than with the
+---absence of a line. NOTE for whoever writes the SQLite-down alert: a backend
+---this process has never resolved to exports nothing at all until the first
+---publish -- the family being absent is not evidence sqlite is down, since a
+---gateway that has been writing to sqlite since last Tuesday also has no
+---sqlite line before someone triggers a resolution. Alert on
+---`lr_config_store_backend{backend="file"} == 1`, not on a missing series.
+---@param backend_name string @ "sqlite" | "postgres" | "file"
+function _M.publish_config_backend(backend_name)
+    local name = config_label(backend_name, CONFIG_BACKENDS)
+    if config_backend_published == name then
+        return
+    end
+    config_backend_published = name
+    for candidate in pairs(CONFIG_BACKENDS) do
+        _M.gauge("lr_config_store_backend", { { "backend", candidate } },
+            candidate == name and 1 or 0)
+    end
+end
+
+---One backend resolution ended in a degradation: this process now writes
+---somewhere other than what the operator asked for. `reason` is a fixed enum;
+---a value outside it is reported as "unknown" rather than passed through.
+---@param reason string @ driver_missing|probe_failed|unavailable|runtime_error|unknown_name
+function _M.note_config_degradation(reason)
+    _M.counter("lr_config_store_degradations_total",
+        { { "reason", config_label(reason, CONFIG_DEGRADATION_REASONS) } })
+end
+
+---One config-store save attempt, classified by the caller.
+---
+---`mirror_failed` is the series that matters most, and it is the reason the
+---result is a *parameter* rather than something inferred here: the database
+---committed and the human-readable mirror did not, so the stale file is free
+---to be adopted back over the newer db value by the external-edit path. The
+---save still returned ok to its caller, so nothing on the request path will
+---ever notice -- this counter is the only place it exists.
+---@param result string @ ok|conflict|unavailable|mirror_failed
+function _M.note_config_save(result)
+    _M.counter("lr_config_store_saves_total",
+        { { "result", config_label(result, CONFIG_SAVE_RESULTS) } })
+end
 -- ------------------------------------------------------------------ window
 
 -- One key per 200ms bucket: a minute of history costs 300 keys, and the stats
@@ -1659,6 +1744,31 @@ local HELP = {
     lr_watch_owned_workers = "Workers the in-process watcher currently owns",
     lr_watch_protected_workers = "Pre-existing workers the in-process watcher will never delete",
     lr_watch_model_map_entries = "Active watcher model-map renames",
+    -- Config-store persistence (resty.luarouter.store_dispatcher). Before these
+    -- existed, all 71 lr_* names were watch / gpu_load / inflight: a gateway that
+    -- had silently degraded to the file backend exported nothing about it, so the
+    -- split-brain shape (this replica writing db, its twin writing a file, each
+    -- believing it is the authoritative source) had no signal anywhere.
+    --   backend        = the one this process actually writes to, 1 across the
+    --                    three known values with the others at 0, so "am I on
+    --                    file?" is a read rather than the absence of a line
+    --   degradations   = a resolution that ended on a weaker backend than the one
+    --                    the operator asked for. reason is a fixed enum:
+    --                    driver_missing (module/driver not in the image),
+    --                    probe_failed (answers available() but cannot hand back a
+    --                    revision), unavailable (openable but refused),
+    --                    runtime_error (the backend broke mid-life), unknown_name
+    --                    (LMR_CONFIG_STORE_BACKEND spelled something unrecognised)
+    --   saves          = save attempts by result. conflict is a CAS rejection, and
+    --                    unavailable is a save that could not reach the backend at
+    --                    all -- both are counted where they happen, in the backend,
+    --                    so a save path in another file cannot quietly drop them.
+    --                    mirror_failed is the dangerous one: the db committed and
+    --                    the file mirror did not, which leaves the stale file free
+    --                    to be adopted back over the newer db value.
+    lr_config_store_backend = "Config snapshot backend this process writes to (1=active) by backend (sqlite/postgres/file)",
+    lr_config_store_degradations_total = "Config store resolutions that degraded to a weaker backend by reason",
+    lr_config_store_saves_total = "Config snapshot save attempts by result (ok/conflict/unavailable/mirror_failed)",
     -- Power channel of the GPU load source (the per-worker max_power_w cap). Separate
     -- families from lr_gpu_load* on purpose: those are a 0..1 score, these are
     -- absolute watts, and one dashboard axis cannot carry both. They only appear
@@ -1869,6 +1979,26 @@ function _M.prometheus_text()
         local keys_f = family("smg_worker_routing_keys_active")
         for worker_url, count in pairs(routing_keys) do
             keys_f.gauges[label_pairs({ { "worker", worker_url } })] = count
+        end
+    end
+    -- Config-store backend: derived at scrape time from the dispatcher when that
+    -- module is already loaded, so the series always names what the process is
+    -- really doing even if lr_stats evicted the stored gauge. package.loaded (not
+    -- a require) keeps the scrape side-effect free: a poll must never be the thing
+    -- that opens the database, and a process that has not resolved a backend yet
+    -- renders nothing here rather than an invented default -- the same honest
+    -- absence the per-worker pool sizes follow.
+    local dispatcher = package.loaded["resty.luarouter.store_dispatcher"]
+    if type(dispatcher) == "table"
+        and type(dispatcher.active_backend_name) == "function" then
+        local resolved = dispatcher.active_backend_name()
+        if type(resolved) == "string" and CONFIG_BACKENDS[resolved] then
+            config_backend_published = resolved
+            for candidate in pairs(CONFIG_BACKENDS) do
+                family("lr_config_store_backend").gauges[
+                    label_pairs({ { "backend", candidate } })
+                ] = (candidate == resolved) and 1 or 0
+            end
         end
     end
     family("smg_http_inflight_requests").gauges[""] = _M.inflight()

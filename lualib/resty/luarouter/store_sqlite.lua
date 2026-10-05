@@ -36,8 +36,28 @@ local function env(name)
     return trim(v)
 end
 
-local function warn(...)
-    if ngx and ngx.log then pcall(ngx.log, ngx.WARN, ...) end
+-- One WARN per key for the life of the worker. The failure paths below include
+-- the read path (load/revision run on config reads), so an unthrottled warn is a
+-- log-flood away from being worse than the silence it replaces -- while a plain
+-- "log once ever" is what made the old dispatcher signal useless: it said the
+-- true thing exactly once, at boot, and then nothing for the remaining weeks.
+-- Deduping per *key* rather than per module keeps the distinct failures
+-- distinguishable (a broken table and a broken driver are not the same news),
+-- and _M.reset_warn_state() lets a test or an ops reload re-arm them.
+local warned = {}
+
+local function warn(key, ...)
+    if warned[key] then return end
+    warned[key] = true
+    if ngx and ngx.log then
+        pcall(ngx.log, ngx.WARN, "luarouter store sqlite: ", ...)
+    end
+end
+
+---Re-arm the per-key WARNs so a backend that broke, was fixed, and broke again
+---can say so again.
+function _M.reset_warn_state()
+    warned = {}
 end
 
 -- ------------------------------------------------------------ driver binding
@@ -76,11 +96,19 @@ local function ensure_open()
     if not path then return nil, "no LMR_CONFIG_STORE_PATH or LMR_CONFIG_FILE" end
     if opened_path == path then return path end
     if driver.is_open and driver.is_open() and opened_path ~= path then
+        -- The shared driver keeps one connection per process, so a second path
+        -- here would silently read and write somebody else's file. Refusing is
+        -- right; saying nothing was not.
+        warn("held", "refusing ", path, ": connection already held by ",
+            tostring(opened_path))
         return nil, "sqlite connection already held by " .. tostring(opened_path)
     end
     -- driver.open raises on failure.
     local ok, err = pcall(driver.open, path)
-    if not ok then return nil, "open " .. path .. ": " .. tostring(err) end
+    if not ok then
+        warn("open", "cannot open ", path, ": ", tostring(err))
+        return nil, "open " .. path .. ": " .. tostring(err)
+    end
     opened_path = path
     local ddl = [[CREATE TABLE IF NOT EXISTS lr_config_snapshot(
   key TEXT PRIMARY KEY,
@@ -90,27 +118,66 @@ local function ensure_open()
     local created, derr = driver.exec(ddl)
     if not created then
         opened_path = nil
+        warn("ddl", "cannot create lr_config_snapshot: ", tostring(derr))
         return nil, "create table: " .. tostring(derr)
     end
     driver.exec("PRAGMA busy_timeout=" .. DEFAULT_BUSY_MS)
     return path
 end
 
+---Tell the dispatcher that the backend it may still be holding is gone.
+---
+---Without this the dispatcher keeps serving the module it cached, so a backend
+---that breaks mid-life is used-but-refused on every save and the operator sees
+---neither a WARN (the dispatcher already spent its one) nor a gauge that moved.
+---The require is lazy because the dispatcher loads this module itself: a
+---top-level require here would be a cycle.
+local function report_broken(why)
+    local ok, dispatcher = pcall(require, "resty.luarouter.store_dispatcher")
+    if ok and type(dispatcher) == "table"
+        and type(dispatcher.notify_backend_broken) == "function" then
+        pcall(dispatcher.notify_backend_broken, "sqlite", why)
+    end
+end
+
 --- Mark this backend unusable so the dispatcher can fall back to file.
 function _M.disable(why)
     broken = why or "disabled"
     opened_path = nil
+    -- The one-way door of this backend: after this, available() refuses for the
+    -- rest of the process and the dispatcher falls to file. Silence here is what
+    -- let a mid-life breakage look like a gateway that "was always on file", so
+    -- this is logged unconditionally rather than through the deduped keys -- and
+    -- the keys are re-armed so the other pending failures can say themselves
+    -- again, now that there is a fresh cause behind them.
+    warned = {}
+    if ngx and ngx.log then
+        pcall(ngx.log, ngx.WARN,
+            "luarouter store sqlite: backend disabled: ", tostring(why))
+    end
+    report_broken(why)
     return nil, why
 end
+
+
 
 function _M.broken_reason()
     return broken
 end
 
 function _M.available()
-    if not driver then return false, "no sqlite driver: " .. tostring(driver_err) end
-    if broken then return false, broken end
-    if not db_path() then return false, "no store path configured" end
+    if not driver then
+        warn("driver", "no sqlite driver: ", tostring(driver_err))
+        return false, "no sqlite driver: " .. tostring(driver_err)
+    end
+    if broken then
+        warn("broken", "backend disabled: ", broken)
+        return false, broken
+    end
+    if not db_path() then
+        warn("path", "no store path configured (set LMR_CONFIG_STORE_PATH or LMR_CONFIG_FILE)")
+        return false, "no store path configured"
+    end
     return true
 end
 
@@ -128,7 +195,10 @@ function _M.revision()
     if not path then return nil, oerr end
     local rows, qerr = driver.query(
         "SELECT revision FROM lr_config_snapshot WHERE key = ?", { SNAPSHOT_KEY })
-    if not rows then return nil, tostring(qerr) end
+    if not rows then
+        warn("revision-query", "revision read failed: ", tostring(qerr))
+        return nil, tostring(qerr)
+    end
     if #rows == 0 then return nil end
     return tonumber(rows[1].revision)
 end
@@ -141,10 +211,20 @@ function _M.load()
     if not path then return nil, oerr end
     local rows, qerr = driver.query(
         "SELECT revision, body FROM lr_config_snapshot WHERE key = ?", { SNAPSHOT_KEY })
-    if not rows then return nil, tostring(qerr) end
+    if not rows then
+        warn("load-query", "snapshot read failed: ", tostring(qerr))
+        return nil, tostring(qerr)
+    end
     if #rows == 0 then return nil, "empty store", nil end
     local snap = cjson.decode(rows[1].body)
-    if not snap then return nil, "stored snapshot is not json", nil end
+    if not snap then
+        -- Bytes in the authoritative column that the gateway cannot read back.
+        -- Not safe to stay silent about: the config layer falls through to the
+        -- file on nil, so this is the moment the mirror becomes the truth.
+        warn("load-decode", "stored snapshot is not json (revision ",
+            tostring(rows[1].revision), "); readers fall back to the file")
+        return nil, "stored snapshot is not json", nil
+    end
     return snap, nil, tonumber(rows[1].revision)
 end
 
@@ -166,7 +246,10 @@ function _M.save(snap, expect_revision)
 
     local cur_rows, qerr = driver.query(
         "SELECT revision FROM lr_config_snapshot WHERE key = ?", { SNAPSHOT_KEY })
-    if not cur_rows then return false, tostring(qerr) end
+    if not cur_rows then
+        warn("save-read", "cannot read the current revision: ", tostring(qerr))
+        return false, tostring(qerr)
+    end
     local cur = (#cur_rows > 0) and tonumber(cur_rows[1].revision) or nil
 
     if expect_revision ~= nil and cur ~= nil and cur ~= expect_revision then
@@ -179,18 +262,36 @@ function _M.save(snap, expect_revision)
         local ins, ierr = driver.exec(
             "INSERT INTO lr_config_snapshot(key, revision, body, updated_at) VALUES(?,?,?,?)",
             { SNAPSHOT_KEY, next_rev, text, now() })
-        if not ins then return false, "insert: " .. tostring(ierr) end
+        if not ins then
+            warn("insert", "insert failed: ", tostring(ierr))
+            return false, "insert: " .. tostring(ierr)
+        end
         return true, nil, next_rev
     end
 
     local updated, uerr = driver.exec(
         "UPDATE lr_config_snapshot SET revision=?, body=?, updated_at=? WHERE key=? AND revision=?",
         { next_rev, text, now(), SNAPSHOT_KEY, expect_revision or cur })
-    if not updated then return false, "update: " .. tostring(uerr) end
+    if not updated then
+        warn("update", "update failed at revision ", tostring(next_rev), ": ",
+            tostring(uerr))
+        return false, "update: " .. tostring(uerr)
+    end
     local after = driver.query(
         "SELECT revision FROM lr_config_snapshot WHERE key = ?", { SNAPSHOT_KEY })
     if after and #after > 0 and tonumber(after[1].revision) == next_rev then
         return true, nil, next_rev
+    end
+    -- Two different outcomes wear the same "conflict" wording from here and the
+    -- distinction is the whole value of this line: either another writer won the
+    -- race (harmless, the caller retries) or the UPDATE reported success while
+    -- the row does not say what it was just written to say (the commit is a lie).
+    -- The second is findable nowhere else, so it is logged as itself.
+    if not after or #after == 0 then
+        warn("verify-gone", "UPDATE reported success and the snapshot row is gone")
+    elseif tonumber(after[1].revision) ~= next_rev then
+        warn("verify", "UPDATE reported success at revision ", tostring(next_rev),
+            " but the stored revision is ", tostring(tonumber(after[1].revision)))
     end
     return false, string.format("revision conflict: expected %s, current %s",
         tostring(expect_revision or cur), tostring(cur)), cur
