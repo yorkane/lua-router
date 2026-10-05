@@ -1,0 +1,801 @@
+-- resty.luarouter.config_store.snapshot
+-- P12 配置内部形态与派生视图 + P13 env 层装配 + P14 snapshot_of + P15 卡片 patch 合并与
+-- 配置期校验 + P16 cfg_from_document。snapshot_of 与 cfg_from_document 同域（磁盘字节
+-- 形状是对外契约）；sync_virtual_view 只在三条写路径上被显式调用，读时不派生。
+--
+-- 由 lualib/resty/luarouter/config_store.lua 拆分而来：函数体逐行原样搬家，只调整 require 与
+-- 跨模块接线（doc/refactor-arch-2026-10-05.md §1–§2）。原文里经 _M.x() 的自调 → 经 CS_FACADE
+-- 表调用（保住单测换桩的可拦截性逐点一致）；原文里的同文件 local 直调 → 直接 require 对端
+-- 子模块的共享表调用（不进 facade 导出面，_M 契约因此逐名不变）。
+local CS_FACADE = require "resty.luarouter.config_store"
+local cjson = require "cjson.safe"
+local JSON_NULL = cjson.null
+local CS_LEXICON = require "resty.luarouter.config_store.lexicon"
+local CS_ENV = require "resty.luarouter.config_store.env"
+local CS_PROFILES = require "resty.luarouter.config_store.profiles"
+local CS_UPSTREAMS = require "resty.luarouter.config_store.upstreams"
+
+local _M = {}
+
+local function new_cfg()
+    return {
+        default_effort = nil,
+        effort_map = {},
+        model_ctx = {},
+        -- 平铺层的「服务实际上下文限制」（与 model_ctx 同形状）：卡片上的
+        -- context_limit 优先，这里是没有卡片时的兜底读数。
+        model_context_limit = {},
+        model_effort = {},
+        model_configs = {},
+        virtual_models = {},
+        -- Routing overrides (doc/gap-routing-dyn.md). Both stay empty when the
+        -- operator has not touched the routing page, which is what keeps the
+        -- policy chain byte-identical to the pre-feature behaviour.
+        policy = nil,
+        model_policies = {},
+        -- Virtual-model profiles (doc/gap-virtual-models.md 3.1): alias -> {target,
+        -- workers, policy, effort}. virtual_models stays the alias->target map the
+        -- pre-feature readers use, so removing an entry clears both views.
+        virtual_profiles = {},
+        -- Ordered upstream declaration layer (normalized url + key tri-state).
+        upstreams = {},
+        -- /v1/models「只广告虚拟入口」开关，两份读数按**来源**分家（见
+        -- _M.models_virtual_only 的优先级说明）：
+        --   * models_virtual_only      = 磁盘快照里操作员声明的那一份，nil = 「没说」
+        --   * models_virtual_only_env  = 环境层那一份，nil = 「没说」
+        -- 只有磁盘那一份会被 snapshot_of 回写。两份都必须三态（nil / true / false）而不是
+        -- 合并成一个布尔：false 是「说了要全量广告」这个结论，要能压过另一层的 true，而 nil
+        -- 只是沉默（与硬规则 9 第二条同一套三态纪律）。合并成一份的代价更实在 —— 任何
+        -- 「env 赢进来又被 write_snapshot 落盘」的路径，都会把一个只存在于环境变量里的声明
+        -- 冻结进配置文件，操作员之后删掉 env 也关不掉它（本文件为 target / explicit_targets
+        -- 已经立过两次同样的规矩）。
+        models_virtual_only = nil,
+        models_virtual_only_env = nil,
+    }
+end
+
+--- Derive the legacy alias -> representative-target map from the profiles, which are
+--- the single source of truth (root ruling 2026-10-02).
+---
+--- 为什么派生而不是并行维护：这两张表各自被独立写入过（cfg_from_document 与
+--- apply_profiles 各写一次），于是任何一条只清一张表的路径都会留下"幻影别名"——
+--- resolve_model / /v1/models / 模型文档三处 reader 各自读到不同的一张。1 对多之后
+--- virtual_models 的单值语义本来也不成立了（一个入口对应一组模型，没有唯一的"它的
+--- target"），把它降级成派生视图既消除了双写，也让 reader 在"必须只有一个名字"的
+--- 地方继续读到代表值而不是 nil。
+local function sync_virtual_view(cfg)
+    local map = {}
+    for alias, profile in pairs(cfg.virtual_profiles or {}) do
+        if type(profile) == "table" then
+            -- 写过 targets 的入口，代表值取**组头**而不是 profile.target：操作员可以先写
+            -- target、再用 JSON 视图把那个名字从组里删掉，此时 profile.target 是一个已经
+            -- 不属于这个入口的名字。让它进派生视图，resolve_model / 模型文档就会把流量与
+            -- 卡片去找一个根本不在这个组里的模型名（选路本身不受影响：组候选的转发名一律
+            -- 取 lr_bound_model）。profile.target 本身保持写过的原值不动，磁盘上的字节仍
+            -- 由操作员说了算 —— 这里只保证派生视图与组口径一致。
+            local rep = profile.target
+            if profile.explicit_targets == true and type(profile.targets) == "table" then
+                local head = profile.targets[1]
+                if type(head) == "string" and head ~= "" then
+                    rep = head
+                end
+            end
+            map[alias] = rep
+        end
+    end
+    cfg.virtual_models = map
+end
+
+--- 档位映射的对外形状：内部按 from 建表，磁盘与 UI 用有序数组 {from,to}。卡片、条目、
+--- 全局三层共用这一个序列化器，往返（读回来再写出去）才不会有三种不同的字节。
+local function effort_pairs(map)
+    local out = {}
+    if type(map) ~= "table" then return out end
+    for _, from in ipairs(CS_LEXICON.sorted_keys(map)) do
+        out[#out + 1] = { from = from, to = map[from] }
+    end
+    return out
+end
+
+local function new_card()
+    -- context_limit is the *engine's* real capability (what the serving process can
+    -- actually hold), declared by the operator from the engine's own report -- it is
+    -- not the client-facing window an entry advertises. It exists only to validate
+    -- declared context_window values at configuration time; nothing on the hot path
+    -- clamps with it (root ruling 2026-10-04: the gateway rewrites no output budget).
+    -- 五个能力位都是三态：nil = 操作员没说（该维度让位给引擎自报），false = 说了不支持。
+    -- 显式写成 nil 是为了把「这张卡片存在」与「这张卡片声明过能力位」分开——前者由
+    -- new_card 决定，后者只看这些键上有没有真布尔（读侧一律 type == "boolean" 判定）。
+    return { ctx = nil, context_limit = nil, default_effort = nil,
+             effort_map = {}, modalities = nil, supports_tool_use = nil,
+             supports_streaming = nil, supports_reasoning = nil,
+             supports_vision = nil, supports_reasoning_effort = nil }
+end
+
+local function cfg_from_env()
+    local cfg = new_cfg()
+    local default_effort = CS_FACADE.normalize_effort(CS_ENV.env("LMR_DEFAULT_EFFORT"))
+    if default_effort and default_effort ~= false then cfg.default_effort = default_effort end
+
+    -- 开关的环境层，写进 models_virtual_only_env（不写磁盘层那一份，理由见 new_cfg）。
+    -- env() 对「未声明」和「空串」都答 nil，所以这里只认「说过」= 非 nil，值本身交给
+    -- advertise_truthy 判定；缺省不设 = 关 = /v1/models 逐字节与开关落地前一致
+    -- （AGENTS.md「新开关缺省零行为变化」）。
+    --
+    -- env 的 false 不单独造一个「明确说关」的三态：LMR_MODELS_VIRTUAL_ONLY=false 在这里
+    -- 就是关，和没说一样，反正磁盘层无论如何都压过它（见 _M.models_virtual_only）。
+    local virtual_only_env = CS_ENV.env("LMR_MODELS_VIRTUAL_ONLY")
+    if virtual_only_env ~= nil then
+        cfg.models_virtual_only_env = CS_LEXICON.advertise_truthy(virtual_only_env)
+    end
+
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_EFFORT_MAP"))) do
+        local from = CS_FACADE.normalize_effort(pair[1])
+        if from and from ~= false and pair[2] ~= "" then cfg.effort_map[from] = pair[2] end
+    end
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_CTX"))) do
+        local ctx = CS_LEXICON.parse_positive_int(pair[2])
+        if ctx then cfg.model_ctx[pair[1]] = ctx end
+    end
+    -- 平铺层的真实上下文限制，与 LMR_MODEL_CTX 同一形状（model=value）。它只是
+    -- 「操作员从引擎自报读数里抄来的真实能力」，用来校验声明窗口，不参与任何钳制。
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_CONTEXT_LIMIT"))) do
+        local limit = CS_LEXICON.parse_positive_int(pair[2])
+        if limit then cfg.model_context_limit[pair[1]] = limit end
+    end
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_EFFORT"))) do
+        local effort = CS_FACADE.normalize_effort(pair[2])
+        if effort and effort ~= false then cfg.model_effort[pair[1]] = effort end
+    end
+
+    local cards = cfg.model_configs
+    local function card_for(model)
+        local card = cards[model]
+        if not card then card = new_card(); cards[model] = card end
+        return card
+    end
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_EFFORT_MAP"))) do
+        local from, to = pair[2]:match("^(.-)>(.*)$")
+        from = CS_FACADE.normalize_effort(from)
+        to = CS_FACADE.normalize_effort(to)
+        if from and to and from ~= false and to ~= false then
+            card_for(pair[1]).effort_map[from] = to
+        end
+    end
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_MODALITIES"))) do
+        local caps = CS_LEXICON.parse_caps(pair[2])
+        if caps then card_for(pair[1]).modalities = caps end
+    end
+    -- 卡片级 tool use 声明的 env 层：model=true|false。缺省不设 = 一个卡片都不建，
+    -- 行为与改动前逐字节一致（新开关缺省零行为变化）。只认严格的小写 true/false，
+    -- 其他写法一律当「没写」——env 层的垃圾值历来是忽略而不是拉网关下水。
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_TOOL_USE"))) do
+        local value = CS_LEXICON.lower(pair[2])
+        if value == "true" or value == "false" then
+            card_for(pair[1]).supports_tool_use = (value == "true")
+        end
+    end
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_VIRTUAL_MODELS"))) do
+        local alias, target = pair[1], pair[2]
+        if alias ~= "" and target ~= "" and alias ~= target then
+            -- Old alias=target pairs are exactly the new shape with no candidates
+            -- and no overrides, so both views get the same content.
+            cfg.virtual_profiles[alias] = { target = target, targets = { target } }
+        end
+    end
+    for _, entry in ipairs(CS_FACADE.env_upstreams()) do
+        local item, err = CS_UPSTREAMS.upstream_from_entry(entry, #cfg.upstreams + 1)
+        if item then
+            local dup = false
+            for _, existing in ipairs(cfg.upstreams) do
+                if existing.url == item.url then dup = true break end
+            end
+            if not dup then cfg.upstreams[#cfg.upstreams + 1] = item end
+        elseif err then
+            CS_LEXICON.ngx_log_warn("luarouter config env upstream skipped: ", err)
+        end
+    end
+    -- virtual_models 是派生视图，env 层同样要同步：否则 LMR_VIRTUAL_MODELS 种子进来的别名
+    -- 只进了 virtual_profiles 一张表，resolve_model / snapshot_of / virtual_models_list 三个
+    -- 读者全都读不到它，行为等同于整条 env 配置被静默丢弃。
+    sync_virtual_view(cfg)
+    return cfg
+end
+
+--- Array snapshot, same key set and shapes as Rust RuntimeConfig::snapshot().
+local function snapshot_of(cfg)
+    local effort_map = {}
+    for _, from in ipairs(CS_LEXICON.sorted_keys(cfg.effort_map)) do
+        effort_map[#effort_map + 1] = { from = from, to = cfg.effort_map[from] }
+    end
+    local model_ctx = {}
+    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_ctx)) do
+        model_ctx[#model_ctx + 1] = { model = model, ctx = cfg.model_ctx[model] }
+    end
+    local model_context_limit = {}
+    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_context_limit)) do
+        model_context_limit[#model_context_limit + 1] = {
+            model = model, context_limit = cfg.model_context_limit[model],
+        }
+    end
+    local model_effort = {}
+    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_effort)) do
+        model_effort[#model_effort + 1] = { model = model, effort = cfg.model_effort[model] }
+    end
+    local model_configs = {}
+    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_configs)) do
+        local card = cfg.model_configs[model]
+        local map = {}
+        for _, from in ipairs(CS_LEXICON.sorted_keys(card.effort_map)) do
+            map[#map + 1] = { from = from, to = card.effort_map[from] }
+        end
+        model_configs[#model_configs + 1] = {
+            model = model,
+            ctx = CS_LEXICON.nul(card.ctx),
+            context_limit = CS_LEXICON.nul(card.context_limit),
+            default_effort = CS_LEXICON.nul(card.default_effort),
+            effort_map = CS_LEXICON.arr(map),
+            modalities = CS_LEXICON.nul(card.modalities),
+            -- Tri-state: absent/null = "unknown" (nul renders the JSON null the editor
+            -- round-trips as "leave alone"), false = the operator said no. The two must
+            -- never merge on the way to disk, hence nul() rather than a bare field.
+            -- 四条新能力位同一条纪律（2026-10-05）：全部走 nul，false 落 false、
+            -- 没说落 null，编辑器的「留空 = 不动」与「说不支持」因此在磁盘上仍然可分。
+            supports_tool_use = CS_LEXICON.nul(card.supports_tool_use),
+            supports_streaming = CS_LEXICON.nul(card.supports_streaming),
+            supports_reasoning = CS_LEXICON.nul(card.supports_reasoning),
+            supports_vision = CS_LEXICON.nul(card.supports_vision),
+            supports_reasoning_effort = CS_LEXICON.nul(card.supports_reasoning_effort),
+        }
+    end
+    local virtual_models = {}
+    for _, alias in ipairs(CS_LEXICON.sorted_keys(cfg.virtual_models)) do
+        local profile = cfg.virtual_profiles[alias] or { target = cfg.virtual_models[alias] }
+        -- target 只在操作员真的写过它时回写。candidates-only 的配置里 profile.target 是
+        -- 从第一条绑定推出来的代表值，写进磁盘就变成一个没人声明过的模型名：它会被后续
+        -- reader 当成真实模型去找 effort/policy 卡，也会让"删掉 target"这种编辑在下次
+        -- reload 后悄悄复活。缺省字段（而不是 null）是这里既有的往返约定。
+        local entry = { model = alias }
+        -- Same "only what the operator wrote" rule as target above: a legacy pair or a
+        -- candidates-only row re-derives its group at read time, so re-emitting it here
+        -- would put a derived list on disk and make "delete the targets" an edit that
+        -- silently resurrects itself on the next reload.
+        if profile.explicit_targets and profile.targets then
+            entry.targets = { table.unpack(profile.targets) }
+        end
+        if profile.candidates then
+            if profile.explicit_target then
+                entry.target = profile.target or cfg.virtual_models[alias]
+            end
+            entry.candidates = CS_PROFILES.copy_bindings(profile.candidates)
+        elseif not profile.explicit_targets then
+            entry.target = profile.target or cfg.virtual_models[alias]
+        end
+        -- Optional fields are absent rather than null so a snapshot written by an
+        -- older build round-trips unchanged and the JSON editor stays readable.
+        if profile.workers then entry.workers = profile.workers end
+        -- policy/effort are legacy-carried only (root ruling 2026-10-02): the hot path
+        -- ignores them, but a row that still has them keeps them on disk so nothing an
+        -- operator never deleted can vanish from the authoritative JSON view.
+        if profile.policy then entry.policy = profile.policy end
+        if profile.effort then entry.effort = profile.effort end
+        -- Entry-level declarations (root ruling 2026-10-04): written only when the
+        -- operator wrote them, same "never invent a field" rule as the block above.
+        -- supports_tool_use is the exception that proves it -- false is *written as*
+        -- false, because false is an answer and not an absence.
+        if profile.default_effort then entry.default_effort = profile.default_effort end
+        if profile.effort_map then
+            entry.effort_map = effort_pairs(profile.effort_map)
+        end
+        if profile.modalities then entry.modalities = { table.unpack(profile.modalities) } end
+        -- 能力位 false 是结论、必须写成 false；缺席是沉默、必须整个键不出现（写 null
+        -- 会让老 build 与 JSON 编辑器把「擦掉声明」与「说了不支持」读成同一件事）。
+        -- 与卡片那五条用 nul 相反：条目层是可选字段缺席的约定（见上面 default_effort 一段）。
+        for _, field in ipairs({ "supports_tool_use", "supports_streaming",
+                                 "supports_reasoning", "supports_vision",
+                                 "supports_reasoning_effort" }) do
+            if profile[field] ~= nil then entry[field] = profile[field] end
+        end
+        if profile.context_window then entry.context_window = profile.context_window end
+        virtual_models[#virtual_models + 1] = entry
+    end
+    local upstreams = {}
+    for _, item in ipairs(cfg.upstreams or {}) do
+        local entry = {
+            url = item.url,
+            model_id = CS_LEXICON.nul(item.model_id),
+            -- Never echo the secret: the field is present and always null so the
+            -- JSON editor round-trips it as "leave the stored key alone" (3.4).
+            api_key = JSON_NULL,
+            priority = tonumber(item.priority) or 50,
+            cost = tonumber(item.cost) or 1.0,
+            labels = item.labels or {},
+            disable_health_check = (item.disable_health_check and true) or false,
+        }
+        -- Advertised coverage rides the snapshot so the JSON editor round-trips it:
+        -- absent when nothing was declared (never an explicit null), which is what
+        -- distinguishes "the probe decides" from "declared empty" on the way back in.
+        if item.models then entry.models = { table.unpack(item.models) } end
+        -- Capacity caps round-trip the same way: written only when the row declared a
+        -- usable limit, and *absent* (never an explicit null) for "unlimited". Writing
+        -- an explicit null would make the snapshot carry a field no operator declared,
+        -- and an old build reading it would have to know the key means nothing.
+        for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+            local cap = CS_PROFILES.declared_cap(item[field], field == "max_concurrency")
+            if cap ~= nil then entry[field] = cap end
+        end
+        -- Persistence half of the key: state + value ride the snapshot so a
+        -- restart (or another worker) can re-apply the same key without ever
+        -- seeing it on the wire.
+        if item.api_key_state then entry.api_key_state = item.api_key_state end
+        if item.api_key_stored then entry.api_key_stored = item.api_key_stored end
+        entry.has_api_key = (item.api_key_state == "set") == true
+        upstreams[#upstreams + 1] = entry
+    end
+    local model_policies = {}
+    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_policies)) do
+        model_policies[#model_policies + 1] = { model = model, policy = cfg.model_policies[model] }
+    end
+    local snap = {
+        default_effort = CS_LEXICON.nul(cfg.default_effort),
+        effort_map = CS_LEXICON.arr(effort_map),
+        model_ctx = CS_LEXICON.arr(model_ctx),
+        model_context_limit = CS_LEXICON.arr(model_context_limit),
+        model_effort = CS_LEXICON.arr(model_effort),
+        model_configs = CS_LEXICON.arr(model_configs),
+        virtual_models = CS_LEXICON.arr(virtual_models),
+        policy = CS_LEXICON.nul(cfg.policy),
+        model_policies = CS_LEXICON.arr(model_policies),
+        upstreams = CS_LEXICON.arr(upstreams),
+    }
+    -- 开关的回写半：只有磁盘层那一份会被 re-emit，而且只在操作员真的在这份文件里说过时
+    -- 才有键 —— 缺席而不是显式 null，与 target / explicit_targets / caps 同一套「绝不无中生有
+    -- 一个没人声明过的字段」的约定（也保住「从没碰过这个开关的部署，落盘字节与今天逐字节
+    -- 相同」）。环境层刻意不回写：把 env 的读数冻结进配置文件，等于让操作员删了环境变量也
+    -- 关不掉它。
+    --
+    -- 这一支就是「从 /_ui/config 保存一次会把这个键抹掉」那个 bug 的正解：整表替换走
+    -- cfg_from_document -> snapshot_of，未知键在两端都没有落点，于是每次保存都把它从磁盘上
+    -- 擦掉。读侧（cfg_from_document）与写侧（这里）必须同时有，缺一个都等于没修。
+    if cfg.models_virtual_only ~= nil then
+        snap.models_virtual_only = cfg.models_virtual_only
+    end
+    return snap
+end
+
+-- --------------------------------------------------------------- validation
+
+--- Merge one patch into a model card (Rust RuntimeConfig::merge_model_patch):
+--- absent field = leave alone, null = clear back to auto.
+local function merge_model_patch(card, patch)
+    if patch.ctx ~= nil or patch.ctx == JSON_NULL then
+        local raw = patch.ctx
+        if raw == JSON_NULL then
+            card.ctx = nil
+        elseif type(raw) == "number" then
+            local n = CS_LEXICON.parse_positive_int(raw)
+            if not n then return nil, "ctx must be greater than zero" end
+            card.ctx = n
+        elseif type(raw) == "string" then
+            local s = CS_LEXICON.trim(raw)
+            if s == "" then
+                card.ctx = nil
+            else
+                local n = CS_LEXICON.parse_positive_int(s)
+                if not n then return nil, string.format("ctx must be a number: %s", s) end
+                card.ctx = n
+            end
+        else
+            return nil, "ctx must be a number or null"
+        end
+    end
+
+    -- 服务真实上下文限制（引擎自报能力，操作员抄录）。解析口径照抄 ctx：absent =
+    -- leave alone, null = clear back to "unknown"（未知即不校验）。它不参与任何
+    -- max_tokens 钳制（2026-10-04 裁定），唯一用途是配置期校验声明窗口。
+    if patch.context_limit ~= nil then
+        local raw = patch.context_limit
+        if raw == JSON_NULL then
+            card.context_limit = nil
+        elseif type(raw) == "number" then
+            local n = CS_LEXICON.parse_positive_int(raw)
+            if not n then return nil, "context_limit must be greater than zero" end
+            card.context_limit = n
+        elseif type(raw) == "string" then
+            local s = CS_LEXICON.trim(raw)
+            if s == "" then
+                card.context_limit = nil
+            else
+                local n = CS_LEXICON.parse_positive_int(s)
+                if not n then return nil, string.format("context_limit must be a number: %s", s) end
+                card.context_limit = n
+            end
+        else
+            return nil, "context_limit must be a number or null"
+        end
+    end
+
+    if patch.default_effort ~= nil or patch.default_effort == JSON_NULL then
+        local raw = patch.default_effort
+        if raw == JSON_NULL then
+            card.default_effort = nil
+        elseif type(raw) == "string" then
+            local trimmed = CS_LEXICON.trim(raw)
+            if trimmed == "" or CS_LEXICON.lower(trimmed) == "null" then
+                card.default_effort = nil
+            else
+                local effort = CS_FACADE.normalize_effort(trimmed)
+                if effort == false then
+                    return nil, string.format(
+                        "unknown effort for default_effort: %s (want one of %s)",
+                        trimmed, CS_LEXICON.EFFORT_LEVELS_JOIN)
+                end
+                card.default_effort = effort
+            end
+        else
+            return nil, "default_effort must be a string or null"
+        end
+    end
+
+    if patch.effort_map ~= nil then
+        if patch.effort_map == JSON_NULL then
+            card.effort_map = {}
+        elseif CS_LEXICON.is_array(patch.effort_map) then
+            local next_map = {}
+            for _, entry in ipairs(patch.effort_map) do
+                local from = CS_FACADE.normalize_effort(entry.from)
+                local to = CS_LEXICON.trim(entry.to)
+                if from == false or from == nil then
+                    return nil, string.format("unknown effort in map: %s", tostring(entry.from or ""))
+                end
+                if to ~= "" then
+                    local to_norm = CS_FACADE.normalize_effort(to)
+                    if to_norm == false then
+                        return nil, string.format(
+                            "unknown effort in map target: %s (want one of %s)", to, CS_LEXICON.EFFORT_LEVELS_JOIN)
+                    end
+                    next_map[from] = to_norm
+                end
+            end
+            card.effort_map = next_map
+        else
+            return nil, "effort_map must be an array"
+        end
+    end
+
+    if patch.modalities ~= nil or patch.modalities == JSON_NULL then
+        local raw = patch.modalities
+        if raw == JSON_NULL then
+            card.modalities = nil
+        elseif CS_LEXICON.is_array(raw) then
+            local caps = {}
+            for _, item in ipairs(raw) do
+                if type(item) == "string" then
+                    local cap = CS_LEXICON.lower(CS_LEXICON.trim(item))
+                    if CS_LEXICON.MODALITY_SET[cap] then caps[#caps + 1] = cap end
+                end
+            end
+            if #caps == 0 then
+                card.modalities = { "text" }  -- explicit empty = text only, not auto
+            else
+                table.insert(caps, 1, "text")
+                local seen, ordered = {}, {}
+                for _, cap in ipairs(caps) do
+                    if not seen[cap] then seen[cap] = true ordered[#ordered + 1] = cap end
+                end
+                table.sort(ordered, function(a, b)
+                    if a == "text" then return b ~= "text" end
+                    if b == "text" then return false end
+                    return a < b
+                end)
+                card.modalities = ordered
+            end
+        else
+            return nil, "modalities must be an array or null"
+        end
+    end
+
+    -- 五个能力位（tool use 加上 2026-10-05 补齐的 streaming / reasoning / vision /
+    -- reasoning_effort）：三态，nil = 不知道，false = 操作员说了不支持。解析口径照抄
+    -- 其他卡片字段：absent = leave alone，null = clear 回「不知道」，布尔 = 写死。
+    -- 这一族是「config 声明 > 引擎自报 > 整键省略」优先级里 config 那一层的唯一入口。
+    -- 字段名与虚拟模型条目、UI 完全同名（扁平三态，与已上线的 supports_tool_use 同形状）：
+    -- 刻意不折进 supports:{} 子对象，那会让已被测试钉住的 supports_tool_use 长出第二条路径。
+    -- 五条走同一个循环，「每条都被读写」因此是结构性事实，而不是逐字段抄写的细心。
+    for _, field in ipairs({ "supports_tool_use", "supports_streaming",
+                             "supports_reasoning", "supports_vision",
+                             "supports_reasoning_effort" }) do
+        local raw = patch[field]
+        if raw ~= nil then
+            if raw == JSON_NULL then
+                card[field] = nil
+            elseif type(raw) == "boolean" then
+                card[field] = raw
+            else
+                return nil, string.format("%s must be a boolean or null", field)
+            end
+        end
+    end
+    return true
+end
+
+--- Configuration-time check for the *declared* window of a virtual-model entry.
+---
+--- 背景（生产 21.k:8801，2026-10-04）：操作员给入口写 context_window=350000，而该组里的
+--- 引擎实际只装得下 262144（SGLang 报 context_length 524288，但反复告警 derived
+--- context_length 262144，模型 config 的 original_max_position_embeddings 也是 262144）。
+--- 老版本网关还会把这个声明值当输出预算塞进 max_tokens，于是「输入 + 350000」超过真实窗口
+--- 直接 400。router 侧已经不再改写任何输出预算（commit 75ecc37），这里补上另一半：声明窗口
+--- 必须在**配置期**就落在服务真实能力之内，让操作员当场看到矛盾，而不是等线上 400。
+---   * 只在条目真的写了 context_window、且组内**至少一张**卡声明了 context_limit 时判定；
+---     谁都没声明 = 不知道引擎真实能力 = 不校验（宽容，不假装知道）；
+---   * 组内多个读数取**最小值**：一组由该入口不控制的引擎提供服务，只有按最窄的那台才算安全
+---     口径（与 virtual_ctx_cap 取最小值同一个理由）；
+---   * 比较是**严格小于**：声明值等于真实限制同样拒绝（整窗都占满 = 没有余量）。
+--- 读数来源与 ctx_cap 同形状：卡片的 context_limit 优先，其次平铺的 cfg.model_context_limit。
+---
+--- 只在两条**入口写入**路径上调用（apply_profiles 与 apply_document）。两处刻意不判：
+---   * cfg_from_document —— 它同时是磁盘快照的读路径，在那里拒绝会让一份已经落盘的配置在下次
+---     reload 整体退回 env 默认（等于把网关配置抹平）。矛盾要让操作员在保存时看到，不能让已经
+---     跑着的实例在重启时失去配置；
+---   * apply_model_config（单卡写入）—— 那正是操作员**登记引擎真实读数**的动作。若在这里拦下
+---     「已有入口配得过宽」，就变成「因为存在坏入口，所以永远记不下它到底能装多少」，操作员
+---     只能先猜一个数再改回来，等于把修复顺序堵死。读数一登记完，下一次入口保存就被拦。
+---@param cfg table @ 即将生效的配置（map 形态，卡片与条目都已装配好）
+---@return boolean ok, string|nil err
+local function validate_declared_context_windows(cfg)
+    if type(cfg) ~= "table" then return true end
+    local limits = cfg.model_context_limit or {}
+    local cards = cfg.model_configs or {}
+    for _, alias in ipairs(CS_LEXICON.sorted_keys(cfg.virtual_profiles or {})) do
+        local profile = cfg.virtual_profiles[alias]
+        local declared = type(profile) == "table" and profile.context_window or nil
+        if type(declared) == "number" and declared >= 1 then
+            -- 判定范围 = 这个入口的服务组；没有组的单绑定行退到代表值，与 virtual_ctx_cap
+            -- 的「组只有一个成员就是它自己」同口径。
+            local group
+            if type(profile.targets) == "table" and #profile.targets > 0 then
+                group = profile.targets
+            elseif type(profile.target) == "string" and profile.target ~= "" then
+                group = { profile.target }
+            else
+                group = {}
+            end
+            local narrowest, narrowest_model
+            for i = 1, #group do
+                local model = group[i]
+                local card = cards[model]
+                local limit = (card and card.context_limit) or limits[model]
+                if type(limit) == "number" and limit >= 1
+                    and (narrowest == nil or limit < narrowest) then
+                    narrowest, narrowest_model = limit, model
+                end
+            end
+            if narrowest ~= nil and declared >= narrowest then
+                return nil, string.format(
+                    "virtual model %s declares context_window %d, but service %s can only hold %d: the declared window must be strictly smaller than the real context_limit",
+                    alias, declared, tostring(narrowest_model), narrowest)
+            end
+        end
+    end
+    return true
+end
+
+--- Whole-document build (used by apply_document and from_snapshot): every
+--- section is rebuilt from the payload, absent sections stay empty.
+---@param doc table @ decoded document / stored snapshot
+---@param previous table|nil @ url -> prior upstreams row, for key inheritance
+local function cfg_from_document(doc, previous)
+    local cfg = new_cfg()
+    if type(doc) ~= "table" then return cfg end
+
+    if doc.default_effort ~= nil then
+        local raw = doc.default_effort
+        if raw == JSON_NULL then
+            cfg.default_effort = nil
+        elseif type(raw) == "string" then
+            local trimmed = CS_LEXICON.trim(raw)
+            if trimmed ~= "" and CS_LEXICON.lower(trimmed) ~= "null" then
+                local effort = CS_FACADE.normalize_effort(trimmed)
+                if effort == false then
+                    return nil, string.format("unknown default_effort: %s", trimmed)
+                end
+                cfg.default_effort = effort
+            end
+        else
+            return nil, "default_effort must be a string or null"
+        end
+    end
+
+    if doc.effort_map ~= nil then
+        if not CS_LEXICON.is_array(doc.effort_map) then return nil, "effort_map must be an array" end
+        for _, entry in ipairs(doc.effort_map) do
+            local from = CS_FACADE.normalize_effort(entry.from)
+            local to = CS_LEXICON.trim(entry.to)
+            if from == false or from == nil then
+                return nil, string.format("unknown effort in effort_map: %s", tostring(entry.from or ""))
+            end
+            if to ~= "" then
+                local to_norm = CS_FACADE.normalize_effort(to)
+                if to_norm == false then
+                    return nil, string.format("unknown effort in effort_map target: %s", to)
+                end
+                cfg.effort_map[from] = to_norm
+            end
+        end
+    end
+
+    if doc.model_ctx ~= nil then
+        if not CS_LEXICON.is_array(doc.model_ctx) then return nil, "model_ctx must be an array" end
+        for _, entry in ipairs(doc.model_ctx) do
+            local model = CS_LEXICON.trim(entry.model)
+            if model ~= "" then
+                if entry.ctx == nil or entry.ctx == JSON_NULL then
+                    return nil, string.format("model_ctx for %s needs a numeric ctx", model)
+                end
+                local ctx = CS_LEXICON.parse_positive_int(entry.ctx)
+                if not ctx then
+                    return nil, string.format("model_ctx for %s must be greater than zero", model)
+                end
+                cfg.model_ctx[model] = ctx
+            end
+        end
+    end
+
+    -- 平铺层的「服务实际上下文限制」，解析口径照抄 model_ctx 那一套：行形状
+    -- {model, context_limit}，值必须是正整数（缺值或非法值与 model_ctx 同文案家族报错）。
+    -- 卡片上的 context_limit 优先，这一层是没有卡片时的兜底读数。
+    if doc.model_context_limit ~= nil then
+        if not CS_LEXICON.is_array(doc.model_context_limit) then
+            return nil, "model_context_limit must be an array"
+        end
+        for _, entry in ipairs(doc.model_context_limit) do
+            local model = CS_LEXICON.trim(entry.model)
+            if model ~= "" then
+                local raw = entry.context_limit
+                if raw == nil or raw == JSON_NULL then
+                    return nil, string.format("model_context_limit for %s needs a numeric context_limit", model)
+                end
+                local limit = CS_LEXICON.parse_positive_int(raw)
+                if not limit then
+                    return nil, string.format("model_context_limit for %s must be greater than zero", model)
+                end
+                cfg.model_context_limit[model] = limit
+            end
+        end
+    end
+
+    if doc.model_effort ~= nil then
+        if not CS_LEXICON.is_array(doc.model_effort) then return nil, "model_effort must be an array" end
+        for _, entry in ipairs(doc.model_effort) do
+            local model = CS_LEXICON.trim(entry.model)
+            local raw = entry.effort
+            local trimmed = type(raw) == "string" and CS_LEXICON.trim(raw) or ""
+            if model ~= "" and trimmed ~= "" and CS_LEXICON.lower(trimmed) ~= "null" then
+                local effort = CS_FACADE.normalize_effort(trimmed)
+                if effort == false then
+                    return nil, string.format("unknown effort for %s", model)
+                end
+                cfg.model_effort[model] = effort
+            end
+        end
+    end
+
+    if doc.virtual_models ~= nil then
+        if not CS_LEXICON.is_array(doc.virtual_models) then return nil, "virtual_models must be an array" end
+        local built, berr = CS_PROFILES.build_profiles(doc.virtual_models, nil)
+        if not built then return nil, berr end
+        for alias, profile in pairs(built) do
+            cfg.virtual_profiles[alias] = profile
+        end
+        sync_virtual_view(cfg)
+    end
+
+    if doc.upstreams ~= nil then
+        local rows, uerr = CS_UPSTREAMS.build_upstreams(rawget(doc, "upstreams"), previous)
+        if not rows then return nil, uerr end
+        cfg.upstreams = rows
+    end
+
+    if doc.policy ~= nil then
+        local raw = doc.policy
+        if raw == JSON_NULL then
+            cfg.policy = nil
+        elseif type(raw) == "string" then
+            local trimmed = CS_LEXICON.trim(raw)
+            if trimmed == "" or CS_LEXICON.lower(trimmed) == "null" then
+                cfg.policy = nil
+            else
+                local name = CS_FACADE.normalize_policy(trimmed)
+                if name == false then
+                    return nil, string.format("unknown policy: %s (want one of %s)",
+                        trimmed, CS_LEXICON.POLICY_NAMES_JOIN)
+                end
+                cfg.policy = name
+            end
+        else
+            return nil, "policy must be a string or null"
+        end
+    end
+
+    if doc.model_policies ~= nil then
+        if not CS_LEXICON.is_array(doc.model_policies) then return nil, "model_policies must be an array" end
+        local built = {}
+        for _, entry in ipairs(doc.model_policies) do
+            local model = CS_LEXICON.trim(entry.model)
+            if model == "" then
+                return nil, "every model_policies entry needs a model"
+            end
+            local raw = entry.policy
+            local trimmed = type(raw) == "string" and CS_LEXICON.trim(raw) or ""
+            if raw == JSON_NULL or trimmed == "" or CS_LEXICON.lower(trimmed) == "null" then
+                -- an explicit null/empty row drops the override (inherit the global)
+                goto next_model_policy
+            end
+            local name = CS_FACADE.normalize_policy(trimmed)
+            if name == false then
+                return nil, string.format("unknown policy for %s: %s (want one of %s)",
+                    model, trimmed, CS_LEXICON.POLICY_NAMES_JOIN)
+            end
+            built[model] = name
+            ::next_model_policy::
+        end
+        cfg.model_policies = built
+    end
+
+    if doc.model_configs ~= nil then
+        if not CS_LEXICON.is_array(doc.model_configs) then return nil, "model_configs must be an array" end
+        local built = {}
+        for _, entry in ipairs(doc.model_configs) do
+            local model = CS_LEXICON.trim(entry.model)
+            if model == "" then return nil, "every model_configs entry needs a model" end
+            local card = new_card()
+            local ok, err = merge_model_patch(card, entry)
+            if not ok then return nil, err end
+            built[model] = card
+        end
+        cfg.model_configs = built
+    end
+
+    -- /v1/models「只广告虚拟入口」开关的磁盘层。三态与缺省纪律：
+    --   * 键缺席（含老配置文件）= 「没说」= 保持 nil,让给环境层；
+    --   * 显式 null 同上,是 JSON 编辑器里「擦掉这条声明」的写法,不是「关」；
+    --   * true / false 都是结论,false 也是「说了要全量广告」,必须压过 env 的 true。
+    -- 非布尔的垃圾值按「未知字段拒绝」的老口径报错（同 supports_tool_use 文案家族）：
+    -- 这是 /_ui/config 权威面的整表写入口,静默吞掉一个能改变对外广告形状的键,等于让
+    -- 操作员以为他打开了开关。
+    do
+        local raw = rawget(doc, "models_virtual_only")
+        if raw ~= nil then
+            if raw == JSON_NULL then
+                cfg.models_virtual_only = nil
+            elseif type(raw) == "boolean" then
+                cfg.models_virtual_only = raw
+            else
+                return nil, "models_virtual_only must be a boolean or null"
+            end
+        end
+    end
+
+    return cfg
+end
+
+_M.cfg_from_document = cfg_from_document
+
+_M.snapshot_of = snapshot_of
+
+-- ------------------------------------------------------------ shared storage
+
+-- ------------------------------------------------- 跨子模块直调的原文 local
+-- 这些函数在原文里是同文件 local 直调、从未挂在 _M 上；拆开后由调用方直接 require 本表
+-- 调用（不经 facade，所以既不是新增导出、也不给单测多开一个可替换点）。
+_M.cfg_from_document = cfg_from_document
+_M.cfg_from_env = cfg_from_env
+_M.effort_pairs = effort_pairs
+_M.merge_model_patch = merge_model_patch
+_M.new_card = new_card
+_M.snapshot_of = snapshot_of
+_M.sync_virtual_view = sync_virtual_view
+_M.validate_declared_context_windows = validate_declared_context_windows
+
+return _M
