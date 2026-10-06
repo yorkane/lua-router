@@ -20,22 +20,27 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261005-190411.log`（tier=full、`KEEP_GOING=1`、
-`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `48b7f6a`）。代码基线：
-`lualib/` **75 个 Lua 文件 / 32 419 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
-单测 13 文件、契约 **666 项 / 23 段**、文档 28 份。
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261006-051452.log`（tier=full、`KEEP_GOING=1`、
+`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `66a891f`）。代码基线：
+`lualib/` **75 个 Lua 文件 / 34 608 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
+单测 13 文件、契约 **691 项 / 24 段**、文档 29 份。
 
 > 锚点取在 2026-10-05 的重构树上：facade + 子模块拆分（router / config_store / registry /
 > watcher / gpu_load / mesh / observability）+ 公共传输库 `httpc.lua` + UI 入口迁移
 > （`/_ui/`→`/u/`、`/_ui/admin/`→`/a/`）全部计入同一份全绿日志，见
 > [doc/refactor-arch-2026-10-05.md](doc/refactor-arch-2026-10-05.md)。上一版锚点（2026-10-03）
 > 遗留的 `[ctx cap]` 断言失效问题也已随 2026-10-04 裁定在测试侧清干净。
+>
+> 当前锚点（2026-10-06）在重构树之上再叠一轮**容量语义重设计**（用户裁定）：并发上下限三态 +
+> GPU 利用率上限取代功率上限 + 绿灯优先选路 + 全池到顶 429，契约新增 `caps` 段（25 项）。执行契约见
+> [doc/caps-redesign-2026-10-06.md](doc/caps-redesign-2026-10-06.md)，实现口径见
+> [doc/gap-worker-caps.md](doc/gap-worker-caps.md)。
 
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
-| unit | luajit 12 + resty 4 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 385 / gpu_load 274 / routing_dyn 122 / profiles 797 / caps_routing 64 / models_shape 83 / models_advertise 70 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
-| contract | **666 / 0 failed / 2 notes** | 23 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
+| unit | luajit 12 + resty 4 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 385 / gpu_load 402 / routing_dyn 122 / profiles 797 / caps_routing 157 / models_shape 83 / models_advertise 70 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
+| contract | **691 / 0 failed / 2 notes** | 24 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
 | e2e_stateful | 101 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
 | e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入 |
@@ -48,16 +53,16 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | e2e_watcher | 108 / 0 | 内建 watcher：三源发现、九条原守卫逐条断言 + 第 10 条守卫（探针确认不可用即摘除，含滞回与单轮保险丝）、model-map 改名、容器重启重发现 |
 | e2e_profiles | 110 / 0 | 虚拟服务入口与 upstreams：白名单 / 入口名走按模型策略（`model_policies[入口名]` 是别名级 policy 停用后的替代入口）/ 停用字段仍接受、仍落盘、解析时 warn 而热路径不读 / api_key 三态与脱敏 / 30s 自愈 / apply 原子性 |
 | e2e_token_accounting | 62 / 0 | 流式 include_usage 透明注入+剥帧、四类 token 指标、400 兜底 sticky |
-| e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry |
+| e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry（mock 的 /metrics 带 `gpu` 标签，利用率通道走同一条路；逐卡归属与容量判定的断言在 e2e_caps S3/S3b） |
 | e2e_routing_dyn | 51 / 0 | 路由动态变更：全局与 per-model 策略热切换免重启、非法名 400 不生效 |
-| e2e_caps | 151 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务并发/功率上限（到限即迁走、读数缺失不排除、上限不摘健康、缺省零变化） |
+| e2e_caps | 175 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务容量三态（S2 三态与 `load_state`、S3/S3b GPU 利用率上限与**逐卡归属**、S4 亲和被打断、S5 全池到顶 **429**、S5b 对照 503、S5c 缺省零变化、S5d 声明层三字段边界、S6 功率通道开关可见性、S8 caps 跨重启存活；读数缺失不排除、上限不摘健康） |
 | e2e_models_advertisement | 190 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
-契约 666 的 23 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
+契约 691 的 24 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
 not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 69、tls_upstream 11、
-cb_race 6、igw 7、discovery 5、prometheus 14、probes 29、cors 37、virtual_models 15、ratelimit 14、
-inflight_age 32、tls_server 19、profiles_upstreams 64。
+cb_race 6、igw 7、caps 25、discovery 5、prometheus 14、probes 29、cors 37、virtual_models 15、
+ratelimit 14、inflight_age 32、tls_server 19、profiles_upstreams 64。
 
 ## 目录
 
@@ -68,14 +73,14 @@ inflight_age 32、tls_server 19、profiles_upstreams 64。
 | `conf/ui.conf` | 全部 UI location：`/_ui/*` 与 `/u/*` 的精确 API 别名、`/u/` 与 `/a/` 静态、旧入口 302、原版 webui 所需端点的根挂载，由入口脚本按存在性 include 进 server{} |
 | `docker-entrypoint.sh` | env 校验 → envsubst → `openresty -t` → exec；缺省策略 `cache_aware`；cache_aware 或 mesh 开启且未显式给 `NGINX_WORKER_PROCESSES` 时把 worker 数收到 1；渲染独立 metrics 监听（缺省 `:29000`，`SMG_METRICS_PORT=0` 关闭） |
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` 门 |
-| `lualib/resty/luarouter/` | 实现（75 个 .lua / 32 419 行，`wc -l` 实测）：七个域是「facade + 同名子目录」——router(364)+12 子模块、config_store(132)+10、registry(169)+7、watcher(65)+7、gpu_load(80)+6、mesh(59)+5、observability(1318)+2，另有公共传输库 httpc.lua 与未拆的单文件（policy / policies 6 文件 / hash / hb / init / config / ui / props / limit / store_*），全部接进请求路径；模块地图见 doc/architect.md §3 |
+| `lualib/resty/luarouter/` | 实现（75 个 .lua / 34 608 行，`wc -l` 实测）：七个域是「facade + 同名子目录」——router(364)+12 子模块、config_store(132)+10、registry(174)+7、watcher(65)+7、gpu_load(80)+6、mesh(59)+5、observability(1328)+2，另有公共传输库 httpc.lua 与未拆的单文件（policy / policies 6 文件 / hash / hb / init / config / ui / props / limit / store_*），全部接进请求路径；模块地图见 doc/architect.md §3 |
 | `ui/` | 原版 llama.cpp webui（规范入口 `/u/`）+ `ui/admin/`（Quasar UMD 管理台四页，规范入口 `/a/`：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（href 指 `/a/`；旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`）。控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField 渲染，`:hint` 不生成 `.q-field__bottom`，说明文字只能并进 `:label` |
 | `test/final_gates.sh` | 22 门硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING` / `GATE_JOBS` / `GATE_DRY_RUN`） |
-| `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），23 段 |
+| `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），24 段 |
 | `test/unit/` | 纯 Lua 单测 13 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑） |
 | `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps / models_advertisement（`models_advertisement` 钉 `/v1/models` 的对外形状，2026-10-04 随第 22 门加入 GATE_ORDER） |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
-| `doc/` | 现状文档 28 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
+| `doc/` | 现状文档 29 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
 
 ## 快速启动
 
@@ -138,8 +143,8 @@ docker run -d --name lua-router --network host \
 | 面 | 路由 | 回答 |
 |---|---|---|
 | 公开面 | `/health` `/liveness` `/readiness` `/v1/models` `/model_info` `/server_info`（各有 GET 与 HEAD 别名）、`/metrics`、`/engine_metrics`、`/health_generate` | 200；`/readiness`、`/v1/models`、`/health_generate`、`/engine_metrics` 在无可用 worker 时分别回 503 / 503 / 503 / 500（`/engine_metrics` 的 500 是契约钉住的 worker-free 形态）。`/v1/models` 每条带齐官方四字段，另附 `capabilities` 扩展（形状、字段来源与优先级见下文〈`/v1/models` 的模型对象形状〉）；虚拟服务入口一并广告：单模型入口 `owned_by: llm-router-><model>`、多模型入口 `owned_by: llm-router` + `owned_by_models`，按 id 升序、不覆盖真实 id |
-| 推理面 | `/v1/chat/completions` `/v1/completions` `/v1/embeddings` `/v1/rerank` `/v1/classify` `/v1/responses` `/generate` | 字节透传 + 顶层 `model` 定点改写（虚拟入口转发的是选中候选的绑定名，不是入口名）；**输出预算三写法一律原样透传**——`max_tokens` / `max_completion_tokens` / `/v1/responses` 用的 `max_output_tokens` 都由调用方决定，网关既不改小也不在缺失时代填（用户裁定 2026-10-04），所以引擎拒的一定是调用方自己要的数；受 `SMG_MAX_CONCURRENT_REQUESTS` 限流（拒绝回 **429 空体**）。请求日志行的 `model` 是入口代表值，**实际落点模型看 `forwarded_model`**，调用方给的那个输出预算记在日志行的 `output_budget`（修复后恒等于请求原值）；组入口（显式写过 `targets`）被健康引擎一致拒绝整组模型名时，503 message 是「No available workers (N healthy engines serve none of the mapped models)」，与「全部熔断或不健康」分开定性。`/v1/responses` 是纯透传路由：非流式 2xx 时对响应顶层回填请求侧元数据六字段（`previous_response_id` / `instructions` / `metadata` / `store` / `model` / `safety_identifier`；`conversation` 不回显，它只对已删除的存储平面有意义），只做出站改写、不入库；流式只透传 |
-| 控制面 | `POST /workers`（202 + Location）、`PUT /workers/{id}`（202，三键 `{status,worker_id,message}`）、`GET /workers[/{id}]`、`DELETE /workers/{id}`、`POST /flush_cache`、`GET /v1/loads` | `PUT` 可改 priority / cost / labels（合并）/ api_key / 健康旋钮 / **每服务上限 `max_concurrency` 与 `max_power_w`**，身份字段忽略；非 UUID → 400、未知 → 404、坏 JSON → 400。`GET /workers` 每条带 `models`（该实例真实广告过的模型，主模型恒居首）、`inflight_requests`（纯在飞数，并发上限的比较对象）、`power_w`（新鲜瓦特读数，**缺席=未知**）与两个已归一的上限；未声明的上限字段**缺席而不是 0**。`worker_type` 与 `connection_mode` 收成单值：只有 `regular` 与 `http`（或其 serde 对象拼写、缺省）被接受，其它值一律 400。`/flush_cache` 向全部 worker POST `{}`（5s 超时），回 `{results:[{worker,status,result}], success, all_failed}`；`/v1/loads` 回 `{workers:[{worker,load}], total_workers, successful, failed}`（worker 侧非 2xx / 超时 / 缺字段记 -1）——两者与 Rust 形状不同，有意偏差 |
+| 推理面 | `/v1/chat/completions` `/v1/completions` `/v1/embeddings` `/v1/rerank` `/v1/classify` `/v1/responses` `/generate` | 字节透传 + 顶层 `model` 定点改写（虚拟入口转发的是选中候选的绑定名，不是入口名）；**输出预算三写法一律原样透传**——`max_tokens` / `max_completion_tokens` / `/v1/responses` 用的 `max_output_tokens` 都由调用方决定，网关既不改小也不在缺失时代填（用户裁定 2026-10-04），所以引擎拒的一定是调用方自己要的数；受 `SMG_MAX_CONCURRENT_REQUESTS` 限流（拒绝回 **429 空体**）。请求日志行的 `model` 是入口代表值，**实际落点模型看 `forwarded_model`**，调用方给的那个输出预算记在日志行的 `output_budget`（修复后恒等于请求原值）；组入口（显式写过 `targets`）被健康引擎一致拒绝整组模型名时，503 message 是「No available workers (N healthy engines serve none of the mapped models)」，与「全部熔断或不健康」分开定性。**全池都抵在容量上限上**时（每台都 `load_state=full`、一个候选都不剩）答 **429**：`error.code` 仍是 `no_available_workers`、`error.type` 随状态码为 `Too Many Requests`、message 精确为「No available workers (N at their concurrency or GPU-util limit)」——容量到顶是「暂时不接单」不是「服务不可用」（用户裁定 2026-10-06），熔断/不健康/组不服务仍是 503 原句，两种处置相反（抬上限 vs 查实例）。`/v1/responses` 是纯透传路由：非流式 2xx 时对响应顶层回填请求侧元数据六字段（`previous_response_id` / `instructions` / `metadata` / `store` / `model` / `safety_identifier`；`conversation` 不回显，它只对已删除的存储平面有意义），只做出站改写、不入库；流式只透传 |
+| 控制面 | `POST /workers`（202 + Location）、`PUT /workers/{id}`（202，三键 `{status,worker_id,message}`）、`GET /workers[/{id}]`、`DELETE /workers/{id}`、`POST /flush_cache`、`GET /v1/loads` | `PUT` 可改 priority / cost / labels（合并）/ api_key / 健康旋钮 / **每服务容量三字段 `min_concurrency`（并发调度下限，整数 1..31）/ `max_concurrency`（并发调度上限，整数 1..32）/ `max_gpu_util`（GPU 利用率上限，整数百分比 0..100）**，身份字段忽略；非 UUID → 400、未知 → 404、坏 JSON → 400；退役的 `max_power_w` 与任何未知字段一样被忽略。`GET /workers` 每条带 `models`（该实例真实广告过的模型，主模型恒居首）、`inflight_requests`（纯在飞数，并发档的比较对象）、`gpu_util`（该 worker 自己那张卡的 0..1 新鲜利用率，**缺席=未知**）、`power_w`（新鲜瓦特读数，**缺席=未知**；纯观测，不参与任何容量判定）、三个已归一的上限，以及**判定结果本身** `load_state`（`idle`/`busy`/`full`，由 `registry.capacity_state` 一处算出；**这台没声明任何上限时该键整个缺席**，不是 null——前端只读不重算）；未声明的上限字段**缺席而不是 0**（利用率档的 0 是最严档，不是清除）。`metadata` 里带 watcher 解析出的 `gpu` 卡号（容器名 `…-gpu0`..`…-gpu7` 或进程 `--device-id` / `CUDA_VISIBLE_DEVICES`），管理台据此在实例名后画 GPU 徽章。`worker_type` 与 `connection_mode` 收成单值：只有 `regular` 与 `http`（或其 serde 对象拼写、缺省）被接受，其它值一律 400。`/flush_cache` 向全部 worker POST `{}`（5s 超时），回 `{results:[{worker,status,result}], success, all_failed}`；`/v1/loads` 回 `{workers:[{worker,load}], total_workers, successful, failed}`（worker 侧非 2xx / 超时 / 缺字段记 -1）——两者与 Rust 形状不同，有意偏差 |
 | mesh / HA 面 | `/ha/{status,health,workers[/id],policies[/id],config[/key],rate-limit,rate-limit/stats,stats,shutdown}` + `/_mesh/internal/{ping,sync,apply,state}` | `SMG_ENABLE_MESH` 未设（缺省）→ `/ha/*` 全部固定 503 `{"error":"mesh not enabled"}`；开启后委托 `mesh.dispatch`，未知的深路径回 404 `{"error":"unknown ha route: <METHOD> <path>"}`。`/_mesh/internal/*` 无鉴权无 loopback 围栏，**信任边界就是网络本身** |
 | `/u/` 与 `/a/` | 页面入口：`/u/` = 原版 llama.cpp webui，`/a/` = 管理台四页（模型管理 / 服务池 / 路由策略 / 日志监控，按使用频度排序）。旧入口 `/_ui` 与 `/_ui/admin/` 各 302 过来（相对引用 + no-store）；`/_ui/*` 精确 API 别名全部保留、`/_ui/` 静态双活（当前 bundle 的硬编码路径不受影响）。原版 webui 所需端点已**根挂载**：`/props` `/slots` `/tools` `/models/load` `/models/unload` `/models/sse` `/v1/stream` `/v1/streams/lookup` `/v1/chat/completions/control` `/properties`，`/u/` 与原 `/_ui/` 双活 | **无鉴权**；已注册路径的错误方法按 404 sink 回答 |
 | 404 sink | 任意未注册路径（含已删的 `/v1/conversations*`、`/v1/tokenize`、`/parse/*` 等） | `{"error":{"type":"Not Found","code":"not_found",…}}` |
@@ -159,7 +164,7 @@ docker run -d --name lua-router --network host \
 `advertise_virtual_entry` → `fill_model_fields`。对外列表里的模型名来自 `registry/records.lua` 的
 `models()`——它是 Rust 对拍钉住的那一列，
 只取每条 worker 的**主模型** `model_id`，因此一台引擎广告多个名字时只有主模型出现在这里
-（多广告的那些走同文件的 `all_models()` / `worker_models()`，目前无人消费，见 doc/gap-worker-caps.md §8）。
+（多广告的那些走同文件的 `all_models()` / `worker_models()`，目前无人消费，见 doc/gap-worker-caps.md §11）。
 虚拟入口由同文件的 `inject_virtual_models` 追加：入口名与某个真实 worker 同名则丢弃别名，
 最后整表按 id 升序。无可用 worker 时整个响应是 503 纯文本 `No models available`（不是 JSON——Rust 侧只重写带
 `data` 数组的响应，这个文本答案原样透传，见 `models_handler` 的 worker-free 分支）。
@@ -356,28 +361,66 @@ watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连�
 限流只管推理面：公开面、控制面、`/_ui/*` 都不占令牌。拒绝回 **429 + 空体**；令牌在
 `finish_request`（流式 pump 完）与 `on_log`（客户端中途断开）双点归还。
 
-### GPU 负载源与每服务上限（`SMG_LOAD_*`，缺省全关）
+### GPU 负载源与每服务容量上限（`SMG_LOAD_*`）
 
-负载两路源（`none|metrics|prom`）的 env 表在 [doc/gap-gpu-load.md](doc/gap-gpu-load.md) §5；
-下面是**每服务并发/功率上限**那三个开关（[doc/gap-worker-caps.md](doc/gap-worker-caps.md) §4）。
+负载两路源（`none|metrics|prom`）的 env 表在 [doc/gap-gpu-load.md](doc/gap-gpu-load.md) §5；容量判定
+（三态 / 绿灯优先 / 429）的完整口径在 [doc/gap-worker-caps.md](doc/gap-worker-caps.md)。
+
+**每服务上限是 worker 记录上的三个字段，不是 env**（用户裁定 2026-10-06）：
+`min_concurrency`（并发调度**下限**，整数 1..31，缺席等价 1；在飞低于它 = 绿灯）、
+`max_concurrency`（并发调度**上限**，整数 1..32，`<=0`/非数字 = 不限，向下取整；达到即红灯）、
+`max_gpu_util`（**GPU 利用率上限**，整数百分比 0..100；缺席 = 不限，**0 是合法的最严档**而不是清除，
+清除用负数或删键）。可经 `POST/PUT /workers`、`upstreams` 声明、config 声明层配置。
+
+三态：`full` = 在飞 ≥ 上限，或**新鲜**利用率读数 ≥ `max_gpu_util`；`idle` = 未 full 且在飞 < 下限；
+其余 `busy`。判定只在一处（`registry.capacity_state`），`/workers` 的 `load_state` 与选路的绿灯优先
+裁剪读的是同一次判定。`full` 在候选集层面**硬排除**（即使 cache_aware 亲和命中也迁走）；
+有 idle 时黄灯**让位**（是裁剪不是排除，计 `smg_worker_capacity_preferred_idle_total`）；
+全池没有 idle 时黄灯继续接活直到触自己的上限。**不摘 worker、不改健康**。两条读数各自的
+「未知」语义：`inflight` 是本网关自有计数（缺键 = 0，从不「未知」）；`gpu_util` 是外部采样，
+**缺席 = 未知 → 不排除**（监控挂掉只许损失精度，不许损失容量）。
+
+**全池都抵在上限上**（`capped > 0` 且候选为空）答 **429**
+`no_available_workers` +「No available workers (N at their concurrency or GPU-util limit)」；
+熔断 / 不健康 / 组不服务保持 **503** 与原句不动。
+
+指标：`smg_worker_capacity_excluded_total{reason="concurrency_max|gpu_util"}`
+与 `smg_worker_capacity_preferred_idle_total`（Lua 独有超集），加利用率族 `lr_gpu_load_util_*`。
+
+**`max_power_w`（瓦特上限）已退役**：声明层读到 warn 一次并丢弃、`PUT` 忽略、`/workers` 不回显、
+容量判定不读。**功率采集链保留**为纯观测（`pw:` 键、`lr_gpu_load_power_*` 六族、`power_w` 字段），
+换掉它的理由是 21.k 实测八个实例的功率读数完全相同（整机最热卡口径，八台同值），零区分度；
+DCGM 的 `DCGM_FI_DEV_GPU_UTIL` 带 `gpu="0".."7"` 标签才能逐卡区分。见
+[doc/gap-worker-caps.md](doc/gap-worker-caps.md) §6。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SMG_LOAD_POWER` | 关 | `SMG_LOAD_SOURCE=metrics` 时是否顺带扫功率 gauge |
-| `SMG_LOAD_POWER_KEYS` | `DCGM_FI_DEV_POWER_USAGE` | 功率 gauge 名单（逗号/空格分隔）。`node_hwmon_*` 是整机口径，配「取最大」会把同机 worker 全体顶穿上限，故刻意不进缺省 |
-| `SMG_LOAD_POWER_QUERY` | 空 = 不采功率 | `SMG_LOAD_SOURCE=prom` 时的第二条 PromQL（须保留 `instance` 标签，否则机器归属退化成采不到） |
+| `SMG_LOAD_UTIL_ENABLED` | **开（1）** | 利用率通道（`gu:` 键，容量判定的数据源）是否采集。缺省开 = 零选路行为变化：判定只在记录显式配了 `max_gpu_util` 时发生 |
+| `SMG_LOAD_UTIL_QUERY` | 空 = 缺省串 | prom 路的第三条 PromQL。缺省 `max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)`——**`gpu` 必须留在 by 里**，聚合掉它 = 八台 worker 共用一个数 |
+| `SMG_LOAD_UTIL_KEYS` | 空 = 内置名册 | metrics 路的利用率 gauge 名册。内置含 `dcgm_fi_dev_gpu_util`（DCGM 真名）+ nvidia/dcgm 两个同量纲写法，**刻意不含 KV-cache 用量名** |
 
-每服务上限本身是 **worker 记录上的字段**，不是 env：`max_concurrency`（在飞请求数上限，`<=0`/非数字
-= 不限，向下取整）与 `max_power_w`（瓦特上限，`<=0`/非数字 = 不限），可经 `POST/PUT /workers`、
-`upstreams` 声明、config 声明层配置。到顶即在候选集层面**硬排除**（即使 cache_aware 亲和命中也迁走），
-不摘 worker、不改健康；**功率读数未知时不排除**；全场都在上限上时 503 `no_available_workers`
-不放宽，message 追加「N at their configured concurrency/power cap」。指标：
-`smg_worker_capacity_excluded_total{reason="concurrency|power"}`（Lua 独有超集）与
-`lr_gpu_load_power_*` 六族。
+这三个名字走 `config.lua` 装配（fork 前解析，天然进 `/probe/config`），三份 conf 也一并 `env` 声明
+（给 `util_config` 的 `os.getenv` 兜底分支放行）。仍**不可热改**：worker 环境 fork 时固定，生效方式是
+重启容器。
 
-⚠ 这三个名字由 `gpu_load` 自己 `os.getenv` 现读、**没进 `config.lua`**：必须三份 conf 都显式
-`env` 声明（漏一份就静默失效）、**不可热改**（worker 环境 fork 时固定）、也进不了 `/_ui/config`
-的 JSON 视图与管理台。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SMG_LOAD_POWER` | 关 | （纯观测）`SMG_LOAD_SOURCE=metrics` 时是否顺带扫功率 gauge |
+| `SMG_LOAD_POWER_KEYS` | `DCGM_FI_DEV_POWER_USAGE` | 功率 gauge 名单（逗号/空格分隔）。`node_hwmon_*` 是整机口径，配「取最大」会把同机 worker 全体读成同一个数，故刻意不进缺省 |
+| `SMG_LOAD_POWER_QUERY` | 空 = 不采功率 | prom 路的第二条 PromQL（须保留 `instance` 标签，否则机器归属退化成采不到） |
+
+⚠ 功率这三个名字由 `gpu_load` 自己 `os.getenv` 现读、**没进 `config.lua`**：必须三份 conf 都显式
+`env` 声明（漏一份就静默失效）、**不可热改**、也进不了 `/_ui/config` 的 JSON 视图与管理台。
+四组通道（负载 / 功率 / 利用率）**全部搭载**在负载源上：`SMG_LOAD_SOURCE=none` 时定时器根本不启动，
+设了任何开关都不会有读数（registry 侧一律按「未知 → 不排除」放行，留去重 WARN）。
+
+**GPU 归属标注**：watcher 从容器名解析 `gpu<N>`（`gpu_from_name`），并对 proc 一路发现的候选补一次
+socket→pid→cmdline 解析（`gpu_from_cmdline` 读 `--device-id N`，其次 `CUDA_VISIBLE_DEVICES=N`），
+只在原值为空时填充、已有值绝不覆盖，落进台账 `g|<url>` 与记录 `labels.gpu`，于是 `/workers` 的
+`metadata.gpu` 有值、管理台实例名后亮出 GPU 徽章，`gu:` 的逐卡归属也有了地址。它是**纯 label**：
+不进排除、不进摘除、不进探针、不进宽限，任何一步失败一律降级为没有标注，服务发现本身一个字节
+都不受影响（21.k 的形状：`qwen38-27b-dflash-tgt-gpu0` 在 8012、`pennyroyal-orca-gpu1` 在 8021、
+`q38fn-pennyroyal-gpu2..7` 在 8022–8027）。
 
 ### watcher 服务发现（`SMG_WATCHER_ENABLED`，缺省关）
 
@@ -493,13 +536,15 @@ docker run --rm -v "$PWD:/repo:ro" -w /repo \
   路线在 [doc/gap-tls-chain.md](doc/gap-tls-chain.md) §5/§6）；③ mTLS 客户端证书鉴权未实现
   （e2e_tls_chain 已实测）；④ watcher 扫描污染根治（proc 扫描需要端口黑白名单或 GPU 负载门禁
   标签，以区分测试 mock）；⑤ UI 会话历史页（history 平面已删，原版 webui 的会话页待下次 UI
-  升级摘除）；⑥ GPU↔worker 映射靠 host（同机独立多卡会共享读数，见
-  [doc/gap-gpu-load.md](doc/gap-gpu-load.md)）。
-  ⑦ 每服务上限的两个残余缺口（mesh 不同步 `models`/上限→上限每网关独立；`disable_health_check` 的
-  worker 永不获得引擎背书，组入口的模型背书只能靠 config 行声明），见
-  [doc/gap-worker-caps.md](doc/gap-worker-caps.md) §8；⑧ 功率三开关未进 `config.lua`/JSON/UI
-  （`SMG_LOAD_POWER` 一族由 gpu_load 现读 env，不可热改、管理台看不见）；⑨ `registry.info()` 不输出
-  `models_verified`，管理台的「引擎已验证」徽章与模型页的已验证计数恒不生效（补一个字段即通）。
+  升级摘除）；⑥ **打分**那一路的 GPU↔worker 映射仍靠 host（同机独立多卡共享 `xl:` 读数；准入门用的
+  `gu:` 有逐卡归属，见 [doc/gap-gpu-load.md](doc/gap-gpu-load.md) §8 / §10）。
+  ⑦ 每服务上限的残余缺口（mesh 不同步 `models`/三个上限→上限每网关独立；`disable_health_check` 的
+  worker 永不获得引擎背书，组入口的模型背书只能靠 config 行声明；`lr_gpu_load_util_gpu` /
+  `lr_gpu_load_power_watts` 这类 gauge 无 TTL，worker 删除后旧序列留在 `/metrics`），见
+  [doc/gap-worker-caps.md](doc/gap-worker-caps.md) §11；⑧ 功率三开关未进 `config.lua`/JSON/UI
+  （`SMG_LOAD_POWER` 一族由 gpu_load 现读 env，不可热改、管理台看不见；利用率那三个已走
+  `config.lua`）；⑨ `registry/records.lua` 的 `info()` 不输出 `models_verified`，管理台的
+  「引擎已验证」徽章与模型页的已验证计数恒不生效（补一个字段即通）。
 - **TODO 不实现**（用户指示 2026-09-30）：MCP server 调用、wasm 中间件，唯一口径
   [doc/todo-deferred.md](doc/todo-deferred.md)。引用时不要写成「在接」「排期中」：`/wasm` 三条
   路由固定 501，`smg_mcp_*` 四条家族刻意不注册。
@@ -514,7 +559,7 @@ grep -rn 'require *"resty\.luarouter\.<模块>"' lualib/resty/luarouter \
 
 ## 文档索引
 
-doc/ 现状文档 28 份。裁剪前平面的历史留档（feature-gap、verification、impl-*、fix-majors、
+doc/ 现状文档 29 份。裁剪前平面的历史留档（feature-gap、verification、impl-*、fix-majors、
 gap-{grpc,history,tokenizer,otel,discovery-watch,dp-jwt,auth-tls,http-semantics,core,integration,
 test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精简删除，需要时查 git 历史。
 
@@ -533,7 +578,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-mesh.md](doc/gap-mesh.md) | mesh / HA 的 CRDT 设计、带宽代价与围栏 |
 | [doc/gap-mesh-final.md](doc/gap-mesh-final.md) | `/ha/status` 幻影键根因与真修 + 双真节点 e2e |
 | [doc/gap-watcher-merge.md](doc/gap-watcher-merge.md) | watcher 合并入进程：三源发现、九条原守卫对照 + 第 10 条摘除守卫、env 映射与偏差 |
-| [doc/gap-gpu-load.md](doc/gap-gpu-load.md) | GPU 负载源：metrics 抓取与远程 Prom 查询两路、优先级与 TTL |
+| [doc/gap-gpu-load.md](doc/gap-gpu-load.md) | GPU 负载源：metrics 抓取与远程 Prom 查询两路、优先级与 TTL；功率观测通道（纯观测）与逐卡利用率准入门 |
 | [doc/gap-routing-dyn.md](doc/gap-routing-dyn.md) | 路由动态变更：policy/model_policies 热配置与优先级链 |
 | [doc/gap-token-accounting.md](doc/gap-token-accounting.md) | 流式 token 核算：include_usage 注入/剥帧、四类 token 指标 |
 | [doc/gap-inflight-age.md](doc/gap-inflight-age.md) | 在途请求年龄采样：槽表、TTL 与 Rust 语义偏差 |
@@ -541,7 +586,8 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-tls-chain.md](doc/gap-tls-chain.md) | 证书链 / SNI / 握手负例门与入口预检缺口 |
 | [doc/gap-virtual-models.md](doc/gap-virtual-models.md) | 虚拟模型服务主入口（1 对多 `targets` + 条目级 `context_window`＝对外声明的上下文总窗口 + 卡片 `context_limit` 配置期校验）与 upstreams 持久化接入 |
 | [doc/gap-pool-merge.md](doc/gap-pool-merge.md) | 服务池页：运行态与声明态的统一视图、归属徽章、上限的事实来源 |
-| [doc/gap-worker-caps.md](doc/gap-worker-caps.md) | 每服务并发/功率上限：候选集硬排除、最热卡功率口径、功率通道与残余缺口 |
+| [doc/caps-redesign-2026-10-06.md](doc/caps-redesign-2026-10-06.md) | 容量语义重设计的执行契约：三条裁定、字段/三态/绿灯优先/429 的逐节口径、UI 契约与波次文件所有权 |
+| [doc/gap-worker-caps.md](doc/gap-worker-caps.md) | 每服务容量三态：并发上下限 + GPU 利用率上限、候选集硬排除与绿灯优先、全池到顶 429、功率上限退役与残余缺口 |
 | [doc/parity-cpu-ablation.md](doc/parity-cpu-ablation.md) | 1.54x CPU 回退定责与消融实验计划 |
 | [doc/parity-contract.md](doc/parity-contract.md) | 契约对拍原始报告（33 组） |
 | [doc/parity-routing.md](doc/parity-routing.md) | 路由行为对拍原始报告 |

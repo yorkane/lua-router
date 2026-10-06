@@ -110,8 +110,12 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
 - 并发上限：给 8026 配 max_concurrency=1，并发压上去之后
   smg_worker_capacity_excluded_total{reason="concurrency"} 真实增长，流量迁到 8025/8027，
   而 8026 本身仍留在池中——上限是选路信号而不是健康信号，不摘 worker。
-- 功率上限：给 8025 配 max_power_w=50（实测 96W）后
+- 功率上限（**⚠️ 旧口径历史记录，已被 2026-10-06 的 `max_gpu_util`（GPU 利用率上限）取代**）：
+  给 8025 配 max_power_w=50（实测 96W）后
   smg_worker_capacity_excluded_total{reason="power"} 增长，该 worker 被跳过、请求仍成功。
+  判定现在读的是**逐卡利用率**，功率整条链只保留为纯观测；本条与下面两段功率段落保留为当时
+  （2026-10-01）记录的事实，现行口径见文末〈2026-10-06 容量新口径部署提示〉与
+  [gap-worker-caps.md](gap-worker-caps.md)。
 - 验证完已把两个 worker 的上限与全部虚拟模型配置清回（workers with caps: 0 / 8，
   health OK，推理 200）。
 
@@ -147,6 +151,10 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
   别误判成「上限没摘干净」。
 ### 功率上限的真机形态（2026-10-01 23:1x）
 
+> ⚠️ 旧口径历史记录：功率上限（`max_power_w`）已于 2026-10-06 被 `max_gpu_util`（GPU 利用率上限）取代——
+> 判定改读逐卡利用率，功率整条链只保留为**纯观测**。以下保留为当时（2026-10-01）记录的事实，
+> 现行口径见文末〈2026-10-06 容量新口径部署提示〉与 [gap-worker-caps.md](gap-worker-caps.md)。
+
 **这台机器上功率是整机共享读数**（8/8 worker 的 lr_gpu_load_power_watts 完全相同，95.982W），
 所以给单个 worker 配 max_power_w 会连带排除同机全部实例——这不是 bug，是「最热卡口径」的
 必然结果，也正是该口径在单卡隔离部署（CUDA_VISIBLE_DEVICES 级）下才有区分度的原因。
@@ -164,6 +172,13 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
 （功率超限 → 迁到另一 worker、读数缺失 → 不排除），真机这边只能给出共享口径的证据。
 
 ### 清限的一个操作坑
+
+> ⚠️ 旧口径历史记录：功率上限（`max_power_w`）已于 2026-10-06 被 `max_gpu_util`（GPU 利用率上限）取代——
+> 判定改读逐卡利用率，功率整条链只保留为**纯观测**。以下保留为当时（2026-10-01）记录的事实，
+> 现行口径见文末〈2026-10-06 容量新口径部署提示〉与 [gap-worker-caps.md](gap-worker-caps.md)。
+
+> 本段「PUT 写 0 = 清回不限」是**当时的清除拼法**，已随功率上限退役；现行清除哨兵见文末：
+> 并发两档写 0 即清除，利用率档写 0 是**最严档**、清除要写负数或删键。
 
 PUT max_power_w=0 / max_concurrency=0 是「清回不限」，但**连续对多个 worker 快速发
 PUT 时，后两条可能不生效**（update 走后台队列，间隔太近会挤在一起）。表现为 /workers 里
@@ -272,3 +287,88 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 
 **踩过的坑**：/_ui/logs 被 conf/ui.conf 的 location 接管，调用的是 observability.handle_logs()，
 不是 router.lua 的 ui_logs_handler。改 handler 没用，必须改 handle_logs()。
+
+## 2026-10-06 容量新口径部署提示
+
+上面「功率上限」那几段是**历史记录**。本轮（2026-10-06，HEAD `66a891f`，全量门禁锚点
+`/data/tmp/lr-gates/gates-20261006-051452.log`：22/22 绿、0 skipped）每服务上限换成三个字段，
+判定从「瓦特」改读「逐卡 GPU 利用率」。部署时要用的口径都收在这一节。
+
+### 三个字段怎么配
+
+配在 worker 记录 / `upstreams` 声明行上（`POST|PUT /workers`、`/_ui/config` 的 JSON、config 声明层三条路都通）：
+
+| 字段 | 取值域 | 缺席时 | 清除（已配过之后） |
+|---|---|---|---|
+| `min_concurrency` | 整数 1..31（并发调度**下限**，绿灯线） | 等价 1 | `PUT /workers` 写 0（声明层只认 1..31，写 0 是 400） |
+| `max_concurrency` | 整数 1..32（并发调度**上限**） | 不限 | 写 0（PUT 与声明层都折叠为不限） |
+| `max_gpu_util` | 整数百分比 0..100（GPU 利用率**上限**） | 不限 | 写**负数**（如 -1）或删键 |
+
+注意**声明层删键不等于当场摘门**：`upstreams` 里的 caps 只下发不清除，从声明里删掉要等下次重启
+才消失；要当场摘，用 `PUT /workers/{id}` 写该档的清除哨兵（并发两档 0、利用率档 -1）。
+
+- `max_gpu_util=0` 是**合法的最严档**，不是清除：任何新鲜读数（>=0）都判 `full`——0 的语义是
+  「这台一点都不许接」。这也是它的清除哨兵跟并发两档不一样的原因：并发档 `<=0` 一律折叠成「不限」，
+  利用率档只有「缺失 / 非数字 / 负数」才是「不限」。`config_store` 声明期还钉住
+  `min_concurrency < max_concurrency`，写反了 400。
+- `max_power_w` 已退役：声明层里还写着它的行，解析时 **warn 一次并丢弃该键**；`PUT` 带它和带任何
+  未知字段一样被忽略；`GET /workers` 不再回显。老配置不用手改，它会自己变干净，但别指望改回来还生效。
+- 功率**采集**链没删，只是降级为纯观测：`SMG_LOAD_POWER` / `SMG_LOAD_POWER_KEYS` /
+  `SMG_LOAD_POWER_QUERY` 照旧（`pw:` 键、`lr_gpu_load_power_*` 六族、`/workers` 的 `power_w` 字段），
+  用来看谁热，不再参与任何容量判定。
+
+### 读数未知 = 不排除
+
+`gu:<worker_id>` 是 gpu_load 利用率通道写的 0..1 毫整数（带 TTL）。这条键**缺席就是未知**，未知一律
+不排除——监控挂掉、Prom 查询写错、worker 自己 `/metrics` 拉不到，后果都只是「这一档闸门暂时不生效」，
+绝不允许变成「这台不接活」。所以部署完先确认 `lr_gpu_load_util_workers`（有几台拿到读数）与
+`lr_gpu_load_util_gpu{worker=...}` 真有值，再谈配 `max_gpu_util`；配了闸门而读数一条都没有，等于没配。
+
+利用率三件套走 `config.lua` 装配（缺省即开）：`SMG_LOAD_UTIL_ENABLED=1`、`SMG_LOAD_UTIL_KEYS`
+（空 = 内置名册，含 DCGM 真名 `dcgm_fi_dev_gpu_util`，刻意不含 KV-cache 用量名）、`SMG_LOAD_UTIL_QUERY`
+（空 = `max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)`）。**prom 路的 `gpu` 标签必须留在 `by` 里**：
+聚合掉它，同机 8 台就共用一个数，逐卡归属当场作废（2026-10-04 的 342.371 事故就是这个形状）。判断自己
+是逐卡还是整机口径，看 `lr_gpu_load_util_per_card_workers` 与 `lr_gpu_load_util_fallback_total` 的差——
+回退是**计数**的，不静默。四个通道（负载 / 功率 / 利用率）全部搭载在 `SMG_LOAD_SOURCE` 上，它设成
+`none` 时定时器根本不启动，其他开关设了也不会有读数。
+
+### 选路行为，部署后该怎么验
+
+- `full`（在飞 >= `max_concurrency` **或** 新鲜 `gu:` >= `max_gpu_util`）在候选集装配时**硬排除**，
+  cache_aware 亲和命中也迁走；不摘 worker、不改健康、不进熔断。
+- 有 `idle`（未 full 且在飞 < `min_concurrency`）时只把 idle 子集交给策略，`busy` 让位
+  （`smg_worker_capacity_preferred_idle_total`）；全池没有 idle 时黄灯继续接活直到触自己的上限。
+  让位是**裁剪**不是排除：显式 `x-smg-target-worker` 钉人时 `busy` 仍在名单里（`why.stepped_aside`），
+  但 `full` 也救不回来。
+- **全池都到顶**（每台都 `full`、候选为空）答 **429**：`error.code=no_available_workers`、
+  `error.type=Too Many Requests`、message 精确为「No available workers (N at their concurrency or
+  GPU-util limit)」。熔断 / 不健康 / 组不服务仍是 **503** 原句（all circuits open or unhealthy、
+  healthy engines serve none of the mapped models）。排障时两条处置相反：429 抬上限或减并发，
+  503 查实例本身。上面 2026-10-01 那几段记录的 503 是**当时**的口径，别照抄到新版排障。
+- 排除计数器只有两个 reason：`smg_worker_capacity_excluded_total{reason="concurrency_max"}` 与
+  `{reason="gpu_util"}`。上面历史段落里的 `reason="concurrency"` 与 `reason="power"` 是**当时的标签名**，
+  新版查不到它们——瓦特那一档随 `max_power_w` 一起退场，不再有对应的排除计数。
+
+验的时候按老规矩：串行发请求测不出上限（在飞早归零），必须真并发把在飞堆起来；批量清限时每条 PUT
+之间 sleep 1s 并复核 `/workers`，别把 202 当已生效。
+
+### GPU 标注与 21.k 现状
+
+21.k 实测：8 个 sglang 实例的**功率读数完全相同**（整机最热卡口径，8 台同值约 271 W），也就是说
+功率这个读数额外区分不了任何两个实例；能区分的是 DCGM 的 `DCGM_FI_DEV_GPU_UTIL`，它带
+`gpu="0".."7"` 标签，逐卡一条序列。本轮 watcher 会从**容器名**解析卡号（`gpu_from_name`：
+`…-gpu0`..`…-gpu7`），proc 一路发现的候选再补一次 socket→pid→`/proc` 命令行解析
+（`gpu_from_cmdline` 读 `--device-id N`，其次 `CUDA_VISIBLE_DEVICES=N`），只在原值为空时填、已有值绝不
+覆盖，落进台账与记录 `labels.gpu`，于是 `/workers` 的 `metadata.gpu` 有值、管理台在实例名后亮出 GPU 徽章，
+`gu:` 的逐卡归属也同时有了地址。它是**纯 label**：不进排除、不进摘除、不进探针、不进宽限，任何一步失败
+一律降级为「没有标注」，服务发现本身一个字节都不受影响。21.k 的名册：
+`qwen38-27b-dflash-tgt-gpu0` 在 8012、`pennyroyal-orca-gpu1` 在 8021、`q38fn-pennyroyal-gpu2..7` 在
+8022–8027。容器名不带 `gpuN` 且命令行也没有卡号的部署，逐卡归属只能靠
+`lr_gpu_load_util_fallback_total` 显形（覆盖率看 `lr_gpu_load_util_per_card_workers` 与它的差）。
+
+最后一条纪律：这些改动只在 **21.k:8802（测试）** 上验，8801 是生产，未经用户明确要求不得更新。
+
+> 另记一条已知残留：`observability` 的 gauge 没有 TTL 也没有删除原语，worker 被删掉之后它的
+> `lr_gpu_load_util_gpu{worker=...}` 与 `lr_gpu_load_power_watts{worker=...}` 会永久留在 `/metrics`
+> （本轮在 8802 实测到已删 mock 18301–18303 的序列仍在）。功率 gauge 一直如此，本轮利用率 gauge
+> 继承了同一特性。登记与后续修法见 [gap-worker-caps.md](gap-worker-caps.md) §11 第 10 条。

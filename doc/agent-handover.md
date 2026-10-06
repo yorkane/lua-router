@@ -1,8 +1,8 @@
 # Agent 交接说明（lua-router）
 
 > 写给接手本仓库的 agent：目标是用最少考古成本进入正确的工作状态。本文只写**当前事实**与**操作纪律**，
-> 设计推导在 git 历史与保留文档里（§7 地图）。最后核对：2026-10-05（重构后首份全量门禁
-> **22/22 全绿**，锚点 `/data/tmp/lr-gates/gates-20261005-190411.log`，tier=full）。
+> 设计推导在 git 历史与保留文档里（§7 地图）。最后核对：2026-10-06（容量语义重设计后首份全量门禁
+> **22/22 全绿**，锚点 `/data/tmp/lr-gates/gates-20261006-051452.log`，tier=full）。
 >
 > **本文引用代码的口径：文件 + 函数名，不钉行号。** 2026-10-05 把七个 2000+ 行的大文件拆成
 > facade + 子模块，旧树里所有「文件:行号」引用随之全部漂移（同一个行号在拆分前后指向不同函数），
@@ -22,11 +22,12 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-05，树 HEAD `48b7f6a`）：**全量门禁 22/22 全绿 / 0 skipped**（tier=full，锚点
-`/data/tmp/lr-gates/gates-20261005-190411.log`；含契约 666 项 / 23 段）。代码：**`lualib/` 75 个 Lua
-文件 / 32 419 行**（七个域 = facade + 子模块，其余单文件；行数口径 `find lualib -name '*.lua' | xargs wc -l`），
-单测 13 个文件（门禁 luajit 12 + resty 4 口径）。文档 28 份。仓库：github.com/yorkane/lua-router
-（public，main 直推）。
+基线（2026-10-06，树 HEAD `66a891f`）：**全量门禁 22/22 全绿 / 0 skipped**（tier=full，锚点
+`/data/tmp/lr-gates/gates-20261006-051452.log`；含契约 **691 项 / 24 段**（新增 `caps` 段 25 项）、
+`e2e_caps` **175 checks**、`test_caps_routing` **157 checks**、`test_gpu_load` **402 checks**）。代码：
+**`lualib/` 75 个 Lua 文件 / 34 608 行**（七个域 = facade + 子模块，其余单文件；行数口径
+`find lualib -name '*.lua' | xargs wc -l`），单测 13 个文件（门禁 luajit 12 + resty 4 口径）。
+文档 29 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
 
@@ -113,7 +114,9 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
   gpu_load.lua(80) facade
     gpu_load/parse.lua(629)  exposition 解析族 · cards.lua(492) 卡归属与四路功率口径
     gpu_load/runpass.lua(526) run_pass 主循环（stats 字段口径单点定义）· seams.lua(305) 九枚 live seams
-    gpu_load/export.lua(237) 指标导出 + 定时器（第三通道：绝对瓦特写 pw:，只服务 max_power_w）
+    gpu_load/parse.lua(765) 利用率解析（util_fraction 0..100→0..1 / util_by_card 逐卡归约）
+    gpu_load/cards.lua(848) 四路利用率口径 assign_util（认不出卡回退整机 max 并计 lr_gpu_load_util_fallback_total）
+    gpu_load/export.lua(304) 指标导出 + 定时器（三通道：负载 / 功率 pw: 纯观测 / 利用率 gu: 供 max_gpu_util）
     gpu_load/prom.lua(209)   Prom 客户端
   mesh.lua(59) facade
     mesh/crdt.lua(1368)  不拆：时钟/LWW/版本向量 + 成员表 + 分区检测 + observe_worker + 快照合并
@@ -221,17 +224,34 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
   luarouter_config）；进程内可变状态只许 cache_aware 树、bucket 计数、mesh 成员表（三者都已钉 worker=1 或有衰减文档）。
 - **缺省零行为变化**：所有新开关（SMG_WATCHER_ENABLED、SMG_LOAD_SOURCE、policy 覆盖）缺省时对外行为
   与旧版逐字节一致，这是门禁判据的一部分。
-- **每服务上限是「候选集层面的硬排除」，并且「读数未知 → 不排除」**（用户裁定 2026-10-01，新增的安全性地基）：
-  worker 记录上的 `max_concurrency` / `max_power_w` 到顶时该 worker 必须**从候选数组里剔除**，
-  **即使 cache_aware 的亲和命中也照样迁走**（判定在 `registry.capacity_exclusion`，接入在
-  `router.candidates_for`、`policy:select` 之前，`policies/` 零改动）。不许把它实现成策略里的一个负载
-  打分项：亲和命中按 URL 直取 tenant、完全不看负载，打分挪不走它想挪的流量。它同时**不摘 worker、
-  不改健康位与熔断状态**——这是「这一轮不给它派活」，不是「它坏了」。另一半地基是**功率读数未知时
-  绝不排除**：`pw:` 缺席=「未知」而非 0，`set_power_w` 拒收负值/NaN/±inf，采不到就什么都不写、靠 TTL
-  过期回到 nil，**绝不写 0、绝不沿用上一次旧值**。理由与下面的探针红线同源：监控系统挂掉的代价只能是
-  精度，不能是容量。全场都在上限上时 fail-closed 503 `no_available_workers` 不放宽（只给 message 加一个
-  「N at their configured concurrency/power cap」从句，让操作员分清「池子空了」与「池子满了」）。
-  完整口径见 [gap-worker-caps.md](gap-worker-caps.md) §1–§3。
+- **每服务容量是「三态 + 候选集层面的硬排除」，并且「读数未知 → 不排除」**（用户裁定 2026-10-01 立基，
+  2026-10-06 重设计为三字段三态）：worker 记录上的 `min_concurrency`（下限，缺席=1）/ `max_concurrency`
+  （上限，≤32）/ `max_gpu_util`（GPU 利用率上限 0..100，**0 是最严档不是清除**）。`registry.capacity_state`
+  一处判 `idle`（在飞<下限）/ `busy` / `full`（在飞≥上限 **或** 新鲜 `gu:`≥利用率上限）/ nil（三门全缺席
+  =无门）。`capacity_exclusion` 只对 full 命中，在 `router.candidates_for` 组门+绑定之后**硬排除**，
+  **即使 cache_aware 的亲和命中也照样迁走**（`policies/` 零改动）。不许把它实现成策略里的负载打分项：
+  亲和命中按 URL 直取 tenant、完全不看负载，打分挪不走它想挪的流量。
+  **绿灯优先**：有 idle 候选时黄灯让位（子集裁剪，非排除，计 `smg_worker_capacity_preferred_idle_total`）；
+  全池都 ≥ 下限时黄灯可继续接直到触达上限——这正是「让 GPU 更均衡」的落点。它**不摘 worker、不改健康位与
+  熔断状态**——这是「这一轮不给它派活」，不是「它坏了」。另一半地基是**读数未知时绝不排除**：`gu:`
+  缺席=「未知」而非 0，采不到就什么都不写、靠 TTL 过期回到 nil，**绝不写 0、绝不沿用上一次旧值**。
+  理由与下面的探针红线同源：监控系统挂掉的代价只能是精度，不能是容量。
+  **全池都到顶时答 429**（用户裁定 2026-10-06，取代 2026-10-01 的 503 口径）：`error.code` 仍是
+  `no_available_workers`、`error.type` 为 `Too Many Requests`、message 精确为
+  「No available workers (N at their concurrency or GPU-util limit)」——容量到顶是「暂时不接单」不是
+  「服务不可用」。熔断/不健康/组不服务仍 503 原句，两者处置相反（抬上限 vs 查实例）。
+  旧 `max_power_w` 已退役（读到 warn 一次并丢弃、`/workers` 不回显、判定不读），功率采集链 `pw:` 保留为
+  **纯观测**（21.k 实测 8 台读数同值——整机最热卡口径，无法区分实例，这也是改用逐卡利用率的原因）。
+  完整口径见 [gap-worker-caps.md](gap-worker-caps.md)。
+- **GPU 归属标注是纯 label，不许借它改路由身份**（2026-10-06 新增）：watcher 从**容器名**
+  （`q38fn-pennyroyal-gpu3` → gpu=3）或**进程启动参数**（`--device-id N` / `CUDA_VISIBLE_DEVICES=N`）
+  解析卡号，补进 `labels.gpu`，经 `/workers` 的 `metadata.gpu` 回显，管理台据此画 GPU 徽章。
+  三条纪律：① 守卫 3（首接触快照）保护下的 worker **只补 labels.gpu 这一个键**，绝不改 URL /
+  model_id / 健康位 / 熔断 / 优先级 / DP 展开 / 容量字段——那些是操作员与环境声明过的东西；
+  ② 已有值绝不覆盖（docker 容器名优先于进程参数）；③ **刻意不跟 `policy.bump_generation()`**——
+  `labels.gpu` 不进任何选路输入，而 bump 会让下一次 select 走整表重建亲和树，一台八实例的机器会因
+  八次「补个卡号」丢掉学到的前缀亲和。**采集失败一律降级为无标注**（不抛错、不影响发现/探针/摘除）。
+  21.k 实测：8 台 env 播种 + 守卫 3 保护的实例，一轮 tick 内全部补齐 gpu0..gpu7。
 - **per-alias `policy` / `effort` 停用是刻意的兼容行为，不要当 bug 修**（用户裁定 2026-10-02，虚拟模型语义反转）：
   这两个字段**仍被接受、仍往返落盘、解析时 warn**（`config_store/profiles.lua` 的 `profile_from_entry` 里各一条 warn），
   但**热路径一律不读**——为的是旧文档导出再导入仍然通过校验，同时不让一行没人删的字段继续执行一条
