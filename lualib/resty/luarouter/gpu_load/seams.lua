@@ -253,6 +253,84 @@ local function default_write_power(id, watts, timestamp, ttl_secs, url)
     return stored, why
 end
 
+---Store one **utilization** sample on the registry's independent gu: key.
+---
+---Structure is default_write_power()'s, and so is the reason for two return values:
+---the caller must tell "there was no reading" (nothing written, the old sample TTLs
+---out, the cap reads *unknown*) from "registry refused a number" (a lying exporter,
+---worth a counter) and from "the store itself failed" (this gateway out of shared
+---dict memory). Both are counted separately in runpass and exported as separate
+---families, because an operator reading one number must not be sent looking at the
+---wrong machine.
+---
+---Who screens what: the **authority** on what counts as a usable utilization reading
+---is registry.set_gpu_util() (it refuses negatives/NaN/±inf/>1 and never writes a
+---gu: key for them, so a refused sample leaves the key to expire back to nil =
+---unknown = do not exclude). gpu_load's half of the bargain is collection and
+---normalisation only: parse.collects, cards attributes, this seam stores. The
+---pre-screen below exists for the same reason power's does -- it is what lets a false
+---from registry be attributed to the dict rather than to the number.
+---
+---It deliberately does **not** reuse util_fraction(), and the reason is a bug class
+---specific to this channel: util_fraction() carries the percent heuristic (anything
+---above 1 is read as 0..100 and divided), so re-running it on an **already normalized**
+---value would turn a corrupt 150 into a legitimate-looking 1.5 -> 0.015 and *hide* the
+---very bug the pre-screen is here to catch. What arrives here is a fraction by contract
+---(cards.assign_util hands out exactly what util_fraction produced), so the guard
+---mirrors the registry's own predicate -- non-finite / negative / > 1 refused -- and
+---the registry stays the authority that decides the stored (milli) shape.
+---@param id string
+---@param util number|nil @ normalized 0..1 utilization
+---@param timestamp number @ ms clock (accepted for seam symmetry, unused here)
+---@param ttl_secs number
+---@param url string|nil @ only for the gauge label
+---@return boolean stored, string reason
+local function default_write_util_inner(id, util, ttl_secs, url)
+    local registry = registry_mod()
+    if not registry or type(registry.set_gpu_util) ~= "function" then
+        return false, "no-registry"
+    end
+    local stored = registry.set_gpu_util(id, util, ttl_secs)
+    if not stored then
+        return false, "rejected"
+    end
+    if url then
+        _M.publish_worker_util_gauge(url, util)
+    end
+    return true, "stored"
+end
+
+---Store one utilization sample, telling the two kinds of "not stored" apart.
+---
+---registry.set_gpu_util() answers false both when it refuses an unusable number and
+---when the shared dict had no room. The first means the exporter is lying, the second
+---means this gateway is out of memory, so the seam re-screens with util_fraction()
+---and re-labels: a number that is still usable can only have been refused by the
+---dict, which is counted as an error of *this* module rather than a rejection. (The
+---"rejected" branch is rare by construction -- everything reaching here already went
+---through util_fraction() on the way out of the parser.)
+---@param id string
+---@param util number|nil @ normalized 0..1 utilization
+---@param timestamp number @ ms clock (accepted for seam symmetry, unused here)
+---@param ttl_secs number
+---@param url string|nil @ only for the gauge label
+---@return boolean stored, string reason
+local function default_write_util(id, util, timestamp, ttl_secs, url)
+    local number = tonumber(util)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge
+        or number < 0 or number > 1 then
+        return false, "rejected"
+    end
+    local stored, why = default_write_util_inner(id, util, ttl_secs, url)
+    if (not stored) and why == "rejected" then
+        -- The number is usable, so registry's only remaining reason to refuse is
+        -- the shared dict. It already logged the shdict error itself.
+        return false, "store-failed"
+    end
+    return stored, why
+end
+
 -- One warn key per (class, target) so a Prometheus that is down does not spend the
 -- error log; the window is the reason the key carries the class.
 local warned_at = {}
@@ -300,6 +378,7 @@ M.hb_mod, M.registry_mod = hb_mod, registry_mod
 M.default_workers, M.default_gpu_hints = default_workers, default_gpu_hints
 M.default_get, M.default_post = default_get, default_post
 M.default_write, M.default_write_power = default_write, default_write_power
+M.default_write_util = default_write_util
 M.worker_headers = worker_headers
 
 return M

@@ -69,6 +69,22 @@ env SMG_WATCHER_MODEL_MAP;
 env SMG_LOAD_POWER;
 env SMG_LOAD_POWER_KEYS;
 env SMG_LOAD_POWER_QUERY;
+#
+# GPU 利用率通道（doc/caps-redesign-2026-10-06.md §5，registry 的 gu: 键 / 每 worker 的
+# max_gpu_util 上限的数据源）。这三个名字与上面三个的区别：它们由 resty.luarouter.config
+# 在 init_by_lua 里装配（fork 之前，不受白名单影响，天然进 /probe/config），这里的 env
+# 声明是为了让 gpu_load/cards.util_config() 的 os.getenv 兜底分支也能读到——两条路都通。
+#   SMG_LOAD_UTIL_ENABLED  缺省 1（采集开；判定只在记录显式配了 max_gpu_util 时发生，
+#                          所以缺省开 = 现有部署零选路行为变化）；0/false/no/off 关
+#   SMG_LOAD_UTIL_KEYS     覆盖 metrics 路的利用率 gauge 名册，逗号/空格分隔
+#   SMG_LOAD_UTIL_QUERY    prom 路的第三条 PromQL；空 = 缺省串
+#                          max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)
+#                          （gpu 必须留在 by 里：聚合掉它 = 八台 worker 共用一个数）
+# 利用率与功率一样**搭载**在负载源上：SMG_LOAD_SOURCE=none 时定时器不启动，设了也没有
+# 读数（registry 侧「未知 -> 不排除」）。test/conf/nginx-lua-router.conf 必须同步。
+env SMG_LOAD_UTIL_ENABLED;
+env SMG_LOAD_UTIL_KEYS;
+env SMG_LOAD_UTIL_QUERY;
 
 
 worker_processes ${WORKER_PROCESSES};

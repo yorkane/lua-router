@@ -1,5 +1,10 @@
 local _M = require "resty.luarouter.watcher"
 local env_mod = require "resty.luarouter.watcher.env"
+local cjson = require "cjson.safe"
+
+-- cjson 的 JSON null 哨兵抓成 file-local：「这条池行对卡号有没有已经说过话」那一判
+-- （row_gpu）每 tick 每候选都要跑一次，热路径不查表。
+local cjson_null = cjson.null
 
 -- watcher/reconcile.lua -- the guards single decision point.  The whole
 -- reconcile() function lives here *undivided*: the comment above it in the
@@ -32,6 +37,15 @@ end
 local function notice(log, message)
     if type(log) == "function" then
         log("notice", message)
+    end
+end
+
+---warn/notice 的 DEBUG 档兄弟。GPU 归属标注的「没写成」走这一档：registry 那侧底下是
+---resty.lock + JSON 编解码，一处持续失败会以每 tick 每 worker 一条的频率刷进 error.log，
+---而那条路径的失败上限本来就只是"没标上"。报警信号是 pass 计数（stats），日志只是查因线索。
+local function note_debug(log, message)
+    if type(log) == "function" then
+        log("debug", message)
     end
 end
 
@@ -132,6 +146,157 @@ end
 
 _M.note_config_skip = note_config_skip
 
+------------------------------------------------------------------ gpu 归属补给
+--
+-- 这一节是**纯 label 补给**：把发现层从容器名解析出来的卡号（discover 的
+-- _M.gpu_from_name → 候选的 gpu 字段）落到**已经在池里**的那条 worker 记录的
+-- labels.gpu 上。它存在的理由是 21.k 的实际形状：八个 sglang 实例由 compose 的
+-- SMG_WORKER_URLS 播种进池（registry.discovery.bootstrap → registry.add({url=…})，
+-- 一个 labels 都不带），容器名却把卡号写在脸上（qwen38-27b-dflash-tgt-gpu0 …
+-- pennyroyal-orca-gpu7）。播种的下一拍守卫 3 就把池里已有的行整排 protect 掉
+-- （日志：watcher: protecting 8 pre-existing worker(s)），于是
+--   * register 对它们永远不会被调用 —— make_register 里 `if entry.gpu then
+--     labels.gpu = entry.gpu` 那一段是 watcher 唯一一处写 labels.gpu 的地方，
+--     对 protected 行一次都没执行过；
+--   * registry.add 的幂等分支对重复 URL 只回一条 failed job 就 return，**不碰记录**
+--     （registry/records.lua 的 add），所以「再 add 一次把 labels 带上」这条路在盘上
+--     不成立；
+--   * reconcile 对 protected 行只做 model-map rename（本文件 protected_seen 那一圈），
+--     从不认领发现层的元数据。
+-- 三条链合起来的结果就是 labels 恒空：/_ui 的卡号徽章不亮，gpu_load 的逐卡 util 归属
+-- 也只有 ledger 的 g|<url> 提示可依（逐卡功率读台账、逐卡 util 读记录 labels.gpu）。
+--
+-- 为什么补 label 不违反守卫 3（「不改操作员/环境已经声明过的东西」）：守卫 3 保护的是
+-- **路由身份与调度判定** —— URL、model_id、健康位、熔断、优先级、权重、DP 展开、并发与
+-- 利用率上限；改这些会改变「谁被选中、选中之后被怎么对待」，而这些正是操作员或环境写进
+-- SMG_WORKER_URLS / PUT /workers / 声明层的读数。labels.gpu 不在其中：本函数一次只写
+-- labels 里的 gpu 这一个键（registry.update 的 labels 支是**合并**语义，见
+-- registry/discovery.lua 的 changes.labels 注释），写下去的读数来自**对方容器的名字**，
+-- 是网关自己看见的事实，不是对操作员陈述的覆盖。三条护栏把这条论证钉在代码里：
+--   * **已有值绝不覆盖**：行里已经带 labels.gpu（哪怕是操作员手写的 "all" 这类非数字
+--     形状）就跳过 —— 操作员声明优先；非数字值也不去动它，逐卡匹配那条既有降级路径
+--     （解析不出卡就不归属、不封顶）原样保留；
+--   * **config 行整体不碰**：_M.is_config_member 那一判排在写之前。声明层行的 labels
+--     归 config_store 所有，而 registry.update 对 config 行会把整个 labels 表**替换**成
+--     文档里那一份（labels_replace），从 watcher 发一次「只带 gpu」的补丁等于让一次
+--     监控补齐去清空操作员声明的 label 集 —— 那是越权，直接不写；
+--   * **失败只是没标上**：写不进去不影响发现、探针、摘除、宽限 —— 本函数的返回值不喂给
+--     上面任何判定，也不读它们的结论，计数只进 stats。
+--
+-- 写入走 registry 侧既有的 labels 写入接口（live.lua 的 make_patch_labels →
+-- registry.update 的 labels 支 → registry/records.lua 的 patch_record），不另开写路径，
+-- 于是合并语义、锁、mesh 镜像、derived 标记的重算都是现成的那一份。
+
+---池行现在带的是哪张卡：`labels.gpu` 的**原始**值，未经数字收窄。
+---
+---故意不做 gpu_load.parse.worker_gpu 那样的「只认纯数字」收窄：这一判的职责是「这条记录
+---对卡号有没有已经说过话」，任何非空值都算说过（操作员写的 "all" 也是一句陈述，不许被
+---监控层覆盖）。cjson 的 null 哨兵算「没说过」——历史上有的写路径会把缺失落成 JSON null。
+---@param record table|nil @ 池行（actual_pool 的形状，带 labels）
+---@return string|nil @ 有值时返回它的字符串形态，否则 nil
+local function row_gpu(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local labels = record.labels
+    if type(labels) ~= "table" then
+        return nil
+    end
+    local value = labels.gpu
+    if value == nil or value == false or value == cjson_null then
+        return nil
+    end
+    local text = tostring(value)
+    if text == "" then
+        return nil
+    end
+    return text
+end
+
+_M.row_gpu = row_gpu
+
+---发现层给的卡号能不能落到 labels 上：只收纯数字串。
+---
+---discover 的 gpu_from_name 本来就只产数字串，这一判是挡住注入形状（未来的新来源、或
+---夹具里的假候选）把 "nvidia0" / UUID 之类写进 labels.gpu —— 那种值 gpu_load 的逐卡匹配
+---永远对不上，等于用一条永远用不上的读数占住「已声明」的位置、把能用的那条挡在门外。
+---@param gpu any
+---@return string|nil
+local function usable_gpu(gpu)
+    if type(gpu) ~= "string" then
+        return nil
+    end
+    if string.match(gpu, "^%d+$") then
+        return gpu
+    end
+    return nil
+end
+
+---把本轮候选带来的卡号补给**已在池中**的记录（owned 与 protected 一视同仁）。
+---
+---只在「本轮该 URL 探到了（进了 sources）且候选认得它的卡、而池行自己还不带卡」时发一次
+---patch；patch 成功后池行已经带 gpu，下一 tick 第一条判据就不成立，于是稳态每 tick 的成本
+---是每个候选几次表查找，不发任何写。刻意**不**在探针失败的候选上补卡：那一行本轮对
+---/v1/models 什么都没说出口，把 label 补给一条正在被摘除链处理的行，只会让「这条记录说的
+---是谁」在宽限期里多一份说不清的读数（ledger 的 g| 提示同口径 —— 它也只在探到之后写）。
+---
+---@param state table @ reconcile 的 state（读 actual / candidates / patch_gpu_label / log / stats）
+---@param sources table @ url -> true：本轮探到的候选集合（discovered 的 URL 集）
+---@return number patched @ 本轮真正写成的条数
+function _M.annotate_gpu_labels(state, sources)
+    local patch = state.patch_gpu_label
+    if type(patch) ~= "function" then
+        -- 纯层夹具（test/unit/test_watcher.lua 的 harness）不注入这条接缝：没有写入
+        -- 后端就等于这件事没人做，静默返回，不动任何既有断言。生产由 live.run_pass 注入。
+        return 0
+    end
+    if type(state.actual) ~= "table" then
+        return 0
+    end
+    local stats = state.stats
+    local patched = 0
+    for i = 1, #(state.candidates or {}) do
+        local cand = state.candidates[i]
+        local url = type(cand) == "table" and cand.url or nil
+        if url and sources[url] then
+            local gpu = usable_gpu(cand.gpu)
+            local row = state.actual[url]
+            -- 顺序即代价：先看候选有没有话说（绝大多数没有），再看池行缺不缺，
+            -- 最后才可能摸一次 registry。
+            if gpu and row and row_gpu(row) == nil
+                and not _M.is_config_member(state, url) then
+                -- 逐条 pcall：一条记录写入抛出来（registry 底下是 lock + 编解码 + shdict）
+                -- 只让**这一条**没标上，本轮其余候选与后续守卫照跑。外层 reconcile 那里
+                -- 还有一层 pcall 兜底，两道都不许把异常递给调用方。
+                local okp, ok, err = pcall(patch, url, tostring(row.id or ""), gpu)
+                if not okp then
+                    ok, err = false, tostring(ok)
+                end
+                if ok then
+                    patched = patched + 1
+                    -- 把这一轮的结论就地写回这一行的视图：同一次 pass 里同一条记录不可能
+                    -- 被发第二次 patch（重复 URL 的候选也走这条 memo），生产的 actual 是本轮
+                    -- 现读的快照，改写它不影响任何外部状态。
+                    row.labels = type(row.labels) == "table" and row.labels or {}
+                    row.labels.gpu = gpu
+                    note_debug(state.log, string.format(
+                        "watcher: labelled %s with gpu %s (from container name)", url, gpu))
+                else
+                    stats.gpu_label_fails = (stats.gpu_label_fails or 0) + 1
+                    note_debug(state.log, string.format(
+                        "watcher: gpu label for %s not written: %s",
+                        url, tostring(err or "patch refused")))
+                end
+            end
+        end
+    end
+    if patched > 0 then
+        stats.gpu_labels_patched = (stats.gpu_labels_patched or 0) + patched
+    end
+    return patched
+end
+
+
 ---One reconcile pass. Everything outside this function is plumbing, which makes
 ---the guards above auditable in one place and testable with fakes -- including the
 ---probe-verdict pre-pass below, which deliberately stays inside this function so
@@ -207,6 +372,25 @@ function _M.reconcile(state)
         end
     end
     stats.discovered = #discovered
+
+    -- GPU 归属补给（纯 label；为什么这事不违反守卫 3，见本文件「gpu 归属补给」一节的论证）：
+    -- 本轮探到的候选里，凡是「候选认得卡号、池行自己还不带卡」的，补一次 labels.gpu。
+    -- 位置排在守卫 3 的快照**之后**：首接触那一拍先把池里已有的行整排 protect 掉，而那八条
+    -- 正是等着被补标注的对象；也排在 adds / renames / removals 之前 —— 补给与它们互不通信，
+    -- 既不读它们的结论，也不把任何结论喂给它们（摘除判定看到的状态与本轮有无 patch 无关）。
+    -- sources 只收本轮探到的 URL：探针没答上的那批留给 g| 台账提示（同口径），不写记录。
+    local probed_urls = {}
+    for i = 1, #discovered do
+        probed_urls[discovered[i].url] = true
+    end
+    -- 整段套 pcall：这是「补给」不是「判定」，一条 label 写不写得成都不能让本轮的守卫
+    -- 少跑一步（registry 底下是 lock + 编解码，任何一处抛出来都只是没标上，
+    -- 下一 tick 自然重试）。
+    local annotated, ann_err = pcall(_M.annotate_gpu_labels, state, probed_urls)
+    if not annotated then
+        note_debug(state.log, string.format(
+            "watcher: gpu label pass skipped: %s", tostring(ann_err)))
+    end
 
     -- desired = discovered - protected (guard 3 again, from the other side).
     local desired, protected_seen = {}, {}

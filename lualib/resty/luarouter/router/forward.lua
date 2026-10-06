@@ -593,6 +593,27 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
                     break
                 end
             end
+            -- An explicit pin outranks the green-light preference: the narrowing is a
+            -- hint for the *policy*, and a request that names its instance by id is not
+            -- asking to be load-balanced away from it (candidates_for keeps the stepped-
+            -- aside records on `why.stepped_aside` for exactly this). Nothing similar
+            -- exists for the hard capacity gate -- a worker at its ceiling stays
+            -- unreachable to a pin, which is the contract e2e_caps pins as
+            -- "an explicit pin cannot resurrect a capped worker". A stepped-aside record
+            -- is stamped like any survivor, and it never went through the policy, so the
+            -- affinity tree is left with the green it would have chosen: the pin answers
+            -- this one request, the next one follows the lights again.
+            if not worker and why ~= nil then
+                local aside = why.stepped_aside
+                if aside then
+                    for i = 1, #aside do
+                        if aside[i].id == pinned then
+                            worker = aside[i]
+                            break
+                        end
+                    end
+                end
+            end
         end
         if not worker then
             worker = policy_for(policy_model, profile):select({
@@ -607,27 +628,33 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
         if not worker then
             observability.record_router_error(model or "unknown", endpoint, "no_workers")
             observability.note_error()
-            ngx.status = 503
             -- The body is printed by route_inference, so the JSON content type
             -- has to be claimed here; Rust answers this path as application/json.
             ngx.header["Content-Type"] = "application/json"
-            -- Same status, same code, one extra clause in the message: an operator
-            -- staring at a 503 has to know whether the pool is empty or *full*, since
-            -- the two have opposite fixes (add a worker vs raise a cap). The code stays
-            -- pinned to no_available_workers, which is what the contract asserts and
-            -- what the UI keys on.
-            -- No relaxation on this path, deliberately: falling back to the capped
-            -- workers when every candidate is over its ceiling would reproduce the exact
-            -- behaviour the caps exist to remove, and would do it under load, which is
-            -- when it hurts most. Failing closed also matches the neighbouring
-            -- concurrency gate, which answers 429 instead of queueing past its limit.
+            -- Two shapes, two statuses, one code. An operator has to know whether the
+            -- pool is empty or *full*, since the two have opposite fixes (add a worker
+            -- vs raise a cap), and the code stays pinned to no_available_workers, which
+            -- is what the contract asserts and what the UI keys on.
+            --
+            -- **用户裁定 2026-10-06 覆盖 2026-10-01 的「全到顶 503」口径**：容量到顶
+            -- 不是服务不可用，是暂时没法接单——全池都抵在并发/GPU 利用率上限时答 **429**
+            -- （Too Many Requests），熔断/不健康/组不服务仍走 503 原文案。理由：用户要求
+            -- 「到顶不能直接 429，除非全池满」——中途任何时候有其他实例可接就转过去
+            -- （candidates_for 的硬排除与绿灯优先保证了这一点），只有整组一个不剩才落
+            -- 429；这与本机并发闸（limit.lua）对超限请求答 429 的姿态一致，客户端的重试
+            -- 逻辑（429 可退避重试、503 常被视为宕机）也终于和真实原因对得上。
+            -- No relaxation here either: queueing past the ceilings or falling back to
+            -- the full workers would reproduce exactly what the caps exist to remove,
+            -- and would do it under load, which is when it hurts most.
             -- Candidates that are healthy but *unavailable* (breaker open, sweep down)
-            -- keep the original wording untouched, so a pre-feature 503 reads exactly as
-            -- it did before this feature existed.
+            -- keep the original 503 wording untouched, so a pre-feature 503 reads
+            -- exactly as it did before this feature existed.
+            local status = 503
             local message = "No available workers (all circuits open or unhealthy)"
             if why ~= nil and why.capped > 0 and #candidates == 0 then
+                status = 429
                 message = "No available workers (" .. tostring(why.capped)
-                    .. " at their configured concurrency/power cap)"
+                    .. " at their concurrency or GPU-util limit)"
             elseif why ~= nil and why.group and why.refused > 0
                 and #candidates == 0 then
                 -- 组入口专属：这些实例是健康的，只是引擎答过「我不服务这一组里的任何
@@ -636,7 +663,8 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
                 message = "No available workers (" .. tostring(why.refused)
                     .. " healthy engines serve none of the mapped models)"
             end
-            return 503, error_body(503, "no_available_workers", message)
+            ngx.status = status
+            return status, error_body(status, "no_available_workers", message)
         end
 
         ngx.ctx.lr_worker = worker

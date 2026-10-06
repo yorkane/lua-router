@@ -9,8 +9,12 @@
 --     rule is what power_of_two, manual min_load, cache_aware escape and the
 --     WorkerInfo load field all read;
 --   * capacity_exclusion is a hard admission gate, not a ranking term, and a missing
---     power reading means unknown: it never excludes. xl: and pw: never share a
---     field, because watts are an admission number and load is a score.
+--     reading means unknown: it never excludes. capacity_state is the one place the
+--     three-way verdict (idle/busy/full) is computed - the /workers echo and the
+--     router's green-light narrowing both read *that*, so no second caller can derive
+--     the traffic-light from a different mix of readings (doc/caps-redesign-2026-10-06.md
+--     section 2). xl:, pw: and gu: never share a field with each other or with the
+--     in-flight counter, because a score and an admission number are different kinds.
 
 local M = {}
 
@@ -18,6 +22,7 @@ local keys = require "resty.luarouter.registry.keys"
 
 
 local K_ACTIVE = keys.K_ACTIVE
+local K_GPU_UTIL = keys.K_GPU_UTIL
 local K_LOAD = keys.K_LOAD
 local K_POWER = keys.K_POWER
 local K_SLOAD = keys.K_SLOAD
@@ -174,7 +179,7 @@ end
 ---cap: a fractional 2.5 slots would read "third request allowed" one way and
 ---"two slots" the other, and "at most 2" is the safe reading of both.
 ---@param value any
----@param integer boolean @ true for a request count, false for watts
+---@param integer boolean @ true for a request count, false for a float reading
 ---@return number|nil limit
 function M.cap_limit(value, integer)
     local number = tonumber(value)
@@ -186,6 +191,25 @@ function M.cap_limit(value, integer)
         return math.floor(number)
     end
     return number
+end
+
+---Normalize one declared GPU-utilisation ceiling in percent (0..100). This is
+---deliberately *not* cap_limit: the utilisation scale carries a meaningful zero
+---(`max_gpu_util = 0` is the legal strictest rung - any fresh reading at all means
+-- "full"), so only a missing, non-numeric, NaN, +/-inf or negative value means
+---"no limit". The value is floored to an integer percent; a stored 0 must survive,
+---and clearing the cap is spelled "absent" or any negative number, both of which
+---fold to nil here and therefore to "no gate" at read time
+---(doc/caps-redesign-2026-10-06.md section 1).
+---@param value any
+---@return number|nil limit @ integer percent, or nil for "unlimited"
+function M.util_limit(value)
+    local number = tonumber(value)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge or number < 0 then
+        return nil
+    end
+    return math.floor(number)
 end
 
 ---The router's own in-flight request count for one worker: the *pure* number,
@@ -218,54 +242,126 @@ function M.inflight_requests(id)
     return shdict():get(K_LOAD .. id) or 0
 end
 
----Hard capacity gate for one candidate worker.
----
----Root ruling 2026-10-01: a worker at its configured in-flight or power ceiling
----must leave the candidate set even when cache_aware's affinity tree would have
----kept it here. So this is an *exclusion*, evaluated where candidates are
----assembled, not another term in the ranking: the policies' own load escape
----(balance_abs/rel thresholds, power_of_two's low-load branch) turns "busier"
----into "less preferred", which under affinity keeps exactly the traffic this
----rule is meant to move. Absent = selectable; a returned table = exclude, with
----{reason="concurrency"|"power"} and the two numbers that decided it so the
----caller can count and log which kind fired.
----
----The two readings are different in kind on purpose:
----  * concurrency is this gateway's own counter, always known;
----  * power is an external sample, and *missing means unknown, not zero*. A
----    monitoring system that dies must cost accuracy, never capacity, so a nil
----    sample never excludes -- the same rule the load samples follow, and the
----    reason the key is TTL'd rather than last-value-wins.
----Both caps default to unlimited, and an uncapped worker costs zero shdict reads.
----@param record table @ static record (needs id; cap fields optional)
----@param d table|nil @ shared dict (resolved when omitted)
----@return table|nil exclusion @ nil = selectable
-function M.capacity_exclusion(record, d)
+---------------------------------------------------------------- capacity verdict
+--
+-- Per-worker ceilings on the two things that actually run a serving instance out of
+-- headroom: requests in flight (this gateway's own counter) and how busy the GPU
+-- actually is (an external sample). doc/caps-redesign-2026-10-06.md replaces the
+-- 2026-10-01 two-way gate with a three-way verdict, and the verdict - not the
+-- caller - is what owns the comparison:
+--
+--   full  inflight >= max_concurrency, or a *fresh* gu: sample at/over max_gpu_util
+--   idle  not full, and inflight < min_concurrency (an absent min reads 1)
+--   busy  everything else
+--   nil   no ceiling of any kind declared: no gate at all, i.e. today's behaviour
+--
+-- Three rules decide every shape below, and they are the reason a caller must not
+-- recompute this at home:
+--   * the readings are different in kind. `lo:` is this gateway's counter and is
+--     always known (a missing key is 0 in-flight, never "unknown"); `gu:` is an
+--     external sample whose absence means *unknown, not zero* - a monitoring
+--     system that dies must cost accuracy, never capacity, so it never excludes.
+--     That is why `gu:` is TTL'd rather than last-value-wins.
+--   * `gu:` is read raw and never through _M.load. `xl:` - the ranking channel -
+--     is scaled by load_scale into in-flight-request units, so comparing a
+--     utilisation ceiling against it would make a scoring knob move an admission
+--     gate. See the header comment of registry/keys.lua.
+--   * the watt ceiling left the verdict on 2026-10-06. `pw:` and its exporter
+--     family stay (pure observation), but no capacity decision reads them any
+--     more, and the reason strings "concurrency"/"power" are retired.
+
+---The verdict behind both public faces: the traffic-light plus the numbers that
+---decided it. Private so that `capacity_state` stays exactly the one-value
+---predicate the UI contract pins it to.
+---@param record table
+---@param d table|nil
+---@return string|nil state @ "idle"|"busy"|"full", nil = no gate declared
+---@return table|nil verdict @ set only for "full": the reason and its two numbers
+local function capacity_verdict(record, d)
     if type(record) ~= "table" then
         return nil
     end
+    -- One normalization for all three integer ceilings, and deliberately the same call
+    -- shape the old gate used for max_concurrency (no floor): records.add stores the
+    -- floored value, info() echoes the unfloored reading, and the verdict has to read
+    -- the same number the console shows. The 1..31 / 1..32 range rules belong to the
+    -- declaration layer (config_store), which is what the router-side consumer of
+    -- these names was written against.
     local max_c = R.cap_limit(record.max_concurrency)
-    local max_w = R.cap_limit(record.max_power_w)
-    if max_c == nil and max_w == nil then
+    local min_c = R.cap_limit(record.min_concurrency)
+    local max_u = M.util_limit(record.max_gpu_util)
+    if max_c == nil and min_c == nil and max_u == nil then
         return nil
     end
     d = d or shdict()
     local id = record.id
-    if max_c ~= nil then
-        local inflight = d:get(K_LOAD .. id) or 0
-        if inflight >= max_c then
-            return { reason = "concurrency", inflight = inflight,
-                max_concurrency = max_c }
+    local inflight = tonumber(d:get(K_LOAD .. id)) or 0
+
+    if max_c ~= nil and inflight >= max_c then
+        return "full", { reason = "concurrency_max", inflight = inflight,
+            max_concurrency = max_c }
+    end
+    if max_u ~= nil then
+        local milli = tonumber(d:get(K_GPU_UTIL .. id))
+        -- Integer arithmetic: milli is percent x 10 and the ceiling is a percent, so
+        -- milli >= max_u * 10 is the same comparison without a float division.
+        if milli ~= nil and milli >= max_u * 10 then
+            return "full", { reason = "gpu_util", gpu_util = milli / 1000,
+                max_gpu_util = max_u }
         end
     end
-    if max_w ~= nil then
-        local milli = d:get(K_POWER .. id)
-        if milli ~= nil and milli >= max_w * 1000 then
-            return { reason = "power", power_w = milli / 1000,
-                max_power_w = max_w }
-        end
+    -- The lower rung only ever *adds* an idle/busy distinction: no ceiling of its own
+    -- was reached above, and a worker cannot be "full" because it is too empty.
+    if inflight < (min_c or 1) then
+        return "idle"
     end
-    return nil
+    return "busy"
+end
+
+---Three-way capacity state of one worker, or nil when it declares no ceiling.
+---
+---This is the *single* place the traffic-light is computed: `GET /workers` echoes it
+---as the read-only `load_state` field (registry.records.info) and the router's
+---green-light narrowing (router/candidates.lua) trims its candidate array with it, so
+---the console colour and the scheduling decision cannot drift apart. The UI must
+---display this value and never re-derive it from inflight/cap pairs of its own.
+---
+---Non-counting by construction: nothing here touches observability, and the only
+---call site that bills a metric is the counted candidate-assembly pass going through
+---_M.capacity_exclusion (forward.lua's selection pass). An N-worker pool where two
+---processes both computed - and counted - the same verdict would double-count, which
+---is why this function returns a string and no counter.
+---@param record table @ static record (needs id; cap fields optional)
+---@param d table|nil @ shared dict (resolved when omitted)
+---@return string|nil state @ "idle" | "busy" | "full" | nil (no gate)
+function M.capacity_state(record, d)
+    local state = capacity_verdict(record, d)
+    return state
+end
+
+---Hard capacity gate for one candidate worker: set only for a "full" verdict.
+---
+---Root ruling 2026-10-01: a worker at its configured ceiling must leave the candidate
+---set even when cache_aware's affinity tree would have kept it here, so this is an
+---*exclusion* evaluated where candidates are assembled, not another term in the
+---ranking - the policies' own load escape turns "busier" into "less preferred", which
+---under affinity keeps exactly the traffic this rule is meant to move. Root ruling
+---2026-10-06: the gate fires on `capacity_state == "full"` and nothing else; idle and
+---busy stay selectable (the green-light preference is a narrowing, not an exclusion).
+---
+---Absent = selectable; a returned table = exclude, with {reason=
+---"concurrency_max"|"gpu_util"} and the two numbers that decided it so the caller can
+---count and log which kind fired. The caller's pcall and the
+---"predicate missing = no gate" fail-open discipline stay in router/candidates.lua.
+---@param record table @ static record (needs id; cap fields optional)
+---@param d table|nil @ shared dict (resolved when omitted)
+---@return table|nil exclusion @ nil = selectable
+function M.capacity_exclusion(record, d)
+    local state, verdict = capacity_verdict(record, d)
+    if state ~= "full" then
+        return nil
+    end
+    return verdict
 end
 
 ---Store one raw watt sample for a worker (gpu_load's power pass is the only
@@ -340,6 +436,69 @@ end
 ---@param id string
 function M.clear_power_w(id)
     shdict():delete(K_POWER .. id)
+end
+
+---Store one raw GPU-utilisation sample for a worker.
+--
+--gpu_load's util pass is the only production writer (unit tests may call it
+--directly), which is the same one-writer-per-key discipline `xl:` and `pw:` follow. The
+--fraction goes in as integer milli (percent x 10) so gauge noise below 0.1 % cannot
+--widen the key's type, exactly as the watt channel rounds to milli-watts.
+--
+--Unlike `to_milli` - the *scoring* normalizer, which clamps whatever it is handed into
+--0..1 so a nonsense sample still ranks the worker - this gate feeds an admission
+--decision, and a stored number there is a claim about hardware. A negative or unusable
+--reading is therefore refused rather than clamped: `set_power_w` already refuses a
+--negative watt for the same reason, and "0 % busy" is precisely the reading a broken
+--exporter would produce for a saturated card, which would silently disarm the ceiling.
+--Only out-of-range *above* clamps (a DCGM gauge that momentarily answers 105 %).
+---@param id string
+---@param frac number|nil @ pure utilisation as a 0..1 fraction
+---@param ttl_secs number|nil @ staleness window
+---@return boolean written
+function M.set_gpu_util(id, frac, ttl_secs)
+    local number = tonumber(frac)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge or number < 0 then
+        return false
+    end
+    if number > 1 then
+        number = 1
+    end
+    local seconds = R.stale_ttl(ttl_secs)
+    local ok, err = shdict():set(K_GPU_UTIL .. id,
+        math.floor(number * 1000 + 0.5), seconds)
+    if not ok then
+        -- No-capacity-on-the-dict is the only way this fails, and it is worth one
+        -- line: the utilisation gate silently stops being enforceable for this worker
+        -- until the sample TTLs out or the exporter refills it.
+        if ngx and ngx.log then
+            ngx.log(ngx.WARN, "luarouter: gpu util sample for ", tostring(id),
+                " not stored: ", tostring(err))
+        end
+        return false
+    end
+    return true
+end
+
+---The fresh utilisation sample for one worker: nil when there is none (an absent
+---sample is *unknown*, and never collapses to 0 - that distinction is what makes the
+---utilisation ceiling safe to leave switched on, and the reason the key is TTL'd).
+---@param id string
+---@return number|nil util @ 0..1
+function M.gpu_util(id)
+    local milli = shdict():get(K_GPU_UTIL .. id)
+    if milli == nil then
+        return nil
+    end
+    return milli / 1000
+end
+
+---Drop the utilisation sample (an operator override, a re-registration, or a test;
+---TTL expiry is the ordinary life cycle).
+---@param id string
+function M.clear_gpu_util(id)
+    shdict():delete(K_GPU_UTIL .. id)
 end
 
 ---Normalized 0..1 -> milli integer, nil for anything unusable. NaN and the

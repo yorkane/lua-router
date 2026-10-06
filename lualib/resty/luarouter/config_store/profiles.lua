@@ -744,6 +744,37 @@ local function declared_cap(value, integer)
     return integer and math.floor(number) or number
 end
 
+--- Utilisation ceiling for the declaration layer (doc/caps-redesign-2026-10-06.md section 1).
+---
+--- 它是 declared_cap 之外的**另一个档**，不是 declared_cap(value, true)：cap_limit 把一切
+--- <= 0 折成 nil，而 util 档必须保住 0 这个读数 —— 0 是「卡一有利用率就算到顶」的极严档，
+--- 是一个结论而不是沉默。于是 -1（非数、缺省同归此支）与 0 在这里读成两件不同的事，而并发
+--- 档里两者本来就都塌成「不限」，两档无法共用一个归一器。
+---
+--- 其余纪律与 declared_cap 一致，为的是 drift / patch 对同一含义只见到一个值：非数、NaN、
+--- ±inf、负数、小数、>100 一律归一成 nil = 不限，存储侧写成**键缺席**（绝不写显式 null）。
+--- 小数刻意判 nil 而不是 floor：DCGM 的利用率读数本身是整数百分比，55.5 没有诚实读法，而
+--- 「操作员没说一个整百分比」的安全读法是让门保持敞开（读数未知绝不 cost capacity），
+--- 而不是悄悄变成 55 去提前排除。
+---
+--- 与 declared_cap 同一条 registry 优先口径：registry 在场时用它的 util_limit 当权威实现，
+--- 让声明层与 POST/PUT /workers 对同一输入落进同一条记录；末尾几行只是纯 Lua 单测口径的
+--- 兜底（registry 缺席或被 stub 换掉时），并打一条 warn，不作为生产口径。
+local function declared_util(value)
+    local reg = CS_LEXICON.store_registry()
+    if reg and type(reg.util_limit) == "function" then
+        return reg.util_limit(value)
+    end
+    local number = tonumber(value)
+    if number == nil or number ~= number
+        or number == math.huge or number == -math.huge
+        or number < 0 or number > 100 or math.floor(number) ~= number then
+        return nil
+    end
+    CS_LEXICON.ngx_log_warn("luarouter config upstream cap normalization without registry (worker stub?)")
+    return number
+end
+
 --- Chain guard for the per-candidate bindings.
 
 --- 一条绑定如果指向另一个别名，选到那个候选后转发体里的 model 就成了别名本身，而它根本
@@ -778,6 +809,7 @@ end
 _M.build_profiles = build_profiles
 _M.copy_bindings = copy_bindings
 _M.declared_cap = declared_cap
+_M.declared_util = declared_util
 _M.norm_pool_url = norm_pool_url
 
 return _M

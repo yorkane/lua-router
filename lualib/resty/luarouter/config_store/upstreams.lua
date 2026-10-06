@@ -17,6 +17,54 @@ local _M = {}
 
 local UPSTREAMS_LIMIT = 256
 
+-- Ranges from doc/caps-redesign-2026-10-06.md §1, kept as named constants because three
+-- separate code paths (parse, the console's own copy of the rule, and the error text) have
+-- to agree on them: min 1..31 leaves room below a max of 32 so the strict-less-than rule
+-- always has a legal spelling, and util 0..100 is a whole percentage.
+local MIN_CONCURRENCY_LIMIT = 31
+local MAX_CONCURRENCY_LIMIT = 32
+local MAX_GPU_UTIL_LIMIT = 100
+
+-- Per-instance capacity gates (doc/caps-redesign-2026-10-06.md §1). The three fields share
+-- one field list so parse / defaults / drift / patch / create cannot drift apart, and one
+-- normalizer dispatch so a field's "unlimited" spelling is decided in exactly one place:
+-- the two concurrency tiers go through declared_cap (registry.cap_limit), the utilisation
+-- tier through declared_util (0 is a legal, strict reading there, which cap_limit would
+-- erase). max_power_w is retired: an old row that still names it warns once per process
+-- and the key is dropped -- no migration (a watts -> utilisation conversion would decide
+-- for the operator, which the design rules out).
+local CAP_FIELDS = { "min_concurrency", "max_concurrency", "max_gpu_util" }
+
+local function cap_normalize(field, value)
+    if field == "max_gpu_util" then return CS_PROFILES.declared_util(value) end
+    return CS_PROFILES.declared_cap(value, true)
+end
+
+--- The one value the *pool side* reads back as "no limit" for this field. The concurrency
+--- tiers keep the historical explicit 0 (cap_limit folds <= 0 to nil, and an uncapped
+--- record costs no dict read). The utilisation tier cannot use 0 -- that is its strictest
+--- legal value -- so it clears with an explicit -1, which declared_util / the registry's
+--- util reader fold to nil. Same "explicit sentinel, only sent when the stored row really
+--- holds a limit" rule as before; only the sentinel spelling is per-tier.
+local function cap_clear_value(field)
+    if field == "max_gpu_util" then return -1 end
+    return 0
+end
+
+-- warn-once memo for the retired max_power_w: current() re-parses the whole snapshot on
+-- every request (SNAPSHOT_TTL windows the disk read, not the parse), so a per-entry warn
+-- would fill error.log from a legacy row that is on disk for a reason the operator has
+-- already been told about once.
+local retired_power_warned = false
+
+local function warn_retired_power_w(canonical)
+    if retired_power_warned then return end
+    retired_power_warned = true
+    CS_LEXICON.ngx_log_warn("luarouter upstream ", tostring(canonical),
+        " declares retired max_power_w; ignored (capacity caps are now ",
+        "min_concurrency / max_concurrency / max_gpu_util -- see doc/caps-redesign-2026-10-06.md)")
+end
+
 --- Mask one upstreams row for a response body (contract 3.4): api_key is
 --- present but always null, has_api_key says whether a secret is held, and the
 --- persistence fields (api_key_state / api_key_stored) never leave the store.
@@ -162,18 +210,104 @@ local function upstream_from_entry(entry, index)
         out.disable_health_check = dhc
     end
 
-    -- Per-worker capacity caps (doc/gap-worker-caps.md): the pool side already
-    -- accepts them on POST/PUT /workers, so a declaration that cannot carry them is
-    -- a field the console can set and the document cannot keep. Absent / null /
-    -- invalid all normalize to nil = "unlimited", which is stored as *absent* (never
-    -- an explicit null) exactly like the other optional fields, so a row that never
-    -- mentions caps keeps its pre-feature byte-identical shape.
-    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
+    -- Per-worker capacity gates (doc/caps-redesign-2026-10-06.md §1, which supersedes
+    -- doc/gap-worker-caps.md): the pool side accepts them on POST/PUT /workers, so a
+    -- declaration that cannot carry them is a field the console can set and the document
+    -- cannot keep. Absent / null / "means unlimited" all store as *absent* (never an
+    -- explicit null) exactly like the other optional fields, so a row that never mentions
+    -- caps keeps its pre-feature byte-identical shape.
+    --
+    -- How hard each tier pushes back on a value it cannot use is decided per tier, and the
+    -- asymmetry is deliberate:
+    --   * max_concurrency keeps today's normalization verbatim. The console has always sent
+    --     an explicit 0 for "unlimited" and 2.5 for "at most 2", and five readers (add /
+    --     update / info / capacity_exclusion / declared_cap) share that one folding, so the
+    --     declaration layer must not unilaterally turn a legacy spelling into a 400
+    --     (doc/gap-worker-caps.md §8 item 3). Anything cap_limit reads as unlimited is
+    --     stored as *absent*, and a whole number above 32 is the only refusal.
+    --   * min_concurrency is new, so it has no legacy spelling to honour: a value that is
+    --     not a whole 1..31 is a typo, and a floor the gateway quietly dropped is a gate
+    --     the operator believes is closed -- 400.
+    --   * max_gpu_util follows the design's split: a negative or non-numeric reading is
+    --     "not said" (nil, same unlimited the reader would fold it to), while a number that
+    --     cannot be a whole percentage -- 101, 55.5 -- is refused. Zero passes through: it
+    --     is the strictest legal gate, not an absence.
+    local caps_said = {}
+    for _, field in ipairs(CAP_FIELDS) do
         local value = rawget(entry, field)
         if value ~= nil and value ~= JSON_NULL then
-            local cap = CS_PROFILES.declared_cap(value, field == "max_concurrency")
-            if cap ~= nil then out[field] = cap end
+            if field == "max_gpu_util" then
+                local number = tonumber(value)
+                if number ~= nil and number == number
+                    and number ~= math.huge and number ~= -math.huge then
+                    if number < 0 then
+                        -- "said nothing": the reader folds it to unlimited either way.
+                        number = nil
+                    elseif number > MAX_GPU_UTIL_LIMIT or math.floor(number) ~= number then
+                        return nil, string.format(
+                            "upstream %s max_gpu_util must be a whole percentage between 0 and %d",
+                            canonical, MAX_GPU_UTIL_LIMIT)
+                    end
+                else
+                    number = nil
+                end
+                if number ~= nil then
+                    -- The registry reader stays the authority for the *stored* value (same
+                    -- posture as the concurrency tier): the range checks above decide what
+                    -- counts as said-vs-400, declared_util decides the canonical number
+                    -- that lands in the row.
+                    local cap = CS_PROFILES.declared_util(number)
+                    if cap ~= nil then
+                        out[field] = cap
+                        caps_said[field] = cap
+                    end
+                end
+            elseif field == "max_concurrency" then
+                local cap = CS_PROFILES.declared_cap(value, true)
+                if cap ~= nil then
+                    if cap > MAX_CONCURRENCY_LIMIT then
+                        return nil, string.format(
+                            "upstream %s max_concurrency must be at most %d",
+                            canonical, MAX_CONCURRENCY_LIMIT)
+                    end
+                    out[field] = cap
+                    caps_said[field] = cap
+                end
+            else
+                local cap = cap_normalize(field, value)
+                -- Integrality is tested on the raw reading, not on the normalized one:
+                -- cap_limit *floors* a fractional value (that is what makes 2.5 a legal
+                -- max_concurrency), so by the time this branch sees it a typo like 1.5 has
+                -- already become a plausible 1. A floor is not a number the operator has to
+                -- be protected from rounding -- it is the green threshold, so a fractional
+                -- reading is a typo and says nothing about what was meant.
+                local number = tonumber(value)
+                if cap == nil or number == nil or cap ~= number
+                    or cap < 1 or cap > MIN_CONCURRENCY_LIMIT then
+                    return nil, string.format(
+                        "upstream %s min_concurrency must be an integer between 1 and %d",
+                        canonical, MIN_CONCURRENCY_LIMIT)
+                end
+                out[field] = cap
+                caps_said[field] = cap
+            end
         end
+    end
+    -- Both concurrency tiers declared: the green floor has to sit strictly below the red
+    -- ceiling, otherwise "idle" and "full" overlap (or invert) and every state judgment in
+    -- the pool becomes arbitrary. max_concurrency unlimited (nil) has no ceiling to violate.
+    if caps_said.min_concurrency ~= nil and caps_said.max_concurrency ~= nil
+        and caps_said.min_concurrency >= caps_said.max_concurrency then
+        return nil, string.format(
+            "upstream %s min_concurrency (%d) must be less than max_concurrency (%d)",
+            canonical, caps_said.min_concurrency, caps_said.max_concurrency)
+    end
+    -- Retired field: warn once and drop it. No migration -- the new fields carry no watts
+    -- equivalent, and inventing a watts -> utilisation conversion would set an operator's
+    -- gate for them (doc/caps-redesign-2026-10-06.md §1).
+    local legacy_power = rawget(entry, "max_power_w")
+    if legacy_power ~= nil and legacy_power ~= JSON_NULL then
+        warn_retired_power_w(canonical)
     end
     return out, nil
 end
@@ -237,8 +371,9 @@ local function upstream_defaults(item)
         -- declares no cap from reporting drift against a worker that has none either
         -- (a permanent drift would make the 30s self-heal rewrite the same worker
         -- forever, the failure mode models_covered() exists to avoid).
-        max_concurrency = CS_PROFILES.declared_cap(item.max_concurrency, true),
-        max_power_w = CS_PROFILES.declared_cap(item.max_power_w, false),
+        min_concurrency = cap_normalize("min_concurrency", item.min_concurrency),
+        max_concurrency = cap_normalize("max_concurrency", item.max_concurrency),
+        max_gpu_util = cap_normalize("max_gpu_util", item.max_gpu_util),
     }
 end
 
@@ -293,8 +428,8 @@ local function upstream_drifts(item, record)
     -- reads all of those as "unlimited", and an absent field is also "unlimited".
     -- Comparing raw would report a drift that the pool can never satisfy (the two
     -- stored shapes both normalize to nil), i.e. the endless self-heal loop again.
-    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
-        local have = CS_PROFILES.declared_cap(record[field], field == "max_concurrency")
+    for _, field in ipairs(CAP_FIELDS) do
+        local have = cap_normalize(field, record[field])
         if have ~= want[field] then return true end
     end
     if not same_labels(want.labels, record.labels) then return true end
@@ -319,11 +454,13 @@ end
 ---
 --- `record` (the live pool row, optional) decides only the cap *clears*: registry.update
 --- ignores an absent or null number field, so "the declaration stopped naming a cap"
---- cannot be sent as a deletion -- the one spelling the pool reads back as unlimited is
---- an explicit 0 (cap_limit folds <=0 to nil, and an uncapped record costs no dict read).
---- That 0 is therefore sent only when the stored row really holds a limit; sending it
---- unconditionally would materialize two keys on every config worker the operator never
---- capped, which is the byte-shape change this layer promises to avoid.
+--- cannot be sent as a deletion -- the pool only reads back "unlimited" from an explicit
+--- sentinel its own reader folds to nil: 0 for the concurrency tiers (cap_limit folds
+--- <= 0), and -1 for the utilisation tier, which cannot use 0 because that is its
+--- strictest gate (see cap_clear_value). Each sentinel is sent only when the stored row
+--- really holds a limit; sending them unconditionally would materialize keys on every
+--- config worker the operator never capped, which is the byte-shape change this layer
+--- promises to avoid.
 local function upstream_patch(item, record)
     local want = upstream_defaults(item)
     local patch = {
@@ -333,12 +470,11 @@ local function upstream_patch(item, record)
         labels = want.labels,
         disable_health_check = want.disable_health_check,
     }
-    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
-        local integer = field == "max_concurrency"
+    for _, field in ipairs(CAP_FIELDS) do
         if want[field] ~= nil then
             patch[field] = want[field]
-        elseif record and CS_PROFILES.declared_cap(record[field], integer) ~= nil then
-            patch[field] = 0
+        elseif record and cap_normalize(field, record[field]) ~= nil then
+            patch[field] = cap_clear_value(field)
         end
     end
     -- Carried only when the row says something: registry.patch_record folds it into
@@ -377,11 +513,10 @@ end
 ---@return table|nil patch @ nil = nothing to project
 local function upstream_caps_only_patch(item, record)
     local patch
-    for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
-        local integer = field == "max_concurrency"
-        local want = CS_PROFILES.declared_cap(item[field], integer)
+    for _, field in ipairs(CAP_FIELDS) do
+        local want = cap_normalize(field, item[field])
         if want ~= nil then
-            local have = record and CS_PROFILES.declared_cap(record[field], integer) or nil
+            local have = record and cap_normalize(field, record[field]) or nil
             if have ~= want then
                 patch = patch or {}
                 patch[field] = want
@@ -458,12 +593,14 @@ function _M.reconcile_upstreams()
                 labels = item.labels or {},
                 disable_health_check = (item.disable_health_check and true) or false,
                 -- Caps ride the create path too, so a worker the declaration layer
-                -- creates is born capped instead of waiting for the next drift tick:
-                -- the self-heal gap between add and the following reconcile would
-                -- otherwise let one uncapped request through a worker the operator had
-                -- already fenced. registry.add normalizes them with the same cap_limit.
-                max_concurrency = CS_PROFILES.declared_cap(item.max_concurrency, true),
-                max_power_w = CS_PROFILES.declared_cap(item.max_power_w, false),
+                -- creates is born gated instead of waiting for the next drift tick: the
+                -- self-heal gap between add and the following reconcile would otherwise
+                -- let one uncapped request through a worker the operator had already
+                -- fenced. registry.add normalizes them with the same readers (cap_limit
+                -- for the two concurrency tiers, the utilisation reader for the third).
+                min_concurrency = cap_normalize("min_concurrency", item.min_concurrency),
+                max_concurrency = cap_normalize("max_concurrency", item.max_concurrency),
+                max_gpu_util = cap_normalize("max_gpu_util", item.max_gpu_util),
                 discovery = "config",
             }, CS_LEXICON.store_config() or {})
             if res then
@@ -555,6 +692,10 @@ end
 -- ------------------------------------------------- 跨子模块直调的原文 local
 -- 这些函数在原文里是同文件 local 直调、从未挂在 _M 上；拆开后由调用方直接 require 本表
 -- 调用（不经 facade，所以既不是新增导出、也不给单测多开一个可替换点）。
+-- 容量门字段名册：本波新增的共享件（doc/caps-redesign-2026-10-06.md §1）。snapshot.lua
+-- 的落盘段与 reconcile 的三条写路径都从这同一份名单取值，字段不在两个文件里各写一遍。
+-- 不是导出面契约的一部分（老 _M 契约逐名不变），只是跨子模块共用。
+_M.CAP_FIELDS = CAP_FIELDS
 _M.build_upstreams = build_upstreams
 _M.previous_upstream_map = previous_upstream_map
 _M.sanitize_upstream_rows = sanitize_upstream_rows

@@ -22,6 +22,36 @@ local DEFAULT_METRIC_KEYS = {
 }
 _M.DEFAULT_METRIC_KEYS = DEFAULT_METRIC_KEYS
 
+-- 利用率通道（doc/caps-redesign-2026-10-06.md §5）的 gauge 名册。它与上面的**负载**名册
+-- 是两份，且刻意不包含两个 KV-cache 用量名：KV cache 占用率量的是「引擎装了多少 token」，
+-- 不是「卡有多忙」，把它喂给 GPU 利用率上限判定 = 一个把缓存塞满但卡闲着的引擎被当成满载
+-- 摘出候选集。准入判据只认 GPU 利用率这一族。
+--   * dcgm_fi_dev_gpu_util   21.k 上的**真名**：dcgm-exporter :9400 写的是
+--       DCGM_FI_DEV_GPU_UTIL{gpu="0",...,Hostname="gpu-pro6000-1"} 0（样本
+--       /data/tmp/dcgm-metrics-9400.txt，测绘 lr-map-gpuload-2026.md §3.1）。这条是本轮
+--       新增：名册里原来只有 dcgm_gpu_utilization，那是另一个 exporter 的写法，与 DCGM 的
+--       真名对不上，所以 21.k 上「用 metrics 路取利用率」其实一直没生效，生产读数全靠 prom
+--       路那条 SMG_LOAD_PROM_QUERY。旧写法保留——别的数据源还在用它。
+--   * nvidia_gpu_utilization / dcgm_gpu_utilization  其余 exporter 的同量纲写法（0..100）。
+-- 量纲两种都有（DCGM/nvidia 是 0..100 百分数），所以读数一律过 util_fraction()，
+-- 不复用 normalize() 那条「>1 就当百分数」的启发式——理由见该函数上方。
+local DEFAULT_UTIL_METRIC_KEYS = {
+    "dcgm_fi_dev_gpu_util",
+    "nvidia_gpu_utilization",
+    "dcgm_gpu_utilization",
+}
+_M.DEFAULT_UTIL_METRIC_KEYS = DEFAULT_UTIL_METRIC_KEYS
+
+-- prom 路利用率查询的缺省 PromQL（SMG_LOAD_UTIL_QUERY 缺省值）。它是**唯一权威**的一份
+-- 字面量：config.lua 装配 + cards.util_config() 的回落都指向这里，两处不再各抄一遍。
+-- gpu 必须留在 by 里，理由与功率那条一模一样（lr-map-gpuload-2026.md §2.2）：把它聚合掉
+-- 就是 21.k 八台 worker 共用一个数（342.371）的复刻，逐卡归属当天就退化回整机 max。
+-- Hostname 与 instance 也都留在 by 里：util_fold（复用 power_fold 的机器身份规则）靠这两
+-- 个标签在「一台 Prometheus 抓了多台机器的本机 exporter」时识破归属冲突，而本机 worker 全
+-- 注册成 http://127.0.0.1:80xx，只有 exporter 的抓取地址能把读数交回本机。
+local DEFAULT_UTIL_QUERY = "max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)"
+_M.DEFAULT_UTIL_QUERY = DEFAULT_UTIL_QUERY
+
 -- 功率 gauge 的候选名（SMG_LOAD_POWER_KEYS 为空时用）。列在这里的名字都是在
 -- 21.k（8x RTX PRO 6000 Blackwell SE）上真实抓到的写法：
 --   * DCGM_FI_DEV_POWER_USAGE        dcgm-exporter :9400 的每卡瓦特，
@@ -408,6 +438,112 @@ function _M.power_watt(value)
         return nil
     end
     return number
+end
+
+------------------------------------------------------------- util (0..1 busy)
+
+-- 一个还能被当成「单卡 GPU 利用率」的原始读数上限（百分数量纲）。DCGM 的
+-- DCGM_FI_DEV_GPU_UTIL 定义域是 0..100（'# HELP ... GPU utilization (in %).'），
+-- 驱动舍入到 105 仍算满载；而 1000 以上的读数几乎只会是被误配进名册的**计数器**
+-- （运行时长、能量焦耳、token 累计……），那种数字喂给利用率上限判定，会让这一路
+-- worker 永久高于任何 0..100 的上限而整个从候选集消失——一个配错的 gauge 名单独
+-- 干掉一个实例，与 MAX_PLAUSIBLE_WATTS 防的是同一类事故。宁可回「未知」。
+local MAX_PLAUSIBLE_UTIL_PERCENT = 1000
+_M.MAX_PLAUSIBLE_UTIL_PERCENT = MAX_PLAUSIBLE_UTIL_PERCENT
+
+---Usable single-GPU **utilization** reading normalized to 0..1, or nil.
+---
+---利用率是准入门（registry 的 gu: 键 -> capacity_state/capacity_exclusion）的读数，
+---所以它不复用 normalize() 那条「>1 就当百分数、越界一律夹到 1」的打分启发式——
+---lr-map-gpuload-2026.md §3.2 点名的缺口就在这一条：作为打分可以，作为准入太软。
+---本函数的口径（doc/caps-redesign-2026-10-06.md §5 钉死）：
+---  * 非数 / NaN / ±inf：同 parse_number() 的口径，nil。
+---  * **负数 -> nil**（绝不夹到 0）：0 % 是合法读数（21.k 的 dcgm 空载就报
+---    DCGM_FI_DEV_GPU_UTIL{gpu="0"} 0），而负数是坏 exporter；夹成 0 等于给一台
+---    撒谎的 exporter 发免检牌——它永远「远低于任何上限」，这正是功率侧拒收 0 W
+---    的同一类事故，只是方向反过来。
+---  * 0..1（含端点）：按分数收。恰好 1 = 满载（与 normalize() 对负载的口径一致，
+---    xl: 与 gu: 两把键对「1」必须同义，否则同一个 exporter 在打分与准入两路读出
+---    两种世界）。百分数量纲里 1 % 的真读数被当满载是**过判**——过判只会少用一台
+---    worker（还能被 per_card/fallback 计数与日志看见），漏判会让满载卡继续接活，
+---    两害相权取过判。
+---  * 1..MAX_PLAUSIBLE_UTIL_PERCENT：按百分数收，/100 后夹到 1（105 % 仍是满载）。
+---  * 超出上限：nil（未知 -> 不排除），理由见 MAX_PLAUSIBLE_UTIL_PERCENT 上方。
+---@param value number|string|nil
+---@return number|nil util @ normalized 0..1
+function _M.util_fraction(value)
+    local number = _M.parse_number(value)
+    if number == nil or number < 0 then
+        return nil
+    end
+    if number <= 1 then
+        return number
+    end
+    if number > MAX_PLAUSIBLE_UTIL_PERCENT then
+        return nil
+    end
+    local util = number / 100
+    if util > 1 then
+        util = 1
+    end
+    return util
+end
+
+---Per-card **utilization** readings for one /metrics exposition (the metrics
+---path's util scan; the counterpart of power_watts_by_card()).
+---
+---与功率版同一次正文扫描、同样的两路归约（whole = 整机最热卡，by_card[gpu] = 该卡），
+---差的只有两点：筛子换成 util_fraction()（功率的 power_watt() 会把合法的 0 拒掉，
+---利用率不能），以及名册默认 DEFAULT_UTIL_METRIC_KEYS（不含 KV-cache 用量名）。
+---gpu 标签只认纯数字（"0".."7"），口径与功率逐卡归属完全一致。
+---@param text string|nil @ the exposition body
+---@param names table[]|string|nil @ gauge names to keep (default DEFAULT_UTIL_METRIC_KEYS)
+---@return number|nil whole @ hottest card on the machine, 0..1
+---@return table @ by_card @ gpu id -> 0..1
+---@return boolean @ have_cards @ any usable series named a card
+function _M.util_by_card(text, names)
+    local whole, by_card, have_cards = nil, {}, false
+    if type(text) ~= "string" or text == "" then
+        return whole, by_card, have_cards
+    end
+    local wanted = {}
+    local list = _M.metric_key_list(names)
+    if #list == 0 then
+        list = _M.metric_key_list(DEFAULT_UTIL_METRIC_KEYS)
+    end
+    for i = 1, #list do
+        wanted[list[i]] = true
+    end
+    for line in string.gmatch(text, "[^\r\n]+") do
+        if string.byte(line, 1) ~= 35 then
+            local identity, value_text, labelled = split_sample(line)
+            local name = canon(identity)
+            if name and wanted[name] then
+                local util = _M.util_fraction(value_text)
+                if util then
+                    if whole == nil or util > whole then
+                        whole = util
+                    end
+                    local labels = _M.parse_labels(labelled)
+                    local raw = labels and labels.gpu
+                    local gpu = nil
+                    if type(raw) == "string" or type(raw) == "number" then
+                        local t = string.match(tostring(raw), "^%s*(.-)%s*$")
+                        if t and string.match(t, "^%d+$") then
+                            gpu = t
+                        end
+                    end
+                    if gpu then
+                        have_cards = true
+                        if by_card[gpu] == nil or util > by_card[gpu] then
+                            by_card[gpu] = util
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return whole, by_card, have_cards
 end
 
 ---Max **usable** watt reading over every power gauge in one exposition.

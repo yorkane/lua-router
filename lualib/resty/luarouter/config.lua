@@ -242,6 +242,32 @@ function _M.load()
         -- number in the same order of magnitude as SMG_BALANCE_ABS_THRESHOLD.
         load_scale = num("SMG_LOAD_SCALE", 100),
 
+        -- ==================== GPU utilization channel ====================
+        -- doc/caps-redesign-2026-10-06.md §5：gu: 键（逐卡 GPU 利用率 0..1，TTL'd）的唯一
+        -- 写者通道，registry 的 max_gpu_util 上限判定读它。与负载/功率两路共用同一个定时器
+        -- 与同一份抓取（metrics 路同一正文多扫一遍；prom 路最多再多一条 PromQL），所以
+        -- SMG_LOAD_SOURCE 仍是总开关：它是 none 时这里设了也不会有任何读数（registry 侧
+        -- 「读数未知 -> 不排除」，红线 §0 第 2 条）。
+        --  * SMG_LOAD_UTIL_ENABLED 缺省 **1**（设计书 §5）。缺省开不改变任何现有部署的选路
+        --    行为：判定只发生在记录显式配了 max_gpu_util 的时候，采集本身只是把读数写进
+        --    registry；而缺省关的代价是操作员要多记一个开关才知道利用率上限为什么一直
+        --    按「未知」放行。显式关：0/false/no/off。
+        --  * SMG_LOAD_UTIL_QUERY 空 = 用 gpu_load/parse.lua 的 DEFAULT_UTIL_QUERY
+        --    （max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)——**带 gpu 标签才有
+        --    逐卡**，把它聚合掉就是 342.371 的利用率复刻；权威串只有一份，这里不重复字面量
+        --    的判读逻辑，空值原样交给 util_config 兜底）。prom 路「这条查询要不要多发」
+        --    看的是**操作员有没有显式写过它**（runpass 的 util_enabled 口径），所以空值
+        --    在这里保持空串而不是就地填缺省。
+        --  * SMG_LOAD_UTIL_KEYS 覆盖 metrics 路的利用率 gauge 名册；空 = 内置名册
+        --    （DEFAULT_UTIL_METRIC_KEYS：dcgm_fi_dev_gpu_util 真名 + nvidia/dcgm 两个同量纲
+        --    写法，刻意不含 KV-cache 用量名——准入判据只认 GPU 利用率）。
+        -- 这三个名字与功率那三个不同，走的是 config.lua 装配（fork 前解析，天然进
+        -- /probe/config）；三份 conf 的 env 声明只是为了让 util_config 的 os.getenv 兜底
+        -- 分支在「手搓 cfg」的调用面里也能读到，两条路都通。
+        load_util_enabled = bool("SMG_LOAD_UTIL_ENABLED", true),
+        load_util_query = str("SMG_LOAD_UTIL_QUERY", ""),
+        load_util_keys = list("SMG_LOAD_UTIL_KEYS"),
+
         -- ==================== retries ====================
         max_retries = num("SMG_RETRY_MAX_RETRIES", 5),
         initial_backoff_ms = num("SMG_RETRY_INITIAL_BACKOFF_MS", 50),

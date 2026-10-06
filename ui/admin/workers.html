@@ -119,7 +119,7 @@
                       <q-icon v-else name="mdi-help-circle-outline" color="grey-6" size="18px"></q-icon>
                       <div>
                         <strong>{{ props.row.url }}</strong>
-                        <span>{{ props.row.id || props.row.url }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span></span>
+                        <span>{{ props.row.id || props.row.url }}<span v-if="props.row.worker_type && props.row.worker_type !== 'regular'"> · {{ props.row.worker_type }}</span><q-badge v-if="gpuBadge(props.row)" outline color="blue-8" class="chip-soft" style="margin-left:6px">{{ gpuBadge(props.row) }}<q-tooltip>{{ t.gpuBadgeHint }}</q-tooltip></q-badge></span>
                         <div v-if="coveredModels(props.row).length" class="served-models" style="margin-top:4px">
                           <span class="model-tag" v-for="m in coveredModels(props.row)" :key="m">{{ m }}</span>
                         </div>
@@ -145,6 +145,15 @@
                   <q-td :props="props">
                     <div class="route-cell">
                       <q-badge :color="healthColor(props.row)" :label="healthLabel(props.row)" text-color="white"></q-badge>
+                      <!-- 容量三态灯：颜色只有一个来源 —— 后端 /workers 的 load_state（由
+                           registry.capacity_state 判定）。前端一行都不重算：网关的绿灯优先裁剪与这里的
+                           上色读的是同一次判定，各自再算一套就会和选路说不一样的话（旧的 capExceeded
+                           纯前端判定正是这个缺陷，本轮按设计书废弃）。
+                           load_state 缺席 = 这台实例没声明任何上限（无门）：呈中性灰，不画成绿。 -->
+                      <q-badge :color="loadStateColor(props.row)" :label="loadStateLabel(props.row)" :text-color="loadStateTextColor(props.row)">
+                        <q-icon v-if="props.row.load_state === 'full'" name="mdi-account-off" size="12px"></q-icon>
+                        <q-tooltip>{{ loadStateTooltip(props.row) }}</q-tooltip>
+                      </q-badge>
                       <q-badge v-if="props.row.job_status" outline :color="jobColor(props.row.job_status.status)" class="chip-soft">
                         {{ jobLabel(props.row.job_status) }}
                       </q-badge>
@@ -156,17 +165,23 @@
                 <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
                 <template v-slot:body-cell-capacity="props">
                   <q-td :props="props">
-                    <!-- 三行读法：阈值（谁的口径）/ 实测（只读，绝不回写）/ 归属与漂移 -->
+                    <!-- 三行读法：阈值（谁的口径）/ 实测（只读，绝不回写）/ 归属与漂移。
+                         第一段是并发区间 min–max（min 缺席按 1，max 缺席 = 不限），第二段是 GPU 利用率
+                         上限（0..100 整数百分比，缺席 = 不限）。颜色不在这张列里 —— 它是状态列的三态灯，
+                         判定只在后端。功率上限那段随 doc/caps-redesign-2026-10-06.md 整段删除：pw: 读数
+                         与它的指标族仍作为观测保留，但容量判定与 UI 都不再看瓦特。 -->
                     <div style="display:flex;flex-direction:column;gap:2px">
                       <div class="route-cell" style="gap:6px">
-                        <q-icon name="mdi-buffer" size="13px" :color="capExceeded(props.row, 'max_concurrency', 'concurrency') ? 'red-4' : 'grey-6'"></q-icon>
-                        <span class="mono" :class="{'text-red-4': capExceeded(props.row, 'max_concurrency', 'concurrency')}">{{ capConfigText(props.row, 'max_concurrency') }}</span>
+                        <!-- 图标名必须落在 vendor 打包的 MDI v7 名单里：原先用的那个名字不在名单内，
+                             渲染出来是空白；换成对过 css 与字体两侧的名字。 -->
+                        <q-icon name="mdi-account-multiple" size="13px" color="grey-6"></q-icon>
+                        <span class="mono">{{ capRangeText(props.row) }}</span>
                         <span class="muted mono" style="font-size:11px">{{ capMeasuredText(props.row, 'concurrency') }}</span>
                       </div>
                       <div class="route-cell" style="gap:6px">
-                        <q-icon name="mdi-flash-outline" size="13px" :color="capExceeded(props.row, 'max_power_w', 'power') ? 'red-4' : 'grey-6'"></q-icon>
-                        <span class="mono" :class="{'text-red-4': capExceeded(props.row, 'max_power_w', 'power')}">{{ capConfigText(props.row, 'max_power_w') }}</span>
-                        <span class="muted mono" style="font-size:11px">{{ capMeasuredText(props.row, 'power') }}</span>
+                        <q-icon name="mdi-speedometer-slow" size="13px" color="grey-6"></q-icon>
+                        <span class="mono">{{ capConfigText(props.row, 'max_gpu_util') }}</span>
+                        <span class="muted mono" style="font-size:11px">{{ capMeasuredText(props.row, 'gpu_util') }}</span>
                       </div>
                       <!-- 归属：声明层是上限的事实来源（自愈按声明写回池行）；未声明/被
                            watcher 抢先认领的行才由运行态 PUT 说了算。两种情况必须看得见面，
@@ -262,8 +277,12 @@
                     <q-input v-model="addForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
                   </div>
                   <div class="form-grid-2">
-                    <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
-                    <q-input v-model="addForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
+                    <!-- 容量三门共用 .form-grid-2：第三格自然换到下一行，比三行竖排省垂直空间。
+                         预填 1 / 8 是把「新行通常就想被管住」先画上，清空上限才回到不限；
+                         利用率门一律留空 = 不限（0 是合法的极严档，不能拿 0 当「没填」）。 -->
+                    <q-input v-model="addForm.min_concurrency" dense outlined dark type="number" step="1" :label="t.minConcurrencyField" :hint="t.minConcurrencyHint" :rules="[capRules.add.min]"></q-input>
+                    <q-input v-model="addForm.max_concurrency" dense outlined dark type="number" step="1" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRules.add.max]"></q-input>
+                    <q-input v-model="addForm.max_gpu_util" dense outlined dark type="number" step="1" :label="t.maxGpuUtilField" :hint="t.maxGpuUtilHint" :rules="[capRules.add.util]"></q-input>
                   </div>
                   <div class="form-grid-2">
                     <q-input v-model="addForm.modelsText" dense outlined dark type="textarea" rows="2"
@@ -278,7 +297,9 @@
               </q-card-section>
               <q-card-actions align="right">
                 <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="addOpen = false"></q-btn>
-                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="addSubmitText" type="submit" @click="submitAdd"></q-btn>
+                <!-- 容量三门校验（含 min < max 交叉校验）不过时保存按钮直接禁用：让操作员在
+                     字段下面看到红字，而不是点了提交被静默拦下。 -->
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :disable="!addCapsOk" :label="addSubmitText" type="submit" @click="submitAdd"></q-btn>
               </q-card-actions>
             </q-card>
           </q-dialog>
@@ -301,8 +322,9 @@
                     <q-input v-model="declForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :rules="[numberRule]"></q-input>
                   </div>
                   <div class="form-grid-2">
-                    <q-input v-model="declForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[numberRule]"></q-input>
-                    <q-input v-model="declForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[numberRule]"></q-input>
+                    <q-input v-model="declForm.min_concurrency" dense outlined dark type="number" step="1" :label="t.minConcurrencyField" :hint="t.minConcurrencyHint" :rules="[capRules.decl.min]"></q-input>
+                    <q-input v-model="declForm.max_concurrency" dense outlined dark type="number" step="1" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRules.decl.max]"></q-input>
+                    <q-input v-model="declForm.max_gpu_util" dense outlined dark type="number" step="1" :label="t.maxGpuUtilField" :hint="t.maxGpuUtilHint" :rules="[capRules.decl.util]"></q-input>
                   </div>
                   <div class="form-grid-2">
                     <q-input v-model="declForm.modelsText" dense outlined dark type="textarea" rows="2"
@@ -321,7 +343,7 @@
               </q-card-section>
               <q-card-actions align="right">
                 <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="declOpen = false"></q-btn>
-                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.declSubmit" type="submit" @click="submitDecl"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :disable="!declCapsOk" :label="t.declSubmit" type="submit" @click="submitDecl"></q-btn>
               </q-card-actions>
             </q-card>
           </q-dialog>
@@ -341,9 +363,11 @@
                     <q-input v-model="editForm.cost" dense outlined dark type="number" step="0.1" :label="t.costField" :hint="t.costHint" :disable="selected.cap_owner === 'declared'"></q-input>
                   </div>
                   <div class="form-grid-2">
-                    <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRule]" :disable="selected.cap_owner === 'declared'"></q-input>
-                    <q-input v-model="editForm.max_power_w" dense outlined dark type="number" step="1" :label="t.maxPowerField" :hint="t.maxPowerHint" :rules="[capRule]" :disable="selected.cap_owner === 'declared'"></q-input>
+                    <q-input v-model="editForm.min_concurrency" dense outlined dark type="number" step="1" :label="t.minConcurrencyField" :hint="t.minConcurrencyHint" :rules="[capRules.edit.min]" :disable="selected.cap_owner === 'declared'"></q-input>
+                    <q-input v-model="editForm.max_concurrency" dense outlined dark type="number" step="1" :label="t.maxConcurrencyField" :hint="t.maxConcurrencyHint" :rules="[capRules.edit.max]" :disable="selected.cap_owner === 'declared'"></q-input>
+                    <q-input v-model="editForm.max_gpu_util" dense outlined dark type="number" step="1" :label="t.maxGpuUtilField" :hint="t.maxGpuUtilHint" :rules="[capRules.edit.util]" :disable="selected.cap_owner === 'declared'"></q-input>
                   </div>
+                  <div class="muted" style="font-size:11px">{{ t.capRuntimeNote }}</div>
                   <div class="form-grid-2">
                     <q-input v-model="editForm.labels" dense outlined dark :label="t.labelsField" :hint="t.labelsHint" :rules="[labelsRule]" :disable="selected.cap_owner === 'declared'"></q-input>
                     <q-toggle v-model="editForm.disable_health_check" dense color="teal-4" :label="t.disableHealth" :disable="selected.cap_owner === 'declared'"></q-toggle>
@@ -352,7 +376,7 @@
               </q-card-section>
               <q-card-actions align="right">
                 <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="editOpen = false"></q-btn>
-                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :label="t.updateSubmit" @click="submitEdit"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :disable="!editCapsOk" :label="t.updateSubmit" @click="submitEdit"></q-btn>
               </q-card-actions>
             </q-card>
           </q-dialog>
@@ -402,6 +426,12 @@
     function clone (value) {
       return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
     }
+    // 后端只在「至少声明了一道门」时返回 load_state，值域 idle/busy/full。其余形状（后端尚未
+    // 带这个字段、或代理把缺键写成了 null）一律折成 undefined —— 灯呈「未设限」中性态，
+    // 绝不冒充成某个网关没有判定过的状态。
+    function normaliseLoadState (value) {
+      return value === 'idle' || value === 'busy' || value === 'full' ? value : undefined
+    }
 
     const app = Vue.createApp({
       setup () {
@@ -436,11 +466,16 @@
         let declTimer
         let waitTimer
 
-        const blankAdd = () => ({ url: '', model_id: '', api_key: '', priority: '', cost: '', max_concurrency: '', max_power_w: '', modelsText: '', labelsText: '', disable_health_check: false })
-        const blankDecl = () => ({ url: '', model_id: '', api_key: '', clearKey: false, priority: '', cost: '', max_concurrency: '', max_power_w: '', modelsText: '', labelsText: '', disable_health_check: false })
+        // 容量三门的预填口径（doc/caps-redesign-2026-10-06.md §1）：min 缺席等价 1、max 缺席 = 不限，
+        // 所以新增/编辑声明时先画上 1 / 8（操作员最常写的那组），清空上限输入框才撤回不限；
+        // 利用率门一律留空 = 不限 —— 0 是合法的极严档，不能拿 0 当「没填」。
+        const blankAdd = () => ({ url: '', model_id: '', api_key: '', priority: '', cost: '', min_concurrency: '1', max_concurrency: '8', max_gpu_util: '', modelsText: '', labelsText: '', disable_health_check: false })
+        const blankDecl = () => ({ url: '', model_id: '', api_key: '', clearKey: false, priority: '', cost: '', min_concurrency: '1', max_concurrency: '8', max_gpu_util: '', modelsText: '', labelsText: '', disable_health_check: false })
         const addForm = reactive(blankAdd())
         const declForm = reactive(blankDecl())
-        const editForm = reactive({ priority: '', cost: '', max_concurrency: '', max_power_w: '', labels: '', disable_health_check: false })
+        // 运行态 PUT 不预填数字：那里的空串是「不下发该字段」（见 appendCaps 的三态），
+        // 预填一个数等于每次编辑都替操作员新增一道他没写的门。
+        const editForm = reactive({ priority: '', cost: '', min_concurrency: '', max_concurrency: '', max_gpu_util: '', labels: '', disable_health_check: false })
         const pagination = reactive({ rowsPerPage: 20 })
 
         const c = computed(() => window.lmrI18n.messages[locale.value].common)
@@ -495,11 +530,17 @@
               models_verified: worker.models_verified, is_healthy: Boolean(worker.is_healthy), load: worker.load,
               priority: worker.priority, cost: worker.cost,
               // 两份上限分开留：pool_* 是池记录此刻真实的值，decl_* 是配置文档写的期望值。
-              // 合并后的 max_* 只是「显示值」，归属见下面的 capOwnership。
-              pool_max_concurrency: worker.max_concurrency, pool_max_power_w: worker.max_power_w,
-              decl_max_concurrency: undefined, decl_max_power_w: undefined,
-              max_concurrency: worker.max_concurrency, max_power_w: worker.max_power_w,
-              inflight_requests: worker.inflight_requests, power_w: worker.power_w, labels: worker.metadata || {},
+              // 合并后的 min/max_gpu_util/max_* 只是「显示值」，归属见下面的 capOwnership。
+              // 瓦特那一档随 2026-10-06 退役，两侧都不再搬运 power_w / max_power_w。
+              pool_min_concurrency: worker.min_concurrency, pool_max_concurrency: worker.max_concurrency,
+              pool_max_gpu_util: worker.max_gpu_util,
+              decl_min_concurrency: undefined, decl_max_concurrency: undefined, decl_max_gpu_util: undefined,
+              min_concurrency: worker.min_concurrency, max_concurrency: worker.max_concurrency,
+              max_gpu_util: worker.max_gpu_util,
+              // 三态灯与实测读数原样带过来：判定在后端，这里只做搬运（load_state 只认三个值，
+              // 其它形状一律折成缺席，避免 null 冒充成「网关拒绝命名的状态」）。
+              load_state: normaliseLoadState(worker.load_state),
+              inflight_requests: worker.inflight_requests, gpu_util: worker.gpu_util, labels: worker.metadata || {},
               job_status: worker.job_status, disable_health_check: Boolean(worker.disable_health_check),
               discovery: worker.discovery || 'dynamic', decl: null, decl_url: '' })
           })
@@ -511,10 +552,11 @@
             const declaredPriority = Number.isFinite(Number(decl.priority)) ? Number(decl.priority) : 50
             const declaredCost = Number.isFinite(Number(decl.cost)) ? Number(decl.cost) : 1
             if (row) {
-              row.decl = decl
-              row.decl_url = normUrl(decl.url)
-              row.decl_max_concurrency = decl.max_concurrency
-              row.decl_max_power_w = decl.max_power_w
+            row.decl = decl
+            row.decl_url = normUrl(decl.url)
+            row.decl_min_concurrency = decl.min_concurrency
+            row.decl_max_concurrency = decl.max_concurrency
+            row.decl_max_gpu_util = decl.max_gpu_util
               // 上限的显示值绝不在这里定：只有声明层真正拥有这一行时才用声明值，
               // 否则必须保持池里的真实值 —— 见下面 out.forEach 里的 cap_owner 判定。
               // 这里过早覆盖会让「watcher 抢先持有池行」的服务显示出根本没用上的声明值。
@@ -528,11 +570,15 @@
               byKey.set(key, { key, url: normUrl(decl.url), inPool: false, id: '', worker_type: 'regular',
                 model_id: decl.model_id || '', models: Array.isArray(decl.models) ? decl.models.slice() : [],
                 models_verified: null, is_healthy: false, load: null,
-                priority: declaredPriority, cost: declaredCost,
-                pool_max_concurrency: undefined, pool_max_power_w: undefined,
-                decl_max_concurrency: decl.max_concurrency, decl_max_power_w: decl.max_power_w,
-                max_concurrency: decl.max_concurrency, max_power_w: decl.max_power_w,
-                inflight_requests: null, power_w: null, labels: decl.labels || {}, job_status: null,
+            priority: declaredPriority, cost: declaredCost,
+            pool_min_concurrency: undefined, pool_max_concurrency: undefined, pool_max_gpu_util: undefined,
+            decl_min_concurrency: decl.min_concurrency, decl_max_concurrency: decl.max_concurrency,
+            decl_max_gpu_util: decl.max_gpu_util,
+            min_concurrency: decl.min_concurrency, max_concurrency: decl.max_concurrency,
+            max_gpu_util: decl.max_gpu_util,
+            // 未入池的行没有池记录，也就没有判定：灯呈「未设限」中性态，而不是替它猜一个。
+            load_state: undefined,
+            inflight_requests: null, gpu_util: null, labels: decl.labels || {}, job_status: null,
                 disable_health_check: Boolean(decl.disable_health_check), discovery: 'config', decl, decl_url: normUrl(decl.url) })
             }
           })
@@ -556,14 +602,22 @@
             row.cap_owner = ownedByDecl ? 'declared' : 'runtime'
             if (ownedByDecl) row.has_key = row.decl_has_key
             else if (row.decl_has_key) row.key_inert = true
-            if (ownedByDecl) {
-              row.max_concurrency = row.decl_max_concurrency
-              row.max_power_w = row.decl_max_power_w
-            }
-            row.cap_drift = ownedByDecl && row.inPool ? [
-              capNumber(row.decl_max_concurrency) !== capNumber(row.pool_max_concurrency),
-              capNumber(row.decl_max_power_w) !== capNumber(row.pool_max_power_w)
-            ] : [false, false]
+          if (ownedByDecl) {
+          }
+          if (ownedByDecl) {
+            row.min_concurrency = row.decl_min_concurrency
+            row.max_concurrency = row.decl_max_concurrency
+            row.max_gpu_util = row.decl_max_gpu_util
+          }
+          // 漂移徽章的两个槽位照旧（模板按 [0]||[1] 判断，形状不能动）：槽 0 是并发两档
+          // （min 与 max 任一不一致都算 —— 自愈同样会按声明把 min 写回池记录），
+          // 槽 1 是利用率上限。归一化各按各的读法：并发用 capNumber（<=0 折成不限），
+          // 利用率用 utilNumber（0 是合法的极严档，不能被折成不限）。
+          row.cap_drift = ownedByDecl && row.inPool ? [
+            capNumber(row.decl_min_concurrency) !== capNumber(row.pool_min_concurrency)
+              || capNumber(row.decl_max_concurrency) !== capNumber(row.pool_max_concurrency),
+            utilNumber(row.decl_max_gpu_util) !== utilNumber(row.pool_max_gpu_util)
+          ] : [false, false]
             row.cap_shadowed = Boolean(row.decl_url) && !ownedByDecl
           })
           out.sort((a, b) => String(a.url).localeCompare(String(b.url)))
@@ -674,23 +728,32 @@
         }
 
         // ── 容量上限（配置）与实时读数 ──
-        // max_concurrency / max_power_w 是操作员写的阈值；inflight_requests 与 power_w
-        // 是网关自己的在飞计数和监控采到的瓦特。两者必须分行且视觉区分：实测值是只读的，
+        // 三道门（并发下限 / 并发上限 / GPU 利用率上限）是操作员写的阈值；inflight_requests 与
+        // gpu_util 是网关自己的在飞计数和监控采到的利用率。两者必须分行且视觉区分：实测值是只读的，
         // 一旦被当成配置回写，就等于让监控采样替操作员改了选路规则。
-        // 读数缺席 = 未知（power_w 在没有新鲜采样时压根不出现），未知一律显示「—」而非 0，
-        // 与后端 capacity_exclusion 的「未知不排除」同口径。
+        // 读数缺席 = 未知（gpu_util 在没有新鲜采样时压根不出现），未知一律显示「未采集」而非 0，
+        // 与后端「未知不排除」同口径（doc/caps-redesign-2026-10-06.md §0 第 2 条）。
+        // 瓦特读数（power_w）随 2026-10-06 的容量重设计退出判定，UI 也不再画它、不再发它的键。
         function capNumber (value) {
           const number = Number(value)
           if (!Number.isFinite(number) || number <= 0) return null
           return number
         }
+        // 利用率门的归一化与并发门不同：0 是合法值（最严档），只有缺席 / 非数 / 负数才是「不限」，
+        // 与后端 registry.util_limit 同一个读法。用 capNumber 画它会把 0 显示成「不限」。
+        function utilNumber (value) {
+          const number = Number(value)
+          if (!Number.isFinite(number) || number < 0) return null
+          return Math.floor(number)
+        }
         function inflightOf (row) {
           const number = Number(row && row.inflight_requests)
           return Number.isFinite(number) && row.inPool ? number : null
         }
-        function powerOf (row) {
+        // /workers 的 gpu_util 是 0..1 的纯利用率（registry 的 gu: 键），缺席 = 未采集。
+        function gpuUtilOf (row) {
           if (!row || !row.inPool) return null
-          const value = row.power_w
+          const value = row.gpu_util
           if (value === null || value === undefined || value === '') return null
           const number = Number(value)
           return Number.isFinite(number) ? number : null
@@ -701,31 +764,83 @@
           return Number.isInteger(number) ? String(number) : number.toFixed(1)
         }
         function capConfigText (row, field) {
+          // 利用率门走 utilNumber：0 是合法的「最严档」，用 capNumber 会被折成「不限」。
+          if (field === 'max_gpu_util') {
+            const cap = utilNumber(row && row[field])
+            if (cap === null) return t.value.capUnlimited
+            return '≤' + cap + '%'
+          }
           const cap = capNumber(row && row[field])
           if (cap === null) return t.value.capUnlimited
-          return '≤' + formatCapNumber(cap) + (field === 'max_power_w' ? ' W' : '')
+          return '≤' + formatCapNumber(cap)
+        }
+        // 并发阈值显示成区间：min–max。min 缺席按 1（后端把缺席等价成 1），max 缺席 = 不限；
+        // 两门都没配时整段说「未设限」，而不是画一个看起来像配置的区间。
+        function capRangeText (row) {
+          const min = capNumber(row && row.min_concurrency) || 1
+          const max = capNumber(row && row.max_concurrency)
+          if (max === null && utilNumber(row && row.max_gpu_util) === null) return t.value.capNoGate
+          if (max === null) return min + '–' + t.value.capUnlimited
+          return min + '–' + max
         }
         function capMeasuredText (row, kind) {
-          if (kind === 'power') {
-            const watts = powerOf(row)
-            return watts === null
+          if (kind === 'gpu_util') {
+            const util = gpuUtilOf(row)
+            // 缺席写成「未采集」而不是 0%：监控挂了只该损失精度，画成 0 会看着像「卡闲着、肯定不挡」。
+            return util === null
               ? t.value.capNoSample
-              : t.value.capMeasured + ' ' + formatCapNumber(watts) + ' W'
+              : t.value.capMeasured + ' ' + Math.round(util * 100) + '%'
           }
           const inflight = inflightOf(row)
           return t.value.capMeasured + ' ' + (inflight === null ? '—' : formatCapNumber(inflight))
         }
-        // 达到上限 = 这条实例此刻被选路硬排除（即使 cache_aware 想留在本地）。
-        // 未知读数永不判超限；未入池的行没有读数，也永不判超限。
-        function capExceeded (row, field, kind) {
-          const cap = capNumber(row && row[field])
-          if (cap === null) return false
-          const measured = kind === 'power' ? powerOf(row) : inflightOf(row)
-          return measured !== null && measured >= cap
+        // 旧的 capExceeded（前端拿读数自己比阈值判「超限」再上色）已删除：那套判定与网关的
+        // 准入判定各算各的，会出现「表里红着但其实还在接流量」或反过来。颜色改读 load_state。
+        // ── 三态灯：唯一数据源是 /workers 的 load_state（registry.capacity_state 判定） ──
+        // 缺席 = 这台实例没声明任何门（后端在这种情况下不返回该键），呈中性灰，绝不显示成绿：
+        // 绿意味着「此刻很闲」，而无门不代表闲，只代表没人给它定过阈值。
+        function loadStateColor (row) {
+          const state = row && row.load_state
+          if (state === 'idle') return 'teal-6'
+          if (state === 'busy') return 'amber-8'
+          if (state === 'full') return 'red-8'
+          return 'grey-8'
         }
+        function loadStateTextColor (row) {
+          return (row && row.load_state) ? 'white' : undefined
+        }
+        function loadStateLabel (row) {
+          const state = row && row.load_state
+          if (state === 'idle') return t.value.loadIdle
+          if (state === 'busy') return t.value.loadBusy
+          if (state === 'full') return t.value.loadFull
+          return t.value.loadUnmanaged
+        }
+        // 悬停把决定颜色的两个数也讲出来：绿/黄/红本身不够可诊断，操作员要能看见「为什么是这个颜色」。
+        function loadStateTooltip (row) {
+          const state = row && row.load_state
+          if (!state) return t.value.loadUnmanagedHint
+          if (state === 'full') return t.value.loadFullHint
+          if (state === 'idle') return t.value.loadIdleHint
+          return t.value.loadBusyHint
+        }
+        // GPU 徽章：数据源是 /workers 的 metadata.gpu（registry 把 labels 整表转出的），零新增请求。
+        // 没有这个 label 时不显示徽章 —— 宁可不标也不猜，标错的卡号比没有更坏。
+        function gpuBadge (row) {
+          const value = row && row.labels && row.labels.gpu
+          if (value === undefined || value === null || value === '') return ''
+          return 'GPU' + String(value)
+        }
+        // 排序按「最紧的那道门」：并发上限与利用率上限取较小者做刻度，未设限的两道都记 -1，
+        // 于是不设限的行沉底、紧门的行浮在前排，与灯的观感一致。
         function capacitySortValue (row) {
           const cap = capNumber(row && row.max_concurrency)
-          return cap === null ? -1 : cap
+          const util = utilNumber(row && row.max_gpu_util)
+          const scores = []
+          if (cap !== null) scores.push(cap)
+          if (util !== null) scores.push(util)
+          if (scores.length === 0) return -1
+          return Math.min.apply(null, scores)
         }
         // 运行态 PUT 的三态：空串 = 不下发该字段（保持不变）；0/负数 = 0（撤上限）；>0 = 设定。
         // 后端 cap_limit 把 <=0/非数归一为不限，所以这里不能把空串当 0 发出去。
@@ -737,33 +852,145 @@
           if (number <= 0) return 0
           return integer ? Math.floor(number) : number
         }
-        function capRule (value) {
+        // 三门的边界（与后端 config_store 同源，别在这里发明新数）：
+        //   min 1..31、max 1..32（31 是给「min < max 且 max 可到 32」留位）、util 0..100 整数。
+        const CAP_MIN_LIMIT = 31
+        const CAP_MAX_LIMIT = 32
+        const CAP_UTIL_LIMIT = 100
+        // 单格解析：空 → {empty:true}；非整数 / 越界 → {message}；否则 → {value}。
+        // 三门共用，越界文案带上区间，操作员看得见到底哪一格写错。
+        function parseCapField (value, min, max) {
           const text = String(value === null || value === undefined ? '' : value).trim()
-          if (!text) return true
-          return Number.isFinite(Number(text)) || t.value.capRule
+          if (text === '') return { empty: true }
+          const number = Number(text)
+          if (!Number.isFinite(number)) return { message: t.value.numberRule }
+          if (!Number.isInteger(number)) return { message: t.value.capNeedInteger }
+          if (number < min || number > max) {
+            return { message: t.value.capOutOfRange.replace('{min}', min).replace('{max}', max) }
+          }
+          return { value: number }
         }
+        // 规则工厂：三处对话框共用一套判定。max 与 util 的留空是有语义的值（= 不限），也是声明层
+        // 撤掉这两道门的唯一写法（整表替换语义下删键即未声明），表单不许把它们判成错误 —— 否则
+        // 「不限」这一档在管理台里没法表达，而且回填会把没设过上限的老条目凭空加出一道门（违反
+        // §0 的缺省零行为变化）。min 的留空与填 1 在后端完全等价（缺席即 1），所以按契约做成必填：
+        // 清空只会被当成还没填完；老条目在回填时直接画成 1，因此必填不会拦住「只想改密钥」这类
+        // 无关编辑。运行态 PUT 一侧三格都可空 —— 那里的空串是「这个字段别下发」。
+        // min < max 的交叉校验在 min 与 max 两格都挂：哪一格被改动都会重算一次，判定与后端
+        // config_store 的 min>=max 400 同口径（先在这里拦，红字才落在字段下面）。
+        function capRulesFor (form) {
+          return capRulesForForm(form, false)
+        }
+        function capRulesForForm (form, requireMin) {
+          const bothConcurrency = () => {
+            const lo = parseCapField(form.min_concurrency, 1, CAP_MIN_LIMIT)
+            const hi = parseCapField(form.max_concurrency, 1, CAP_MAX_LIMIT)
+            if (lo.message) return lo.message
+            if (hi.message) return hi.message
+            if (lo.empty && requireMin) return t.value.capRequired
+            if (!lo.empty && !hi.empty && lo.value >= hi.value) return t.value.capMinBelowMax
+            return true
+          }
+          return {
+            min: () => bothConcurrency(),
+            max: () => bothConcurrency(),
+            util: value => {
+              const u = parseCapField(value, 0, CAP_UTIL_LIMIT)
+              if (u.message) return u.message
+              return true
+            }
+          }
+        }
+        const capRules = {
+          add: capRulesFor(addForm),
+          decl: capRulesFor(declForm),
+          // 运行态那一组还多一条：PUT 无法用空串撤门（空串=不下发），所以允许填 -1
+          // 显式撤掉利用率门 —— registry.util_limit 把负数折成「无门」，与后端同口径。
+          edit: (() => {
+            const base = capRulesFor(editForm)
+            return {
+              min: base.min,
+              max: base.max,
+              util: value => {
+                const text = String(value === null || value === undefined ? '' : value).trim()
+                if (text === '-1') return true
+                return base.util(value)
+              }
+            }
+          })()
+        }
+        // 保存按钮的禁用位：与 rules 同一套判定，避免「按钮能点、提交被静默拦」。
+        const capsOkFor = (form, requireMin) => {
+          const rules = capRulesForForm(form, requireMin)
+          return rules.min() === true && rules.max() === true && rules.util(form.max_gpu_util) === true
+        }
+        const addCapsOk = computed(() => capsOkFor(addForm, true))
+        const declCapsOk = computed(() => capsOkFor(declForm, true))
+        // 运行态：三格都可空（不下发），但填了的必须合法；且 min/max 同时填了要 min < max。
+        const editCapsOk = computed(() => {
+          const rules = capRulesFor(editForm)
+          if (rules.min() !== true || rules.max() !== true) return false
+          const text = String(editForm.max_gpu_util === null || editForm.max_gpu_util === undefined ? '' : editForm.max_gpu_util).trim()
+          if (text === '-1') return true
+          return rules.util(editForm.max_gpu_util) === true
+        })
         function numberRule (value) {
           const text = String(value === null || value === undefined ? '' : value).trim()
           if (!text) return true
           return Number.isFinite(Number(text)) || t.value.numberRule
         }
-        function capsValid (form) {
-          return capRule(form.max_concurrency) === true && capRule(form.max_power_w) === true
-        }
         function numberFieldsValid (form) {
           return numberRule(form.priority) === true && numberRule(form.cost) === true
-            && numberRule(form.max_concurrency) === true && numberRule(form.max_power_w) === true
         }
         function appendCaps (target, form) {
+          // 三道门各自走 PUT 的三态；**绝不下发 max_power_w**：那个键已于 2026-10-06 退役，
+          // 后端解析时对它的存在 warn 一次并丢弃，UI 再发就等于每轮刷一条无意义的告警。
+          const min = capFormValue(form.min_concurrency, true)
+          if (min !== undefined) target.min_concurrency = min
           const concurrency = capFormValue(form.max_concurrency, true)
           if (concurrency !== undefined) target.max_concurrency = concurrency
-          const power = capFormValue(form.max_power_w, false)
-          if (power !== undefined) target.max_power_w = power
+          const util = utilFormValue(form.max_gpu_util)
+          if (util !== undefined) target.max_gpu_util = util
           return target
         }
+        // 利用率门的 PUT 三态必须单独写：capFormValue 把「<=0」一律折成 0，而 0 在这道门上
+        // 是有意义的最严档（有任何新鲜读数即判满），拿它当「撤门」就把撤门变成了拧到最紧 ——
+        // 与 registry.util_limit 的读法对齐后：负数 = 显式撤门（后端折成无门），0 原样落 0。
+        function utilFormValue (value) {
+          const text = String(value === null || value === undefined ? '' : value).trim()
+          if (text === '') return undefined
+          const number = Number(text)
+          if (!Number.isFinite(number) || !Number.isInteger(number)) return null
+          if (number < 0) return -1
+          return number
+        }
+        // 运行态编辑框的回填：读池记录里此刻真实的值（pool_*），而不是合并后的显示值 ——
+        // 显示值在声明拥有的行上会被换成声明的期望值，用它回填 PUT 就是在替自愈背书。
         function capsFromRow (row) {
           const number = value => (value === undefined || value === null || value === false) ? '' : String(value)
-          return { max_concurrency: number(row && row.max_concurrency), max_power_w: number(row && row.max_power_w) }
+          const source = row || {}
+          return {
+            min_concurrency: number(source.pool_min_concurrency),
+            max_concurrency: number(source.pool_max_concurrency),
+            max_gpu_util: number(source.pool_max_gpu_util)
+          }
+        }
+        // 声明层表单回填共用：缺席 → 空串（画成「不限」）。util 的 0 必须原样回填 ——
+        // 它是合法的极严档，不是「没填」。
+        function emptyWhenAbsent (value) {
+          return (value === undefined || value === null || value === false) ? '' : String(value)
+        }
+        // 声明层写回：字段留空 → 整键删除（未声明）；填了 → 按整数写入。
+        // 与后端 config_store 的三份边界（1..31 / 1..32 / 0..100）同一口径，越界的在 rules 里已被拦。
+        function writeCap (entry, form, field, min, max) {
+          const text = String(form[field] === null || form[field] === undefined ? '' : form[field]).trim()
+          const number = Number(text)
+          if (text !== '' && Number.isFinite(number) && Number.isInteger(number) && number >= min && number <= max) {
+            entry[field] = number
+          } else {
+            delete entry[field]
+          }
+          return entry
         }
 
         // ── 校验规则 ──
@@ -811,6 +1038,10 @@
           delete entry.has_api_key
           delete entry.api_key_state
           delete entry.api_key_stored
+          // 退役键的硬性抹除：base 可能是从 GET /_ui/config 克隆来的**旧**条目，里面还写着
+          // max_power_w。表单不再画它，但整表替换会把它原样带回、后端每轮 warn 一次并丢弃；
+          // UI 侧一并删掉，旧配置只要在管理台被编辑过一次就彻底不再携带这个键。
+          delete entry.max_power_w
           entry.url = normUrl(form.url)
           const model = String(form.model_id || '').trim()
           if (model) entry.model_id = model
@@ -827,16 +1058,21 @@
           else delete entry.cost
           // 上限两字段：空串在声明层就是「不限」——整表替换语义下缺省字段等于未声明，
           // 所以清空输入框是操作员有意的「撤掉上限」，不是「保持原值」。
-          // 并发上限只能是整数：与后端 cap_limit(value, integer=true) 的 math.floor 同口径，
-          // 免得 UI 显示 2.7 而池里落 2（自愈下一轮就会显示成不一致）。
-          const concurrency = capNumber(form.max_concurrency)
-          const concurrencyText = String(form.max_concurrency === null || form.max_concurrency === undefined ? '' : form.max_concurrency).trim()
-          if (concurrencyText !== '' && concurrency !== null) entry.max_concurrency = Math.floor(concurrency)
-          else delete entry.max_concurrency
-          const power = capNumber(form.max_power_w)
-          const powerText = String(form.max_power_w === null || form.max_power_w === undefined ? '' : form.max_power_w).trim()
-          if (powerText !== '' && power !== null) entry.max_power_w = power
-          else delete entry.max_power_w
+          // 三道门各自独立往返：写了就落整数，留空就整键删除（= 未声明 = 不限）。
+          // 全部取整数：与后端 config_store 的 1..31 / 1..32 / 0..100 判定同口径，
+          // 免得 UI 显示 2.7 而池里落 2（自愈下一轮就显示成不一致）。
+          // max_power_w 绝不再写：那个键已退役，后端解析时对它的存在 warn 一次并丢弃。
+          writeCap(entry, form, 'min_concurrency', 1, CAP_MIN_LIMIT)
+          writeCap(entry, form, 'max_concurrency', 1, CAP_MAX_LIMIT)
+          writeCap(entry, form, 'max_gpu_util', 0, CAP_UTIL_LIMIT)
+          // 中立下限不落键：min=1 与「整个字段缺席」在判定上等价（registry 的 `min_c or 1`），
+          // 而**单独**一道 min 门会把一个今天完全无管的实例点亮成绿/黄灯，并让绿灯优先开始裁剪
+          // 候选数组 —— 那就是替操作员做了一个他没做的决定（§0 第 3 条的缺省零行为变化）。
+          // 所以两道上限都没声明时，把表单预填出来的那个 1 撤掉；填了 max 或 util 才连 min 一起落。
+          if (entry.min_concurrency === 1 && entry.max_concurrency === undefined
+              && entry.max_gpu_util === undefined) {
+            delete entry.min_concurrency
+          }
           const models = modelsList(form.modelsText)
           if (models.length) entry.models = models
           else delete entry.models
@@ -863,8 +1099,13 @@
             clearKey: false,
             priority: decl.priority === undefined || decl.priority === null ? '' : String(decl.priority),
             cost: decl.cost === undefined || decl.cost === null ? '' : String(decl.cost),
-            max_concurrency: decl.max_concurrency === undefined || decl.max_concurrency === null ? '' : String(decl.max_concurrency),
-            max_power_w: decl.max_power_w === undefined || decl.max_power_w === null ? '' : String(decl.max_power_w),
+            // 三门回填：缺席就画成空串（= 不限），绝不把「未声明」回填成一个数。
+            // 下限缺席 = 后端等价的那道 1，直接预填 1：必填位留空会把「只想改密钥」这类
+            // 与容量无关的编辑整个禁掉。上限与利用率绝不这样补 —— 那两道门的「缺席」和「填个数」
+            // 语义不同，凭空画一个数就等于替操作员新增一道他没写的门。
+            min_concurrency: emptyWhenAbsent(decl.min_concurrency) || '1',
+            max_concurrency: emptyWhenAbsent(decl.max_concurrency),
+            max_gpu_util: emptyWhenAbsent(decl.max_gpu_util),
             modelsText: Array.isArray(decl.models) ? decl.models.join(',') : '',
             labelsText: Object.entries(decl.labels || {}).map(entry => entry[0] + '=' + entry[1]).join(','),
             disable_health_check: Boolean(decl.disable_health_check)
@@ -878,8 +1119,11 @@
             clearKey: false,
             priority: row.priority === undefined ? '' : String(row.priority),
             cost: row.cost === undefined ? '' : String(row.cost),
-            max_concurrency: capsFromRow(row).max_concurrency,
-            max_power_w: capsFromRow(row).max_power_w,
+            // 声明层入口的回填读显示值（这一行的事实来源已经按 cap_owner 选好），
+            // 与运行态那侧读 pool_* 不同：这里是写配置文档，写期望值才对。
+            min_concurrency: emptyWhenAbsent(row.min_concurrency) || '1',
+            max_concurrency: emptyWhenAbsent(row.max_concurrency),
+            max_gpu_util: emptyWhenAbsent(row.max_gpu_util),
             modelsText: (row.models || []).join(','),
             labelsText: labelKeys(row).map(key => key + '=' + row.labels[key]).join(','),
             disable_health_check: Boolean(row.disable_health_check)
@@ -949,10 +1193,13 @@
           addMode.value = unsupported.value ? 'runtime' : 'declared'
           addOpen.value = true
         }
-        async function submitAdd () {
-          if (urlRule(addForm.url) !== true || labelsRule(addForm.labelsText) !== true) return
-          if (addMode.value === 'declared') {
-            if (!numberFieldsValid(addForm)) return
+      async function submitAdd () {
+        if (urlRule(addForm.url) !== true || labelsRule(addForm.labelsText) !== true) return
+        // 三门校验（含 min < max）在任何一条写入路径之前先过：按钮位已按同一判定禁用，
+        // 这里是回车提交绕过按钮时的第二道。
+        if (!addCapsOk.value) return
+        if (addMode.value === 'declared') {
+          if (!numberFieldsValid(addForm)) return
             const entry = buildEntry(addForm, null)
             await saveDecls(list => {
               const entries = list.slice()
@@ -965,8 +1212,8 @@
             })
             return
           }
-          if (!capsValid(addForm) || !numberRule(addForm.priority) || !numberRule(addForm.cost)) return
-          submitting.value = true
+        if (!numberRule(addForm.priority) || !numberRule(addForm.cost)) return
+        submitting.value = true
           try {
             const spec = { url: normUrl(addForm.url) }
             if (String(addForm.model_id || '').trim()) spec.model_id = String(addForm.model_id).trim()
@@ -1063,8 +1310,9 @@
           }
         }
 
-        async function submitDecl () {
-          if (declUrlRule(declForm.url) !== true || !numberFieldsValid(declForm) || labelsRule(declForm.labelsText) !== true) return
+      async function submitDecl () {
+        if (declUrlRule(declForm.url) !== true || !numberFieldsValid(declForm) || labelsRule(declForm.labelsText) !== true) return
+        if (!declCapsOk.value) return
           // base 条目与"是否已存在"必须在 saveDecls 重新拉取**之后**决定：
           // 用刷新前的旧快照建条目，会让并发编辑（另一个标签刚改过这条）被静默回写掉。
           let existed = false
@@ -1094,8 +1342,8 @@
           })
         }
 
-        async function submitEdit () {
-          if (!capsValid(editForm) || !labelsRule(editForm.labels)) return
+      async function submitEdit () {
+        if (!editCapsOk.value || !labelsRule(editForm.labels)) return
           // 防御性拒绝：入口已按归属收敛，但若仍给声明拥有的行提交 PUT，这些字段会在
           // 30 秒内被自愈按声明覆盖 —— 与其静默发出去，不如挡下并指回声明层。
           if (selected.value.cap_owner === 'declared') {
@@ -1370,10 +1618,12 @@
           coveredModels, declForm, declOpen, declUrlRule, decls, declaredNote, editForm, editOpen, filter,
           formatCost, groups, hasKey, healthColor, healthLabel, healthyCount, jobColor, jobLabel, jsonError,
           jsonOpen, jsonText, labelKeys, labelsKv, labelsRule, load, loading, loadError, modelsList, rows,
-          modelsVerifiedOf, numberRule, capRule, openAdd, openDeclEdit, openEdit, openJson, openWorker, originColor,
+          modelsVerifiedOf, numberRule, openAdd, openDeclEdit, openEdit, openJson, openWorker, originColor,
           originLabel, pagination, prettyUpstreams, removeDeclaration, removeWorker, resetJson,
           saveJson, selected, submitting, submitAdd, submitDecl, submitEdit, t, waitingNotice, unsupported, urlRule,
-          capConfigText, capMeasuredText, capExceeded, capNumber
+          capConfigText, capMeasuredText, capNumber, capRangeText,
+          loadStateColor, loadStateLabel, loadStateTextColor, loadStateTooltip, gpuBadge,
+          capRules, addCapsOk, declCapsOk, editCapsOk
         }
       }
     })

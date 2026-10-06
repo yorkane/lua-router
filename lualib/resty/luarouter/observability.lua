@@ -912,14 +912,24 @@ local HELP = {
     -- why an empty combination is simply absent rather than rendered as 0.
     smg_worker_pool_size = "Current worker pool size by worker_type, connection_mode, model",
     -- Lua-side superset: the Rust gateway has no per-worker capacity caps, so this
-    -- family only exists here. router.lua's candidate filter emits it with
-    -- reason=concurrency|power, and those two readings are different in kind (an
-    -- in-flight count this gateway owns versus an external watt sample), so one
-    -- HELP line naming both keeps a Grafana legend from reading the family as a
-    -- single undifferentiated failure mode. Missing this entry is not cosmetic:
-    -- the exporter prints the TYPE line with no HELP above it and the scraper is
-    -- left with a blank description.
-    smg_worker_capacity_excluded_total = "Candidates removed from selection by their configured concurrency or power cap by reason",
+    -- family only exists here. The candidate filter (router/candidates.lua) emits it
+    -- with reason=concurrency_max|gpu_util, and those two readings are different in
+    -- kind (an in-flight count this gateway owns versus an external GPU-utilisation
+    -- sample), so one HELP line naming both keeps a Grafana legend from reading the
+    -- family as a single undifferentiated failure mode. Missing this entry is not
+    -- cosmetic: the exporter prints the TYPE line with no HELP above it and the
+    -- scraper is left with a blank description.
+    -- (doc/caps-redesign-2026-10-06.md section 6: reason=power retired with the watt
+    -- ceiling; the readings are now max_concurrency and max_gpu_util.)
+    smg_worker_capacity_excluded_total = "Candidates removed from selection by their configured concurrency limit or GPU-utilisation limit by reason",
+    -- Sibling of the family above, and deliberately *not* part of it: the green-light
+    -- preference (doc/caps-redesign-2026-10-06.md section 3) hands the policy only the
+    -- idle subset when one exists, so busy workers yield without being excluded -- they
+    -- stay selectable and nothing about them is "removed". A separate family is what
+    -- keeps "the pool refused traffic" (excluded_total) readable apart from "the pool
+    -- preferred someone else" (this one); one counted sample per request pass that
+    -- actually stepped a busy candidate aside.
+    smg_worker_capacity_preferred_idle_total = "Selection passes where idle workers were preferred and busy workers yielded the choice",
     -- Lua-side superset: Rust has no tracing-self metrics and no in-flight gauge.
     smg_http_inflight_requests = "Requests currently being served by the router",
     -- Rust renders this family as non-cumulative gt/le gauges off a 30 s..86400 s

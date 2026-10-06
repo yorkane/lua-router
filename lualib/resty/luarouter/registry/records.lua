@@ -51,6 +51,7 @@ local K_CBS = keys.K_CBS
 local K_CBSTATE = keys.K_CBSTATE
 local K_DISC = keys.K_DISC
 local K_DPROBE = keys.K_DPROBE
+local K_GPU_UTIL = keys.K_GPU_UTIL
 local K_HEALTH = keys.K_HEALTH
 local K_HFAIL = keys.K_HFAIL
 local K_HSEL = keys.K_HSEL
@@ -409,15 +410,21 @@ function M.add(req, cfg)
             model_caps = clone_model_caps(rawget(req, "model_caps")),
             priority = tonumber(req.priority) or 50,
             cost = tonumber(req.cost) or 1.0,
-            -- Per-worker capacity caps (doc/gap-worker-caps.md): stored only when a
-            -- usable limit was declared, so a record built without them keeps its
-            -- exact pre-feature shape and the selection path short-circuits on
-            -- `cap == nil` before it touches a dict. Every registration entry
+            -- Per-worker capacity ceilings (doc/caps-redesign-2026-10-06.md section 1):
+            -- stored only when a usable limit was declared, so a record built without
+            -- them keeps its exact pre-feature shape and the verdict short-circuits on
+            -- "all three absent" before it touches a dict. Every registration entry
             -- point (POST /workers, the watcher, the config declaration layer, the
             -- bootstrap seed, DP ranks) gets them from here rather than its own
-            -- call site, which is what keeps the four paths identical.
+            -- call site, which is what keeps the four paths identical. The watt
+            -- ceiling is gone: `pw:` stayed a pure observation, and the scheduler's
+            -- busy-side knob is now the utilisation percent (`max_gpu_util`, whose
+            -- meaningful zero is why it normalizes through util_limit, not cap_limit).
+            -- `min_concurrency` is the lower rung of the three-way verdict and is
+            -- absent-equivalent-to-1, so it is stored the same way rather than defaulted.
             max_concurrency = R.cap_limit(rawget(req, "max_concurrency"), true),
-            max_power_w = R.cap_limit(rawget(req, "max_power_w"), false),
+            min_concurrency = R.cap_limit(rawget(req, "min_concurrency"), true),
+            max_gpu_util = R.util_limit(rawget(req, "max_gpu_util")),
             worker_type = worker_type or "regular",
             connection_mode = mode,
             api_key = req.api_key,
@@ -614,20 +621,36 @@ function M.info(record, d)
         metadata = metadata,
         disable_health_check = record.disable_health_check or false,
         job_status = job,
-        -- Capacity caps and their two live readings (doc/gap-worker-caps.md).
-        -- A cap that was never declared is *absent* rather than 0 -- 0 would read
-        -- as "a limit of zero slots" to anything that does not know cap_limit's
-        -- normalization, and the admin console needs to tell "unlimited" apart from
-        -- "configured to 0 and therefore never selectable". inflight_requests is
-        -- the pure request count (what the concurrency cap compares against), which
-        -- is deliberately not `load` -- that field is the ranking number and mixes
-        -- in the GPU sample. power_w stays nil while no fresh watt sample exists,
-        -- which is the same "unknown, not zero" the power cap reads.
+        -- The three ceilings and their live readings (doc/caps-redesign-2026-10-06.md
+        -- section 1-2). A ceiling that was never declared is *absent* rather than 0 --
+        -- 0 would read as "a limit of zero slots" to anything that does not know
+        -- cap_limit's normalization, and the console has to tell "unlimited" apart from
+        -- the one rung where 0 *is* a limit (max_gpu_util, folded by util_limit).
+        -- inflight_requests is the pure request count (what the concurrency ceiling
+        -- compares against), which is deliberately not `load` -- that field is the
+        -- ranking number and mixes in the GPU sample. gpu_util and power_w stay nil
+        -- while no fresh sample exists: "unknown, not zero" is what keeps both channels
+        -- safe to leave switched on, and power_w only survives as an observation.
         max_concurrency = R.cap_limit(record.max_concurrency),
-        max_power_w = R.cap_limit(record.max_power_w),
+        min_concurrency = R.cap_limit(record.min_concurrency),
+        max_gpu_util = R.util_limit(record.max_gpu_util),
+        -- The verdict itself (doc/caps-redesign-2026-10-06.md section 2): read-only, and
+        -- computed here rather than in the browser. The pool table colours with this
+        -- value and the router trims its candidate array with the same call, so neither
+        -- side can drift into a private definition of "full". Absent when the worker
+        -- declares no ceiling at all -- an explicit null would make an uncapped row look
+        -- like a state the gateway refused to name.
+        load_state = R.capacity_state(record, d),
         inflight_requests = d:get(K_LOAD .. id) or 0,
         power_w = (function()
             local milli = d:get(K_POWER .. id)
+            return milli and (milli / 1000) or nil
+        end)(),
+        -- The live reading the utilisation ceiling compares against, in the 0..1 shape
+        -- the exporter publishes it in (power_w just above stays for the dashboards:
+        -- the watt channel is pure observation now). Nil = no fresh sample = unknown.
+        gpu_util = (function()
+            local milli = d:get(K_GPU_UTIL .. id)
             return milli and (milli / 1000) or nil
         end)(),
         -- Provenance for GET /workers (doc/gap-virtual-models.md 3.1): config

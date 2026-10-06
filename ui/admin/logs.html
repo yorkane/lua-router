@@ -27,15 +27,8 @@
     .agg-table tbody tr:hover td { background: rgba(255, 255, 255, .018); }
     .agg-table td.ellipsis { max-width: 34ch; }
     .agg-empty td { color: var(--muted); text-align: center; padding: 18px 12px; }
-    /* 吞吐卡：输入与输出各带自己的标签，两个数都必须能在主值区站住，
-       所以不靠位置猜哪个是输入哪个是输出；允许换行是因为窄屏下两项挤一行会断行错位。
-       字号比 stat-value 单行紧一档，窄屏由 app.css 的 media 段再收一档。
-       输入主值恒为「含 cache」口径（调用方发过来的全部 prompt），见下方卡片注释。 */
-    .tok-lines { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 7px; }
-    .tok-item { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; white-space: nowrap; }
-    .tok-item > i { color: var(--muted); font-size: 11.5px; font-style: normal; letter-spacing: .02em; }
-    .tok-item > b { font-size: 21px; font-weight: 520; letter-spacing: -.03em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-    .tok-item.in > b { color: #eceef7; }
+    /* 顶部紧凑统计条（.stats-strip）与输入/输出 tok/s 大字卡（.tok-hero-card）
+       的样式统一放 app.css；页内只留聚合表的原生 table 样式。 */
   </style>
 </head>
 <body>
@@ -56,7 +49,7 @@
               </div>
               <q-btn outline no-caps icon="mdi-filter-remove-outline" class="secondary-button" :label="t.clearFilters" @click="resetFilters"></q-btn>
               <q-btn outline no-caps icon="mdi-broom" class="secondary-button" :label="t.clear" @click="clearList"><q-tooltip>{{ t.clearHint }}</q-tooltip></q-btn>
-              <q-btn outline no-caps icon="mdi-refresh" :label="c.refresh" class="secondary-button" :loading="loading" @click="reload"></q-btn>
+              <q-btn outline no-caps icon="mdi-refresh" :label="c.refresh" class="secondary-button" :loading="loading || refreshing" @click="reload"></q-btn>
             </div>
           </header>
 
@@ -70,20 +63,33 @@
             <template v-slot:action><q-btn flat dense no-caps :label="c.retry" @click="reload"></q-btn></template>
           </q-banner>
 
-          <section class="stat-grid cols-4">
-            <q-card flat class="stat-card"><q-card-section>
-              <q-icon name="mdi-airballoon" class="stat-icon purple"></q-icon>
-              <div class="stat-label">{{ t.summaryInflight }}</div>
-              <div class="stat-value">{{ fmtInt(stats.inflight) }}</div>
-              <div class="stat-note">{{ windowNote }}</div>
-            </q-card-section></q-card>
-            <q-card flat class="stat-card"><q-card-section>
-              <q-icon name="mdi-chart-bell-curve-cumulative" class="stat-icon blue"></q-icon>
-              <div class="stat-label">{{ t.summaryReqWindow }} / {{ t.summaryErrors }}</div>
-              <div class="stat-value">{{ fmtInt(stats.requests_window) }} <span class="muted" style="font-size:15px">/ {{ fmtInt(stats.errors_window) }}</span></div>
-              <div class="stat-note">{{ t.summaryDuration }} {{ fmtMs(stats.avg_duration_ms) }}</div>
-            </q-card-section></q-card>
-            <q-card flat class="stat-card"><q-card-section>
+          <!-- 顶部（2026-10-06 重排）：inflight / 窗口请求 / 窗口错误 / 缓冲 四块合并成一条
+               紧凑统计条（.stats-strip），腾出的整块给输入/输出 tok/s 大字卡（.tok-hero-card）。
+               数据源与口径不变：全部读 stats（summarizeWindow 的 60s 完成时刻窗口），只改呈现。 -->
+          <section class="stats-strip">
+            <div class="strip-item">
+              <span class="strip-k">{{ t.summaryInflight }}</span>
+              <b class="strip-v">{{ fmtInt(stats.inflight) }}</b>
+              <span class="strip-note">{{ windowNote }}</span>
+            </div>
+            <div class="strip-item">
+              <span class="strip-k">{{ t.summaryReqWindow }}</span>
+              <b class="strip-v">{{ fmtInt(stats.requests_window) }}</b>
+              <span class="strip-note">{{ t.summaryDuration }} {{ fmtMs(stats.avg_duration_ms) }}</span>
+            </div>
+            <div class="strip-item">
+              <span class="strip-k">{{ t.summaryErrors }}</span>
+              <b class="strip-v" :class="Number(stats.errors_window) > 0 ? 'err' : ''">{{ fmtInt(stats.errors_window) }}</b>
+            </div>
+            <div class="strip-item">
+              <span class="strip-k">{{ t.summaryBuffer }}</span>
+              <b class="strip-v">{{ fmtInt(stats.buffered) }}</b>
+              <span class="strip-note">{{ bufferNote }} · {{ t.summaryUptime }} {{ fmtUptime(stats.uptime_s) }}</span>
+            </div>
+          </section>
+
+          <q-card flat class="tok-hero-card">
+            <q-card-section>
               <q-icon name="mdi-speedometer" class="stat-icon teal"></q-icon>
               <!-- 输入 tok/s 恒为「含 cache」口径 = Σ(prompt_tokens) / 60：这就是调用方发过来的
                    全部 prompt（含被前缀缓存命中的部分），是计费与客户端上下文压力的口径，
@@ -94,9 +100,9 @@
                    算术在 summarizeWindow：inTok 只加 prompt_tokens，绝不减 cached_tokens。
                    文案走页内 AGG_DICT（i18n.js 他人并行维护）。 -->
               <div class="stat-label">{{ ta('tokCardLabel') }} {{ t.summaryWindow60 }}</div>
-              <div class="tok-lines">
-                <span class="tok-item in"><i>{{ ta('tokIn') }}</i><b>{{ fmtThousands(stats.input_tok_s) }}</b></span>
-                <span class="tok-item"><i>{{ ta('tokOut') }}</i><b>{{ fmtThousands(stats.output_tok_s) }}</b></span>
+              <div class="tok-hero-lines">
+                <div class="tok-hero-item in"><i>{{ ta('tokIn') }}</i><b>{{ fmtThousands(stats.input_tok_s) }}</b></div>
+                <div class="tok-hero-item out"><i>{{ ta('tokOut') }}</i><b>{{ fmtThousands(stats.output_tok_s) }}</b></div>
               </div>
               <!-- cache_hit_pct 在首帧（stats 还是空对象）是 undefined，用 || 一并兜成 —，
                    否则 ta 的占位符替换会把 "{pct}" 原样印在卡上 -->
@@ -104,17 +110,11 @@
               <!-- 窗口 token 总量与上面的 tok/s 同源（同一窗口同一批行），窄屏由 app.css 收起 -->
               <div class="stat-note tok-totals">{{ ta('tokTotals', { raw: fmtK(stats.input_tokens_window), out: fmtK(stats.completion_tokens_window) }) }}</div>
               <!-- 口径说明（窗口切法 / 剔除估算条数）包在 .tok-basis 里：桌面全量展示，
-                   窄屏由 app.css 收掉，让四张卡能横向排成一行而不吃掉整屏高度。
-                   被收掉的只是「怎么算的」注脚，三个读数（输入/输出/prefill）任何屏宽都在。 -->
+                   窄屏由 app.css 收掉。被收掉的只是「怎么算的」注脚，
+                   三个读数（输入/输出/prefill）任何屏宽都在。 -->
               <div class="stat-note">{{ t.summaryTtft }} {{ fmtMs(stats.avg_ttft_ms) }}<span class="tok-basis"> · {{ ta('tokWindowBasis') }}<template v-if="stats.estimated_excluded"> · {{ ta('tokEstExcluded', { n: stats.estimated_excluded }) }}</template></span></div>
-            </q-card-section></q-card>
-            <q-card flat class="stat-card"><q-card-section>
-              <q-icon name="mdi-database-sync" class="stat-icon red"></q-icon>
-              <div class="stat-label">{{ t.summaryBuffer }}</div>
-              <div class="stat-value">{{ fmtInt(stats.buffered) }}</div>
-              <div class="stat-note">{{ bufferNote }} · {{ t.summaryUptime }} {{ fmtUptime(stats.uptime_s) }}</div>
-            </q-card-section></q-card>
-          </section>
+            </q-card-section>
+          </q-card>
 
           <q-card flat class="surface-card">
             <q-card-section class="surface-heading filter-bar">
@@ -134,13 +134,16 @@
             </q-card-section>
             <q-separator dark></q-separator>
 
+            <!-- 抖动修复 L1：轮询期不再进 loading 占位（QTable 会在 thead 插一条
+                 QLinearProgress 动画线，每 2s 出现又消失）。loading 只在首屏空表时
+                 展示，对齐 workers.html 的 q-inner-loading 口径。 -->
             <q-table
               flat
               dense
               dark
               :rows="visibleRows"
               :columns="columns"
-              :loading="loading"
+              :loading="loading && rows.length === 0"
               :pagination="pagination"
               :rows-per-page-options="[25, 50, 100, 0]"
               :expanded="expandedRows"
@@ -157,9 +160,19 @@
                     <q-btn flat round dense size="sm" :icon="props.expand ? 'mdi-chevron-up' : 'mdi-chevron-down'"
                            :aria-label="props.expand ? t.collapse : t.expand" @click="toggleRow(props.row)"></q-btn>
                   </q-td>
-                  <!-- tok/s 作为第一个数据列：扫表时先看解码速率 -->
+                  <!-- 列序（2026-10-06 重排）：时间 → 状态 → tok/s → 耗时 → TTFT → Tok →
+                       cache → 模型 → 档位 → 实例 → 策略。状态紧跟时间，模型落在 cache 之后，
+                       与 columns computed 的声明顺序一致（整行在 v-slot:body 自绘）。 -->
                   <q-td key="time" :props="props"><span class="mono">{{ formatTime(props.row.ts_ms) }}</span></q-td>
+                  <q-td key="status" :props="props">
+                    <span class="st-code" :class="statusClass(props.row.status)">{{ props.row.status }}</span>
+                    <q-badge v-if="props.row.stream" outline color="blue-4" class="chip-soft q-ml-xs">SSE</q-badge>
+                  </q-td>
                   <q-td key="rate" :props="props"><span class="mono">{{ fmtRate(props.row.tok_per_s) }}</span></q-td>
+                  <q-td key="duration" :props="props"><span class="mono">{{ fmtMs(props.row.duration_ms) }}</span></q-td>
+                  <q-td key="ttft" :props="props"><span class="mono">{{ fmtMs(props.row.ttft_ms) }}</span></q-td>
+                  <q-td key="tokens" :props="props"><span class="mono">{{ fmtK(props.row.completion_tokens) }} / {{ fmtK(props.row.prompt_tokens) }}</span></q-td>
+                  <q-td key="cached" :props="props"><span class="mono">{{ cacheHitPct(props.row) }}</span></q-td>
                   <q-td key="model" :props="props">
                     <div class="model-cell">
                       <strong>{{ props.row.model }}</strong>
@@ -167,17 +180,8 @@
                         {{ props.row.requested_model }} →</span>
                     </div>
                   </q-td>
-
-                  <q-td key="status" :props="props">
-                    <span class="st-code" :class="statusClass(props.row.status)">{{ props.row.status }}</span>
-                    <q-badge v-if="props.row.stream" outline color="blue-4" class="chip-soft q-ml-xs">SSE</q-badge>
-                  </q-td>
-                  <q-td key="duration" :props="props"><span class="mono">{{ fmtMs(props.row.duration_ms) }}</span></q-td>
-                  <q-td key="ttft" :props="props"><span class="mono">{{ fmtMs(props.row.ttft_ms) }}</span></q-td>
-                  <q-td key="tokens" :props="props"><span class="mono">{{ fmtK(props.row.completion_tokens) }} / {{ fmtK(props.row.prompt_tokens) }}</span></q-td>
-                  <q-td key="cached" :props="props"><span class="mono">{{ cacheHitPct(props.row) }}</span></q-td>
                   <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
-                  <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span><span v-if="props.row.gpuLabel" class="muted" style="font-size:10px;margin-left:4px">{{ props.row.gpuLabel }}</span></q-td>
+                  <q-td key="worker" :props="props"><span class="mono">{{ props.row.worker || '—' }}</span><span v-if="gpuLabelOf(props.row)" class="muted" style="font-size:10px;margin-left:4px">{{ gpuLabelOf(props.row) }}</span></q-td>
                   <q-td key="route" :props="props"><span class="mono">{{ props.row.route_type || '—' }}</span></q-td>
                 </q-tr>
                 <q-tr v-show="props.expand" :key="'exp-' + props.row.seq" class="lmr-detail-row">
@@ -470,6 +474,10 @@
         const stats = ref({})
         const cursor = ref(0)
         const capacity = ref(0)
+        // 抖动修复 L2/L3：loadedOnce=首屏是否成功过；lastPollSig=上一帧轮询快照指纹
+        //（append 与 clearList 会作废它，确保有真实变化时下一轮必然替换）。
+        let loadedOnce = false
+        let lastPollSig = ''
         const locale = ref(window.lmrI18n.getLocale())
         const loading = ref(false)
         const olderLoading = ref(false)
@@ -482,6 +490,10 @@
         const pagination = reactive({ rowsPerPage: 50, sortBy: 'seq', descending: true })
         let source = null
         let statsTimer
+        // 抖动修复 L5：autoTimer 原先是隐式全局变量（重复 mount 会泄漏定时器），显式声明。
+        let autoTimer = null
+        // 手动刷新的按钮反馈：loading 现在只服务首屏（见 initialLoad），轮询期不再翻转它。
+        const refreshing = ref(false)
         let unsubscribeLocale
 
         const c = computed(() => window.lmrI18n.messages[locale.value].common)
@@ -489,17 +501,17 @@
 
         const columns = computed(() => [
           { name: 'detail', label: '', field: 'seq', align: 'center', style: 'width:34px' },
-          // tok/s 紧跟 detail 列，成为第一个数据列
           { name: 'time', label: t.value.colTime, field: 'ts_ms', align: 'left', sortable: true, style: 'width:110px' },
-          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
-          { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
-
+          // 状态紧跟时间（2026-10-06 列序重排；整行在 v-slot:body 自绘，两处顺序必须一致）
           { name: 'status', label: t.value.colStatus, field: 'status', align: 'left', sortable: true, style: 'width:90px' },
+          { name: 'rate', label: t.value.colRate, field: 'tok_per_s', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'duration', label: t.value.colDuration, field: 'duration_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'ttft', label: t.value.colTtft, field: 'ttft_ms', align: 'left', sortable: true, style: 'width:90px' },
           { name: 'tokens', label: t.value.colTokens, field: 'completion_tokens', align: 'left', sortable: true, style: 'width:110px' },
           // 缓存命中率：cached_tokens / prompt_tokens 的百分比，绝对值在详情行展示
           { name: 'cached', label: 'cache', field: 'cached_tokens', align: 'left', sortable: true, style: 'width:90px' },
+          // 模型列落在 cache 之后（2026-10-06 列序重排）
+          { name: 'model', label: t.value.colModel, field: 'model', align: 'left', sortable: true },
           { name: 'effort', label: t.value.detailEffort, field: 'effort', align: 'left', style: 'width:90px' },
           { name: 'worker', label: t.value.colWorker, field: 'worker', align: 'left', sortable: true, style: 'width:150px' },
           { name: 'route', label: t.value.colRoute, field: 'route_type', align: 'left', style: 'width:110px' }
@@ -799,14 +811,6 @@
           update(() => { modelSuggest.value = value ? distinctModels.value.filter(name => name.toLowerCase().includes(value.toLowerCase())) : [] })
         }
 
-        function cellText (col, row) {
-          if (col.name === 'time') return formatTime(row.ts_ms)
-          if (col.name === 'worker') return row[col.field] || '—'
-          if (col.name === 'route') return row.route_type || '—'
-          if (col.name === 'rate') return fmtRate(row.tok_per_s)
-          return row[col.field] === null || row[col.field] === undefined ? '—' : row[col.field]
-        }
-
         function fmtInt (value) { return Number.isFinite(Number(value)) ? String(Math.round(Number(value))) : '—' }
         function fmtOne (value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—' }
         // token 计数用 k 口径：>=1000 显示一位小数的 k，<1000 显示整数原值。
@@ -871,44 +875,69 @@
           return 'sc'
         }
 
+        // GPU 标注改在渲染期查表（不再就地往响应对象里注入 r.gpuLabel——那会污染
+        // /_ui/logs 返回的响应对象，让同一 seq 在两轮之间出现「有/无标注」两种渲染结果）。
+        function gpuLabelOf (row) {
+          const key = normalizeUrl((row && (row.worker || row.selected)) || '')
+          if (!key) return ''
+          const gpu = gpuIndex.value[key]
+          return (gpu === null || gpu === undefined) ? '' : 'GPU(' + gpu + ')'
+        }
+
         // 环形缓冲：seq 递增，SSE 推一条追加一条，重复 seq 忽略
         function append (record) {
           if (!record || typeof record !== 'object') return
           if (!Number.isFinite(Number(record.seq))) return
           if (rows.value.some(row => row.seq === record.seq)) return
 
-          const sk = normalizeUrl(record.worker || record.selected || "")
-          const sg = gpuIndex.value[sk]
-          if (sg !== null && sg !== undefined) record.gpuLabel = 'GPU(' + sg + ')'
           rows.value = rows.value.concat([record])
           const overflow = rows.value.length - LOCAL_CAP
           if (overflow > 0) rows.value = rows.value.slice(overflow)
           if (Number(record.seq) > cursor.value) cursor.value = Number(record.seq)
+          // SSE 推进过 rows 后作废「上一帧快照」指纹，下一轮轮询必须重新比对
+          lastPollSig = ''
         }
 
-        async function initialLoad () {
-          // 聚合表的 GPU 标签随本函数一起刷（2s 轮询与手动刷新都走这里），不另开轮询
+        // 轮询快照指纹：cursor + 行序号区间 + 条数。环形缓冲只追加不覆写，
+        // 因此指纹相同 ⇔ 内容与现有一致，可以整段跳过替换（抖动修复 L3）。
+        function pollSig (list) {
+          if (!list.length) return '0'
+          return String(list[0].seq) + '-' + String(list[list.length - 1].seq) + '-' + String(list.length)
+        }
+
+        async function initialLoad (opts) {
+          const quiet = !!(opts && opts.quiet)
+          // 聚合表的 GPU 标签随本函数一起刷（轮询与手动刷新都走这里），不另开轮询
           try { logBackendsPayload.value = await window.lmrApi.logBackends() } catch (err) { logBackendsPayload.value = null }
-          loading.value = true
+          // 抖动修复 L1：loading 只服务首屏（配合 :loading="loading && rows.length === 0"），
+          // 轮询与手动刷新走 refreshing，避免每 2s 在 thead 插拔 QLinearProgress 动画线。
+          if (!loadedOnce) loading.value = true
+          else if (!quiet) refreshing.value = true
           loadError.value = ''
           try {
             const result = await window.lmrApi.logs(0, PAGE_LIMIT)
             if (result.requests) result.requests.reverse()
-            rows.value = (result.requests || []).slice(-LOCAL_CAP)
-            rows.value.forEach(r => {
-              const wk = normalizeUrl(r.worker || r.selected || "")
-              const wg = gpuIndex.value[wk]
-              if (wg !== null && wg !== undefined) r.gpuLabel = 'GPU(' + wg + ')'
-            })
-            cursor.value = Number(result.cursor) || 0
+            const incoming = (result.requests || []).slice(-LOCAL_CAP)
+            const nextCursor = Number(result.cursor) || 0
+            const sig = nextCursor + '|' + pollSig(incoming)
+            // 抖动修复 L3：cursor 与内容都没变 → 不整段替换 rows（引用不变 → 表格不重渲染）
+            if (sig !== lastPollSig) {
+              rows.value = incoming
+              lastPollSig = sig
+            }
+            cursor.value = nextCursor
             capacity.value = Number(result.capacity) || 0
             disabledReason.value = ''
+            loadedOnce = true
           } catch (error) {
-            rows.value = []
+            // 抖动修复 L2：只有「首屏从未成功过」才清空；后续轮询失败保留上一帧，
+            // 消灭 q-table__bottom--nodata 占位与分页条之间的来回翻转。
+            if (!loadedOnce) rows.value = []
             if (error.status === 503) disabledReason.value = t.value.logsDisabled
             else loadError.value = error.message
           } finally {
             loading.value = false
+            refreshing.value = false
           }
           await refreshStats()
         }
@@ -930,9 +959,17 @@
           }
         }
 
+        // 抖动修复 L5：SSE 已经实时推流，2s 全量轮询与它功能重复（是抖动的根因）。
+        // 流连接期间把轮询降档为 FALLBACK_POLL_MS 的兜底心跳；流断开则恢复 2s 逐拍。
+        // 轮询一律走 quiet 模式（不动 loading），定时器本身仍每 2s 触发一次判断。
+        const FALLBACK_POLL_MS = 15000
+        let lastPollAt = 0
+
         async function autoRefresh () {
-          if (!live.value || loading.value) return
-          try { await initialLoad() } catch (err) {}
+          if (!live.value || loading.value || refreshing.value) return
+          if (streamConnected.value && Date.now() - lastPollAt < FALLBACK_POLL_MS) return
+          lastPollAt = Date.now()
+          try { await initialLoad({ quiet: true }) } catch (err) {}
         }
         async function refreshStats () {
           try {
@@ -1002,6 +1039,9 @@
         }
         function clearList () {
           rows.value = []
+          // 清空只清本地列表：作废轮询指纹，下一轮把缓冲整段拉回来（与改造前语义一致——
+          // 改造前 initialLoad 每轮无条件整段替换，清空后 2s 内也会被填回）。
+          lastPollSig = ''
         }
         function resetFilters () {
           Object.assign(filters, { status: '', model: '', text: '' })
@@ -1048,9 +1088,9 @@
         Vue.watch(live, on => (on ? openStream() : closeStream()))
 
         return {
-          bufferNote, c, capacity, cellText, clearList, columns, cursor, disabledReason, filters,
+          bufferNote, c, capacity, clearList, columns, cursor, disabledReason, filters,
           fmtInt, fmtK, fmtMs, fmtOne, fmtRate, fmtThousands,
-          cacheHitPct, promptPreview,
+          cacheHitPct, gpuLabelOf, promptPreview, refreshing,
           fmtUptime, formatTime, expandedRows, loadError, loadedNote, loading, loadOlder, modelFilter,
           effortCell, toggleRow,
           aggOpen, aggNote, aggModelRows, aggBackendRows, aggEffortRows, ta,

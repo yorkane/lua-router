@@ -2343,6 +2343,155 @@ if section igw; then
 fi
 
 # ==========================================================================
+if section caps; then
+    # 每服务容量上限的兜底契约（doc/caps-redesign-2026-10-06.md §4，用户裁定 2026-10-06
+    # 覆盖 2026-10-01 的「全到顶 503」口径）：全池都抵在并发/GPU 利用率上限上时答
+    # **429**（容量到顶是"暂时没法接单"，不是服务不可用），code 沿用
+    # no_available_workers（契约改动面最小），error.type 随状态码变 Too Many
+    # Requests，message 精确等于新文案。熔断/不健康/模型门造成的空候选**仍是 503
+    # 原文案**——那三条由 cb_race 与上面的 igw 段钉着（本段刻意不重复也不放松它们）。
+    # 对照 e2e_caps 的 S5（同一分支的 e2e 断言）：这里钉契约面（状态码、头、JSON
+    # 形状、精确字符串），那边钉行为面（谁接了流量）。
+    CAP_SLOW_A=$(free_port)
+    LATENCY_MS=5000 python3 "$SCRIPT_DIR/mock_llm_worker.py" \
+        --host 0.0.0.0 --port "$CAP_SLOW_A" --model cap-model \
+        >"$TMP_DIR/mock-cap-a.log" 2>&1 &
+    MOCK_PIDS="$MOCK_PIDS $!"
+    CAP_SLOW_B=$(free_port)
+    LATENCY_MS=5000 python3 "$SCRIPT_DIR/mock_llm_worker.py" \
+        --host 0.0.0.0 --port "$CAP_SLOW_B" --model cap-model \
+        >"$TMP_DIR/mock-cap-b.log" 2>&1 &
+    MOCK_PIDS="$MOCK_PIDS $!"
+    CAP_FAST_C=$(free_port)
+    python3 "$SCRIPT_DIR/mock_llm_worker.py" \
+        --host 0.0.0.0 --port "$CAP_FAST_C" --model cap-model \
+        >"$TMP_DIR/mock-cap-c.log" 2>&1 &
+    MOCK_PIDS="$MOCK_PIDS $!"
+    for _ in $(seq 1 50); do
+        curl -fsS -m 1 "http://127.0.0.1:$CAP_SLOW_A/health" >/dev/null 2>&1 &&
+        curl -fsS -m 1 "http://127.0.0.1:$CAP_SLOW_B/health" >/dev/null 2>&1 &&
+        curl -fsS -m 1 "http://127.0.0.1:$CAP_FAST_C/health" >/dev/null 2>&1 &&
+        break
+        sleep 0.1
+    done
+
+    start_container lr-caps-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1
+    CAP_BASE=$BASE
+    CAP_GW=$(container_gateway lr-caps-$SUIT)
+    register_worker "$CAP_BASE" \
+        "{\"url\":\"http://$CAP_GW:$CAP_SLOW_A\",\"model_id\":\"cap-model\",\"max_concurrency\":1,\"max_gpu_util\":60}"
+    assert_eq "caps: capped worker A registered" "$STATUS" "202"
+    CAP_ID_A=$REG_ID
+    register_worker "$CAP_BASE" \
+        "{\"url\":\"http://$CAP_GW:$CAP_SLOW_B\",\"model_id\":\"cap-model\",\"max_concurrency\":1}"
+    assert_eq "caps: capped worker B registered" "$STATUS" "202"
+    CAP_ID_B=$REG_ID
+    register_worker "$CAP_BASE" \
+        "{\"url\":\"http://$CAP_GW:$CAP_FAST_C\",\"model_id\":\"cap-model\"}"
+    assert_eq "caps: uncapped witness worker C registered" "$STATUS" "202"
+    CAP_ID_C=$REG_ID
+    wait_healthy_worker "$CAP_BASE" 25 3 || fail "caps workers never all became healthy"
+
+    # GET /workers 的容量形状（§2）：声明的上限逐字段回显（util 是整数百分比）；
+    # 声明了上限的行带 load_state，**没声明任何上限的行是键缺席而不是 null**（null
+    # 会让无门行冒充一个网关拒绝命名的态）；退役的 max_power_w 哪里都不再出现。
+    request "$CAP_BASE" GET /workers
+    assert_json "caps: declared util ceiling echoes as an integer percent" \
+        '.workers[] | select(.id=="'"$CAP_ID_A"'") | .max_gpu_util' "60"
+    assert_json "caps: the gated row carries load_state (idle at rest)" \
+        '.workers[] | select(.id=="'"$CAP_ID_A"'") | .load_state' "idle"
+    assert_json "caps: an ungated row has no load_state key at all" \
+        '.workers[] | select(.id=="'"$CAP_ID_C"'") | has("load_state") | tostring' "false"
+    assert_json "caps: an ungated row carries none of the three cap keys" \
+        '.workers[] | select(.id=="'"$CAP_ID_C"'") | (has("max_concurrency") or has("min_concurrency") or has("max_gpu_util")) | tostring' "false"
+    assert_json "caps: the retired max_power_w is not echoed anywhere" \
+        '[.workers[] | select(has("max_power_w"))] | length' "0"
+
+    # PUT 运行时面接受三个新字段（与 priority/cost 同一条 UPDATE_NUMBER_FIELDS 的
+    # 202 路径；范围校验住在声明层，记录面按读时归一）。max_power_w 已从白名单退役：
+    # PUT 它像任何未知键一样被忽略——既不落记录，也不炸成 400。
+    request "$CAP_BASE" PUT "/workers/$CAP_ID_B" -H 'Content-Type: application/json' \
+        --data '{"min_concurrency":2,"max_concurrency":8,"max_gpu_util":40,"max_power_w":123}'
+    assert_eq "caps: PUT accepts the three capacity fields (202)" "$STATUS" "202"
+    request "$CAP_BASE" GET "/workers/$CAP_ID_B"
+    assert_json "caps: PUT applied min_concurrency" '.min_concurrency' "2"
+    assert_json "caps: PUT applied max_concurrency" '.max_concurrency' "8"
+    assert_json "caps: PUT applied max_gpu_util" '.max_gpu_util' "40"
+    assert_json "caps: PUT ignored the retired max_power_w" 'has("max_power_w") | tostring' "false"
+    # 还原成「全场只剩并发上限 1」的形状：util 档用**负数**清除（0 在那一档是结论不是
+    # 清除，这是 cap_limit 与 util_limit 的分岔，运行时面也必须照这个口径收）。
+    request "$CAP_BASE" PUT "/workers/$CAP_ID_B" -H 'Content-Type: application/json' \
+        --data '{"min_concurrency":1,"max_concurrency":1,"max_gpu_util":-1}'
+    assert_eq "caps: PUT back to concurrency-only (202)" "$STATUS" "202"
+    request "$CAP_BASE" GET "/workers/$CAP_ID_B"
+    assert_json "caps: a negative util ceiling folds back to unlimited (absent)" \
+        'has("max_gpu_util") | tostring' "false"
+
+    # 见证行 C 必须先出池，否则"全池到顶"永远等不来（C 无上限，流量总有去处）。
+    request "$CAP_BASE" DELETE "/workers/$CAP_ID_C"
+    assert_eq "caps: witness row deleted" "$STATUS" "202"
+    for _ in $(seq 1 80); do
+        curl -sS "$CAP_BASE/workers" | grep -q "$CAP_ID_C" || break
+        sleep 0.1
+    done
+    assert_eq "caps: pool holds only the two capped rows before the burst" \
+        "$(curl -sS "$CAP_BASE/workers" | grep -c "$CAP_ID_C" || true)" "0"
+
+    # 两条 pin 住的长响应把两台各自钉在槽位上（LATENCY_MS=5000 保证重叠窗口），
+    # 第三条无处可去 → 429。pin 走 x-smg-target-worker，让"谁占着哪台"是事实而不是
+    # round_robin 的运气。
+    cap_chat() {
+        # cap_chat TAG WORKER_ID -> $TMP_DIR/cap-TAG.code
+        local tag=$1 worker=$2
+        curl -sS -m 20 -o "$TMP_DIR/cap-$tag.body" -w '%{http_code}' \
+            -X POST "$CAP_BASE/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -H "x-smg-target-worker: $worker" \
+            --data "{\"model\":\"cap-model\",\"messages\":[{\"role\":\"user\",\"content\":\"$tag\"}]}" \
+            >"$TMP_DIR/cap-$tag.code" 2>/dev/null || true
+    }
+    cap_chat hold-a "$CAP_ID_A" &
+    CAP_PID_A=$!
+    cap_chat hold-b "$CAP_ID_B" &
+    CAP_PID_B=$!
+    ia=0
+    ib=0
+    for _ in $(seq 1 100); do
+        ia=$(curl -sS "$CAP_BASE/workers" | jq -r --arg id "$CAP_ID_A" \
+            '.workers[] | select(.id==$id) | .inflight_requests // 0')
+        ib=$(curl -sS "$CAP_BASE/workers" | jq -r --arg id "$CAP_ID_B" \
+            '.workers[] | select(.id==$id) | .inflight_requests // 0')
+        [[ "$ia" =~ ^[0-9]+$ ]] || ia=0
+        [[ "$ib" =~ ^[0-9]+$ ]] || ib=0
+        [[ "$ia" -ge 1 && "$ib" -ge 1 ]] && break
+        sleep 0.1
+    done
+    assert_eq "caps: both workers sit at their concurrency cap" \
+        "$([[ "$ia" -ge 1 && "$ib" -ge 1 ]] && echo yes || echo no)" "yes"
+    request "$CAP_BASE" GET /workers
+    assert_json "caps: the at-cap rows turn red (load_state=full)" \
+        '[.workers[] | select(.load_state == "full")] | length' "2"
+
+    request "$CAP_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"cap-model","messages":[{"role":"user","content":"the request with nowhere to go"}]}'
+    assert_eq "caps: a full pool answers 429 (capacity is not unavailability)" "$STATUS" "429"
+    assert_eq "caps: the 429 keeps the X-SMG-Error-Code header" \
+        "$(header_of X-SMG-Error-Code)" "no_available_workers"
+    assert_json "caps: the 429 error code stays no_available_workers" \
+        '.error.code' "no_available_workers"
+    assert_json "caps: the 429 error type follows the new status" \
+        '.error.type' "Too Many Requests"
+    assert_json "caps: the 429 message is the exact cap wording" \
+        '.error.message' "No available workers (2 at their concurrency or GPU-util limit)"
+
+    wait $CAP_PID_A 2>/dev/null || true
+    wait $CAP_PID_B 2>/dev/null || true
+    assert_eq "caps: the two held requests completed normally" \
+        "$(printf '%s\n%s\n' "$(<$TMP_DIR/cap-hold-a.code)" "$(<$TMP_DIR/cap-hold-b.code)" | sort | tr '\n' ' ')" \
+        "200 200 "
+fi
+
+# ==========================================================================
 if section discovery; then
     # Register with no model_id: the health sweep must discover the served model
     # through /model_info and republish it in /v1/models.

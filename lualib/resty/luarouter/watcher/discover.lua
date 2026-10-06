@@ -5,6 +5,7 @@ local env_mod = require "resty.luarouter.watcher.env"
 local json_decode = cjson.decode
 local uri_encode = env_mod.uri_encode
 local has_ngx = env_mod.has_ngx
+local gpu_from_cmdline = env_mod.gpu_from_cmdline
 
 -- watcher/discover.lua -- the three discovery sources (docker published
 -- ports beat container IPs, /proc listening sockets, the allow-list), the
@@ -108,7 +109,11 @@ function _M.listening_sockets(reader)
                             local key = host .. "|" .. port
                             if not seen[key] then
                                 seen[key] = true
-                                out[#out + 1] = { host = host, port = port }
+                                -- inode 是 /proc/net/tcp 自带的第 10 列（不是新扫描），
+                                -- 只顺手记下，给下面的 socket->pid GPU 标注用。桩数据
+                                -- （单测注入的假 /proc）通常没有这一列 -> nil -> 不触发扫描。
+                                out[#out + 1] = { host = host, port = port,
+                                                  inode = tonumber(fields[10]) }
                             end
                         end
                     end
@@ -117,6 +122,318 @@ function _M.listening_sockets(reader)
         end
     end
     return out
+end
+
+------------------------------------------------------------------ gpu label
+-- doc/caps-redesign-2026-10-06.md §9：给 proc 路径发现的实例补 GPU 归属标注。
+--
+-- 这段是**纯 label 采集**，不参与任何判定：结果只写进候选自己的 gpu 字段，
+-- 后面由 reconcile 现成的 info.gpu / ledger.set_gpu_hint 那条链带给 /workers 与
+-- gpu_load 逐卡归属。它不进排除、不进摘除、不进探针、不进宽限，任何一步失败
+-- （/proc 不可读、权限不够、格式变、ffi 不在）一律 nil —— 服务发现本身一个字节
+-- 都不受影响（watcher 十条守卫与探针分档红线的原样前提）。
+--
+-- 开销控制（watcher 每 tick 都跑这条路径，不能让它变重）：
+--  1. **不需要的 tick 零开销**：只有「至少一个 proc 候选自己不带 gpu，且它的
+--     LISTEN socket 拿到了 inode」才开扫（want 集为空 -> 直接 return，一次
+--     syscall 都不新增）。
+--  2. **先看 cmdline，再决定要不要碰 fd 目录**：绝大多数进程既没有 --device-id
+--     也没有 CUDA_VISIBLE_DEVICES，一次 io.open 就被排除，根本不进它的 fd 枚举。
+--     于是每 tick 的实际成本约等于「一次 /proc 目录列举 + 每个 pid 一次 cmdline
+--     open + 少数几个 GPU 进程的 fd readlink」，而不是「全机所有 fd 全扫」。
+--  3. **限量**：单 tick 最多看 PID_LIMIT 个 pid；单个 pid 的 fd 条目超过
+--     FD_LIMIT（python 推理服务能开到上千）就放弃该 pid；readlink 总额
+--     READLINK_LIMIT，超了带着「认不出」收工。异常膨胀只会让标注变 nil，不会拖长 tick。
+--  4. **memo（一次 collect() = 一个 tick）**：同 inode 解析一次就丢出 want 集
+--     （全部命中立刻提前结束）、同 pid 的 cmdline 只读一次。跨 tick 不缓存：
+--     pid 会被回收复用，把上一轮的卡号留给新进程正是这类标注最容易出错的地方。
+
+local PROC_GPU_PID_LIMIT = 4096        -- 单 tick 最多探测的 pid 数
+local PROC_GPU_FD_LIMIT = 2048         -- 单个 pid 最多枚举的 fd 条目数
+local PROC_GPU_READLINK_LIMIT = 16384  -- 单 tick readlink 总额
+local PROC_GPU_ITER_LIMIT = 16         -- readdir 迭代保险丝倍数
+local SOCKET_PREFIX = "socket:["
+-- 独立的字面 pattern：SOCKET_PREFIX 的 "[" 在这里必须转义成 %[，所以不复用它。
+local SOCKET_INODE = "^socket:%[(%d+)%]$"
+
+local ffi_tried = false
+local ffi_backend = nil
+
+---The two /proc primitives that pure io.open cannot do: list a directory and read
+---a symlink.  io.popen is deliberately off the table (per-tick background path --
+---forking a shell every pass is out of the question, and the watcher's own contract
+---is pure file reads), and the image carries no lfs, so libc through LuaJIT's ffi
+---is the only available primitive.  Anything missing or shape-incompatible yields
+---nil, which the caller degrades to "no gpu label".
+---@return table|nil @{ffi=, C=, link_buf=}
+local function syscall_backend()
+    if ffi_tried then
+        return ffi_backend
+    end
+    ffi_tried = true
+    local ok, ffi = pcall(require, "ffi")
+    if not ok or type(ffi) ~= "table" or type(ffi.cdef) ~= "function" then
+        return nil
+    end
+    local declared = pcall(function()
+        ffi.cdef([=[
+typedef struct { unsigned long long d_ino; long long d_off;
+                 unsigned short d_reclen; unsigned char d_type;
+                 char d_name[256]; } lr_watch_dirent;
+typedef struct __dirstream lr_watch_DIR;
+lr_watch_DIR *opendir(const char *name);
+lr_watch_dirent *readdir(lr_watch_DIR *dirp);
+int closedir(lr_watch_DIR *dirp);
+long readlink(const char *path, char *buf, unsigned long bufsiz);
+]=])
+    end)
+    if not declared then
+        -- 名字与别的模块的 cdef 撞了：这是纯 label，直接放弃，不跟它抢
+        return nil
+    end
+    local built = pcall(function()
+        ffi_backend = { ffi = ffi, C = ffi.C, link_buf = ffi.new("char[64]") }
+    end)
+    if not built then
+        ffi_backend = nil
+    end
+    return ffi_backend
+end
+
+---Entry names of a directory.  Returns nil when the directory is unreadable
+---(missing, no permission) or when it overflowed the limit and reject_overflow
+---asked for that to count as unreadable.
+---@param bk table @ syscall_backend()
+---@param path string
+---@param limit number
+---@param reject_overflow boolean
+---@return table|nil names, boolean overflow
+local function dir_names(bk, path, limit, reject_overflow)
+    local dir = bk.C.opendir(path)
+    if dir == nil then          -- NULL：不可读/不存在，绝不把空指针交给 readdir
+        return nil, false
+    end
+    local names, iterations, overflow = {}, 0, false
+    local hard_cap = limit * PROC_GPU_ITER_LIMIT + 128
+    while true do
+        iterations = iterations + 1
+        if iterations > hard_cap then
+            overflow = true
+            break
+        end
+        local ent = bk.C.readdir(dir)
+        if ent == nil then      -- NULL：读完或出错，两者都按"到此为止"处理
+            break
+        end
+        -- d_name 紧跟在 19 字节的头后面，整条记录 d_reclen 字节；按 d_reclen 收窄
+        -- 读取范围，绝不越过内核交给我们的那块缓冲。
+        local reclen = tonumber(ent.d_reclen) or 0
+        if reclen < 19 or reclen > 65536 then
+            -- 记录长度读不出可信值 = 布局不是我们认的那个：整个目录按"读不了"处理，
+            -- 不拿 255 去猜（那会读到缓冲外面去）。降级 = 没有 gpu 标注。
+            overflow = true
+            break
+        end
+        local room = reclen - 19
+        if room > 255 then room = 255 end
+        if room < 1 then room = 1 end
+        local chars = {}
+        local k = 0
+        while k < room do
+            local c = ent.d_name[k]
+            if c == 0 then break end
+            chars[#chars + 1] = string.char(tonumber(c))
+            k = k + 1
+        end
+        local name = table.concat(chars)
+        if name ~= "" and name ~= "." and name ~= ".." then
+            if #names >= limit then
+                overflow = true
+                break
+            end
+            names[#names + 1] = name
+        end
+    end
+    bk.C.closedir(dir)
+    if overflow and reject_overflow then
+        return nil, true
+    end
+    return names, overflow
+end
+
+---One readlink, into the shared per-tick buffer.  nil on any error.
+---@param bk table
+---@param path string
+---@return string|nil
+local function link_target(bk, path)
+    local n = bk.C.readlink(path, bk.link_buf, 63)
+    if n == nil or n < 0 or n > 63 then
+        return nil
+    end
+    local ok, target = pcall(bk.ffi.string, bk.link_buf, tonumber(n))
+    if not ok then
+        return nil
+    end
+    return target
+end
+
+---@param target string|nil
+---@return number|nil @ the socket inode, nil when this fd is not a socket
+local function socket_inode_of(target)
+    if type(target) ~= "string" or string.sub(target, 1, #SOCKET_PREFIX) ~= SOCKET_PREFIX then
+        return nil
+    end
+    local digits = string.match(target, SOCKET_INODE)
+    return tonumber(digits)
+end
+
+local function read_whole(path)
+    local handle = io.open(path, "r")
+    if not handle then
+        return nil
+    end
+    local body = handle:read("a")
+    handle:close()
+    return body
+end
+
+---Resolve inode -> gpu id for the wanted LISTEN sockets by walking /proc once.
+---Every failure mode (no ffi, unreadable /proc, odd layout, budget spent) simply
+---leaves the inode out of the result, i.e. "no label".
+---@param bk table
+---@param want table @ {[inode number]=true}; resolved inodes are removed as we go
+---@param root string @ normally "/proc"
+---@param counters table|nil @ 可选计数器：**只有探针传**，生产路径恒 nil（不多走一个分支）。
+---        pids_seen / cmdline_reads / fd_dirs / fd_entries / fd_skipped / readlinks /
+---        readlinks_capped / pids_capped
+---@return table @ {[inode number]=gpu id}
+local function scan_proc_for_gpu(bk, want, root, counters)
+    local found = {}
+    local pids = dir_names(bk, root, PROC_GPU_PID_LIMIT, false)
+    if not pids then
+        return found
+    end
+    if counters then counters.pids_seen = #pids end
+    local pending = 0
+    for _ in pairs(want) do
+        pending = pending + 1
+    end
+    local cmdline_memo, readlinks = {}, 0
+    for i = 1, #pids do
+        if pending == 0 then
+            break                       -- 全部命中，提前收工
+        end
+        if readlinks >= PROC_GPU_READLINK_LIMIT then
+            if counters then counters.readlinks_capped = true end
+            break                       -- 预算花完：剩下的按"认不出"处理
+        end
+        if i > PROC_GPU_PID_LIMIT then
+            if counters then counters.pids_capped = true end
+            break                       -- pid 预算花完：同样只是"认不出"
+        end
+        local pid = pids[i]
+        if tonumber(pid) then
+            -- 同一 pid 本 tick 只读一次 cmdline（kernel 线程读到空串，同样进 memo）
+            local gpu = cmdline_memo[pid]
+            if gpu == nil then
+                if counters then
+                    counters.cmdline_reads = (counters.cmdline_reads or 0) + 1
+                end
+                local body = nil
+                local ok, value = pcall(read_whole, root .. "/" .. pid .. "/cmdline")
+                if ok then body = value end
+                local parsed = nil
+                if type(body) == "string" then
+                    local ok2, gpu_value = pcall(gpu_from_cmdline, body)
+                    if ok2 and type(gpu_value) == "string" then
+                        parsed = gpu_value
+                    end
+                end
+                gpu = parsed or false
+                cmdline_memo[pid] = gpu
+            end
+            if gpu ~= false then
+                local fds = dir_names(bk, root .. "/" .. pid .. "/fd",
+                    PROC_GPU_FD_LIMIT, true)
+                if counters then
+                    counters.fd_dirs = (counters.fd_dirs or 0) + 1
+                    if fds then counters.fd_entries = (counters.fd_entries or 0) + #fds
+                    else counters.fd_skipped = (counters.fd_skipped or 0) + 1 end
+                    counters.fd_dirs_pid = counters.fd_dirs_pid or {}
+                    counters.fd_dirs_pid[pid] = (counters.fd_dirs_pid[pid] or 0) + 1
+                end
+                if fds then
+                    for j = 1, #fds do
+                        if readlinks >= PROC_GPU_READLINK_LIMIT or pending == 0 then
+                            break
+                        end
+                        if tonumber(fds[j]) then
+                            readlinks = readlinks + 1
+                            local target = link_target(bk,
+                                root .. "/" .. pid .. "/fd/" .. fds[j])
+                            local ino = socket_inode_of(target)
+                            if ino ~= nil and want[ino] then
+                                want[ino] = nil
+                                pending = pending - 1
+                                found[ino] = gpu
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if counters then counters.readlinks = readlinks end
+    return found
+end
+
+---Fill gpu labels onto proc-sourced candidates that have none (never overwrites
+---a value another source already wrote -- docker 那一路从容器名解析出的卡号优先).
+---@param cands table[]
+---@param opts table|nil @{proc_root=, gpu_lookup=, counters=}（探针注入假 /proc 与计数器；
+---        生产调用方一个都不传，counters 恒 nil）
+local function annotate_proc_gpu(cands, opts)
+    opts = opts or {}
+    local want, need = {}, 0
+    for i = 1, #cands do
+        local cand = cands[i]
+        -- 只给 proc 一路补：docker 一路的卡号（容器名解析）永远优先，这里一个字段都不碰它
+        if cand.source == "proc" and (cand.gpu == nil or cand.gpu == false) then
+            local ino = tonumber(cand.inode)
+            if ino ~= nil and ino > 0 and want[ino] == nil then
+                want[ino] = true
+                need = need + 1
+            end
+        end
+    end
+    if need == 0 then
+        return                       -- 没有候选要标注：本 tick 零新增开销
+    end
+    local root = opts.proc_root or "/proc"
+    local lookup = opts.gpu_lookup
+    if lookup == nil then
+        local bk = syscall_backend()
+        if bk == nil then
+            return
+        end
+        lookup = function(w)
+            return scan_proc_for_gpu(bk, w, root, opts.counters)
+        end
+    end
+    local ok, got = pcall(lookup, want)
+    if not ok or type(got) ~= "table" then
+        return                       -- 探针式的意外：放弃标注，不影响发现
+    end
+    for i = 1, #cands do
+        local cand = cands[i]
+        if cand.source == "proc" and (cand.gpu == nil or cand.gpu == false) then
+            local ino = tonumber(cand.inode)
+            local gpu = ino ~= nil and got[ino] or nil
+            if type(gpu) == "string" and gpu ~= "" then
+                cand.gpu = gpu
+            end
+        end
+    end
 end
 
 ---Candidates from a /containers/json document (the caller does the socket read).
@@ -215,6 +532,9 @@ function _M.local_candidates(sockets, deny, allow)
                 cands[#cands + 1] = {
                     url = _M.normalize_url("http://" .. target .. ":" .. port),
                     source = "proc",
+                    -- inode 随候选带下来，annotate_proc_gpu 拿它去 /proc 找属主进程。
+                    -- 桩 reader（单测假 /proc）没有这一列 -> nil -> 扫描整个跳过。
+                    inode = item.inode,
                 }
             end
         end
@@ -385,7 +705,10 @@ end
 ---@param cfg table
 ---@param reader function|nil @ injectable /proc reader for tests
 ---@return table[]
-function _M.collect(cfg, reader)
+---@param gpu_opts table|nil @{proc_root=, gpu_lookup=} injected only by the
+---        GPU-label probe; the daemon (live.run_pass) never passes it, so the
+---        production path always takes the real-/proc branch.
+function _M.collect(cfg, reader, gpu_opts)
     local lists = {}
     local targets = {}
     for i = 1, #(cfg.targets or {}) do
@@ -433,6 +756,9 @@ function _M.collect(cfg, reader)
                 cands[i].label = port_names[port]
             end
         end
+        -- GPU 归属标注（纯 label）：给不带 gpu 的 proc 候选按 LISTEN inode 找属主
+        -- 进程、从它的 cmdline 认卡号。认不出/扫不动一律保持 nil，发现逻辑本身不动。
+        annotate_proc_gpu(cands, gpu_opts)
         lists[#lists + 1] = cands
     end
 

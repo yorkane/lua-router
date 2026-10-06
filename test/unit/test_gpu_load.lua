@@ -1021,6 +1021,341 @@ package.preload["resty.lock"] = function()
 end
 gpu_load.stop()
 
+--------------------------------------------------------------------------
+-- 16. GPU 利用率采集通道（doc/caps-redesign-2026-10-06.md §5）
+--------------------------------------------------------------------------
+local function util_cases()
+new_case("util_fraction refuses the readings an admission gate cannot trust")
+-- 打分侧的 normalize() 会把越界夹到 1；准入侧不行（caps-redesign §5 点名的缺口）。
+near(gpu_load.util_fraction("65"), 0.65, "percent folded onto 0..1")
+near(gpu_load.util_fraction(65), 0.65, "a number in percent too")
+eq(gpu_load.util_fraction("0"), 0, "0 % is a legal reading (the 21.k idle-card case), not missing")
+near(gpu_load.util_fraction(0.4), 0.4, "a fraction passes through")
+eq(gpu_load.util_fraction(1), 1, "exactly 1 is saturated (same meaning as xl: milli 1000)")
+near(gpu_load.util_fraction("100"), 1, "100 % is a full card")
+near(gpu_load.util_fraction(105), 1, "driver rounding past 100 clamps, still saturated")
+eq(gpu_load.util_fraction(-5), nil, "a negative percent is a liar, not zero busy")
+eq(gpu_load.util_fraction("-1"), nil, "and so is the textual spelling")
+eq(gpu_load.util_fraction("NaN"), nil, "NaN is unknown, never a reading")
+eq(gpu_load.util_fraction("+Inf"), nil, "+Inf is unknown")
+eq(gpu_load.util_fraction("-Inf"), nil, "-Inf is unknown")
+eq(gpu_load.util_fraction(0 / 0), nil, "a Lua NaN is unknown")
+eq(gpu_load.util_fraction(1001), nil, "above MAX_PLAUSIBLE_UTIL_PERCENT it is a mis-fed counter, not 1001 %")
+eq(gpu_load.util_fraction(nil), nil, "missing stays missing")
+eq(gpu_load.util_fraction("abc"), nil, "junk stays missing")
+eq(gpu_load.MAX_PLAUSIBLE_UTIL_PERCENT, 1000, "the plausibility ceiling is the published one")
+
+new_case("the utilization roster is not the scoring roster")
+local util_roster = {}
+for i = 1, #gpu_load.DEFAULT_UTIL_METRIC_KEYS do
+    util_roster[gpu_load.canon(gpu_load.DEFAULT_UTIL_METRIC_KEYS[i])] = true
+end
+check(util_roster.dcgm_fi_dev_gpu_util, "the DCGM name as actually exported (21.k :9400)")
+check(util_roster.nvidia_gpu_utilization and util_roster.dcgm_gpu_utilization,
+    "and the two exporter spellings that were already there")
+check(not util_roster.gpu_cache_usage_perc and not util_roster.vllm_gpu_cache_usage_perc,
+    "no KV-cache gauge: cache occupancy is not card busyness")
+local w_only_cache = gpu_load.util_by_card("vllm:gpu_cache_usage_perc 0.95\n", nil)
+eq(w_only_cache, nil, "a cache-pressure body answers *no* utilization")
+local w_dcgm = gpu_load.util_by_card("DCGM_FI_DEV_GPU_UTIL 42\n", nil)
+near(w_dcgm, 0.42, "while the same scan reads the DCGM gauge")
+
+new_case("util_by_card reduces a whole exposition to the hottest card")
+local TEXU = table.concat({
+    "# HELP DCGM_FI_DEV_GPU_UTIL GPU utilization (in %).",
+    "# TYPE DCGM_FI_DEV_GPU_UTIL gauge",
+    'DCGM_FI_DEV_GPU_UTIL{gpu="0",Hostname="gpu-box"} 12',
+    'DCGM_FI_DEV_GPU_UTIL{gpu="1",Hostname="gpu-box"} 82',
+    'DCGM_FI_DEV_GPU_UTIL{gpu="all"} 40',
+    "DCGM_FI_DEV_GPU_UTIL 7",
+    'NVIDIA_GPU_UTILIZATION{gpu="3"} NaN',
+}, "\n")
+local whole_u, cards_u, have_u = gpu_load.util_by_card(TEXU, nil)
+near(whole_u, 0.82, "whole machine is the hottest card, not the mean")
+near(cards_u["0"], 0.12, "card zero keeps its own reading")
+near(cards_u["1"], 0.82, "card one too")
+eq(cards_u["all"], nil, "a non-numeric gpu label never names a card")
+eq(cards_u["3"], nil, "a NaN series stores nothing")
+eq(have_u, true, "the source did expose card labels")
+local w2, c2, h2 = gpu_load.util_by_card('DCGM_FI_DEV_GPU_UTIL{gpu="2"} -4\n', nil)
+eq(w2, nil, "only a lying series -> unknown, not 0")
+eq(next(c2), nil, "and no per-card key")
+eq(h2, false, "a negative-only body proved nothing about labels either")
+local w3 = gpu_load.util_by_card(nil, nil)
+eq(w3, nil, "nil body, no reading")
+near((gpu_load.util_by_card("dcgm_gpu_utilization 105", { "dcgm_gpu_utilization" })), 1,
+    "an operator roster override works too")
+
+new_case("assign_util: per-card hits, honest fallbacks, no cross-host bleed")
+local UWORKERS = {
+    { id = "a1", url = "http://gpu-a:8800" },
+    { id = "a2", url = "http://gpu-a:8801" },
+    { id = "b1", url = "http://gpu-b:8800" },
+}
+local SEP = gpu_load.CARD_SEP
+local by_host_u = { ["gpu-a"] = 0.82, ["gpu-b"] = 0.2 }
+local cards_u2 = { ["gpu-a" .. SEP .. "0"] = 0.82, ["gpu-a" .. SEP .. "1"] = 0.08 }
+local hints_u = { ["http://gpu-a:8800"] = "1", ["http://gpu-b:8800"] = "0" }
+-- 源是逐卡的：a1 认得卡 -> 自己那张（0.08，哪怕邻居 0.82 更热）
+local out_u, unm_u, pc_u, fb_u = gpu_load.assign_util(UWORKERS, by_host_u, cards_u2, true, hints_u)
+near(out_u.a1, 0.08, "the card owner reads its own card, not the machine max")
+near(out_u.a2, 0.82, "the card-less sibling on the same host falls back to the hottest card")
+near(out_u.b1, 0.2, "the other machine never borrows gpu-a's heat")
+eq(unm_u, 0, "every host in the vector had a worker")
+eq(pc_u, 1, "one per-card attribution (a1; b1's card 0 has no series on gpu-b)")
+eq(fb_u, 2, "a2 and b1 ride the machine max, counted, never silent")
+-- 源根本没有逐卡标签：全员整机 max，全部计入 fallback（老数据源的合法形态）
+local out_l, _, pc_l, fb_l = gpu_load.assign_util(UWORKERS, by_host_u, nil, false, nil)
+near(out_l.a1, 0.82, "legacy source: machine max for a1")
+near(out_l.a2, 0.82, "and for a2")
+eq(pc_l, 0, "no per-card claims without per-card series")
+eq(fb_l, 3, "all three are fallbacks, honestly counted")
+-- 卡认得出但 vector 没有该卡 series -> 回退整机 max（利用率侧与功率侧的刻意差别）
+local out_g, unm_g, pc_g, fb_g = gpu_load.assign_util(
+    { { id = "c1", url = "http://gpu-c:8800" } },
+    { ["gpu-c"] = 0.5 }, { ["gpu-c" .. SEP .. "7"] = 0.5 }, true,
+    { ["http://gpu-c:8800"] = "2" })
+near(out_g.c1, 0.5, "missing card series falls back instead of staying unknown")
+eq(pc_g, 0, "not credited as per-card")
+eq(fb_g, 1, "counted as fallback")
+eq(unm_g, 0, "the host was claimed")
+-- 向量里有机器却没有池内 worker：unmatched 计数保持原义
+local out_n, unm_n = gpu_load.assign_util(UWORKERS, { ["gpu-z"] = 0.4 }, nil, false, nil)
+eq(next(out_n), nil, "nobody on gpu-z, nobody assigned")
+eq(unm_n, 1, "one unmatched host (a topology hint, not an error)")
+eq(#gpu_load.assign_util(nil, by_host_u), 0, "no workers answers the empty shape")
+eq(#gpu_load.assign_util({}, nil, nil, nil, nil), 0, "and junk inputs stay junk-proof")
+
+new_case("util_config: on by default, intent only from an explicit query")
+local cfg_u = gpu_load.util_config({})
+eq(cfg_u.on, true, "the util channel is on by default")
+eq(cfg_u.query, gpu_load.DEFAULT_UTIL_QUERY, "with the single authoritative default PromQL")
+eq(cfg_u.explicit_query, false, "a default string is not operator intent")
+eq(gpu_load.util_config({ load_util_enabled = false }).on, false, "the switch can still be turned off")
+eq(gpu_load.util_config({ load_util_enabled = true }).on, true, "and explicitly on")
+local cfg_e = gpu_load.util_config({ load_util_query = "max by (instance,gpu) (my_util_gauge)" })
+eq(cfg_e.explicit_query, true, "an operator-written query IS intent")
+eq(cfg_e.query, "max by (instance,gpu) (my_util_gauge)", "and it is used verbatim")
+eq(gpu_load.util_config({ load_util_query = "   " }).explicit_query, false,
+    "whitespace is not a query")
+eq(gpu_load.util_config({ load_util_keys = "my_gpu_util" }).keys, "my_gpu_util",
+    "the metrics-path roster override rides through")
+
+new_case("the metrics path scans utilization from the same body, independently")
+reset_store()
+local body_u = table.concat({
+    'DCGM_FI_DEV_GPU_UTIL{gpu="2"} 63',
+    'DCGM_FI_DEV_GPU_UTIL{gpu="3"} 99',
+}, "\n")
+local calls_u, seams_u = counting_seams({
+    workers = {
+        { id = "m1", url = "http://gpu-m:8800", labels = { gpu = "2" } },
+        { id = "m2", url = "http://gpu-m:8801" },
+    },
+    get = function() return { status = 200, body = body_u } end,
+})
+local st_u = gpu_load.run_pass({ load_source = "metrics", load_interval_secs = 15 }, seams_u)
+eq(st_u.util_enabled, true, "the channel is on without being asked for")
+eq(st_u.util_probed, 2, "both bodies were scanned")
+eq(st_u.util_matched, 2, "both readings were stored")
+eq(st_u.util_per_card, 1, "m1 got its own card (63 %)")
+eq(st_u.util_fallback, 1, "m2 got the machine max (99 %) -- counted, not silent")
+near(registry.gpu_util("m1"), 0.63, "the card owner reads 63 %, not the neighbour's 99")
+near(registry.gpu_util("m2"), 0.99, "the cardless worker reads the hottest card")
+eq(st_u.failed, 2, "the load gauge is a separate ledger: no vllm gauge here")
+eq(registry.external_load("m1"), nil, "and no xl: sample was invented")
+-- 采到的读数真的接进了准入门（跨层钉一下：gu: -> capacity_state）
+eq(registry.capacity_state({ id = "m1", max_gpu_util = 5 }), "full",
+    "63 % clears a 5 % ceiling")
+eq(registry.capacity_state({ id = "m1", max_gpu_util = 90 }), "idle",
+    "63 % stays under a 90 % ceiling")
+eq(registry.capacity_state({ id = "m1" }), nil, "no ceiling declared: no gate, whatever the reading")
+
+new_case("utilization and load gauges fail and succeed independently")
+reset_store()
+local _, seams_ix = counting_seams({
+    workers = { { id = "n1", url = "http://gpu-n:8800" } },
+    get = function() return { status = 200, body = "vllm:gpu_cache_usage_perc 0.6\n" } end,
+})
+local st_ix = gpu_load.run_pass({ load_source = "metrics" }, seams_ix)
+eq(st_ix.matched, 1, "the load channel got its sample")
+eq(st_ix.util_probed, 1, "the util channel still looked")
+eq(st_ix.util_failed, 1, "found nothing usable, said so in its own ledger")
+eq(st_ix.util_matched, 0, "and stored nothing")
+eq(registry.gpu_util("n1"), nil, "no gu: key invented from a cache gauge")
+reset_store()
+local _, seams_off = counting_seams({
+    workers = { { id = "n2", url = "http://gpu-n:8800" } },
+    get = function() return { status = 200, body = body_u } end,
+})
+local st_off = gpu_load.run_pass({ load_source = "metrics", load_util_enabled = false }, seams_off)
+eq(st_off.util_enabled, false, "the switch turns the whole channel off")
+eq(st_off.util_probed, 0, "no scan, not even a probe count")
+eq(registry.gpu_util("n2"), nil, "nothing written")
+
+new_case("the write seam rejects a lying number and keeps the dict clean")
+reset_store()
+local _, seams_rej = counting_seams({
+    workers = { { id = "r1", url = "http://gpu-r:8800" } },
+    get = function() return { status = 200, body = body_u } end,
+})
+seams_rej.write_util = function(id, util)
+    if type(util) ~= "number" or util > 1 or util < 0 then
+        return false, "rejected"
+    end
+    if registry.set_gpu_util(id, util, 45) then
+        return true, "stored"
+    end
+    return false, "store-failed"
+end
+local st_re = gpu_load.run_pass({ load_source = "metrics" }, seams_rej)
+eq(st_re.util_matched, 1, "an honest reading stored through the seam")
+near(registry.gpu_util("r1"), 0.99, "r1 is cardless here, so it carries the machine max")
+reset_store()
+local _, seams_rx = counting_seams({
+    workers = { { id = "r2", url = "http://gpu-r:8800" } },
+    get = function() return { status = 200, body = body_u } end,
+})
+seams_rx.write_util = function() return false, "rejected" end
+local st_rx = gpu_load.run_pass({ load_source = "metrics" }, seams_rx)
+eq(st_rx.util_rejected, 1, "a refused store is its own counter")
+eq(st_rx.util_matched, 0, "and not a success")
+eq(registry.gpu_util("r2"), nil, "nothing landed in gu:")
+-- the real seam pre-screens before registry ever sees a number
+local seams_mod = require "resty.luarouter.gpu_load.seams"
+local okz, whz = seams_mod.default_write_util("z1", 1.5, 1, 45, nil)
+eq(okz, false, "150 % normalized is refused outright")
+eq(whz, "rejected", "with the rejection label the pass counts on")
+eq(registry.gpu_util("z1"), nil, "and no key behind it")
+eq(select(2, seams_mod.default_write_util("z1", -0.2, 1, 45, nil)), "rejected", "negative refused")
+eq(select(2, seams_mod.default_write_util("z1", 0 / 0, 1, 45, nil)), "rejected", "NaN refused")
+eq(select(2, seams_mod.default_write_util("z1", math.huge, 1, 45, nil)), "rejected", "+Inf refused")
+check(seams_mod.default_write_util("z9", 0.5, 1, 45, "http://gpu-z:8800"), "a clean fraction stores")
+near(registry.gpu_util("z9"), 0.5, "milli round-trip is exact")
+-- registry itself is the authority above 1: clamps (a momentary 105 % gauge stays saturated)
+check(registry.set_gpu_util("z8", 1.5, 45), "registry clamps instead of refusing above 1")
+near(registry.gpu_util("z8"), 1, "clamped to saturated")
+eq(registry.set_gpu_util("z7", -0.1, 45), false, "registry refuses the negative")
+eq(registry.gpu_util("z7"), nil, "no key at all")
+reset_store()
+
+new_case("a stored util sample ages out through TTL, back to unknown")
+reset_store()
+check(registry.set_gpu_util("t1", 0.7, 30), "a sample with a 30 s window lands")
+near(registry.gpu_util("t1"), 0.7, "fresh: readable within its TTL")
+clock.t = clock.t + 31 * 1000
+eq(registry.gpu_util("t1"), nil, "past the TTL the reading is *unknown*, not 0")
+eq(registry.capacity_state({ id = "t1", max_gpu_util = 10 }), "idle",
+    "and an unknown reading never excludes")
+registry.clear_gpu_util("t1")
+eq(registry.gpu_util("t1"), nil, "clear is the manual door out")
+
+new_case("the prom path adds a third query only on explicit intent")
+reset_store()
+local UVECTOR = require("cjson.safe").encode({
+    status = "success",
+    data = {
+        resultType = "vector",
+        result = {
+            { metric = { instance = "gpu-a:9100", gpu = "0" }, value = { 1700000000, "82" } },
+            { metric = { instance = "gpu-a:9100", gpu = "1" }, value = { 1700000001, "8" } },
+            { metric = { instance = "gpu-b:9100" }, value = { 1700000002, "20" } },
+        },
+    },
+})
+local calls_pu, seams_pu = counting_seams({
+    workers = UWORKERS,
+    post = function() return { status = 200, body = UVECTOR } end,
+})
+seams_pu.gpu_hints = { ["http://gpu-a:8800"] = "1" }
+local st_pu = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "avg by (instance) (load_gauge)", load_scale = 100,
+    load_util_query = "max by (instance,gpu) (util_gauge)",
+}, seams_pu)
+eq(#calls_pu.post, 2, "load query + the explicit utilization query")
+local saw_util_q = false
+for i = 1, #calls_pu.post do
+    if calls_pu.post[i].body:find("util_gauge", 1, true) then saw_util_q = true end
+end
+check(saw_util_q, "the utilization PromQL was actually dialed")
+eq(st_pu.util_enabled, true, "the channel reports itself as running")
+eq(st_pu.util_probed, 1, "one executed util query")
+near(registry.gpu_util("a1"), 0.08, "a1 got its own card through the prom vector")
+near(registry.gpu_util("a2"), 0.82, "a2 fell back to the machine max")
+eq(st_pu.util_per_card, 1, "one per-card attribution")
+eq(st_pu.util_fallback, 2, "a2 and b1 both rode the machine max")
+eq(st_pu.util_unmatched, 0, "every series had a home")
+reset_store()
+local calls_pd, seams_pd = counting_seams({
+    workers = UWORKERS,
+    post = function() return { status = 200, body = UVECTOR } end,
+})
+local st_pd = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "avg by (instance) (load_gauge)", load_scale = 100,
+}, seams_pd)
+eq(#calls_pd.post, 1, "no third POST when nobody asked for the util query")
+eq(st_pd.util_enabled, false, "the default string alone is not intent")
+eq(st_pd.util_probed, 0, "nothing probed")
+eq(registry.gpu_util("a1"), nil, "and nothing stored")
+
+new_case("a down prometheus costs util its own ledger only")
+reset_store()
+local _, seams_pd2 = counting_seams({
+    workers = { UWORKERS[1] },
+    post = function(qbody)
+        if type(qbody) == "string" and qbody:find("util_gauge", 1, true) then
+            return { status = 500, body = "boom" }
+        end
+        return { status = 200, body = UVECTOR }
+    end,
+})
+local st_pd2 = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "avg by (instance) (load_gauge)", load_scale = 100,
+    load_util_query = "max by (instance,gpu) (util_gauge)",
+}, seams_pd2)
+check(st_pd2.util_errors >= 1, "the failed util query is its own error", st_pd2.util_errors)
+eq(st_pd2.matched, 1, "the load channel still delivered its sample")
+near(registry.load("a1"), 82, "load survives on the vector it did get")
+eq(registry.gpu_util("a1"), nil, "util honestly reports nothing collected")
+eq(workers_store["hl:a1"], nil, "no health was spent on the broken prometheus")
+
+new_case("the util family only exports when the channel ran")
+reset_store()
+local _, seams_ex = counting_seams({
+    workers = { { id = "x1", url = "http://gpu-x:8800" } },
+    get = function() return { status = 200, body = body_u } end,
+})
+gpu_load.run_pass({ load_source = "metrics", load_util_enabled = false }, seams_ex)
+for key in pairs(stats_store) do
+    check(not key:find("lr_gpu_load_util", 1, true),
+        "a disabled channel writes no util series: " .. key)
+end
+reset_store()
+gpu_load.run_pass({ load_source = "metrics" }, seams_ex)
+local saw_samples, saw_workers_g, saw_per_card = false, false, false
+local util_gauge_value = nil
+for key, hit in pairs(stats_store) do
+    if key:find("lr_gpu_load_util_samples_total", 1, true) then saw_samples = true end
+    if key:find("lr_gpu_load_util_workers", 1, true) then saw_workers_g = true end
+    if key:find("lr_gpu_load_util_per_card_workers", 1, true) then saw_per_card = true end
+    if key:find("lr_gpu_load_util_gpu|", 1, true) then
+        util_gauge_value = hit.value
+    end
+end
+check(saw_samples, "the samples counter exists once the channel runs")
+check(saw_workers_g, "the coverage gauge exists")
+check(saw_per_card, "and the per-card coverage gauge (the 342.371 witness)")
+check(util_gauge_value ~= nil, "the per-worker lr_gpu_load_util_gpu series was published")
+-- x1 无卡标签：整机最热（0.99）回退并如实导出
+if util_gauge_value ~= nil then
+    near(util_gauge_value, 0.99, "the per-worker util gauge carries the stored fraction")
+end
+end
+util_cases()
+
 io.write(string.format("\n=== %d checks, %d failed ===\n", passed, failed))
 for i = 1, #failures do
     io.write("FAILED: " .. failures[i] .. "\n")

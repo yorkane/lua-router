@@ -316,12 +316,25 @@ local function snapshot_of(cfg)
         -- absent when nothing was declared (never an explicit null), which is what
         -- distinguishes "the probe decides" from "declared empty" on the way back in.
         if item.models then entry.models = { table.unpack(item.models) } end
-        -- Capacity caps round-trip the same way: written only when the row declared a
+        -- Capacity gates round-trip the same way (doc/caps-redesign-2026-10-06.md §1,
+        -- which supersedes doc/gap-worker-caps.md): written only when the row declared a
         -- usable limit, and *absent* (never an explicit null) for "unlimited". Writing
         -- an explicit null would make the snapshot carry a field no operator declared,
         -- and an old build reading it would have to know the key means nothing.
-        for _, field in ipairs({ "max_concurrency", "max_power_w" }) do
-            local cap = CS_PROFILES.declared_cap(item[field], field == "max_concurrency")
+        --
+        -- Per-tier normalizer, and the util tier cannot borrow the concurrency one:
+        -- cap_limit folds <= 0 to nil, which would erase max_gpu_util = 0 -- the
+        -- strictest legal gate -- into silence. An old snapshot that still carries the
+        -- retired max_power_w key re-emits nothing here (the parse layer warns once and
+        -- drops it, so the key leaves the document for good on the next save); no new
+        -- phantom key appears either, which is what the lossless round-trip pins.
+        for _, field in ipairs(CS_UPSTREAMS.CAP_FIELDS) do
+            local cap
+            if field == "max_gpu_util" then
+                cap = CS_PROFILES.declared_util(item[field])
+            else
+                cap = CS_PROFILES.declared_cap(item[field], true)
+            end
             if cap ~= nil then entry[field] = cap end
         end
         -- Persistence half of the key: state + value ride the snapshot so a

@@ -329,6 +329,80 @@ function _M.gpu_from_name(name)
     return string.match(name, "[Gg][Pp][Uu](%d+)")
 end
 
+---The byte that really separates argv entries in /proc/<pid>/cmdline.
+local CMDLINE_NUL = string.char(0)
+
+---Token boundary for gpu_from_cmdline.  File-local on purpose: the label scan runs
+---once per pid per watcher tick, so the predicate must not cost a closure per call.
+---@param byte number
+---@param nul_mode boolean
+---@return boolean
+local function cmdline_sep(byte, nul_mode)
+    if nul_mode then
+        return byte == 0
+    end
+    return byte == 32 or byte == 9 or byte == 10 or byte == 13
+end
+
+---进程**启动命令**里带的 GPU 卡号：sglang 的 `--device-id N`，其次（也是
+---llama.cpp / vLLM 最常见的形式）launcher 前缀里的 `CUDA_VISIBLE_DEVICES=N`。
+---两者都没有 → nil。
+---@param cmdline string|nil @NUL 分隔的 /proc/<pid>/cmdline 原文，或空格拼接的命令行
+---@return string|nil @卡号（数字串），认不出时 nil
+function _M.gpu_from_cmdline(cmdline)
+    if type(cmdline) ~= "string" then
+        return nil
+    end
+    local n = #cmdline
+    if n > 65536 then
+        n = 65536
+    end
+    -- 分隔符口径：窗口里只要出现 NUL 就**只按 NUL 切**（那才是 /proc/<pid>/cmdline 的
+    -- argv 边界；sh -c 的整段引号内容是一整个 argv，其中的 --device-id 不算）；
+    -- 一个 NUL 都没有才退回按空白切（人写的空格串、被截断的旧数据）。
+    local nul_mode = string.find(cmdline, CMDLINE_NUL, 1, true) ~= nil
+    local device_id, visible, expect_arg = nil, nil, false
+    local i = 1
+    while i <= n do
+        local b = string.byte(cmdline, i)
+        if cmdline_sep(b, nul_mode) then
+            i = i + 1
+        else
+            local j = i
+            while j <= n do
+                local c = string.byte(cmdline, j)
+                if cmdline_sep(c, nul_mode) then
+                    break
+                end
+                j = j + 1
+            end
+            local tok = string.sub(cmdline, i, j - 1)
+            i = j
+            if expect_arg then
+                expect_arg = false
+                if device_id == nil and string.match(tok, "^%d+$") then
+                    device_id = tok
+                end
+            elseif tok == "--device-id" then
+                expect_arg = true
+            else
+                local inline = string.match(tok, "^%-%-device%-id=(.+)$")
+                if inline then
+                    if device_id == nil then
+                        device_id = string.match(inline, "^%d+")
+                    end
+                elseif visible == nil then
+                    local cvd = string.match(tok, "^CUDA_VISIBLE_DEVICES=(.+)$")
+                    if cvd then
+                        visible = string.match(cvd, "^%d+")
+                    end
+                end
+            end
+        end
+    end
+    return device_id or visible
+end
+
 -- ------------------------------------------------------------------ env config
 
 ---All knobs read from the environment. Names mirror the daemon's LLM_WATCHER_*
@@ -406,6 +480,9 @@ M.trim, M.is_blank, M.lower = trim, is_blank, lower
 M.sorted_keys, M.bool_from = sorted_keys, bool_from
 M.num_from, M.split_list, M.list_from = num_from, split_list, list_from
 M.uri_encode = uri_encode
+-- 跨模块 helper 面：discover 的 socket->pid GPU 标注用它（gpu_from_name 走 _M 门面，
+-- 这一支和上面同形状：预捕获成 local，热路径不查表）。
+M.gpu_from_cmdline = _M.gpu_from_cmdline
 
 -- Load-time snapshot of the ngx global -- the same expression on the same
 -- synchronous require tick as the original watcher.lua:40 (the facade

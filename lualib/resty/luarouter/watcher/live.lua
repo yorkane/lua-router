@@ -227,6 +227,11 @@ local function actual_pool()
             url = record.url,
             model_id = record.model_id or "unknown",
             is_healthy = registry.is_healthy(record.id),
+            -- labels 随行带出：GPU 归属补给要按「这条记录自己有没有说过卡号」决定要不要
+            -- 写（reconcile 的 row_gpu），而 records() 是本函数唯一的池读取口 —— 在这里
+            -- 补一列，比让补给路径去 registry.get 逐行摸一次 shdict 便宜，且读到的必然是
+            -- 同一轮快照的字节。只带 labels 这一个只读视图，不带上任何判定用的字段。
+            labels = record.labels,
             -- Provenance for the config-member immunity below (guard 4's twin:
             -- upstreams declared through config_store belong to nobody but the
             -- document). registry.records() is the only pool read here, so the
@@ -235,6 +240,73 @@ local function actual_pool()
         }
     end
     return out
+end
+
+---labels 补给的写入接缝：registry 侧既有的「合并 labels」写路径（PUT /workers 的
+---registry.update 的 labels 支 → registry/records.lua 的 patch_record），不另开一条。
+---
+---刻意复用 registry.update 而不是直接调 records.patch_record：那条 PUT 就是 labels 的
+---既有写入口（router/control.lua 的 update_worker_handler 底下走的正是它），合并语义、
+---with_lock、mesh 镜像、K_HSEL 重算全在现成的那一份里；本文件里 make_register /
+---make_unregister 与 POST/DELETE /workers 的关系也是同一种形状。update 的 model_id /
+---models 忽略门只对**非 config 行**生效，而这里的补丁只带 labels 一个字段，那条门根本不参与。
+---@return function @ (url, worker_id, gpu) -> boolean ok, string|nil err
+local function make_patch_labels()
+    local registry = require "resty.luarouter.registry"
+    return function(url, worker_id, gpu)
+        local id = tostring(worker_id or "")
+        if id == "" then
+            -- 纯层夹具之外的真实情况：actual 行没有 id 就没法定位记录。当作「没标上」。
+            return false, "no worker id"
+        end
+        -- 贴着写入前对**现值**再判一次，而不是只信本轮 actual 的快照。两判都必要：
+        --   * config 归属可能在这一轮读取之后才落定（config_store 的 upstreams reconcile
+        --     与本轮 actual 快照之间没有锁），而 registry.update 对 config 行是
+        --     labels_replace 语义 —— 那条路径会把声明层的 label 集整表换掉，绝不让
+        --     watcher 的一次监控补齐去触发它；
+        --   * 卡号也可能在快照之后被别人写上（操作员 PUT /workers，或另一个进程的
+        --     discovery 路径）。「已有值绝不覆盖」只有贴着写入那一刻判才算真。
+        -- registry.record 是现成的只读口（facade 导出 records.record）：一次 shdict 读，
+        -- 只在「确实要写」的分支上才付这个代价。
+        local current = registry.record and registry.record(id)
+        if type(current) ~= "table" then
+            return false, "worker record not found"
+        end
+        if current.discovery == "config" then
+            return false, "config-declared upstream"
+        end
+        if _M.row_gpu(current) ~= nil then
+            return false, "already labelled"
+        end
+        -- registry.update 的第二返回值是错误串（string），第三返回值才分 "validation" /
+        -- "not_found"。两者都不许冒到 reconcile 去，调用方拿到的永远只是 ok + 一行原因。
+        -- 这里刻意**不**跟一次 policy.bump_generation()，与 PUT /workers 的 handler
+        -- （router/control.lua 的 update_worker_handler）不同，理由说清楚：
+        --   * 那个 handler 补 generation 是因为操作员写的 label 里可能是 labels.policy ——
+        --     candidates_for 把它当作按模型的策略提示读（router/candidates.lua），一次
+        --     改写必须让有状态策略重新播种，否则新提示被旧实例盖住；
+        --   * 本接缝一次只写 labels.gpu 这一个键，而 labels.gpu 不在任何选路输入里：
+        --     candidates_for 按 model_id 筛、按 labels.policy 取提示，逐卡归属只被
+        --     gpu_load 的读数归属与 /_ui 的徽章读（gpu_load/cards.lua 的 worker_card、
+        --     props.lua）。bump 的代价在这里是真金白银：refresh_generation 会把 seeded
+        --     清掉，下一次 select 走 prepare() 的 init_workers **整表重建**每棵亲和树
+        --     （policies/cache_aware.lua 的 init_workers 注释「会重建每池的租户集合」），
+        --     一台八个实例的机器会因八次「补个卡号」丢掉八次学到的前缀亲和 —— 那是
+        --     调度质量层面的副作用，而这条路径的红线恰恰是「纯 label 补充不许影响任何
+        --     判定」。ledger 的 g| 提示那条既有通路同样是写归因数据而不惊动策略层。
+        --   * 若将来真有策略开始读 labels.gpu，再在此处补 bump；届时本函数是 labels.gpu
+        --     唯一的 watcher 写入口，改动点只有一处。
+        local ok, err = pcall(function()
+            local result, uerr = registry.update(id, { labels = { gpu = gpu } })
+            if not result then
+                error(tostring(uerr or "worker update refused"), 0)
+            end
+        end)
+        if not ok then
+            return false, tostring(err)
+        end
+        return true
+    end
 end
 
 -- ------------------------------------------------------------------ one pass
@@ -294,10 +366,15 @@ function _M.run_pass(cfg, opts)
         end,
         register = make_register(conf),
         unregister = make_unregister(),
+        -- GPU 归属补给的唯一写入接缝（reconcile 的 annotate_gpu_labels 用）。
+        patch_gpu_label = make_patch_labels(),
         stats = {
             reconciles = 0, adds = 0, add_fails = 0, removes = 0,
             discovered = 0, adds_stuck_released = 0,
             probe_failures = 0, probe_removes = 0, probe_fuse_skips = 0,
+            -- 逐卡归属补给的观测量（observability 不新增 series：这俩只在 pass 日志与
+            -- 探针里看，Grafana 那边 lr_watch_* 家族的口径不动）。
+            gpu_labels_patched = 0, gpu_label_fails = 0,
         },
         log = function(level, message)
             if level == "warn" then

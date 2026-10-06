@@ -11,8 +11,8 @@
 --   ids                        registry/keys (write_ids; a failed set raises)
 --   w: url: u: isel:           registry/records
 --   hl: cbs: cbf: cbu: cbo:    registry/health      (hf:/hs: are written by hb.lua directly)
---   lo: act: xl: sl: pw: xany  registry/loads       (xl:/pw: have one production writer
---                                                    each: gpu_load.lua)
+--   lo: act: xl: sl: pw: gu:   registry/loads       (xl:/pw:/gu: each has one
+--   xany                                           production writer: gpu_load.lua)
 --   job: disc: dpr: mp: mpok:  registry/discovery
 -- Bypass writers that deliberately do not go through this module - do not "tidy" them:
 --   hb.lua:201/215        incr/set hf: and hs: (cross-process-safe counting)
@@ -81,6 +81,24 @@ local K_SLOAD = "sl:"  -- engine self-report, same shape, lower priority
 --   expired key means "no reading", and _M.capacity_exclusion reads that as
 --   *unknown*, which never excludes a worker.
 local K_POWER = "pw:"   -- raw power sample, milli-watts, TTL'd
+-- Per-worker GPU **utilisation** ceiling (doc/caps-redesign-2026-10-06.md section 2): the
+-- pure busy-fraction of the card this worker is pinned to, stored the same way as the
+-- other external readings - integer milli of a 0..1 fraction (percent x 10), TTL'd, so an
+-- expired key reads "no sample" = *unknown*, which never excludes a worker.
+--
+-- Why this needs its own key instead of a second reader on `xl:`: `xl:` is the ranking
+-- channel, and _M.load_with folds it into the in-flight counter through load_scale - it is
+-- kept and consumed in *units of in-flight requests*, which makes it a score, not an
+-- admission number. The concurrency ceiling may only compare `lo:` (see
+-- _M.inflight_requests), and a utilisation ceiling has to compare a utilisation, so it
+-- needs a reading that never passed through load_scale. Reusing `xl:` would let an
+-- operator moving a scoring knob (SMG_LOAD_SCALE) silently move an admission gate.
+--
+-- Why `pw:` is kept: what the 2026-10-06 ruling retires from capacity decisions is the
+-- *watt* comparison, not the collection. The power channel stays a pure observation
+-- (_M.power_samples and the lr_gpu_load_power_* family keep their readers); only
+-- _M.capacity_exclusion stops reading it.
+local K_GPU_UTIL = "gu:" -- pure GPU utilisation sample, milli of a 0..1 fraction, TTL'd
 -- One shared "any sample exists anywhere" flag plus its per-process memo.
 --
 -- The writer is the load timer, which runs in worker 0 only; the readers are the
@@ -310,6 +328,7 @@ M.K_CBS = K_CBS
 M.K_CBSTATE = K_CBSTATE
 M.K_DISC = K_DISC
 M.K_DPROBE = K_DPROBE
+M.K_GPU_UTIL = K_GPU_UTIL
 M.K_HEALTH = K_HEALTH
 M.K_HFAIL = K_HFAIL
 M.K_HSEL = K_HSEL

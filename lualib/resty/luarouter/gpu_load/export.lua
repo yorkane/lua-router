@@ -78,6 +78,45 @@ function _M.publish_metrics(stats)
         pcall(observability.gauge, "lr_gpu_load_power_per_card_workers", {},
             stats.power_per_card or 0)
     end
+    -- GPU 利用率家族（registry 的 gu: 键 / max_gpu_util 上限的数据源）只在**启用**时导出，
+    -- 与功率那族同样的待遇：缺省关闭的实例一个 series 都不写，/metrics 与改动前逐字节一致
+    -- （SMG_LOAD_SOURCE=none 时连定时器都不跑，publish 早退）。
+    -- util_per_card_workers 与 util_fallback_total 是这一族的存在理由（口径同
+    -- lr_gpu_load_power_per_card_workers）：只有 util_workers 一个数的话，「八台各归各卡」
+    -- 与「八台共用一个整机 max」在 /metrics 上完全同形——而利用率侧的回退是**允许**的
+    -- （保守方向，见 cards.lua assign_util 上方），允许而不显形就是 342.371 的复刻。看板
+    -- 拿这两个数一比就知道有多少 worker 还骑在整机 max 上；前者为 0 而后者非 0 = 逐卡归属
+    -- 一台都没接上（卡号没解析出来，或 SMG_LOAD_UTIL_QUERY 把 gpu 聚合掉了）。
+    if stats.util_enabled then
+        pcall(observability.counter, "lr_gpu_load_util_samples_total", {},
+            stats.util_matched or 0)
+        -- 「解析失败」= 拨通了、查询发出去了，却拿不到可用利用率读数：正文里没有 gpu-util
+        -- gauge、或响应不是合法 PromQL 向量。skipped（url 解析不出 host）刻意不在这一族里
+        -- ——它是配置问题，数量随坏 url 线性增长，混进来会淹没真故障。
+        if (stats.util_failed or 0) > 0 or (stats.util_errors or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_util_parse_failures_total", {},
+                (stats.util_failed or 0) + (stats.util_errors or 0))
+        end
+        -- registry 主动拒收（负值 / NaN / ±inf / > 1 由 registry 侧把关）：单独的族，因为它
+        -- 意味着 exporter 在撒谎而不是没数据，运维要查的是 exporter 而不是网络。
+        if (stats.util_rejected or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_util_rejected_total", {},
+                stats.util_rejected)
+        end
+        if (stats.util_unmatched or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_util_unmatched_total", {},
+                stats.util_unmatched)
+        end
+        -- 每次整机 max 回退都计一次（不做静默降级：这是设计书 §5 钉死的口径）。
+        if (stats.util_fallback or 0) > 0 then
+            pcall(observability.counter, "lr_gpu_load_util_fallback_total", {},
+                stats.util_fallback)
+        end
+        pcall(observability.gauge, "lr_gpu_load_util_workers", {},
+            stats.util_matched or 0)
+        pcall(observability.gauge, "lr_gpu_load_util_per_card_workers", {},
+            stats.util_per_card or 0)
+    end
     return true
 end
 
@@ -114,6 +153,27 @@ function _M.publish_worker_power_gauge(url, watts)
     end
     return pcall(observability.gauge, "lr_gpu_load_power_watts",
         { { "worker", tostring(url) } }, watts)
+end
+
+---Per-worker utilization gauge, the utilization counterpart of
+---publish_worker_gauge(). 单位与 lr_gpu_load 同为 0..1，但它是**独立的一族**而不是同一个
+---数：lr_gpu_load 是打分开（registry 的 xl: 键，被 load_scale 折进排序），这一族是准入
+---判定的数据源（registry 的 gu: 键）。两个读数今天恰好来自同一族 gauge，但它们的口径与
+---生命周期各自独立（xl: 名册里有 KV-cache 用量，gu: 刻意没有），把它们画在同一个 series 名
+---下会让人以为「打分与准入看的是同一个数」——那正是这次重设计要拆开的两件事。
+---@param url string
+---@param util number @ normalized 0..1 utilization
+function _M.publish_worker_util_gauge(url, util)
+    if not live_ngx() then
+        return false
+    end
+    local ok_obs, observability = pcall(require, "resty.luarouter.observability")
+    if not ok_obs or type(observability) ~= "table"
+        or type(observability.gauge) ~= "function" then
+        return false
+    end
+    return pcall(observability.gauge, "lr_gpu_load_util_gpu",
+        { { "worker", tostring(url) } }, util)
 end
 
 ------------------------------------------------------------------ the timer
@@ -209,9 +269,16 @@ function _M.start(cfg)
         local power = _M.power_config(cfg)
         local has_load = type(cfg.load_prom_query) == "string"
             and cfg.load_prom_query ~= ""
-        if not _M.query_endpoint(cfg.load_prom_url) or (not has_load and not power.query) then
+        -- 利用率查询也算一条：显式写了 SMG_LOAD_UTIL_QUERY 就是「只从 Prometheus 要利用率
+        -- 读数」这个完全合理的部署，门槛不能把它拒掉（与功率那一条同等待遇）。**缺省串**
+        -- 不算意图——util_config 把两者分开（explicit_query），否则每个漏配负载查询的部署
+        -- 都会因为一个没人要求的缺省值而启动定时器、多打一条 POST，而这里的老断言
+        -- （负载与功率都没配 = 拒启动）也会失效。
+        local util = _M.util_config(cfg)
+        if not _M.query_endpoint(cfg.load_prom_url)
+            or (not has_load and not power.query and not (util.on and util.explicit_query)) then
             return false, "source=prom needs SMG_LOAD_PROM_URL and SMG_LOAD_PROM_QUERY"
-                .. " (or SMG_LOAD_POWER_QUERY for the power channel alone)"
+                .. " (or SMG_LOAD_POWER_QUERY / SMG_LOAD_UTIL_QUERY for that channel alone)"
         end
     end
     if timer_running then

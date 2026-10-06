@@ -1,7 +1,7 @@
 -- 策略选路与候选装配（自 router.lua 逐字搬来，只调整了 require 接线）。
 --
 -- P2 policy_for + P11 candidates_for 三道门（健康→白名单/绑定→模型许可→容量
--- 硬排除→组门）+ card_key 族。选路热路径：函数体逐行原样，门序不许动
+-- 硬排除→组门→绿灯优先裁剪）+ card_key 族。选路热路径：函数体逐行原样，门序不许动
 -- （AGENTS.md 硬规则；doc/gap-worker-caps.md、doc/gap-virtual-models.md §1–§4）。
 -- test/unit/test_caps_routing 与 test_profiles 11b 按字符串锚点切本文件源码配桩
 -- 加载——锚点区间内的代码逐字不许动。
@@ -398,14 +398,23 @@ _M.group_policy_hint = group_policy_hint
 ---@param model string|nil
 ---@param profile table|nil @ virtual-model profile (whitelist / bindings, gap-virtual-models 3.3)
 ---@param counted boolean|nil @ true = the selection pass, and the only caller allowed to
----            count exclusions. log_inference_request runs this same filter again after
----            the response to list what was selectable; letting it count would bill every
----            exclusion twice per request and make the counter unreadable, so counting is
----            opt-in rather than a side effect of asking the question.
+---            count exclusions and green-light yields. log_inference_request runs this
+---            same filter again after the response to list what was selectable; letting it
+---            count would bill every exclusion twice per request and make the counter
+---            unreadable, so counting is opt-in rather than a side effect of asking the
+---            question.
 ---@return table[] candidates, table|nil why
 local function candidates_for(model, profile, counted)
     local records = registry.records()
     local out = {}
+    -- Green-light preference (doc/caps-redesign-2026-10-06.md section 3) works on two
+    -- side arrays indexed 1..live alongside out[i]: the capacity state a survivor was
+    -- priced with, and the model name it was bound to. Parallel arrays rather than one
+    -- table per candidate, because this loop is the selection hot path and the
+    -- pre-feature shape allocated nothing per candidate beyond the decoded record.
+    local states = {}
+    local bindings = {}
+    local live = 0
     local igw = cfg().enable_igw
     local bound_allow, bound_models = profile_bindings(profile)
     local legacy_allow = profile_worker_list(profile)
@@ -426,6 +435,32 @@ local function candidates_for(model, profile, counted)
     -- probe, an older build) means no gate at all, which is the fail-open direction
     -- the rule itself demands -- a missing reading must never cost capacity.
     local cap_check = registry.capacity_exclusion
+    -- The traffic-light half of the *same* verdict, taken once per pass the same way as
+    -- cap_check and with the same fail-open shape: nil -- not the counted pass, a
+    -- stripped unit probe, an older build without capacity_state -- means no narrowing,
+    -- i.e. today's behaviour. The request-log re-read deliberately runs unpriced: it
+    -- exists to list *what was selectable*, and a busy candidate was selectable, so
+    -- narrowing there would shrink the log row's candidate list for a distinction the
+    -- row does not report -- and would pay one lo:/gu: read per candidate for a verdict
+    -- it has no use for.
+    -- Why a second predicate rather than reusing cap_check's verdict: capacity_exclusion
+    -- answers "is this worker out of the pool", so it returns numbers only for the "full"
+    -- case -- idle and busy both come back nil, which carries no state at all. The
+    -- registry owns the comparison (registry/loads.lua bars a caller from deriving the
+    -- light from lo:/gu: at home), so the router asks instead of recomputing. The cost is
+    -- bounded on purpose:
+    --   * a candidate the hard gate already removed is never asked -- it leaves the pass
+    --     before this call -- so the extra predicate runs on survivors only;
+    --   * a candidate that declares no ceiling costs *zero* shdict reads: the registry
+    --     short-circuits on "all three caps nil" before it touches the dict, the same
+    --     guard the hard gate has. An unconfigured pool therefore pays one Lua call per
+    --     candidate and not one extra shdict round-trip;
+    --   * only a candidate that really declares min/max/util pays that single lo: get
+    --     (plus gu: once max_gpu_util is set) -- and the operator configured the ceiling
+    --     precisely so the gateway would read that key. The dict handle is a memoized
+    --     upvalue in registry.keys.shdict, so omitting the `d` argument costs no lookup
+    --     per candidate either.
+    local price = counted and registry.capacity_state or nil
     local capped = 0
     local refused = 0
     for i = 1, #records do
@@ -480,8 +515,8 @@ local function candidates_for(model, profile, counted)
                         { "reason", verdict.reason or "cap" } })
                     observability.log_debug("capacity cap excluded ", record.url,
                         ": ", verdict.reason, " (",
-                        tostring(verdict.inflight or verdict.power_w), " >= ",
-                        tostring(verdict.max_concurrency or verdict.max_power_w), ")")
+                        tostring(verdict.inflight or verdict.gpu_util), " >= ",
+                        tostring(verdict.max_concurrency or verdict.max_gpu_util), ")")
                 end
             end
         end
@@ -526,27 +561,121 @@ local function candidates_for(model, profile, counted)
             end
         end
         if keep then
-            -- The standalone policies read load and health off the worker itself
-            -- (Rust reads them through Worker::load()/is_healthy()), so hand them a
-            -- snapshot alongside the static record. records() decodes fresh tables,
-            -- so neither this field nor the binding can leak back into the dict.
-            record.load = registry.load(record.id)
-            record.healthy = true
-            record.lr_bound_model = binding
-            -- One entry, one affinity tree. The standalone policies bucket their state
-            -- by (pool, model) read off the *worker* (policies/cache_aware.lua
-            -- make_tree_key, prefix_hash/consistent_hashing ring keys, bucket keys), so
-            -- a group spanning two models would split into two trees whose tenant sets
-            -- never see each other -- affinity and load-escape would then hold *inside*
-            -- each model and fail across the group, which is exactly the thing this
-            -- feature is for. Stamping the entry name into the field they read makes the
-            -- whole group one pool. Forwarding is unaffected: it reads lr_bound_model,
-            -- which is always set for a group candidate (never the entry name), so no
-            -- request can be sent upstream under a name no engine knows.
-            if group then
-                record.model_id = group_key_name(profile, model)
+            -- Survived every gate, the hard capacity one included: park it and price its
+            -- traffic light, but do not stamp or measure it yet. The narrowing below can
+            -- still step this candidate aside, and registry.load() (two or three shdict
+            -- reads of its own) must not be billed for a worker that never reaches a policy.
+            live = live + 1
+            out[live] = record
+            bindings[live] = binding
+            if price then
+                local ok, state = pcall(price, record)
+                -- A predicate that throws reads as "state unknown", never as "exclude":
+                -- the same posture as the cap gate's pcall above, for the same reason
+                -- (AGENTS.md hard rule 4 -- a broken reading costs accuracy, not capacity).
+                states[live] = (ok and state) or nil
             end
-            out[#out + 1] = record
+        end
+    end
+    -- Green-light preference (root ruling 2026-10-06, doc/caps-redesign-2026-10-06.md
+    -- section 3): when somebody in the surviving set sits below its lower concurrency
+    -- rung, the yellows step aside for it. A *narrowing*, not an exclusion -- the
+    -- stepped-aside candidates are healthy and under their ceiling, they are merely less
+    -- available than the greens, and the policy keeps all of its freedom inside the
+    -- subset it is handed (policies/ still knows nothing about any of this).
+    -- Three rules shape it, each because the loose reading of a one-line-sounding feature
+    -- breaks something specific:
+    --   * it sits after the group gate and after bindings resolved, so a group entry is
+    --     priced as one pool (one tree, one subset) and an operator's per-candidate
+    --     binding is never undone by a traffic light;
+    --   * only a known "busy" yields. nil means the candidate declares no ceiling (or
+    --     could not be asked), and dropping it would let an uncapped worker starve
+    --     because a capped peer happens to be green -- red line 2 says a reading that
+    --     cannot be had must not cost capacity, and e2e_caps S2 would die on the spot,
+    --     since there the uncapped Y has to take all 6 concurrent requests while the
+    --     capped X stays excluded;
+    --   * when nothing is idle -- every survivor busy, every survivor unknown, or nobody
+    --     left at all -- the array passes through untouched, so a yellow keeps taking
+    --     traffic up to its own ceiling instead of being pushed off a green that already
+    --     holds its minimum (user rule 3).
+    -- yielded rides why.idle for observability and never why.capped: the 429 downstream
+    -- means "every worker is at a hard ceiling", and billing a yield as a cap would let a
+    -- pool that is merely *preferencing* greens answer with a capacity-exhausted diagnostic.
+    local yielded = 0
+    -- Records the narrowing stepped aside, kept only so forward() can still honour an
+    -- explicit `x-smg-target-worker` pin: the pin is not a policy decision, and silently
+    -- rerouting a request that names its instance would turn a debug/affinity tool into
+    -- a coin flip whenever some *other* worker happens to be green. nil unless a yield
+    -- actually happened, so the shape costs nothing on an uncapped pool. The hard
+    -- capacity gate has no such escape -- "an explicit pin cannot resurrect a capped
+    -- worker" is pinned by e2e_caps S3, and `full` candidates never reach this array.
+    local stepped_aside
+    if price and live > 1 then
+        local idle = 0
+        for i = 1, live do
+            local state = states[i]
+            if state == "idle" then
+                idle = idle + 1
+            elseif state == "busy" then
+                yielded = yielded + 1
+            end
+        end
+        if idle > 0 and yielded > 0 then
+            local kept = 0
+            for i = 1, live do
+                if states[i] ~= "busy" then
+                    kept = kept + 1
+                    out[kept] = out[i]
+                    bindings[kept] = bindings[i]
+                else
+                    -- Stamp what the pin path reads (the forwarded model name comes from
+                    -- lr_bound_model; `healthy` keeps the record honest about having
+                    -- passed the health gate) but *not* record.load: only the policies
+                    -- read that, and a pinned request never reaches one, so the
+                    -- stepped-aside workers keep costing the two shdict reads their
+                    -- capacity verdict needed and nothing more.
+                    local stepped = out[i]
+                    stepped.healthy = true
+                    stepped.lr_bound_model = bindings[i]
+                    stepped_aside = stepped_aside or {}
+                    stepped_aside[#stepped_aside + 1] = stepped
+                end
+            end
+            for i = kept + 1, live do
+                out[i] = nil
+                bindings[i] = nil
+            end
+            live = kept
+            if counted then
+                -- One sample per counted pass, the same discipline as the hard gate's
+                -- counter below: the request-log re-read bills nothing.
+                observability.counter("smg_worker_capacity_preferred_idle_total", {})
+            end
+        else
+            yielded = 0
+        end
+    end
+    for i = 1, live do
+        local record = out[i]
+        -- The standalone policies read load and health off the worker itself
+        -- (Rust reads them through Worker::load()/is_healthy()), so hand them a
+        -- snapshot alongside the static record. records() decodes fresh tables,
+        -- so neither this field nor the binding can leak back into the dict.
+        record.load = registry.load(record.id)
+        record.healthy = true
+        record.lr_bound_model = bindings[i]
+        -- One entry, one affinity tree. The standalone policies bucket their state
+        -- by (pool, model) read off the *worker* (policies/cache_aware.lua
+        -- make_tree_key, prefix_hash/consistent_hashing ring keys, bucket keys), so
+        -- a group spanning two models would split into two trees whose tenant sets
+        -- never see each other -- affinity and load-escape would then hold *inside*
+        -- each model and fail across the group, which is exactly the thing this
+        -- feature is for. Stamping the entry name into the field they read makes the
+        -- whole group one pool. Forwarding is unaffected: it reads lr_bound_model,
+        -- which is always set for a group candidate (never the entry name), so no
+        -- request can be sent upstream under a name no engine knows.
+        if group then
+            record.model_id = group_key_name(profile, model)
         end
     end
     -- Second return value: how many candidates the capacity gate removed, so the 503
@@ -557,7 +686,12 @@ local function candidates_for(model, profile, counted)
     -- group 旗标只服务 503 文案：组入口被引擎「答过、且都不服务这一组」时，沿用
     -- 「全部熔断或不健康」是假的（它们健康，只是没有组里的名字）。legacy 路径不带
     -- 这个旗标，所以旧文案一个字都不会变。
-    return out, { capped = capped, refused = refused,
+    -- idle 恒为「被绿灯挤下去的黄灯数」（0 = 这一趟没有发生让位），与 capped/refused 同为
+    -- 常驻数字键：它不参与任何应答文案（429 的判据仍只看 capped），只是让「让位发生过没
+    -- 有、让了几台」在 /metrics 之外还能按请求查。group 旗标保持缺席式缺省——那一个才真的
+    -- 只服务 503 文案。
+    return out, { capped = capped, refused = refused, idle = yielded,
+                  stepped_aside = stepped_aside,
                   group = group ~= nil and true or nil }
 end
 

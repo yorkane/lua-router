@@ -255,13 +255,18 @@ end
 -- and any other body member is ignored rather than rejected.
 local UPDATE_NUMBER_FIELDS = {
     "priority", "cost",
-    -- Capacity caps ride the same PUT path as the scheduling knobs (root ruling
-    -- 2026-10-01), including the config-declaration reconcile's patch. Their
-    -- *meaning* is decided by cap_limit at read time, so a PUT of 0 (or a
-    -- negative, or a null the caller meant as "clear it") all land on
-    -- "unlimited" instead of needing a bespoke validator here; the contract's
-    -- non-numeric-400 rule applies unchanged.
-    "max_concurrency", "max_power_w",
+    -- Capacity ceilings ride the same PUT path as the scheduling knobs (root ruling
+    -- 2026-10-01, reshaped by 2026-10-06's three-way verdict), including the
+    -- config-declaration reconcile's patch. Their *meaning* is decided by the
+    -- normalizer at read time - cap_limit for the two request-count rungs (<=0 folds
+    -- to "unlimited", so a PUT of 0 is the ordinary way to clear one) and util_limit
+    -- for the percent (its zero is the strictest rung, so a ceiling is cleared with a
+    -- negative number or by the declaration dropping the key, never with 0). That is
+    -- why no bespoke validator lives here; the contract's non-numeric-400 rule applies
+    -- unchanged. max_power_w left the list with the watt gate: a PUT naming it is now
+    -- ignored like any unknown field, and `pw:` itself stays collected as an
+    -- observation.
+    "max_concurrency", "min_concurrency", "max_gpu_util",
     "health_check_timeout_secs", "health_check_interval_secs",
     "health_success_threshold", "health_failure_threshold",
 }
