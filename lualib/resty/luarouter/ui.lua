@@ -195,13 +195,34 @@ end
 
 --- GET /_ui/v1/models — every registered worker model plus the virtual
 --- aliases; the picker keys off status.value, everything registered is loaded.
+---
+--- 名字撞车时**入口赢**（2026-10-07 用户裁定方案 A），与 router/models_api.lua 的
+--- inject_virtual_models 同一个方向：入口 X 存在时那个名字那一行是入口行
+--- （owned_by 走入口口径），被遮蔽的真实名不再单独出现。两份列表是给客户端选模型
+--- 用的，"能不能点名访问"必须和 /v1/models 说同一句话 —— 运行态事实（那台实例仍在
+--- 池里、仍是入口 targets 的落点）由 /workers 与 worker 表负责，不在这里表达。
+--- 判据精确到「名字等于某个入口名」：组内成员名不参与，未遮蔽的真实名照常出现。
 function _M.models()
     local data = {}
     local seen = {}
+    -- 纯查表建集合（不 pairs 遍历 data）：列表最后按 id 排序，集合只按名册顺序装配，
+    -- 同一份配置两次请求产出的字节相同。
+    local shadowed, rows = {}, {}
+    if store_ok then
+        -- 名册只取一次：遮蔽集合与下面的入口行必须来自同一份快照，否则热配置在两次
+        -- 读之间翻页会造出「按新名册遮、按旧名册出」的撕裂答案。
+        rows = store.virtual_models_list() or {}
+        for _, row in ipairs(rows) do
+            local alias = row[1]
+            if type(alias) == "string" and alias ~= "" then
+                shadowed[alias] = true
+            end
+        end
+    end
     if props_ok then
         for _, w in ipairs(props.http_workers()) do
             for _, id in ipairs(w.models or {}) do
-                if not seen[id] then
+                if not seen[id] and not shadowed[id] then
                     seen[id] = true
                     data[#data + 1] = {
                         id = id,
@@ -219,7 +240,7 @@ function _M.models()
         -- 只读 [2] 会把整组入口重新标成「某一个模型的别名」——那正是本轮退役掉的旧语义。
         -- 单模型行保持 "llm-router-><model>" 逐字节不变（picker 与契约钉的是 legacy 形状）；
         -- 多模型行改标网关自己拥有，并把整组放进 owned_by_models 供 UI 展示。
-        for _, row in ipairs(store.virtual_models_list()) do
+        for _, row in ipairs(rows) do
             local alias = row[1]
             local tail = {}
             for j = 2, #row do

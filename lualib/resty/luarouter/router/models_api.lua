@@ -43,8 +43,13 @@ local text_response = inference.text_response
 -- 省略是「删键」，不写 null、不写空数组——空数组是一份「一个都不支持」的肯定
 -- 答复，而这里要表达的是不知道。
 --
--- id 的取值集合、排序与别名遮蔽规则一律不变：registry 的 worker 判定、watcher 的
--- 覆盖探针和客户端的模型选择全按 id 建，动了会连带影响选路。
+-- id 的取值集合与排序不变：registry 的 worker 判定、watcher 的覆盖探针和客户端的
+-- 模型选择全按 id 建，动了会连带影响选路。别名遮蔽规则的**方向**已于 2026-10-07 由
+-- 用户裁定反转（方案 A）：入口名与真实模型名同名时**入口赢**——列表里 X 恰好一行，
+-- id 仍是 X，owned_by 走入口口径，真实那一行不再单独出现。Rust
+-- inject_virtual_models 的「真实 worker 保留名字」是旧口径，见该函数的注释。
+-- 被遮蔽的那台实例仍在 /workers 里、仍是入口 targets 的落点，只是客户端不能再按这个
+-- 名字点名访问它；转发体的 model 也仍是真实引擎名（lr_bound_model，不在本文件）。
 
 --- created 取不到上游读数时的值：0 = 未知，恒定，可缓存。
 local MODEL_CREATED_UNKNOWN = 0
@@ -776,10 +781,12 @@ function models_advertise.enabled(store_mod)
 end
 
 --- 只有入口的那份 data[]。一个入口一行，绝不静默少一条（少一条等于让客户端以为
---- 这个服务不存在）：开关关掉真实模型那一半之后，原来「真实 worker 抢了入口的名字，
---- 于是入口被丢弃」那条遮蔽规则已经没有对手，所以这里刻意不做遮蔽判定，配了几条
---- 入口就出几条。重复别名照样去重（同一个 id 出两行会打断按 id 建索引的客户端），
---- 保留的是列表里第一条——store 侧按别名排序，哪条在前是确定的。
+--- 这个服务不存在）：本分支压根不装配真实那一半，所以 2026-10-07 反转后的遮蔽规则
+--- （入口名遮蔽同名实际模型）在这里没有对手——真实行一条都不出，某个名字是否同时
+--- 是入口，对结果没有影响，因此这里刻意不做遮蔽判定，配了几条入口就出几条。开关
+--- 两种状态对同名给的是同一个答案：开=只出入口行；关=出入口行、摘掉真实行（见
+--- inject_virtual_models）。重复别名照样去重（同一个 id 出两行会打断按 id 建索引的
+--- 客户端），保留的是列表里第一条——store 侧按别名排序，哪条在前是确定的。
 --- 返回 nil = 一份入口都拿不到（store 缺席 / reader 没落地 / 配置里根本没有入口），
 --- 调用方据此退回全量广告并如实报一行日志。
 --- capabilities 的聚合口径完全走 advertise_virtual_entry 原样，开关不参与。
@@ -819,9 +826,19 @@ function models_advertise.only_data(store_mod, cfg, caps_by_model)
 end
 
 ---Advertise the runtime virtual-model aliases next to the real ones, the way
----inject_virtual_models (gateway/src/server.rs:831) does: an alias whose name a
----real worker already serves is skipped, the synthetic entries carry created 0
----and owned_by "llm-router-><target>", and the whole list is re-sorted by id.
+---inject_virtual_models (gateway/src/server.rs:831) does — with the winner of a
+---name clash inverted per the 2026-10-07 ruling (方案 A): the entry keeps the
+---name and the real row behind it is dropped, so that an id which routes
+---through the entry's target group is never also advertised as a plain
+---local model.
+---Synthetic entries still carry created 0 and owned_by "llm-router-><target>",
+---and the whole list is re-sorted by id.
+---
+---Why the entry wins: the old direction advertised X as owned_by "local" while
+---route_inference resolved X to the entry's group, so the worker that actually
+---served X was screened out by the group gate and every model=X request died with
+---503 "healthy engines serve none of the mapped models" — an advertisement the
+---router contradicted on every request. Shadowing makes the two surfaces agree.
 ---@param data table @ model entries built from the registry (mutated)
 ---@param sources table|nil @ 同一请求内共享的 {store_mod, cfg, caps_by_model}，
 ---  由 models_handler 装配一次；缺省时本函数自己取（单测直接调它的场景）。
@@ -840,8 +857,39 @@ local function inject_virtual_models(data, sources)
     if #aliases == 0 then
         return
     end
-    local seen = {}
+    -- 遮蔽判定只有一个对手：入口名。先按名册建出「哪些名字是入口」的集合，然后
+    -- 用同一个集合仲裁两个方向 —— 真实行里被入口抢走名字的那一行整行摘掉，
+    -- 入口行则无条件补上。两种语义互斥，必须在同一处判，否则下一轮改动又会在
+    -- 两处各留一半（勘察报告 §2.3 A1/A2）。
+    --
+    -- 判据是**纯查表**（不用 pairs()）：同一份配置连查两次要产出逐字节相同的响应
+    -- （test_models_shape G9 / e2e_models_advertisement 的字节稳定断言），
+    -- pairs 遍历建集合会把顺序依赖带进输出。
+    local shadowed = {}
+    for i = 1, #aliases do
+        local row = aliases[i]
+        if type(row) == "table" then
+            local alias = row[1]
+            if type(alias) == "string" and alias ~= "" then
+                shadowed[alias] = true
+            end
+        end
+    end
+    -- 真实那一半：与入口同名的行摘掉（=「真实 X 不再单独可达」的对外那一面）。
+    -- 判据精确到 id 相等 —— 组内成员名不参与（advertise_virtual_entry 的
+    -- owned_by_models 仍如实挂着整组），否则「Y 也被某入口映射」会把 Y 那行误删。
+    local kept = 0
     for i = 1, #data do
+        if not shadowed[data[i].id] then
+            kept = kept + 1
+            data[kept] = data[i]
+        end
+    end
+    for i = kept + 1, #data do
+        data[i] = nil
+    end
+    local seen = {}
+    for i = 1, kept do
         seen[data[i].id] = true
     end
     for i = 1, #aliases do
@@ -855,11 +903,12 @@ local function inject_virtual_models(data, sources)
             tail[#tail + 1] = tostring(aliases[i][j])
         end
         if not seen[alias] then
-            -- A real worker keeps the name; the alias is dropped rather than
-            -- duplicating the id, which would break clients that key on it. Under the
-            -- group semantics a worker can legitimately *be* one of the mapped models
-            -- while the entry name is still unique, so this rule stays as-is: it guards
-            -- the entry's own id, not the group members'.
+            -- 入口赢：同名时上面已经把真实那一行摘掉，这里无条件补出入口那一行
+            -- （少一条等于让客户端以为整个服务消失了，与 only_data 同一条纪律）。
+            -- seen 此刻只剩两件事要挡：重复的入口名（同一 id 出两行会打断按 id
+            -- 建索引的客户端，保留名册里的第一条 —— store 侧按别名排序，谁在前是
+            -- 确定的），以及「同名入口被别的入口名抢先」。组内成员名与入口重名
+            -- 不误伤：判据守的是入口自己的 id，不是组内成员。
             seen[alias] = true
             data[#data + 1] = advertise_virtual_entry(store_mod, sources.cfg,
                 sources.caps_by_model, alias, tail)
