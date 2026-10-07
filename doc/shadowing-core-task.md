@@ -91,3 +91,11 @@ mutators.lua:161 apply_profiles）要确认同名场景下派生表不产生自�
   `models_are_verified(record)` 配对。**不许改 registry 任何文件**。
 - config_store 取 registry 的既有通道：`CS_LEXICON.store_registry()`（lexicon.lua:276，pcall require + 缓存，
   registry 缺席时返回 nil）。单测里用 `lexicon._reset_pool_module_caches()` 重置缓存后打桩。
+## 再补一条（root 读 sync_virtual_view 全文后确认）
+
+sync_virtual_view（snapshot.lua:66-86）今天的行为：map[alias] = rep，rep = 显式写了 targets 就取组头
+（profile.targets[1]，要求非空字符串），否则用 profile.target。同名场景下 map[X] 会等于 X 自己
+（组头就是 X），而 readers.resolve_model（readers.lua:362 的 cfg.virtual_models[model] or model）
+会让 X 返回 X —— 这一步是自洽的（不构成环，因为引擎认识 X）。你不需要改 resolve_model 或
+sync_virtual_view 的主逻辑，只需保证「放行入口名==组内同名真实模型」之后派生表不报错、不产生自环
+即可（验收判据 c）。
