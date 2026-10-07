@@ -59,3 +59,16 @@ test_models_shape / test_models_advertise 的 cases 表，入口名全都不撞�
 - 不许启动或重启 lua-router 的 8800/8801 实例。
 - 不 git 提交（root 统一提）。
 - 先写完、验完，再一次性回报：新增用例清单、每个用例钉住了什么语义、T11 反证结果、三个单测与契约单段的结果。不要中途发进度。
+
+## root 补充事实（省你一轮）
+
+- test_profiles.lua 的 registry stub（make_registry_stub，:145 起）**record 里没有 models / 
+  models_verified 字段**（全文件 grep models_verified 计数 = 0），也没有 
+  record_models / models_are_verified 方法。所以新判据在现有单测环境里恒为「未被引擎背书」——
+  这正是 797 项全绿却没有一条覆盖遮蔽的原因。T1/T2 要建成，**必须先给 stub 补上** 
+  record.models 与 record.models_verified 字段，以及 stub.record_models(record) 与 
+  stub.models_are_verified(record) 两个方法（照 :148 stub.records 的形状写即可）。
+- 注意 apply_profiles 是**整表替换**语义：测「存量链」（T6 的 existing 分支）要先建 entry-a，
+  再用只含 entry-b 的整表覆盖，existing 才查得到。
+- 卡片那条（T6/T7 上下文）走 apply_model_config 或直接改 cfg.model_configs 后读 ctx_cap；
+  注意 apply_model_config 末尾 commit_snapshot 在裸 luajit 下需要 shdict（单测的 new_shdict 替身已提供）。
