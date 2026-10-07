@@ -13,6 +13,10 @@ local CS_ENV = require "resty.luarouter.config_store.env"
 local CS_PERSISTENCE = require "resty.luarouter.config_store.persistence"
 local CS_UPSTREAMS = require "resty.luarouter.config_store.upstreams"
 local CS_SNAPSHOT = require "resty.luarouter.config_store.snapshot"
+-- 同名遮蔽判据与写入层共用同一份实现（config_store/profiles.lua 的 engine_attested_models）。
+-- 只走对端子模块的共享表、不进 facade 导出面：ctx_cap 与四处写入守卫必须对「这个名字是不是
+-- 引擎报过的真实模型」只有一个答案，两处各查一次 registry 就会在巡检空档里说两套话。
+local CS_PROFILES = require "resty.luarouter.config_store.profiles"
 
 local _M = {}
 
@@ -20,11 +24,17 @@ local _M = {}
 -- further down, and policy_document needs it from earlier in the file.
 local registered_models
 
+-- 磁盘快照的读路径用这份上下文（config_store/profiles.lua 的 new_shadow_context 注释写了
+-- 为什么读路径必须放行）：同名遮蔽的判据只在**写入侧**说话。在这里追问引擎读数会让一份
+-- 当年合法的配置在那台实例恰好没被探到（或已被摘掉）时整体读不回来，而 current() 读不回
+-- 配置就整份退回 env 默认 —— 等于把网关的全部配置抹平。
+local SHADOW_READ = CS_PROFILES.new_shadow_context({ reload = true })
+
 function _M.current()
     CS_FACADE.migrate_once()
     local snap = CS_PERSISTENCE.read_snapshot()
     if snap then
-        local cfg, err = CS_SNAPSHOT.cfg_from_document(snap)
+        local cfg, err = CS_SNAPSHOT.cfg_from_document(snap, nil, SHADOW_READ)
         if cfg then return cfg end
         ngx.log(ngx.WARN, "persisted config invalid (", err, "); falling back to env defaults")
     end
@@ -74,13 +84,64 @@ end
 --- letting a card written under the entry name leak in here would re-open the per-pick
 --- variance the ruling closed.
 ---
+--- 同名遮蔽（用户裁定 2026-10-07，方案 A）让开的那一条：入口名**同时是引擎报过的真实模型**
+--- 时，这张卡片说的就是被遮蔽的那台落点实例本身，它必须能被读到。原来「入口名一律隐身」把
+--- 这一情形一起吞掉了 —— 入口 X 遮蔽真实模型 X 之后，操作员给 X 写的卡片在 ctx_cap /
+--- virtual_ctx_cap / /_ui/props 三条链上全是永不生效的死配置，而契约要求的正是「配置配在
+--- 入口上、落到选中实例」。放宽的判据仍然**不认操作员的声明**：只有 registry 侧
+--- `record_models` ∩ `models_are_verified`（引擎亲口答过 /v1/models 的广告列表）才算数，于是
+---   * 纯虚拟名（引擎从不认识的那个名字）继续隐身，per-pick 抖动那条裁定逐字成立；
+---   * 从没被探到的实例不算引擎背书，此时该名字的卡片复现改动前的答案（读不出来）——
+---     与「探针失败只损失精度、未知不等于否定」同方向，也不让一份配置因巡检空档而变形状。
+--- 判据与写入层共用 config_store/profiles.lua 那份实现：那里决定谁能被写进来，这里决定谁能被
+--- 读出来，两处必须对「真实模型」只有一个答案，不能各查各的。
+---
 --- 已不参与 max_tokens 钳制（2026-10-04 裁定：网关不改写调用方的输出预算，见 router.lua
 --- 的 apply_ctx_cap 恒等空壳）；保留供查看与兼容（UI 与 doc 仍按名字引用，单测也仍断言）。
+--- 便宜的那一半判据：入口自己的模型组里是否含它自己的名字（= 它是否真的遮蔽了一个落点名）。
+--- 只看组、不看 registry，因此纯虚拟名永远 false。手写脏行（组里没有这个名字）同样 false。
+---@param cfg table @ current() 的快照
+---@param name string
+---@return boolean
+local function entry_names_itself(cfg, name)
+    local profile = cfg.virtual_profiles and cfg.virtual_profiles[name]
+    if type(profile) ~= "table" then return false end
+    local group = profile.targets
+    if type(group) == "table" then
+        for i = 1, #group do
+            if group[i] == name then return true end
+        end
+    end
+    return profile.target == name
+end
+
+--- 判据上下文按次现取：卡片读数走 current() 的 TTL 缓存，引擎名册走 registry 的 shdict，
+--- 两处都不是新的进程内状态（「跨请求状态只走 shdict」这条红线不受影响）。registry 缺席时
+--- attested 是 nil = 「没有任何背书」= 卡片继续隐身，缺省零行为变化。
+---@return table ctx
+local function shadow_context()
+    local attested = CS_PROFILES.engine_attested_models
+    if type(attested) ~= "function" then
+        return { attested = nil }
+    end
+    return { attested = attested() }
+end
+
 function _M.ctx_cap(model)
     if type(model) ~= "string" or model == "" then return nil end
     local cfg = CS_FACADE.current()
     if cfg.virtual_profiles[model] ~= nil or cfg.virtual_models[model] ~= nil then
-        return nil
+        -- 名字命中入口表。只有「这个入口名就是它自己所遮蔽的那个实际模型」时继续读卡片，
+        -- 而且先用**便宜的**成员判定筛一遍：入口自己的组里不含这个名字时，这张卡片说的不是
+        -- 它的任何一台落点实例，一律维持隐身——于是纯虚拟名（引擎从不认识的那个名字）这条
+        -- 最常见的路径连 registry 都不用碰，per-pick 抖动那条裁定逐字继续成立。
+        if not entry_names_itself(cfg, model) then return nil end
+        -- 引擎背书这一半是判据的后置条件（不得把操作员的声明当引擎背书）。判据被剥掉时
+        -- （一份只装了 readers 的探针 / profiles 那两项没落地）按「没有背书」处理 = 隐身，
+        -- 与改动前逐字节一致。
+        local may_shadow = CS_PROFILES.may_shadow_own_name
+        if type(may_shadow) ~= "function" then return nil end
+        if not may_shadow(shadow_context(), model, model) then return nil end
     end
     local card = cfg.model_configs[model]
     if card and card.ctx then return card.ctx end

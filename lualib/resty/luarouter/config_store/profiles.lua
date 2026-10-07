@@ -465,6 +465,86 @@ local function entry_has_bindings(entry)
     return #raw > 0
 end
 
+--- 「X 确实是引擎真实模型」的判据（用户裁定 2026-10-07，同名遮蔽方案 A）。
+---
+--- 为什么必须问引擎而不是问配置：入口名可以遮蔽一个实际模型，前提是那个名字**真的**由某个
+--- 引擎提供——否则「入口 X 的组里含 X」就把一个谁都不服务的名字洗白成了合法落点，转发体里
+--- 会出现一个上游不认识的 model（正是 root ruling 4 那道链守卫存在要挡的事）。操作员在
+--- `targets` 里写下一个名字只是人在打字，不能当引擎的背书，所以判据只取 registry 侧那两个
+--- 读数：record_models（引擎答过的广告列表，records.lua 的 models_of）与
+--- models_are_verified（这份列表的来源确实是对方 /v1/models 的亲口回答，没探过 = 不算）。
+--- 两者取交集，与 candidate_allows_model 在选路侧用的是同一套「只有引擎亲口答过的才算结论」
+--- 口径，两条链不会各自定义一个「真实模型」。
+---
+--- 形状与 declared_cap / declared_util 同一条纪律：registry 优先、缺席就退到「什么都不知道」，
+--- 并且**不打 warn**——纯 Lua 单测与网关未起时 registry 缺席是常态而不是误配，喊一行 warn 只
+--- 会让 e2e 的日志断言多一个噪音源。返回空集就是「没有任何名字被引擎背书」，四处守卫因此
+--- 逐字退回改动前的严格语义（探不着的名字仍按今天处理）。
+---@return table<string, boolean>|nil attested @ 名字 -> 是否被引擎背书；nil = 无从知道
+local function engine_attested_models()
+    local reg = CS_LEXICON.store_registry()
+    if reg == nil then return nil end
+    if type(reg.records) ~= "function"
+        or type(reg.models_are_verified) ~= "function"
+        or type(reg.record_models) ~= "function" then
+        return nil
+    end
+    local ok, records = pcall(reg.records)
+    if not ok or type(records) ~= "table" then return nil end
+    local set = {}
+    for i = 1, #records do
+        local record = records[i]
+        local okv, verified = pcall(reg.models_are_verified, record)
+        if okv and verified == true then
+            local okm, list = pcall(reg.record_models, record)
+            if okm and type(list) == "table" then
+                for j = 1, #list do
+                    local name = list[j]
+                    if type(name) == "string" and name ~= "" then
+                        set[name] = true
+                    end
+                end
+            end
+        end
+    end
+    return set
+end
+
+--- 一次写入批次的同名遮蔽判据上下文。
+---
+--- `reload == true` 那份（磁盘快照的读路径）刻意**不查** registry，直接放行同名落点：这条
+--- 路径同时是「把已经落盘的配置读回来」，在那里新增一道拒绝会让一份当年合法的配置在某次
+--- 巡检空档（或那台实例被摘掉）之后整体读不回来，而 `current()` 读不回配置就**整份退回 env
+--- 默认**——等于把网关的全部配置抹平。这正是 `validate_declared_context_windows` 刻意不挂
+--- 在读路径上的同一条理由（见 snapshot.lua 那节注释），两条校验必须同生同灭。
+--- 写入侧（apply_profiles 与整文档 apply_document）照查：判据只在「谁能被写进来」这一头
+--- 说话，落盘之后的字节不再被追问。
+---@param opts table|nil @{reload=true: 磁盘快照的读路径,不查引擎读数}
+local function new_shadow_context(opts)
+    if type(opts) == "table" and opts.reload == true then
+        return { reload = true }
+    end
+    return { attested = engine_attested_models() }
+end
+
+--- 「这个名字是该入口自己要遮蔽的那个真实模型」的唯一判据。
+---
+--- 只认**自己的**名字：`name == alias` 且（读路径放行 或 引擎背书了这个名字）。别人的入口名
+--- 永远不算——那仍是 root ruling 4 要挡的链式转发，与它是否同时是个真实模型无关（两个入口抢
+--- 同一个对外名字会把「一入口一棵亲和树」和 owned_by 的归属说成两套话）。
+---@param ctx table|nil @ new_shadow_context 的产物；nil 当「无从知道」处理
+---@param alias string|nil @ 入口名
+---@param name string|nil @ 被检查的名字（target / 组内成员 / 绑定名）
+---@return boolean
+local function may_shadow_own_name(ctx, alias, name)
+    if type(alias) ~= "string" or alias == "" then return false end
+    if type(name) ~= "string" or name ~= alias then return false end
+    if type(ctx) ~= "table" then return false end
+    if ctx.reload == true then return true end
+    local attested = ctx.attested
+    return type(attested) == "table" and attested[name] == true
+end
+
 --- One validated profile from one entry (shared by the env and document layers).
 --- Returns (profile, nil) or (nil, err); profile carries target plus optional
 --- candidates/workers/policy/effort, with unset fields absent (never JSON_NULL).
@@ -473,7 +553,7 @@ end
 --- instead bind each candidate to its own model, in which case the representative
 --- target is derived from the first explicit binding. Both shapes round-trip; the
 --- legacy {model, target} entry is untouched by this branch.
-local function profile_from_entry(alias, entry)
+local function profile_from_entry(alias, entry, shadow)
     if type(entry) ~= "table" then
         return nil, "virtual model entries must be objects"
     end
@@ -489,7 +569,10 @@ local function profile_from_entry(alias, entry)
     end
     local target = CS_LEXICON.trim(declared_target or "")
     if target == "" then target = nil end
-    if target ~= nil and alias == target then
+    -- 同名遮蔽（方案 A）：入口 X 写 target = X 是被允许的形状之一——X 是引擎报过的真实模型，
+    -- 转发体收到的 model 就是引擎自己认识的那个 X。判据不在这里放宽的就绪状态：没被背书时
+    -- 这一支逐字保持改动前的拒绝与被钉住的文案。
+    if target ~= nil and alias == target and not may_shadow_own_name(shadow, alias, target) then
         return nil, string.format("virtual model %s must differ from its target", alias)
     end
     local candidates, cerr = build_candidate_bindings(alias, rawget(entry, "candidates"))
@@ -562,7 +645,10 @@ local function profile_from_entry(alias, entry)
     -- it a candidates-only entry that names itself gets rejected by the batch chain
     -- check with the "another virtual model" wording, while the identical shape written
     -- as a target gets "must differ from its target". Same mistake, one message.
-    if profile.target == alias then
+    -- 同名遮蔽下这条与上面那条同判据：candidates-only 的入口 X 把所有候选都绑在真实模型 X 上
+    -- 是合法形状（引擎认识 X），所以两处必须共用 may_shadow_own_name，否则同一个配置在
+    -- 「写了 target」与「从候选推出代表值」两条路上会得到两个不同的答案。
+    if profile.target == alias and not may_shadow_own_name(shadow, alias, profile.target) then
         return nil, string.format("virtual model %s must differ from its target", alias)
     end
     -- 记下 target 是操作员写的还是从候选推出来的。快照必须只回写"写过的"字段：一个
@@ -649,13 +735,20 @@ end
 --- Shared by cfg_from_document and apply_profiles so the two writers cannot drift.
 ---@param entries table[] @ document-shape rows
 ---@param existing table|nil @ live alias -> profile map for the cross-batch chain check
+---@param shadow table|nil @ 同名遮蔽判据上下文（new_shadow_context）；nil = 写入侧口径，
+---  现查 registry 的引擎背书。**磁盘快照的读路径必须显式传 {reload=true}**：在那里新增的
+---  拒绝会让一份当年合法的配置在下次 reload 整体退回 env 默认（与 validate_declared_context_windows
+---  刻意不挂读路径同一条理由）。
 ---@return table|nil built, string|nil err
 -- 前向声明：下面两个链守卫是 local function，定义在本函数之后。Lua 里没有这行声明的话，
 -- build_profiles 里的同名标识符会退化成**全局读**（nil），任何一次写 virtual_models 都会
 -- 崩在 "attempt to call global 'assert_no_alias_chain'"。
 local assert_no_alias_chain, assert_bindings_no_alias
 
-local function build_profiles(entries, existing)
+local function build_profiles(entries, existing, shadow)
+    -- nil 是「调用方没表态」= 写入侧（apply_profiles 与整文档 apply_document 都是），
+    -- 因此现查引擎读数；读路径由 cfg_from_document 显式传 reload 上下文。
+    if shadow == nil then shadow = new_shadow_context(nil) end
     local built = {}
     for _, entry in ipairs(entries or {}) do
         if type(entry) ~= "table" then
@@ -678,15 +771,15 @@ local function build_profiles(entries, existing)
                 "virtual model %s needs a target model (an entry needs both model and target)",
                 alias)
         end
-        local profile, perr = profile_from_entry(alias, entry)
+        local profile, perr = profile_from_entry(alias, entry, shadow)
         if not profile then return nil, perr end
         built[alias] = profile
     end
     for _, alias in ipairs(CS_LEXICON.sorted_keys(built)) do
         local profile = built[alias]
-        local cerr = assert_no_alias_chain(built, alias, profile.target)
+        local cerr = assert_no_alias_chain(built, alias, profile.target, shadow)
         if not cerr then
-            cerr = assert_bindings_no_alias(built, existing, alias, profile)
+            cerr = assert_bindings_no_alias(built, existing, alias, profile, shadow)
         end
         if not cerr then
             -- Every model in the group is a name the gateway will forward, so every one
@@ -694,11 +787,19 @@ local function build_profiles(entries, existing)
             -- representative would let `targets: [some-other-alias]` through, and the
             -- forwarded body would then name a name no upstream knows.
             for i = 1, #(profile.targets or {}) do
-                cerr = assert_no_alias_chain(built, alias, profile.targets[i])
-                if not cerr and existing and existing[profile.targets[i]] ~= nil then
+                local member = profile.targets[i]
+                cerr = assert_no_alias_chain(built, alias, member, shadow)
+                -- 存量入口这一半要自己判（assert_no_alias_chain 按设计只看得见本批 built）：
+                -- 编辑一个**已存在**的同名入口时，alias 自己就在存量表里，直接查 existing 会
+                -- 把「把自己的真实模型名放进组里」读成「引用了另一个入口」，那正是今天连自己
+                -- 都拦的形状。判据与组头/绑定两处共用 may_shadow_own_name，只放过自己的名字，
+                -- 别人的入口名继续拒绝（两个入口抢同一个对外名字会打掉「一入口一棵亲和树」与
+                -- owned_by 的归属，硬规则 9③）。
+                if not cerr and not may_shadow_own_name(shadow, alias, member)
+                    and existing and existing[member] ~= nil then
                     cerr = string.format(
                         "virtual model %s target must not be another virtual model: %s",
-                        alias, profile.targets[i])
+                        alias, member)
                 end
                 if cerr then break end
             end
@@ -708,9 +809,21 @@ local function build_profiles(entries, existing)
     return built, nil
 end
 
-assert_no_alias_chain = function(built, alias, target)
+--- 组内/代表值的一个名字如果命中**本批另一个入口**，它是链式转发，必须拒绝（root ruling 4）。
+---
+--- 同名遮蔽（方案 A）唯一让开的一条是「这个名字就是本入口自己的名字，而且引擎背书过它」：
+--- 那时 target/组成员指的是那台实际模型，入口遮蔽它、它只作为落点存在，不是链式转发。
+--- 「另一个入口」与「同名真实模型」的区分就靠 built 的键 + 名字是否等于自己：built 的键是
+--- 入口名，所以别人的入口名照样命中；自己的名字命中是因为自己刚进 built，那一支由
+--- may_shadow_own_name 精确摘掉。被引擎背书的**别人的**入口名不放行——入口赢的规则对同一个
+--- 对外名字只允许有一个主人。
+---@param built table|nil @ alias -> profile for the batch being validated
+---@param alias string @ 入口名
+---@param target string|nil @ 被检查的名字
+---@param shadow table|nil @ 同名遮蔽判据上下文
+assert_no_alias_chain = function(built, alias, target, shadow)
     if built == nil then return nil end
-    if built[target] ~= nil then
+    if built[target] ~= nil and not may_shadow_own_name(shadow, alias, target) then
         return string.format("virtual model %s target must not be another virtual model: %s",
             alias, target)
     end
@@ -783,17 +896,22 @@ end
 --- ruling 4。文案沿用 target 那一族（契约锚定的是措辞家族，不是字段名）。
 ---@param built table|nil @ alias -> profile for the batch being validated
 ---@param existing table|nil @ live alias -> target map (checked when built does not know it)
+---@param shadow table|nil @ 同名遮蔽判据上下文（may_shadow_own_name 用）
 ---@return string|nil err
-assert_bindings_no_alias = function(built, existing, alias, profile)
+assert_bindings_no_alias = function(built, existing, alias, profile, shadow)
     if type(profile) ~= "table" or profile.candidates == nil then return nil end
     for i = 1, #profile.candidates do
         local model = profile.candidates[i].model
         if type(model) == "string" and model ~= "" then
-            if model == alias then
+            -- 绑定名等于入口名在遮蔽下是合法形状：X 是引擎报过的真实模型，转发体里的 model
+            -- 就是它自己（lr_bound_model 与之一致）。没被背书时逐字保持改动前的拒绝与文案。
+            if model == alias and not may_shadow_own_name(shadow, alias, model) then
                 return string.format("virtual model %s must differ from its target", alias)
             end
-            local cerr = assert_no_alias_chain(built, alias, model)
-            if not cerr and existing and existing[model] ~= nil then
+            local cerr = assert_no_alias_chain(built, alias, model, shadow)
+            -- 与组内成员那一条同判据：自己的名字不等于「另一个入口」，即使自己就在存量表里。
+            if not cerr and not may_shadow_own_name(shadow, alias, model)
+                and existing and existing[model] ~= nil then
                 cerr = string.format(
                     "virtual model %s target must not be another virtual model: %s", alias, model)
             end
@@ -807,7 +925,13 @@ end
 -- 这些函数在原文里是同文件 local 直调、从未挂在 _M 上；拆开后由调用方直接 require 本表
 -- 调用（不经 facade，所以既不是新增导出、也不给单测多开一个可替换点）。
 _M.build_profiles = build_profiles
+-- 同名遮蔽判据（方案 A）：入口名与引擎真实模型名的判据只有这一份实现。readers.lua 的
+-- ctx_cap 用它决定「这个名字的卡片是不是落点实例的卡」，与四处写入守卫共用同一套引擎读数，
+-- 不允许两处各定义一个「真实模型」。
 _M.copy_bindings = copy_bindings
+_M.engine_attested_models = engine_attested_models
+_M.may_shadow_own_name = may_shadow_own_name
+_M.new_shadow_context = new_shadow_context
 _M.declared_cap = declared_cap
 _M.declared_util = declared_util
 _M.norm_pool_url = norm_pool_url

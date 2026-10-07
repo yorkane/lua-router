@@ -80,6 +80,16 @@ local function sync_virtual_view(cfg)
                     rep = head
                 end
             end
+            -- 同名遮蔽（方案 A）下 rep 可以**等于 alias 自己**（入口 X 的组头就是它遮蔽的那个
+            -- 真实模型 X）。这不是自映射环，也不需要在这里挡：
+            --   * resolve_model 只在请求入口调用一次（router/inference.lua 的 resolve_alias），
+            --     不存在把返回值再喂回自己的循环，恒等值因此只是「按原名查卡」；
+            --   * 转发体的 model 一律取 worker.lr_bound_model（router/forward.lua），跟这张派生
+            --     表无关，所以恒等映射不会把一个不是引擎真名的字符串发上游——那个名字能被写进
+            --     组里，前提是 build_profiles 问过引擎（config_store/profiles.lua 的判据），
+            --     或者它是磁盘快照的读路径（cfg_from_document 的 reload 上下文），后者不新增状态；
+            --   * 「代表值取组头」这条口径保持不变：入口赢的语义要求 X 的卡片/档位/容量按 X 查，
+            --     组头恰好是 X 时读到的正是被遮蔽那台实例的读数。
             map[alias] = rep
         end
     end
@@ -598,7 +608,13 @@ end
 --- section is rebuilt from the payload, absent sections stay empty.
 ---@param doc table @ decoded document / stored snapshot
 ---@param previous table|nil @ url -> prior upstreams row, for key inheritance
-local function cfg_from_document(doc, previous)
+---@param shadow table|nil @ 同名遮蔽判据上下文，透传给 build_profiles。**磁盘快照的读路径
+---  （config_store/readers.lua 的 current()）必须传 new_shadow_context{reload=true}**：那份
+---  路径上新增的任何拒绝都会让一份已落盘的配置在下次 reload 整体退回 env 默认（等于把网关
+---  配置抹平），与 validate_declared_context_windows 刻意不挂读路径同一条理由。缺省（nil）是
+---  **写入侧**口径：现查 registry 的引擎背书，所以 JSON 编辑器的整文档保存与 /_ui/config/virtual
+---  两条链共用同一道判据，不会因为走的是不同入口而一边严一边松。
+local function cfg_from_document(doc, previous, shadow)
     local cfg = new_cfg()
     if type(doc) ~= "table" then return cfg end
 
@@ -696,7 +712,7 @@ local function cfg_from_document(doc, previous)
 
     if doc.virtual_models ~= nil then
         if not CS_LEXICON.is_array(doc.virtual_models) then return nil, "virtual_models must be an array" end
-        local built, berr = CS_PROFILES.build_profiles(doc.virtual_models, nil)
+        local built, berr = CS_PROFILES.build_profiles(doc.virtual_models, nil, shadow)
         if not built then return nil, berr end
         for alias, profile in pairs(built) do
             cfg.virtual_profiles[alias] = profile
