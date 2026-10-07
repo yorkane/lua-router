@@ -113,9 +113,18 @@ worker 轮换后旧键永久留在 `lr_workers`。
 
 ## 运维处置
 
-- **已执行**：8801 在确认 `inflight=0` 且 `worker_inflight=0` 后重启（46h → 0.03% CPU / 25.6 MiB / 9/9 健康）。
-- **待执行**：8802 有真实流量，需排空窗口重启，或等修复上线后随新镜像部署。
-- **复发判据**：新 gauge 上线后，`smg_cache_aware_tree_nodes` 持续上升即代表 S1 仍在漏；重启是最快的临时缓解。
+- **8801**：先在确认 `inflight=0` 且 `worker_inflight=0` 后重启止血（46h → 0.03% CPU /
+  25.6 MiB / 8/8 健康），再随修复上线部署 `pub/lua-router:8801-20261007-2`，
+  实测 idle 0.005-0.016 核、RSS 27-50 MB、8/8 健康，真实转发（非流式 + SSE + usage 计量）通过。
+- **8802**：带真实流量，用 `docker compose up -d --timeout 60` 优雅重建（该实例未设
+  `worker_shutdown_timeout`，在途 SSE 有 60s 跑完），部署 `pub/lua-router:8802-20261007-1`
+  （与 8801 同一份代码、同一 digest）。100.35% CPU / 3.28 GiB / 5770 映射 → 0.00% CPU /
+  34.7 MiB；8/8 健康后真实转发 200、`[DONE]` 正常收尾。420 个带唯一 nonce 的长请求压测
+  全成功，核占用从 0.019 衰减到 0.002，RSS 30 → 36 MB。
+- **复发判据**：新 gauge 已随本次部署上线。`smg_cache_aware_tree_nodes` 持续上升即代表 S1 仍在漏；
+  实测 420 个长请求只让树长到个位数量级，说明这台机器上亲和树未必是内存增长的主导项，
+  盯 `smg_cache_aware_tree_nodes` / `smg_model_label_cardinality` / `lr_watch_probe_budget_skips_total`
+  一两天即可分辨是哪一项在长。重启仍是最快的临时缓解。
 - 21.k 的 `kcompactd0/1` 各占约 80% 已跑 7 天，是这台机另一件事（内存回收压力），与本问题无关，不要混。
 
 ## 复现与验证位置
