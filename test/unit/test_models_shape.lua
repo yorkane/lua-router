@@ -724,5 +724,144 @@ local first = encode(M.models_handler())
 local second = encode(M.models_handler())
 check("G9 两次输出逐字节相同", first == second, first .. "\n---\n" .. second)
 
+print("=== G10 同名遮蔽（用户裁定 2026-10-07 方案 A）：入口赢，真实那一行不再单独出现 ===")
+-- 判别性：733b386 之前 inject_virtual_models 的裁判方向是「真实 worker 保住名字、入口行被
+-- 丢弃」(if not seen[alias])。把 LR_MODELS_TEST_LEGACY_SRC 指向改动前的 models_api.lua 时，
+-- 本组**每一条**都必须红：同名时入口行缺席 → find 返回 nil，条数/owned_by/created 全对不上。
+local function count_id(rep, id)
+    local n = 0
+    for i = 1, #rep.data do
+        if rep.data[i].id == id then n = n + 1 end
+    end
+    return n
+end
+local function ids_of(rep)
+    local out = {}
+    for i = 1, #rep.data do out[i] = tostring(rep.data[i].id) end
+    return table.concat(out, ",")
+end
+
+-- (a) 单成员同名入口：入口 X 的组里只有被它遮蔽的那个真实模型 X。
+local SHADOW_SOLO = copy_table(UPSTREAM_K3)
+SHADOW_SOLO.id = "shadow-solo"
+SHADOW_SOLO.capabilities = copy_table(UPSTREAM_K3.capabilities)
+SHADOW_SOLO.capabilities.context_length = 262144
+SHADOW_SOLO.capabilities.max_output_tokens = 32768
+SHADOW_SOLO.reasoning_efforts = nil
+SHADOW_SOLO.supports_reasoning_effort = nil
+SHADOW_SOLO.reasoning_effort = nil
+local PLAIN_B = copy_table(UPSTREAM_K3)
+PLAIN_B.id = "plain-b"
+PLAIN_B.capabilities = copy_table(UPSTREAM_K3.capabilities)
+PLAIN_B.capabilities.context_length = 131072
+PLAIN_B.capabilities.max_output_tokens = 16384
+PLAIN_B.reasoning_efforts = nil
+PLAIN_B.supports_reasoning_effort = nil
+PLAIN_B.reasoning_effort = nil
+models_list = { "shadow-solo", "plain-b" }
+advertise_listing(listing_of(SHADOW_SOLO, PLAIN_B))
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function() return { { "shadow-solo", "shadow-solo" } } end
+local rep_shadow = M.models_handler()
+local e_shadow = find(rep_shadow, "shadow-solo")
+check("G10 T9 同名入口在列表里恰好一行（真实那一行被摘掉）",
+      count_id(rep_shadow, "shadow-solo") == 1, ids_of(rep_shadow))
+check("G10 T9 全表条数 = 未被遮蔽的真实模型 + 入口（不多不少、不重复 id）",
+      #rep_shadow.data == 2, ids_of(rep_shadow))
+check("G10 T9 id 集合按升序且无重复", ids_of(rep_shadow) == "plain-b,shadow-solo",
+      ids_of(rep_shadow))
+check("G10 T9 那一行是入口行：单成员 owned_by == llm-router-><绑定名>",
+      e_shadow ~= nil and e_shadow.owned_by == "llm-router->shadow-solo",
+      e_shadow and tostring(e_shadow.owned_by) or "<entry gone>")
+check("G10 T9 入口行不带 owned_by_models（单成员的老口径不因遮蔽改变）",
+      e_shadow ~= nil and rawget(e_shadow, "owned_by_models") == nil)
+check("G10 T9 入口行 created 恒 0（不继承被遮蔽引擎的读数）",
+      e_shadow ~= nil and e_shadow.created == 0,
+      e_shadow and tostring(e_shadow.created) or "<entry gone>")
+check("G10 T9 遮蔽后 required 四字段仍然齐",
+      #missing_required(e_shadow) == 0, join(missing_required(e_shadow)))
+check("G10 T9 未同名的真实行不受影响（那一行还在、owned_by 仍 local）",
+      count_id(rep_shadow, "plain-b") == 1
+      and find(rep_shadow, "plain-b").owned_by == "local", ids_of(rep_shadow))
+-- 判别性的另一半：入口行说的是被遮蔽那台引擎的读数。若实现把入口行做成「谁都不继承」的
+-- 空行（顺手改遮蔽方向时最容易犯），下面这条立刻红。
+check("G10 T9 入口行的数值读数来自被遮蔽的那台引擎",
+      read(e_shadow, "capabilities", "context_length") == 262144
+      and read(e_shadow, "capabilities", "max_output_tokens") == 32768,
+      encode(block(e_shadow, "capabilities") or {}))
+check("G10 T9 遮蔽后两次调用逐字节相同（摘除是纯查表，没把顺序依赖带进输出）",
+      encode(rep_shadow) == encode(M.models_handler()), ids_of(rep_shadow))
+
+-- (b) T10：入口声明的 context_window 在遮蔽后仍然压过引擎自报。
+store_tbl.profile_for = function(name)
+    if name == "shadow-solo" then return { model = name, context_window = 65535 } end
+    return nil
+end
+local rep_cw = M.models_handler()
+check("G10 T10 入口声明 context_window=65535 压过引擎自报的 262144",
+      read(find(rep_cw, "shadow-solo"), "capabilities", "context_length") == 65535,
+      tostring(read(find(rep_cw, "shadow-solo"), "capabilities", "context_length")))
+check("G10 T10 例外只覆盖 length：max_output_tokens 仍取引擎读数",
+      read(find(rep_cw, "shadow-solo"), "capabilities", "max_output_tokens") == 32768,
+      encode(block(find(rep_cw, "shadow-solo"), "capabilities") or {}))
+store_tbl.profile_for = function() return nil end
+local rep_cw_off = M.models_handler()
+check("G10 T10 判别性：撤掉入口声明后同一格回到引擎自报的 262144",
+      read(find(rep_cw_off, "shadow-solo"), "capabilities", "context_length") == 262144,
+      tostring(read(find(rep_cw_off, "shadow-solo"), "capabilities", "context_length")))
+
+-- (c) 多成员同名入口：owned_by 走「入口拥有整组」那一支，被遮蔽的名字仍在组里如实挂着。
+models_list = { "grp-x", "member-b" }
+advertise_listing(listing_of({ id = "grp-x", object = "model",
+    capabilities = { context_length = 262144 } }))
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function()
+    return { { "grp-x", "grp-x", "member-b" } }
+end
+local rep_grp = M.models_handler()
+local e_grp = find(rep_grp, "grp-x")
+check("G10 T9 多成员同名入口也只出一行", count_id(rep_grp, "grp-x") == 1, ids_of(rep_grp))
+check("G10 T9 多成员入口 owned_by == llm-router（入口口径，不是 local）",
+      e_grp ~= nil and e_grp.owned_by == "llm-router",
+      e_grp and tostring(e_grp.owned_by) or "<entry gone>")
+check("G10 T9 owned_by_models 如实挂着整组（含被遮蔽的那个名字）",
+      e_grp ~= nil and type(e_grp.owned_by_models) == "table"
+      and join(e_grp.owned_by_models) == "grp-x,member-b",
+      e_grp and join(e_grp.owned_by_models or {}))
+check("G10 T9 多成员同名入口 created 恒 0",
+      e_grp ~= nil and e_grp.created == 0, e_grp and tostring(e_grp.created))
+check("G10 T9 未同名的成员行照旧单独广告（遮蔽只吃 id 相等的那一行）",
+      count_id(rep_grp, "member-b") == 1
+      and find(rep_grp, "member-b").owned_by == "local", ids_of(rep_grp))
+
+-- (d) 判据精确到入口名：组内成员名与某真实模型同名时**不许**误伤那一行。
+-- 判别性：若有人把摘除判据从「入口名」放宽成「名册里出现过的任何名字」，
+-- m-a / m-b 两行会被一起摘掉 → 这一条红。
+models_list = { "m-a", "m-b" }
+caps_table = {}
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function() return { { "ent", "m-a", "m-b" } } end
+local rep_member = M.models_handler()
+check("G10 组员名与真实模型同名不误伤：三行都在（ent,m-a,m-b）",
+      ids_of(rep_member) == "ent,m-a,m-b", ids_of(rep_member))
+check("G10 组员那两行的 owned_by 仍是 local",
+      find(rep_member, "m-a").owned_by == "local"
+      and find(rep_member, "m-b").owned_by == "local")
+
+-- (e) 同名 + 重复别名：真实行只摘一次，入口行按名册顺序保留第一条。
+models_list = { "dup-name" }
+caps_table = {}
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function()
+    return { { "dup-name", "one" }, { "dup-name", "two" } }
+end
+local rep_dup = M.models_handler()
+check("G10 同名重复别名不重复 id，且保留名册里第一条",
+      count_id(rep_dup, "dup-name") == 1
+      and find(rep_dup, "dup-name").owned_by == "llm-router->one",
+      ids_of(rep_dup) .. " / " .. tostring(find(rep_dup, "dup-name").owned_by))
+caps_table = nil
+store_tbl = bare_store()
+
 print(string.format("\n%d checks, %d failed", checks, fails))
 os.exit(fails == 0 and 0 or 1)

@@ -145,6 +145,47 @@ end
 
 local function make_registry_stub()
     local stub = {}
+    -- 引擎广告读数的两个字段/两个方法（同名遮蔽判据要用）：真 registry 的 record 带
+    -- models 与 models_verified（registry/records.lua 的 add :390-405 与
+    -- models_are_verified :937），config_store/profiles.lua 的 engine_attested_models
+    -- 只认 record_models ∩ models_are_verified。之前这份桩两样都没有，判据在单测里
+    -- 恒答「无从知道」，所以 797 项断言对「同名入口」零覆盖。补齐形状，既有方法一个都不改。
+    local function declared_models(req)
+        local out, seen = {}, {}
+        local function note(name)
+            if type(name) ~= "string" then return end
+            local trimmed = name:match("^%s*(.-)%s*$")
+            -- 与 records.lua 的 norm_models 同口径：占位符 unknown 不是引擎广告过的名字。
+            if trimmed == "" or trimmed == "unknown" or seen[trimmed] then return end
+            seen[trimmed] = true
+            out[#out + 1] = trimmed
+        end
+        note(req.model_id)
+        local list = rawget(req, "models")
+        if type(list) == "table" then
+            for i = 1, #list do note(list[i]) end
+        end
+        return out
+    end
+    local function record_by_key(id_or_record)
+        if type(id_or_record) == "table" then return id_or_record end
+        if type(id_or_record) ~= "string" or id_or_record == "" then return nil end
+        for _, rec in pairs(pool) do
+            if rec.id == id_or_record then return rec end
+        end
+        return nil
+    end
+    --- Advertised list of one record, primary first (registry.record_models 的桩形状).
+    function stub.record_models(id_or_record)
+        local record = record_by_key(id_or_record)
+        if type(record) ~= "table" then return {} end
+        return declared_models(record)
+    end
+    --- Was the advertised list learned from the engine's own /v1/models answer?
+    function stub.models_are_verified(id_or_record)
+        local record = record_by_key(id_or_record)
+        return type(record) == "table" and record.models_verified == true
+    end
     function stub.records()
         local out = {}
         for _, url in ipairs(pool_order) do
@@ -2357,6 +2398,383 @@ check(captured[1]:find('"upstreams":%[%]') ~= nil,
 eq(type(payload.virtual_models) == "table" and #payload.virtual_models, 0,
     "an untouched virtual_models section is an empty array")
 eq(payload.watcher.url, NULL, "the watcher section keeps its shape")
+
+--------------------------------------------------------------------------
+-- 11d. 同名遮蔽（用户裁定 2026-10-07 方案 A）：入口名 == 引擎真实模型名
+--
+-- 勘察（/data/tmp/lr-map-shadow-03-tests.md）：这一族语义此前**零断言**，产品代码的判据
+-- （config_store/profiles.lua 的 engine_attested_models / may_shadow_own_name，
+-- config_store/readers.lua 的 ctx_cap 放宽）在旧 registry stub 下恒答「无从知道」，
+-- 797 项全绿却一条都没咬到。本节按任务书 T1-T8 逐条钉住：
+--   T1 同名 + 引擎背书 → {model=X,target=X} 与 candidates-only 同名绑定建得起来
+--   T2 同名 + 引擎背书 → 组形态 {model=X,targets={X,Y}} 建得起来（含编辑**存量**自己）
+--   T3 引擎未背书（没盖章 / 只是手填配置声明）→ 仍拒绝，四处守卫的文案逐字等于改动前
+--   T4 名字根本不在池里 / registry 整个缺席 → 仍拒绝（缺省零行为变化的红线）
+--   T5 链守卫不被放宽：**别人的**入口名即使被引擎背书也仍拒绝（批内 target / 批内组 / 存量）
+--   T6 同名入口的模型卡读得到（ctx_cap / virtual_ctx_cap 不再是死配置）
+--   T7 纯虚拟名（组里不含自己）继续隐身，per-pick 抖动那条裁定逐字成立
+--   T8 非同名场景逐字节不变（引擎读数在场与否，快照与对外名册字节相同）
+--
+-- 「引擎背书」在这份单测里的唯一来源是 stub 的 record_models ∩ models_are_verified
+-- （照 registry/records.lua 的 add / models_are_verified 形状），所以每条 X 都先用
+-- attest() 放一条**引擎亲口答过 /v1/models** 的记录进池子。
+--------------------------------------------------------------------------
+local function verify_same_name_shadowing()
+local shadow_seq = 0
+--- 放一条「引擎亲口答过 /v1/models」的记录进池子 = 这些名字被引擎背书。
+local function attest(...)
+    local list = {}
+    for i = 1, select("#", ...) do
+        local name = select(i, ...)
+        if type(name) == "string" and name ~= "" then list[#list + 1] = name end
+    end
+    shadow_seq = shadow_seq + 1
+    pool_add_manual({
+        id = "w-engine-" .. shadow_seq,
+        url = "http://engine-" .. shadow_seq .. ".invalid:8080",
+        model_id = list[1] or "unknown",
+        models = list,
+        models_verified = true,
+        priority = 50, cost = 1.0, labels = {},
+    })
+    return list
+end
+--- 判据的直接答案（排序后的名字数组；nil = 判据「无从知道」）。
+local function attested_names()
+    local CS_PROFILES = require "resty.luarouter.config_store.profiles"
+    -- 判别性反证（T11）的回退树上这两个判据函数不存在：这里退成空集而不是崩，
+    -- 让桩自证与 T1-T8 各自如实报 FAIL，而不是整份单测 error 掉在半路。
+    if type(CS_PROFILES.engine_attested_models) ~= "function" then return {} end
+    local set = CS_PROFILES.engine_attested_models()
+    if type(set) ~= "table" then return nil end
+    local out = {}
+    for name in pairs(set) do out[#out + 1] = name end
+    table.sort(out)
+    return out
+end
+local SELF_MSG = "virtual model %s must differ from its target"
+local CHAIN_MSG = "virtual model %s target must not be another virtual model: %s"
+--- 未盖章的同名记录：名字在列表里，但那不是引擎亲口答的。
+local function attest_unverified(name, tag)
+    shadow_seq = shadow_seq + 1
+    pool_add_manual({
+        id = "w-unverified-" .. tostring(tag) .. "-" .. shadow_seq,
+        url = "http://unverified-" .. tostring(tag) .. "-" .. shadow_seq .. ".invalid:8080",
+        model_id = name, models = { name }, models_verified = false,
+        priority = 50, cost = 1.0, labels = {},
+    })
+end
+
+reset_env()
+reset_state(false)
+use_registry({})
+eq(attested_names(), nil, "(stub) registry 缺席时判据答「无从知道」而不是空集")
+use_registry(make_registry_stub())
+reset_env()
+store.apply_upstreams({ { url = A, model_id = "declared-only" } })
+check(attested_names() ~= nil and #attested_names() == 0,
+    "(stub) 只有手填配置声明（discovery=config、从没探过）不构成背书",
+    table.concat(attested_names() or {}, ","))
+reset_env()
+attest("attest-a", "attest-b")
+eq(table.concat(attested_names() or {}, ","), "attest-a,attest-b",
+    "(stub) record_models ∩ models_are_verified 的名字进得了判据")
+reset_env()
+attest_unverified("盖章缺", "selftest")
+check(attested_names() ~= nil and #attested_names() == 0,
+    "(stub) 列表在、章没盖 → 判据里一个名字都没有")
+
+--------------------------------------------------------------------------
+-- T1 同名 + 引擎背书：{model, target} 与 candidates-only 形状建得起来
+--------------------------------------------------------------------------
+reset_env()
+local X = "shadow-x"
+attest(X)
+local t1_snap, t1_err = store.apply_profiles({ { model = X, target = X } })
+eq(t1_err, nil, "(T1) 入口 X 写 target=X 在引擎背书下被接受", t1_err)
+ok(t1_snap ~= nil, "(T1) apply_profiles 回了快照")
+local t1_profile = store.profile_for(X)
+ok(t1_profile ~= nil, "(T1) profile_for 答得出这个同名入口")
+eq(t1_profile and t1_profile.model, X, "(T1) profile 带自己的入口名")
+eq(t1_profile and t1_profile.target, X, "(T1) 代表值就是被遮蔽的那个真实模型名")
+eq(t1_profile and #t1_profile.targets, 1, "(T1) 派生组只有它自己")
+eq(t1_profile and rawget(t1_profile, "explicit_targets"), nil,
+    "(T1) 没人写 targets，条目不是组模式")
+eq(store.resolve_model(X), X, "(T1) resolve_model 自返回（派生视图自洽，无幻影名）")
+eq(#store.profiles_list(), 1, "(T1) 只写进去一行")
+eq(store.profiles_list()[1] and store.profiles_list()[1].target, X,
+    "(T1) 落盘行 keeps its target")
+local t1_vrow = store.virtual_models_list()[1]
+ok(type(t1_vrow) == "table" and t1_vrow[1] == X and #t1_vrow == 2 and t1_vrow[2] == X,
+    "(T1) 广告名册那一行是 alias + 整组（组里就是它自己）",
+    type(t1_vrow) == "table" and table.concat(t1_vrow, ",") or "<nil>")
+reset_env()
+attest(X)
+local _, t1c_err = store.apply_profiles({
+    { model = X, candidates = { { worker = A, model = X } } },
+})
+eq(t1c_err, nil, "(T1) candidates-only 的同名绑定也建得起来（绑定名那一处守卫）", t1c_err)
+eq(store.resolve_model(X), X, "(T1) 派生代表值同样自返回")
+
+--------------------------------------------------------------------------
+-- T2 同名 + 引擎背书：组形态 {model=X, targets={X,Y}} 建得起来
+--------------------------------------------------------------------------
+reset_env()
+local G = "shadow-g"
+attest(G)
+local _, t2_err = store.apply_profiles({ { model = G, targets = { G, "g-other" } } })
+eq(t2_err, nil, "(T2) 组里含自己的真实模型名被接受", t2_err)
+local t2_profile = store.profile_for(G)
+ok(t2_profile ~= nil, "(T2) 同名组入口存在")
+eq(t2_profile and rawget(t2_profile, "explicit_targets"), true,
+    "(T2) 写过 targets 就是组模式")
+eq(t2_profile and #t2_profile.targets, 2, "(T2) 整组两名都在")
+eq(t2_profile and t2_profile.targets[1], G, "(T2) 代表值取声明顺序的组头（= 自己）")
+eq(table.concat(store.virtual_targets(G) or {}, ","), G .. ",g-other",
+    "(T2) virtual_targets 报整组")
+local _, t2_re_err = store.apply_profiles({ { model = G, targets = { G, "g-other" } } })
+eq(t2_re_err, nil,
+    "(T2) 再写一次同样整表：自己的名字在**存量**表里也不算链式转发", t2_re_err)
+eq(#store.profiles_list(), 1, "(T2) 覆盖写后仍只有一行")
+reset_env()
+attest(G)
+local _, t2b_err = store.apply_profiles({ { model = G, targets = { "g-first", G } } })
+eq(t2b_err, nil, "(T2) 自己的名字排在组尾也建得起来", t2b_err)
+eq(store.profile_for(G) and store.profile_for(G).target, "g-first",
+    "(T2) 代表值仍是组头，与遮蔽无关")
+reset_env()
+attest(G)
+store.apply_profiles({ { model = G, targets = { G, "g-other" } } })
+eq(store.current().virtual_models[G], G,
+    "(T2) 派生只读视图对同名入口自返回（sync_virtual_view 不挡自映射）")
+eq(store.profiles_list()[1] and store.profiles_list()[1].targets[1], G,
+    "(T2) 磁盘行原样回写整组")
+
+--------------------------------------------------------------------------
+-- T3 引擎未背书：四处守卫逐字退回改动前的严格拒绝（文案家族被钉住）
+--------------------------------------------------------------------------
+reset_env()
+attest_unverified(X, "target")
+local _, t3_err = store.apply_profiles({ { model = X, target = X } })
+eq(t3_err, string.format(SELF_MSG, X),
+    "(T3) 未背书时「写过的 target」那一支文案逐字等于改动前")
+eq(#store.profiles_list(), 0, "(T3) 拒绝后不留半行")
+reset_env()
+store.apply_upstreams({ { url = A, model_id = X } })
+local _, t3b_err = store.apply_profiles({ { model = X, target = X } })
+eq(t3b_err, string.format(SELF_MSG, X),
+    "(T3) 操作员在配置里写过这个名字 ≠ 引擎背书")
+reset_env()
+attest_unverified(G, "head")
+local _, t3c_err = store.apply_profiles({ { model = G, targets = { G, "g-other" } } })
+eq(t3c_err, string.format(SELF_MSG, G),
+    "(T3) 未背书时「组头代表值」那一支文案逐字等于改动前")
+eq(#store.profiles_list(), 0, "(T3) 未背书的组也没留半行")
+reset_env()
+attest_unverified(G, "tail")
+local _, t3d_err = store.apply_profiles({ { model = G, targets = { "g-first", G } } })
+eq(t3d_err, string.format(CHAIN_MSG, G, G),
+    "(T3) 未背书时组尾那一支落到链守卫，文案逐字等于改动前")
+reset_env()
+attest_unverified(X, "binding")
+local _, t3e_err = store.apply_profiles({
+    { model = X, candidates = { { worker = A, model = X } } },
+})
+eq(t3e_err, string.format(SELF_MSG, X),
+    "(T3) 未背书时「绑定名」那一支文案逐字等于改动前")
+reset_env()
+local _, t3f_err = store.cfg_from_document({ virtual_models = { { model = X, target = X } } })
+eq(t3f_err, string.format(SELF_MSG, X),
+    "(T3) JSON 编辑器那条写入链（cfg_from_document 缺省=写入侧）同一个答案")
+reset_env()
+attest(X)
+local t3_doc_cfg, t3_doc_err = store.cfg_from_document({
+    virtual_models = { { model = X, target = X } },
+})
+eq(t3_doc_err, nil, "(T3) 有背书时 document 链也建得起来（两条链不许一边严一边松）", t3_doc_err)
+eq(t3_doc_cfg and t3_doc_cfg.virtual_profiles[X] and t3_doc_cfg.virtual_profiles[X].target, X,
+    "(T3) document 建出的 profile 代表值就是被遮蔽的真实模型名")
+reset_env()
+attest(X)
+store.apply_profiles({ { model = X, targets = { X, "x-other" } } })
+pool_reset()
+shared.luarouter_config:flush_all()
+store._reset_pool_module_caches()
+use_registry(make_registry_stub())
+local t3r_cfg = store.current()
+ok(t3r_cfg.virtual_profiles[X] ~= nil,
+    "(T3) 引擎读数消失后同名入口仍从磁盘读回来（current 不许整份退回 env 默认）")
+eq(t3r_cfg.virtual_models and t3r_cfg.virtual_models[X], X,
+    "(T3) 巡检空档里派生视图也自洽")
+local _, t3w_err = store.apply_profiles({ { model = X, targets = { X, "x-other" } } })
+check(type(t3w_err) == "string",
+    "(T3) 同一份配置此时**写**不进去：判据只在写入侧说话", t3w_err)
+
+--------------------------------------------------------------------------
+-- T4 名字根本不在池里 / registry 缺席：仍拒绝
+--------------------------------------------------------------------------
+reset_env()
+local ghost = "ghost-model"
+local _, t4_err = store.apply_profiles({ { model = ghost, target = ghost } })
+eq(t4_err, string.format(SELF_MSG, ghost),
+    "(T4) 池里查无此名 → 严格拒绝，文案逐字等于改动前")
+eq(#store.profiles_list(), 0, "(T4) 拒绝后不留半行")
+reset_env()
+attest("not-the-ghost")
+local _, t4b_err = store.apply_profiles({ { model = ghost, target = ghost } })
+eq(t4b_err, string.format(SELF_MSG, ghost),
+    "(T4) 别的名字被背书不把自己的名字洗白（判据精确到名字）")
+reset_env()
+reset_state(false)
+use_registry({})
+local _, t4c_err = store.apply_profiles({ { model = X, target = X } })
+eq(t4c_err, string.format(SELF_MSG, X),
+    "(T4) registry 整个缺席时退回改动前的严格语义（缺省零行为变化）")
+use_registry(make_registry_stub())
+reset_env()
+
+--------------------------------------------------------------------------
+-- T5 链守卫不被放宽：别人的入口名不是「自己要遮蔽的真实模型」
+--------------------------------------------------------------------------
+reset_env()
+local ea, eb = "chain-a", "chain-b"
+attest(ea, "real-under")
+local _, t5_err = store.apply_profiles({
+    { model = ea, target = "real-under" },
+    { model = eb, target = ea },
+})
+eq(t5_err, string.format(CHAIN_MSG, eb, ea),
+    "(T5) 批内 target 指向别人的入口名：即使那名字被引擎背书也仍拒绝", t5_err)
+eq(#store.profiles_list(), 0, "(T5) 拒绝的批次一行都没写")
+reset_env()
+attest(ea)
+local _, t5b_err = store.apply_profiles({
+    { model = ea, targets = { "real-a" } },
+    { model = eb, targets = { ea, "real-b" } },
+})
+check(type(t5b_err) == "string" and t5b_err:find("another virtual model", 1, true) ~= nil,
+    "(T5) 批内组里含别人的入口名 → 拒绝", t5b_err)
+eq(#store.profiles_list(), 0, "(T5) 组形态的拒绝也没留半行")
+reset_env()
+attest(ea)
+store.apply_profiles({ { model = ea, target = "real-live" } })
+eq(#store.profiles_list(), 1, "(T5) 前提：存量里先有 entry-a")
+local _, t5c_err = store.apply_profiles({ { model = eb, target = ea } })
+check(type(t5c_err) == "string" and t5c_err:find("another virtual model", 1, true) ~= nil,
+    "(T5) 存量场景：整表换成 eb→ea 也仍拒绝（判据认的是**引擎读数**，不是入口表）", t5c_err)
+eq(#store.profiles_list(), 1, "(T5) 拒绝后 entry-a 原样还在（没有半状态）")
+reset_env()
+attest(X, "real-live")
+local _, t5d_err = store.apply_profiles({
+    { model = X, target = X },
+    { model = "vm-x-fan", target = "real-live" },
+})
+eq(t5d_err, nil, "(T5) 对照：入口指向真实模型（含被遮蔽的那个）都合法", t5d_err)
+eq(#store.profiles_list(), 2, "(T5) 对照批次两行都写得进去")
+
+--------------------------------------------------------------------------
+-- T6 同名入口的模型卡读得到（「可以在虚拟服务中配置」的直接断言）
+--------------------------------------------------------------------------
+reset_env()
+attest(X)
+eq(select(2, store.apply_profiles({ { model = X, target = X } })), nil, "(T6) 前提：同名入口建得起来")
+eq(select(2, store.apply_model_config({ model = X, ctx = 131072 })), nil,
+    "(T6) 给被遮蔽的那个名字写卡片被接受")
+eq(store.ctx_cap(X), 131072, "(T6) 同名入口的卡片不再是死配置：ctx_cap 答得出")
+eq(store.current().model_configs[X].ctx, 131072, "(T6) 卡片确实在生效的快照里")
+reset_env()
+attest(G)
+store.apply_profiles({ { model = G, targets = { G, "g-other" } } })
+store.apply_model_config({ model = G, ctx = 131072 })
+eq(store.ctx_cap(G), 131072, "(T6) 组形态下同名那张卡也读得到")
+eq(store.virtual_ctx_cap(store.profile_for(G)), 131072,
+    "(T6) 组里只它一张卡时入口的钳制就是这张卡（改动前恒 nil）")
+store.apply_model_config({ model = "g-other", ctx = 8192 })
+eq(store.virtual_ctx_cap(store.profile_for(G)), 8192,
+    "(T6) 组内两张卡取最窄：被遮蔽那台的读数参与仲裁")
+reset_env()
+attest(G)
+store.apply_profiles({ { model = G, targets = { G, "g-other" }, context_window = 65535 } })
+store.apply_model_config({ model = G, ctx = 131072 })
+store.apply_model_config({ model = "g-other", ctx = 8192 })
+eq(store.virtual_ctx_cap(store.profile_for(G)), 65535,
+    "(T6) 显式 context_window 照旧恒赢（遮蔽不许改那条优先级）")
+eq(store.ctx_cap(G), 131072, "(T6) 而卡片本身仍按名字答话")
+
+--------------------------------------------------------------------------
+-- T7 纯虚拟名（组里不含自己）继续隐身
+--------------------------------------------------------------------------
+reset_env()
+local pure = "pure-virtual"
+attest(pure)
+eq(select(2, store.apply_profiles({ { model = pure, targets = { "p-one", "p-two" } } })), nil,
+    "(T7) 前提：纯虚拟入口建得起来（组里没有它自己）")
+eq(select(2, store.apply_model_config({ model = pure, ctx = 4096 })), nil,
+    "(T7) 前提：卡片写得进去")
+eq(store.ctx_cap(pure), nil,
+    "(T7) 纯虚拟入口的名字继续对卡片查找隐身（引擎背书也不是放宽的理由）")
+eq(store.virtual_ctx_cap(store.profile_for(pure)), nil,
+    "(T7) 它的钳制也不许从这张冒名卡片里取数（per-pick 抖动那条裁定逐字成立）")
+reset_env()
+store.apply_model_config({ model = pure, ctx = 2048 })
+eq(store.ctx_cap(pure), 2048, "(T7) 前提：这还不是入口名时卡片照常被读到")
+attest(pure)
+store.apply_profiles({ { model = pure, targets = { "p-one", "p-two" } } })
+eq(store.ctx_cap(pure), nil, "(T7) 卡片先写、后成为纯虚拟入口名：它停止答题")
+reset_env()
+attest(pure)
+store.apply_profiles({ { model = pure, target = "p-lone" } })
+store.apply_model_config({ model = pure, ctx = 512 })
+eq(store.ctx_cap(pure), nil, "(T7) legacy 单目标入口的冒名卡片同样读不到")
+reset_env()
+attest("real-card")
+store.apply_profiles({ { model = "vm-holder", target = "real-card" } })
+store.apply_model_config({ model = "real-card", ctx = 9216 })
+eq(store.ctx_cap("real-card"), 9216, "(T7) 落点模型自己的卡不受入口名守卫影响")
+
+--------------------------------------------------------------------------
+-- T8 非同名场景逐字节不变
+--------------------------------------------------------------------------
+local function no_clash_bytes(use_engine)
+    reset_env()
+    if use_engine then
+        attest("t8-alpha", "t8-beta")
+        attest("t8-gamma")
+    end
+    store.apply_upstreams({ { url = A, model_id = "t8-alpha" }, { url = B, model_id = "t8-beta" } })
+    local _, e = store.apply_profiles({
+        { model = "vm-t8-group", targets = { "t8-alpha", "t8-beta" } },
+        { model = "vm-t8-legacy", target = "t8-gamma", workers = { A } },
+        { model = "vm-t8-bound", candidates = {
+            { worker = A, model = "t8-alpha" }, { worker = B, model = "t8-beta" } } },
+    })
+    if e then return "apply failed: " .. tostring(e) end
+    store.apply_model_config({ model = "t8-alpha", ctx = 131072 })
+    store.apply_model_config({ model = "t8-beta", ctx = 8192 })
+    return table.concat({
+        cjson.encode(store.snapshot_of(store.current())),
+        cjson.encode(store.virtual_models_list() or {}),
+        cjson.encode(store.document()),
+        tostring(store.ctx_cap("vm-t8-group")),
+        tostring(store.ctx_cap("t8-alpha")),
+        tostring(store.virtual_ctx_cap(store.profile_for("vm-t8-group"))),
+        tostring(store.resolve_model("vm-t8-legacy")),
+    }, "|")
+end
+eq(no_clash_bytes(true), no_clash_bytes(false),
+    "(T8) 没有任何入口名撞真实模型名时，引擎读数在场与否不改一个字节")
+reset_env()
+attest("t8-alpha")
+store.apply_profiles({ { model = "vm-t8-x", target = "t8-alpha" } })
+store.apply_model_config({ model = "vm-t8-x", ctx = 1024 })
+eq(store.ctx_cap("vm-t8-x"), nil, "(T8) 非同名入口仍隐身")
+eq(store.resolve_model("vm-t8-x"), "t8-alpha", "(T8) 映射口径不变")
+eq(store.current().virtual_models["vm-t8-x"], "t8-alpha",
+    "(T8) 派生视图也不因遮蔽改动长出新东西")
+reset_env()
+end
+verify_same_name_shadowing()
+
 
 --------------------------------------------------------------------------
 -- 13. 收尾：未映射的 ngx.re 模式必须为空（否则上面的替身在骗人）

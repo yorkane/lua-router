@@ -334,6 +334,34 @@ MA.only_data(store_with_rows({ { "x", "alpha" } }), {}, {})
 check("G5 only_data 每次都重新装配（不吃跨请求缓存）", entry_calls > before,
       before .. " -> " .. entry_calls)
 
+-- (T9/T10 同名遮蔽的广告面兄弟) 真实行在场时开关两种状态对同名给同一个答案。
+-- only_data 这一半不装配真实行，遮蔽在这里天然没有对手；这两条钉的是「入口行无条件出、
+-- 且 id/owned_by/created 走入口口径」——若有人把遮蔽判据错误地搬进 only_data
+-- （比如"真实行里有同名就把入口也丢掉"），下面第一条立刻红。
+-- 判别性反证（root 要求的 T11 在这一半的对应物）：把 733b386 的 inject_virtual_models
+-- 遮蔽改动临时回退时红的是 test_models_shape.lua 的 G10（本文件切的是 models_advertise
+-- 那一块，inject_virtual_models 不在切片里，所以这里恒不咬真实行——这正是本组断言与
+-- G10 互补的原因：G10 咬摘除方向，这里咬开关分支不受遮蔽判据污染）。
+reset_state()
+local clash = { { "real-a", "real-a", "extra" }, { "vm-quiet", "real-b" } }
+local d4 = MA.only_data(store_with_rows(clash), {}, {})
+check("G5 T9 入口名与真实模型同名时开关分支照样出入口行（不读真实名册、无对手）",
+      d4 ~= nil and #d4 == 2 and d4[1].id == "real-a" and d4[2].id == "vm-quiet",
+      d4 and (tostring(#d4) .. ":" .. tostring(d4[1].id) .. "," .. tostring(d4[2].id)) or "nil")
+check("G5 T9 同名入口的 owned_by 走入口口径（多成员 llm-router + created 恒 0）",
+      d4 ~= nil and d4[1].owned_by == "llm-router" and d4[1].created == 0
+      and d4[1]._tail[1] == "real-a" and d4[1]._tail[2] == "extra",
+      d4 and tostring(d4[1].owned_by) or "nil")
+reset_state()
+-- 开关关（缺省）时同名入口走全量分支：那是 inject_virtual_models 的地盘（G10 钉），
+-- 这里只钉 enabled 的两档不因名字撞车而翻面。
+reset_state()
+fake_env[MA.env_key] = "true"
+check("G5 T10 开关开：同名构造下 enabled 仍认识这一档", MA.enabled(store_stub()) == true)
+reset_state()
+check("G5 T10 开关两层都没说过：同名构造也不改变缺省关（零行为变化）",
+      MA.enabled(store_with_rows(clash)) == false)
+
 print("=== G6 常量与契约：开关只有一处读者 ===")
 reset_state()
 check("G6 磁盘键名钉住 models_virtual_only", MA.doc_key == "models_virtual_only",
