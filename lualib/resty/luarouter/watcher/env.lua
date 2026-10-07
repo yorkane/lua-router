@@ -454,6 +454,17 @@ function _M.new_config(getenv, self_ports, metrics_port)
         exclude_patterns = list_from(getenv, "SMG_WATCHER_EXCLUDE"),
         allow_ports = _M.parse_ports(getenv("SMG_WATCHER_ALLOW_PORT")),
         deny_ports = _M.parse_ports(getenv("SMG_WATCHER_DENY_PORT")),
+        -- 每一轮探测的**硬预算**（doc/gap-cpu-idle-burn.md CPU 线第 1 条）。
+        -- 21.k 的实测形状：/proc/net/tcp 有 128 个 LISTEN 端口，而 deny 清单只覆盖
+        -- 约 39 个，于是每 15s 一轮要探约 70-90 个候选，每个候选最多 6 次串行 GET
+        -- （/v1/models、/server_info、/get_server_info、/props、/metrics、/health），
+        -- 单次超时 4s。这就是「空载也烧核」的那台机器上的常驻成本，而它和业务流量
+        -- 完全无关。max_candidates 限制一轮探测多少个**新**候选（已经在台账里的永远
+        -- 全探，摘除判定不能因为预算被饿到），pass_budget_secs 限制一轮的墙钟。
+        -- 0 = 不限制（旧行为）。
+        max_candidates = num_from(getenv, "SMG_WATCHER_MAX_CANDIDATES", 32),
+        pass_budget_secs = num_from(getenv, "SMG_WATCHER_PASS_BUDGET_SECS", 5),
+        probe_fanout = num_from(getenv, "SMG_WATCHER_PROBE_FANOUT", 8),
         self_ports = ports,
         model_map = _M.parse_model_map(
             getenv("SMG_WATCHER_MODEL_MAP") or getenv("LMR_MODEL_MAP") or ""),
@@ -461,6 +472,17 @@ function _M.new_config(getenv, self_ports, metrics_port)
     if cfg.interval_secs < 1 then cfg.interval_secs = 1 end
     if cfg.probe_timeout_secs < 1 then cfg.probe_timeout_secs = 1 end
     if cfg.max_models < 0 then cfg.max_models = 0 end
+    -- 预算闸门的取值边界：负数一律当「不限制」，而不是「一个都不探」——后者会把
+    -- 整个发现层静默关掉，那是比烧核更糟的故障。
+    if cfg.max_candidates < 0 then cfg.max_candidates = 0 end
+    if cfg.pass_budget_secs < 0 then cfg.pass_budget_secs = 0 end
+    -- 一轮的墙钟预算不得超过间隔本身，否则两轮叠在一起（tick 的 single-flight 锁会
+    -- 悄悄跳轮，指标上只看 lr_watch_reconciles_total 会误判成「发现层不干活」。
+    if cfg.pass_budget_secs > cfg.interval_secs then
+        cfg.pass_budget_secs = cfg.interval_secs
+    end
+    if cfg.probe_fanout < 1 then cfg.probe_fanout = 1 end
+    if cfg.probe_fanout > 32 then cfg.probe_fanout = 32 end
     -- The daemon spells "never empty a model, but let it expire" as two knobs
     -- (--no-keep-last plus --keep-last-grace). One number carries both here:
     -- 0 protects the last worker forever, a negative value switches the guard off

@@ -582,7 +582,13 @@ gate_unit() {
     # 「逐 from 问三层、第一个给值的层赢」这条查表口径本身，以及条目层读数确实被喂进了转发链）。
     # 两份的判别性通道（LR_MODELS_TEST_LEGACY_SRC / LR_EFFORT_LEGACY_LUALIB）刻意不在门禁里
     # 设：那是手工核实「断言真会红」的反证手段，需要外挂改动前的旧源码树，门禁只跑 HEAD。
-    for t in test_tree test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing test_models_shape test_models_advertise test_effort_layers; do
+    # test_tree_bounds / test_state_bounds / test_observability：单 worker 空载烧核与进程内
+    # 累积状态的三条闸门（doc/gap-cpu-idle-burn.md）。它们钉的都是「以前只会涨、现在必须
+    # 能降」的形状 —— 亲和树的节点上界与增量预算、_M.instances 的空闲回收、lr_stats 的
+    # model 标签基数与导出扫描上限 —— 回归时不会有任何 HTTP 面症状，只有这些断言会红。
+    # test_tree_bounds 单列而不并进 test_tree：后者是对齐 Rust 的语义基线，新增维度是
+    # Lua 侧的超集，分文件才看得清哪条断言属于哪一边。
+    for t in test_tree test_tree_bounds test_state_bounds test_observability test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing test_models_shape test_models_advertise test_effort_layers; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done

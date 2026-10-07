@@ -33,6 +33,33 @@ local STATS_DICT = "lr_stats"
 -- only durable record of which routing key is bound to which worker.
 local POLICY_DICT = "lr_policy"
 
+---Upper bound for the shared-dict scans in the exporter and the scrape-time joins.
+---Every get_keys call in this module is a read for *rendering*, never a correctness
+---surface, so a bound trades completeness on an absurdly large dict for a hard cap on
+---per-scrape cost inside the single forwarding worker (worker_processes 1 is the prod
+---shape here). Production line counts measured 466-561 rows, so the bound is invisible
+---until a dict has grown pathological -- exactly the case where a cheaper scrape is the
+---point. LR_METRICS_SCAN_LIMIT overrides it; a truncated scan also publishes
+---smg_dict_scan_truncated so the truncation is never silent.
+local SCAN_LIMIT = tonumber(os.getenv("LR_METRICS_SCAN_LIMIT")) or 20000
+if not SCAN_LIMIT or SCAN_LIMIT < 1 then
+    SCAN_LIMIT = 20000   -- never let a typo turn the exporter into an empty page
+end
+
+---测试专用：改写扫描上限（线上没有调用点，配置靠 LR_METRICS_SCAN_LIMIT）。
+---上限本身是加载期读一次的值，重读需要整个模块重载，所以留这一个窄口子给单测钉
+---「扫描确实有界」这条断言。<=0 回到缺省。
+---@param n number|nil
+function _M.set_metrics_scan_limit(n)
+    local v = tonumber(n)
+    if not v or v < 1 then
+        v = tonumber(os.getenv("LR_METRICS_SCAN_LIMIT")) or 20000
+        if not v or v < 1 then v = 20000 end
+    end
+    SCAN_LIMIT = v
+    return SCAN_LIMIT
+end
+
 local json_encode = cjson.encode
 local json_decode = cjson.decode
 
@@ -97,11 +124,91 @@ local function label_text(labels)
     return table.concat(labels, PAIR_SEP)
 end
 
+
+--- model 标签的基数闸门（doc/gap-cpu-idle-burn.md S3）。
+--- lr_stats 的键是 c|/h|/g| + metric + labels，而全仓对这些行没有任何 delete
+---（唯一的 delete 在 logstore.lua 与 inflight 自己的键上）。所以一个取值空间由客户端
+---决定的标签，会把这个字典养到进程结束，/metrics 与每一趟 gauge 扫描都为它付费。
+---入口族的指标早已有 known_name 归一，worker 级的那些没有 —— 这里补上。
+---
+---闸门放在 label_pairs 而不是各调用点：这是每个要落盘的键唯一的必经收口，
+---新增一个带 model 标签的族就不可能因为忘了归一再把漏洞开回来。
+---越过预算后新名字一律并进同一个 other 行：宁可少一维分辨率（它本来只用于人工排查），
+---也不能让「客户端能编出来的每个字符串」换一行字典记录。
+local OTHER_MODEL = "other"
+local model_label_seen = {}
+local model_label_count = 0
+local model_label_cap
+
+---上限只读一次（与桶阶梯同一纪律：这个数已经烘进写出去的键里，不是热开关）。
+---<=0 关闭闸门、原名照落，等于回到改动之前的行为。
+local function model_label_limit()
+    if model_label_cap == nil then
+        model_label_cap = tonumber(os.getenv("LR_MODEL_LABEL_CAP")) or 300
+        if model_label_cap < 0 then
+            model_label_cap = 0
+        end
+    end
+    return model_label_cap
+end
+
+---测试/复位用：丢掉已登记的名字集合并重读上限（线上没有调用点）。
+function _M.reset_model_label_cardinality()
+    model_label_seen = {}
+    model_label_count = 0
+    model_label_cap = nil
+end
+
+---@return number @ 目前存下的 distinct model 标签值个数
+function _M.model_label_cardinality()
+    return model_label_count
+end
+
+---@param value any
+---@return string @ 真正进标签的值
+local function model_label(value)
+    -- nil / empty / non-string, plus the two reserved buckets, short-circuit
+    -- **ahead of** the registration. Written after it, an invalid value (or a
+    -- client that literally sends model=other) would burn a budget slot while
+    -- still costing one row: the ledger and the storage would disagree.
+    if type(value) ~= "string" or value == "" then
+        return "unknown"
+    end
+    if value == "unknown" or value == OTHER_MODEL then
+        return value
+    end
+    if model_label_seen[value] then
+        return value
+    end
+    local cap = model_label_limit()
+    if cap == 0 then
+        return value
+    end
+    if model_label_count >= cap then
+        return OTHER_MODEL
+    end
+    model_label_seen[value] = true
+    model_label_count = model_label_count + 1
+    -- 只在计数变化时发一条 gauge：这道闸门的成本是「每个新名字一次字典写」，
+    -- 不是「每个请求一次」。撞顶本身是运维想在 /metrics 开始对不上账之前看到的信号。
+    _M.gauge("smg_model_label_cardinality", {}, model_label_count)
+    if model_label_count == cap and ngx and ngx.log then
+        ngx.log(ngx.WARN, "luarouter: model label cardinality hit ", cap,
+            "; further model names collapse to ", OTHER_MODEL)
+    end
+    return value
+end
+
 --- Encode one label set: {"model","qwen","endpoint","chat"}.
 local function label_pairs(pairs)
     local parts = {}
     for i = 1, #pairs do
-        parts[#parts + 1] = pairs[i][1] .. KV_SEP .. pairs[i][2]
+        local name = pairs[i][1]
+        local value = pairs[i][2]
+        if name == "model" then
+            value = model_label(value)
+        end
+        parts[#parts + 1] = name .. KV_SEP .. value
     end
     return table.concat(parts, PAIR_SEP)
 end
@@ -831,6 +938,13 @@ function _M.record_watch_pass(stats, owned, protected, map_entries)
     _M.counter("lr_watch_probe_failures_total", {}, stats.probe_failures or 0)
     _M.counter("lr_watch_probe_removes_total", {}, stats.probe_removes or 0)
     _M.counter("lr_watch_probe_fuse_skips_total", {}, stats.probe_fuse_skips or 0)
+    -- Candidate probes this pass did not make because of SMG_WATCHER_MAX_CANDIDATES /
+    -- SMG_WATCHER_PASS_BUDGET_SECS. This is the counter that says "the box has more
+    -- listeners than the probe budget covers", which is the state 21.k was in; without
+    -- it a budgeted pass is indistinguishable from a quiet host. Owned workers are
+    -- never cut, so this rising does NOT mean discovery is being starved.
+    _M.counter("lr_watch_probe_budget_skips_total", {},
+        stats.probe_budget_skips or 0)
     _M.gauge("lr_watch_discovered_workers", {}, stats.discovered or 0)
     _M.gauge("lr_watch_owned_workers", {}, owned or 0)
     _M.gauge("lr_watch_protected_workers", {}, protected or 0)
@@ -950,6 +1064,21 @@ local HELP = {
     smg_worker_routing_keys_active = "Active routing keys per worker",
     -- Lua-side superset: the Rust cache_aware tree exposes no tenant gauge.
     smg_cache_aware_tenant_count = "Tenants tracked by the cache_aware policy trees",
+    -- Same superset, and the reason this branch exists: the 21.k incident could only be
+    -- read off smaps_rollup's Private_Dirty, because nothing said how much affinity
+    -- state the process was carrying. These three say it (doc/gap-cpu-idle-burn.md).
+    smg_cache_aware_tree_count = "cache_aware affinity trees held by this process",
+    smg_cache_aware_tree_nodes = "Live prefix-tree nodes across this process (the memory driver)",
+    smg_cache_aware_tree_chars = "Prompt characters retained by the cache_aware trees",
+    -- S2: instances are per <policy>:<model/entry>, each with its own trees. Before the
+    -- reclaimer this grew with every name that ever appeared and never shrank.
+    smg_policy_instances = "Policy instances alive in this process (per-model/entry)",
+    -- Cardinality guard on the model label; reaching the cap means further names
+    -- collapse to other=, i.e. per-model series stop being trustworthy.
+    smg_model_label_cardinality = "Distinct model label values stored in lr_stats",
+    -- A bounded exporter scan that hit its limit. The counterweight to SCAN_LIMIT:
+    -- truncation must never be silent (label: which dict was scanned).
+    smg_dict_scan_truncated = "1 when the last scrape truncated a shared-dict scan by dict",
     -- Lua-side superset: the in-process watcher (merged llm-watcher daemon), so a
     -- dashboard can see discovery churn without a second scrape target. Names
     -- mirror the daemon's llm_watcher_* families.
@@ -967,6 +1096,7 @@ local HELP = {
     lr_watch_probe_failures_total = "Probe rejections held by the watcher hysteresis instead of evicting",
     lr_watch_probe_removes_total = "Workers removed by the in-process watcher because their probe refused them",
     lr_watch_probe_fuse_skips_total = "Probe-driven removals a watcher pass skipped because its fuse tripped",
+    lr_watch_probe_budget_skips_total = "Candidate probes a watcher pass cut because of its probe budget",
     lr_watch_discovered_workers = "Workers discovered by the last watcher pass",
     lr_watch_owned_workers = "Workers the in-process watcher currently owns",
     lr_watch_protected_workers = "Pre-existing workers the in-process watcher will never delete",
@@ -1098,7 +1228,10 @@ function _M.manual_routing_key_counts(d)
     if not d then
         return counts
     end
-    local keys = d:get_keys(0)
+    -- Bounded: this runs at scrape time on every /metrics, and manual: rows age out
+    -- only through max_idle_secs, so the scan length is set by how many rows the dict
+    -- has ever held rather than by the routing keys that are live.
+    local keys = d:get_keys(SCAN_LIMIT)
     for i = 1, #keys do
         local key = keys[i]
         if key:sub(1, 7) == "manual:" then
@@ -1132,7 +1265,7 @@ end
 ---@return string
 function _M.prometheus_text()
     local d = statsdict()
-    local keys = d:get_keys(0)
+    local keys = d:get_keys(SCAN_LIMIT)
 
     local metrics = {}
     local function family(name)
@@ -1143,6 +1276,14 @@ function _M.prometheus_text()
         end
         return f
     end
+
+    -- 截断必须可见，否则这是一次指标悄悄变少的故障。它不能只走 gauge()：那一行在取
+    -- keys 的时刻还不存在，于是本轮渲染的永远是上一拍的答案。所以直接登记进 family，
+    -- 同时 set 回字典给下一拍。
+    local truncated = (#keys >= SCAN_LIMIT) and 1 or 0
+    local truncated_label = label_pairs({ { "dict", STATS_DICT } })
+    family("smg_dict_scan_truncated").gauges[truncated_label] = truncated
+    d:set("g|smg_dict_scan_truncated|" .. truncated_label, truncated)
 
     local tracker_on = _M.inflight_enabled()
     for i = 1, #keys do

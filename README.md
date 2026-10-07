@@ -299,11 +299,16 @@ watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连�
 | `SMG_CACHE_THRESHOLD` | `0.3` | cache_aware 前缀命中率门槛，越低越粘 |
 | `SMG_BALANCE_ABS_THRESHOLD` / `SMG_BALANCE_REL_THRESHOLD` | `64` / `1.5` | 负载失衡双阈值，触发时暂时放弃亲和 |
 | `SMG_MAX_TREE_SIZE` | `67108864` | 基数树容量上限 |
+| `SMG_MAX_TREE_NODES` | `200000` | **每棵**基数树的节点数上限（doc/gap-cpu-idle-burn.md）。`SMG_MAX_TREE_SIZE` 的语义是「每租户＝每 worker URL 的字符数」，同一批 worker 可以合法地各背满它，也没有任何一维约束节点个数；真正把单转发核与 RSS 压垮的是节点数。`<=0` 关掉这一维 |
+| `SMG_EVICT_BUDGET` | `0` | 单拍最多弹多少个叶子（增量淘汰的硬上界，`0`＝缺省 2000）。树已经失控时，没有预算的那一拍本身就能占秒级核时 |
+| `SMG_POLICY_INSTANCE_TTL_SECS` | `1800` | 策略实例空闲多久**之后**可被回收（只回收「worker 池与热配置都不再声明该名字」的实例；`0` 关闭回收）。历史上 `_M.instances` 只加不减：`router/candidates.lua` 的 profile-forced 路径绕过 `for_model` 的回收分支 |
 | `SMG_PREFIX_TOKEN_COUNT` / `SMG_PREFIX_HASH_LOAD_FACTOR` | `256` / `1.25` | prefix_hash（Lua 按字符数截断，Rust 按 token 数——已知口径差） |
 | `SMG_BUCKET_ADJUST_INTERVAL_SECS` | `5` | bucket 边界重算节拍 |
 | `SMG_EVICTION_INTERVAL_SECS` / `SMG_MAX_IDLE_SECS` | `120` / `14400` | 淘汰定时器 / manual 粘性映射闲置回收 |
 | `SMG_ASSIGNMENT_MODE` | `random` | manual 的分配模式，另有 `min_load` `min_group` |
 | `LR_SNAPSHOT_MAX_BYTES` | `3 MiB` | cache_aware 树快照写入 `lr_policy` 的上限，超限跳过 |
+| `LR_MODEL_LABEL_CAP` | `300` | `lr_stats` 里 distinct `model` 标签值的上限。`lr_stats` 的 c|h|g| 行全仓没有任何 delete，而 model 的取值空间由客户端决定；越预算的新名字并进同一个 `other=` 行。`0` 关闭（原名照落）。当前基数看 `smg_model_label_cardinality` |
+| `LR_METRICS_SCAN_LIMIT` | `20000` | `/metrics` 与功率读数一次共享字典扫描的行数上限（`get_keys(0)` 是整字典同步遍历，在 `worker_processes 1` 的进程里每 10～15s 的 scrape 都要付一次）。被截断时 `smg_dict_scan_truncated{dict=...}=1`，不会静默变少 |
 
 ### 健康检查 / 熔断 / 重试 / 上游连接
 
@@ -434,6 +439,15 @@ socket→pid→cmdline 解析（`gpu_from_cmdline` 读 `--device-id N`，其次 
 body 形态做注册时改名（watcher 在进程内，`/_ui/config/model-map` 与管理台的改名直接调这个模块，无外部 watcher 地址需要配置）。其余旋钮：`SMG_WATCHER_PROBE_TIMEOUT_SECS`(4)、
 `SMG_WATCHER_REMOVE_GRACE_SECS`(300)、`SMG_WATCHER_MAX_MODELS`(8)、
 `SMG_WATCHER_KEEP_LAST_GRACE_SECS`(1800)。指标：`lr_watch_*` 家族。
+
+每轮探测的三条硬预算（doc/gap-cpu-idle-burn.md CPU 线第 1 条）：`SMG_WATCHER_MAX_CANDIDATES`(32)
+限制一轮探测多少个**新**候选（台账里的活体 worker 排在探测队列的豁免前缀，永远全探，
+摘除判定不会被预算饿到）、
+`SMG_WATCHER_PASS_BUDGET_SECS`(5，被 `interval_secs` 封顶)限制一轮的墙钟、
+`SMG_WATCHER_PROBE_FANOUT`(8，1..32)是探测协程池宽度。被切掉的候选算「网关本轮什么都没说」
+而不是「服务不可达」（不计 `probe_fails`、不推进 `missing_since`），规模看
+`lr_watch_probe_budget_skips_total`。21.k 这类 65 个 LISTEN 端口的机器上的完整
+`SMG_WATCHER_DENY_PORT` 建议清单见 [doc/gap-watcher-deny-21k.md](doc/gap-watcher-deny-21k.md)。
 
 ### mesh / HA 集群（`SMG_ENABLE_MESH`，缺省关）
 

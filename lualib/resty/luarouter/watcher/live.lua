@@ -79,10 +79,25 @@ end
 ---@param urls string[]
 ---@param opts table @ classify options (fetch injected here)
 ---@param fanout number|nil
+---@param deadline number|nil @ ngx.now()-based wall deadline; past it the **remaining**
+---        candidates are not dialled at all, except the exempt prefix.
+---@return table @ url -> true for candidates the budget never dialled. A **set of
+---        urls, not a count**: it is the only way to tell "the gateway did not dial
+---        this one" apart from "we dialled it and the transport said nothing", and
+---        reconcile's hysteresis depends on exactly that difference.
 ---@return table @ url -> info|nil
 ---@return table @ url -> classify() rejection reason (nil when the probe itself raised)
-local function probe_pool(urls, opts, fanout)
+---@param protected number|nil @ leading urls the deadline may not cut (owned ledger)
+local function probe_pool(urls, opts, fanout, deadline, protected)
     local results, reasons, next_index = {}, {}, 0
+    local cut = {}
+    -- Index the budget may cut from. Everything before it is the owned ledger, whose
+    -- verdict is what removal bookkeeping reads, so the budget can only ever trim the
+    -- unknown tail. One list rather than two pools is deliberate: the two-pool version
+    -- of this knob dropped the owned results on the way back, so every live owned worker
+    -- answered "no verdict" and reconcile deleted healthy workers
+    -- (e2e_watcher guards 3/4).
+    local first_cuttable = (protected or 0) + 1
     local function one(url)
         local info, reason = _M.classify(url, opts)
         results[url] = info
@@ -90,9 +105,16 @@ local function probe_pool(urls, opts, fanout)
     end
     if not has_ngx or type(ngx.thread) ~= "table" or #urls == 0 then
         for i = 1, #urls do
+            if deadline and i >= first_cuttable and _G.os.time() > deadline then
+                -- 纯 Lua 单测路径没有 cosocket 可等，预算只能按整秒判定
+                for j = i, #urls do
+                    cut[urls[j]] = true
+                end
+                break
+            end
             one(urls[i])
         end
-        return results, reasons
+        return cut, results, reasons
     end
     local width = math.max(1, math.min(fanout or 8, #urls))
     local threads = {}
@@ -102,6 +124,14 @@ local function probe_pool(urls, opts, fanout)
                 next_index = next_index + 1
                 local index = next_index
                 if index > #urls then
+                    return
+                end
+                if deadline and index >= first_cuttable and ngx.now() > deadline then
+                    -- 队列剩余部分整段切掉。已经拿到 index 的协程照常答完自己那一个，
+                    -- 所以池子是会 drain 的，不会挂在截止点上。
+                    for j = index, #urls do
+                        cut[urls[j]] = true
+                    end
                     return
                 end
                 local ok, err = pcall(one, urls[index])
@@ -119,7 +149,7 @@ local function probe_pool(urls, opts, fanout)
     for i = 1, #threads do
         pcall(ngx.thread.wait, threads[i])
     end
-    return results, reasons
+    return cut, results, reasons
 end
 
 -- ----------------------------------------------------------- registry adapters
@@ -311,6 +341,67 @@ end
 
 -- ------------------------------------------------------------------ one pass
 
+---Reason string handed to classify() for a candidate the pass budget cut.
+---It travels through the existing "says nothing" channel on purpose:
+---probe_verdict returns nil for it (watcher/probe.lua), so a budgeted probe is
+---never mistaken for an unreachable service.
+local PROBE_BUDGET_REASON = "probe skipped: pass budget"
+
+---Latch for the one-line WARN about a budget-cut pass. State flips are rare, so this
+---is the whole dedup.
+local probe_budget_warned = false
+
+---Split the candidate list into the order it is probed in and the part the pass
+---budget cuts. Pure (no ngx, no dict, no HTTP) so the split itself is unit-testable:
+---the shape this function returns is exactly what protects the owned pool and what
+---the probe() closure later reads back, and a mistake here is invisible on the wire
+---until a healthy worker is (or is not) evicted.
+---@param urls string[] @ deduplicated, self/exclude-filtered candidates
+---@param owned_set table @ url -> true for the ledger-owned pool
+---@param max_new number @ 0/unbounded keeps the tail; N caps the **non-owned** part
+---@return string[] probe_order @ owned first, then the fresh tail
+---@return number protected @ how many leading entries the deadline may not cut
+---@return table cut @ url -> true for candidates never dialled
+function _M.plan_probes(urls, owned_set, max_new)
+    -- Owned urls only ever come from the filtered candidate list: the ledger can hold
+    -- a url that is now the router's own listener or matches an exclude pattern, and
+    -- re-adding it here would dial exactly the ports the filter above exists to skip.
+    local present = {}
+    for i = 1, #urls do
+        present[urls[i]] = true
+    end
+    local owned, fresh = {}, {}
+    for url in pairs(owned_set or {}) do
+        if present[url] then
+            owned[#owned + 1] = url
+        end
+    end
+    for i = 1, #urls do
+        if not owned_set[urls[i]] then
+            fresh[#fresh + 1] = urls[i]
+        end
+    end
+    -- Stable order, both halves: the budget is then spent on the same candidates round
+    -- after round instead of on whichever source happened to append first, and the
+    -- owned prefix is what makes the deadline unable to starve removal bookkeeping.
+    table.sort(owned)
+    table.sort(fresh)
+    local cut = {}
+    if max_new > 0 and #fresh > max_new then
+        for i = #fresh, max_new + 1, -1 do
+            cut[fresh[i]] = true
+            fresh[i] = nil
+        end
+    end
+    local order = {}
+    for i = 1, #owned do
+        order[#order + 1] = owned[i]
+    end
+    for i = 1, #fresh do
+        order[#order + 1] = fresh[i]
+    end
+    return order, #owned, cut
+end
 ---Run one reconcile pass against the live registry.
 ---@param cfg table @ watcher config from new_config
 ---@param opts table|nil @{reader, fanout} (tests inject the /proc reader)
@@ -330,6 +421,7 @@ function _M.run_pass(cfg, opts)
     -- pure layer calls probe(url) per candidate, and a second HTTP round trip per
     -- URL would double the cost of a pass.
     local urls = {}
+    local seen = {}
     for i = 1, #candidates do
         -- Filter before dialing. reconcile() applies the same two tests, so this is
         -- only about what a pass costs - and skipping the router's own listeners is
@@ -338,18 +430,63 @@ function _M.run_pass(cfg, opts)
         -- /metrics scrape would then be counting the watcher watching itself.
         local cand = candidates[i]
         if cand and cand.url and not _M.is_self_url(cand.url, cfg.self_ports)
-            and not _M.is_excluded(cand.url, cfg.exclude_patterns) then
-            urls[#urls + 1] = candidates[i].url
+            and not _M.is_excluded(cand.url, cfg.exclude_patterns)
+            and not seen[cand.url] then
+            seen[cand.url] = true
+            urls[#urls + 1] = cand.url
         end
     end
+
+    -- Per-pass probe budget: SMG_WATCHER_MAX_CANDIDATES / SMG_WATCHER_PASS_BUDGET_SECS.
+    -- What this protects is the single forwarding core. On 21.k the box has 128 LISTEN
+    -- sockets and the deny list covers about 39 of them, so an unbudgeted pass dials
+    -- 70-90 candidates x up to 6 serial GETs with a 4s timeout, every 15s, forever,
+    -- with no traffic involved at all (doc/gap-cpu-idle-burn.md, CPU line item 1).
+    local budget_secs = tonumber(cfg.pass_budget_secs) or 0
+    local deadline
+    if budget_secs > 0 then
+        deadline = now + budget_secs
+    end
+    local max_new = tonumber(cfg.max_candidates) or 0
+
+    -- Owned urls are always probed, outside both the count and the deadline: their
+    -- verdict is what removal bookkeeping reads. Starve that and a dead worker keeps
+    -- its pool row (the zombie the watcher exists to prevent), while an unbudgeted
+    -- unknown tail is what costs the single forwarding core on a busy box. So the
+    -- budget trims the tail and cannot trim the pool.
+    local owned_set = {}
+    for url in pairs(ledger.owned_urls()) do
+        owned_set[url] = true
+    end
+    local probe_order, protected, cut = _M.plan_probes(urls, owned_set, max_new)
+
     local fetch = make_fetch(math.floor((cfg.probe_timeout_secs or 4) * 1000))
-    local probed, reasons = probe_pool(urls, {
+    local probe_opts = {
         fetch = fetch,
         require_health = cfg.require_health,
         max_models = cfg.max_models,
         allow_models_only = cfg.allow_models_only,
-    }, opts.fanout)
-
+    }
+    local cut_deadline, probed, reasons = probe_pool(probe_order, probe_opts,
+        opts.fanout or cfg.probe_fanout, deadline, protected)
+    for url in pairs(cut_deadline) do
+        cut[url] = true
+    end
+    local skipped = 0
+    for _ in pairs(cut) do
+        skipped = skipped + 1
+    end
+    if skipped > 0 and not probe_budget_warned then
+        -- One line per state change, not per pass: a box with a hundred listeners cuts
+        -- every round, and the pass log already carries the numbers.
+        probe_budget_warned = true
+        ngx.log(ngx.WARN, "luarouter: watcher pass budget cut ", skipped,
+            " candidate probe(s): SMG_WATCHER_MAX_CANDIDATES=", tostring(max_new),
+            ", SMG_WATCHER_PASS_BUDGET_SECS=", tostring(budget_secs),
+            ", pass so far ", string.format("%.2f", ngx.now() - now), "s")
+    elseif skipped == 0 then
+        probe_budget_warned = false
+    end
     local state = {
         cfg = cfg,
         ledger = ledger,
@@ -362,6 +499,13 @@ function _M.run_pass(cfg, opts)
         probe = function(url)
             -- Second return value is the classify() rejection reason: reconcile
             -- cannot decide what to do with a "no" unless it knows which "no" it was.
+            -- Only a url this pass never dialled answers with the budget reason: that is
+            -- the gateway saying nothing, so probe_verdict maps it to nil and neither
+            -- probe_fails nor the missing_since clock moves. A url that *was* dialled
+            -- keeps its own classify() reason, including a deterministic rejection.
+            if cut[url] then
+                return nil, PROBE_BUDGET_REASON
+            end
             return probed[url], reasons[url]
         end,
         register = make_register(conf),
@@ -372,6 +516,7 @@ function _M.run_pass(cfg, opts)
             reconciles = 0, adds = 0, add_fails = 0, removes = 0,
             discovered = 0, adds_stuck_released = 0,
             probe_failures = 0, probe_removes = 0, probe_fuse_skips = 0,
+            probe_budget_skips = skipped,
             -- 逐卡归属补给的观测量（observability 不新增 series：这俩只在 pass 日志与
             -- 探针里看，Grafana 那边 lr_watch_* 家族的口径不动）。
             gpu_labels_patched = 0, gpu_label_fails = 0,

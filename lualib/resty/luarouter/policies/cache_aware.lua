@@ -20,9 +20,24 @@ local DEFAULTS = {
     balance_rel_threshold = 1.1,
     eviction_interval_secs = 30,
     max_tree_size = 10000,
+    -- 每棵树的**节点数**上限。原先只有 max_tree_size，而它的语义是「每租户字符数」
+    -- （见 tree.lua evict_tenant_by_size 的 used <= max_size 判定，tenant 就是 worker
+    -- URL）：同一批 worker URL 可以合法地各背满 max_tree_size 字符，且没有任何一维
+    -- 约束节点个数，而真正压垮单核与 RSS 的是节点数。0 = 不设这一维（兼容旧部署）。
+    max_tree_nodes = 200000,
+    -- 单次淘汰最多弹多少个叶子。0 用 tree.lua 的缺省预算（2000）。
+    -- 淘汰改成增量是为了让单 tick 有硬上界：树失控时原先那一拍要弹空整棵堆，
+    -- 在 worker_processes 1 的进程里那就是秒级的转发核占用。
+    evict_budget = 0,
 }
 
 _M.DEFAULTS = DEFAULTS
+
+-- 与 tree.lua 的粗筛系数同一口径：一条快照条目在 JSON 里至少是
+-- "t":"<text>","tnt":"<url>","e":<n> 这个壳，序列化后按 3 倍字符数估。
+-- 预算是**边遍历边扣**的（serialize），所以这里只需要和 tree 那边保持同一系数，
+-- 不需要再精算 —— 精算的那次 cjson.encode 就是本次要消掉的分配峰值。
+local SNAPSHOT_JSON_SLACK = 3
 
 --------------------------------------------------------------------------
 -- 树 key：pool::model（对齐 make_tree_key / tree_key_for_worker）
@@ -110,11 +125,25 @@ function CacheAware:remove_worker_by_url(url)
 end
 
 --- 定时淘汰全部树（由 init_worker 定时器调用，对齐 PeriodicTask 里的 eviction 线程）
-function CacheAware:evict_all(max_tree_size)
+---
+--- 返回「是否还有树没清完」，让调用方（policy.lua sweep_standalone）知道下一拍要继续，
+--- 而不是在本拍里死磕：单 worker 进程里这两件事的区别就是「延迟追平」与「卡死核」。
+---@param max_tree_size number|nil @ 覆盖每租户字符上限
+---@param max_tree_nodes number|nil @ 覆盖节点数上限（nil 用 config.max_tree_nodes）
+---@param budget number|nil @ 每棵树单次最多弹多少个叶子
+---@return boolean more_work
+function CacheAware:evict_all(max_tree_size, max_tree_nodes, budget)
     local max_size = max_tree_size or self.config.max_tree_size
+    local max_nodes = max_tree_nodes or self.config.max_tree_nodes or 0
+    local pops = budget or self.config.evict_budget or 0
+    if pops < 1 then pops = nil end
+    local more = false
     for _, tree in pairs(self.trees) do
-        tree:evict_tenant_by_size(max_size)
+        if tree:evict_tenant_by_size(max_size, max_nodes, pops) then
+            more = true
+        end
     end
+    return more
 end
 
 --- 失衡时选 min load（并列随机），并且【同样写树】（对齐 select_worker_min_load）
@@ -231,12 +260,67 @@ function CacheAware:needs_request_text()
     return true
 end
 
---- 快照 / 恢复（per-process 表 + lr_policy JSON 落盘用）
-function CacheAware:serialize()
-    local trees = {}
-    for key, tree in pairs(self.trees) do
-        trees[key] = tree:serialize()
+---本进程亲和状态的体量：树数 / 节点总数 / 字符总数。
+---两件事依赖它：(1) policy.lua 的 publish_gauges 把它发成 smg_cache_aware_tree_*，
+---下次不用再去抠 smaps_rollup 猜「是不是又长大了」；(2) save_snapshot 超限时把体量
+---打进 WARN，运维当场能判断是「一长棵失控树」还是「几百棵各自合法的树」。
+---@return number trees, number nodes, number chars
+function CacheAware:tree_stats()
+    local n, c, t = 0, 0, 0
+    for _, tree in pairs(self.trees) do
+        t = t + 1
+        n = n + (tree.live_nodes or 0)
+        c = c + (tree.live_chars or 0)
     end
+    return t, n, c
+end
+
+---便捷读数（超限日志用）。
+---@return number
+function CacheAware:tree_node_count()
+    local _, n = self:tree_stats()
+    return n
+end
+
+--- 快照 / 恢复（per-process 表 + lr_policy JSON 落盘用）
+---
+--- max_chars 是**整份快照**的字节预算（按 JSON 计），逐棵树摊派：每棵拿到剩余预算，
+--- 任何一棵超了就整份放弃。不传 = 不设预算（单测与 mesh 内部调用保持旧行为）。
+---@param max_chars number|nil
+---@return table|nil snapshot
+function CacheAware:serialize(max_chars)
+    local trees = {}
+    local left = max_chars
+    for key, tree in pairs(self.trees) do
+        local snap
+        if left == nil then
+            snap = tree:serialize()
+        else
+            -- 每棵多留 64 字节给 "<key>":{...} 这层壳；判 nil 而不是 0，
+            -- 是因为 tree:serialize 把「超预算」与「空树」都返回 nil/空表要分开看
+            snap = tree:serialize(math.max(0, left - 64))
+        end
+        if left ~= nil and snap == nil then
+            -- 这棵塞不进预算：整份放弃，不做无谓 encode。超限标志挂在这里（而不是
+            -- 只留在 tree 上），save_snapshot 才知道该说那一句 WARN。
+            self.snapshot_oversized = true
+            return nil
+        end
+        trees[key] = snap
+        if left ~= nil then
+            local n = 0
+            for i = 1, #(snap.leaves or {}) do
+                local e = snap.leaves[i]
+                n = n + #(e.t or "") + #(e.tnt or "") + 24
+            end
+            left = left - n * SNAPSHOT_JSON_SLACK
+            if left <= 0 then
+                self.snapshot_oversized = true
+                return nil
+            end
+        end
+    end
+    self.snapshot_oversized = false
     return { policy = "cache_aware", trees = trees }
 end
 
@@ -251,17 +335,31 @@ function CacheAware:restore(snapshot)
 end
 
 --- 快照 → JSON 文本（无 cjson 时返回 nil，调用方降级为不落盘）
+---
+--- 预算必须**传到 serialize 里去边走边估**：原先是先把整棵树拼成条目表 +
+--- cjson.encode 成一个几 MB 的字符串，**然后才**判 #text > max_bytes 并丢弃。也就是说
+--- 树越大，那一次注定被扔掉的分配就越大 —— 单 worker 进程每 120s 制造一次数百 MB 垃圾
+--- 正是这个形状（doc/gap-cpu-idle-burn.md 的 CPU 线与内存线在这里交汇）。现在超预算的
+--- 树在 DFS 阶段就被拒，条目表都不建，encode 只作用于预算内的结构。
+---@param max_bytes number|nil
+---@return string|nil
 function CacheAware:encode_snapshot(max_bytes)
     local ok_cjson, cjson = pcall(require, "cjson.safe")
     if not ok_cjson then
         return nil
     end
-    local text = cjson.encode(self:serialize())
+    local snapshot = self:serialize(max_bytes)
+    if snapshot == nil then
+        return nil            -- 树太大：放弃本次落盘，等淘汰后再试（见 snapshot_oversized）
+    end
+    local text = cjson.encode(snapshot)
     if type(text) ~= "string" then
         return nil
     end
     if max_bytes and #text > max_bytes then
-        return nil            -- 树太大：放弃本次落盘，等淘汰后再试
+        -- 粗筛用的系数偏保守，真超了同样放弃；这条只是最后一道闸，不该是主路径
+        self.snapshot_oversized = true
+        return nil
     end
     return text
 end

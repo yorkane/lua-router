@@ -164,6 +164,11 @@ function _M.probe_verdict(reason)
     if reason == "no probe transport" or reason == "no usable /health endpoint" then
         return nil
     end
+    if reason == "probe skipped: pass budget" then
+        -- 网关自己没拨这一发（本轮预算切掉了它），不是这台服务的结论：既不计入滞回，
+        -- 也不推进 missing_since 宽限。与 no probe transport 同一通道。
+        return nil
+    end
     if reason == "/v1/models answers without data[].id"
         or reason == "it is a router, not a worker"
         or string.find(reason, "advertises ", 1, true) == 1 then

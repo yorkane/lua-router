@@ -65,8 +65,14 @@ local mt = { __index = _M }
 ---Every policy instance this process has built, keyed by name_instance()
 ---("<policy>:<model>"). The eviction sweep walks it so a per-model policy gets the
 ---same LRU maintenance as the default one, and _M.for_model uses it as its cache.
----Entries stay for the life of the process (they carry affinity state) and the
----model cardinality is bounded by the worker set.
+---Entries used to stay for the life of the process (they carry affinity state) on the
+---assumption that model cardinality is bounded by the worker set. That assumption is
+---what let the leak through (doc/gap-cpu-idle-burn.md S2): router/candidates.lua builds
+---the profile-forced and group-entry instances *outside* the for_model has_workers path,
+---so a name that only ever existed in an operator profile — or that a client typed into
+---a request body — kept its entry, and with it a whole affinity tree, until the process
+---restarted. sweep_max_idle now reclaims entries idle past cfg.policy_instance_ttl_secs
+---whose model/entry no longer has a worker and is no longer declared in the config.
 _M.instances = {}
 
 -- ------------------------------------------------------------------ helpers
@@ -77,6 +83,22 @@ local function random_index(n)
     end
     return math.random(1, n)
 end
+
+---Wall clock for idle bookkeeping: ngx.now inside a worker (cheap, monotone enough for
+---a TTL), os.time for pure-Lua unit runs where ngx is absent.
+local function now_secs()
+    if ngx and type(ngx.now) == "function" then
+        return ngx.now()
+    end
+    return os.time()
+end
+
+---Shared-dict scan ceiling for the gauge sweeps. ngx.shared:get_keys(0) walks the whole
+---dictionary while the single worker is held up; every get_keys call in this file is a
+---counting shortcut, not a correctness surface, so a bound trades a slightly low count
+---for a hard upper bound on per-tick cost. 4096 rows is far above the manual-map
+---cardinality observed in production (a few hundred routing keys).
+local DICT_SCAN_LIMIT = 4096
 
 --- Lowest-load entry, ties broken at random (manual's min_load mode).
 local function select_min(candidates, get_value)
@@ -264,6 +286,11 @@ local function build_module(name, cfg)
             balance_rel_threshold = cfg.balance_rel_threshold,
             eviction_interval_secs = cfg.eviction_interval_secs,
             max_tree_size = cfg.max_tree_size,
+            -- 节点数维度与单次淘汰预算必须一起递下去：cache_aware.DEFAULTS 里的值只在
+            -- 调用方没给 config 时生效，而这里给了 policy_cfg，缺字段就等于悄悄用默认，
+            -- 操作员设的 SMG_MAX_TREE_NODES 会读不到（与 SMG_WATCHER_ALLOW_PORT 同一课）。
+            max_tree_nodes = cfg.max_tree_nodes,
+            evict_budget = cfg.evict_budget,
         }
     elseif name == "bucket" then
         policy_cfg = {
@@ -617,6 +644,11 @@ end
 ---Write the tree snapshot back into lr_policy. Skipped when the dump is larger
 ---than the budget (encode_snapshot returns nil) so a full dict cannot be pushed
 ---out by an oversized tree; the next sweep after eviction may fit.
+---
+---超限要说一句话：原先这里静默 return false，于是「快照连续几小时没落盘」与「快照正常」
+---在日志里长得一模一样，而前者意味着亲和状态已经大到塞不进预算 —— 正是本次事故最需要
+---提前看到的信号。按实例去重，只在状态翻转时各说一次（进入超限 WARN 一次，恢复后
+---INFO 一次），120s 一拍也不会把日志刷爆。
 ---@return boolean written
 function _M:save_snapshot()
     local impl = self.impl
@@ -626,7 +658,19 @@ function _M:save_snapshot()
     local max_bytes = self.cfg.snapshot_max_bytes or SNAPSHOT_MAX_BYTES
     local text = impl:encode_snapshot(max_bytes)
     if not text then
+        if not impl.snapshot_oversized_warned then
+            impl.snapshot_oversized_warned = true
+            ngx.log(ngx.WARN, "luarouter: ", self:name_instance(),
+                " snapshot skipped: affinity state exceeds the ", max_bytes,
+                " byte budget (tree nodes=", tostring(impl:tree_node_count()),
+                "); will retry after eviction")
+        end
         return false
+    end
+    if impl.snapshot_oversized_warned then
+        impl.snapshot_oversized_warned = nil
+        ngx.log(ngx.INFO, "luarouter: ", self:name_instance(),
+            " snapshot fits again after eviction")
     end
     local ok, err = dict():set(self:snapshot_key(), text)
     if not ok then
@@ -644,6 +688,12 @@ function _M:select(ctx)
     -- Decision point: router calls policy_for(model):select(...) in one
     -- expression, so the instance that decides is stamped from the same model
     -- the request will be logged against.
+    -- Idle bookkeeping for the instance reclaimer (see sweep_max_idle): stamped on
+    -- *entry* rather than on success, because "this name is still in use" is the
+    -- question the reclaimer asks. A name whose every request fails still must not be
+    -- dropped under the TTL, or the client would keep losing its affinity state.
+    self.last_used = now_secs()
+    self.select_count = (self.select_count or 0) + 1
     if self == _M.default and store_ok then
         stamp_global(self, ctx.model)
     end
@@ -734,28 +784,59 @@ function _M:on_remove(worker_record)
     end
 end
 
+---只采集本实例的亲和体量，**不**自己发 gauge。
+---
+---体量是**进程级**的事实：一个进程里活着的树散落在 _M.instances 的各个实例上，而
+---smg_cache_aware_* 这几个 gauge 没有 label，于是「每个实例各发一次」等于让
+---pairs() 的遍历顺序决定谁覆盖谁——线上看到的是任意一个实例的数字。三个实例时
+---默认实例里装着全部真实请求的树，却被最后遍历到的空实例报成 0，读数正好和
+---「树是空的」一模一样，而这组 gauge 存在的全部意义就是让人看出它又长大了。
+---所以这里只返回累加量，由 sweep_max_idle 跨实例求和后统一发一次。
+---@return number tenants, number trees, number nodes, number chars
+function _M:collect_affinity_stats()
+    if not (self.impl and self.impl._policy_name == "cache_aware") then
+        return 0, 0, 0, 0
+    end
+    local tenants = 0
+    for _, tree in pairs(self.impl.trees or {}) do
+        for _ in pairs(tree:get_tenant_char_count()) do
+            tenants = tenants + 1
+        end
+    end
+    local tcount, nodes, chars = self.impl:tree_stats()
+    return tenants, tcount, nodes, chars
+end
+
+---把本进程**所有**实例的亲和体量求和后发一次 gauge。
+---
+---独立成函数而不是塞在 sweep 的循环里，是为了让它能在单测里被直接驱动：这条契约
+---（求和、只发一次）正是「gauge 被空实例覆盖」那个缺陷的回归点。
+function _M.publish_affinity_gauges()
+    local tenants, trees, nodes, chars = 0, 0, 0, 0
+    for _, inst in pairs(_M.instances or {}) do
+        local it, ic, inn, ich = inst:collect_affinity_stats()
+        tenants = tenants + it
+        trees = trees + ic
+        nodes = nodes + inn
+        chars = chars + ich
+    end
+    observability.gauge("smg_cache_aware_tenant_count", {}, tenants)
+    observability.gauge("smg_cache_aware_tree_count", {}, trees)
+    observability.gauge("smg_cache_aware_tree_nodes", {}, nodes)
+    observability.gauge("smg_cache_aware_tree_chars", {}, chars)
+end
+
 ---Expose the manual policy cache size, mirroring the Rust gauge. Method form:
 ---the sweep calls inst:publish_gauges().
 function _M:publish_gauges()
-    -- cache_aware publishes its tenant footprint so the Logs page can show how
-    -- much affinity state each process is carrying (Rust has no such gauge).
-    if self.impl and self.impl._policy_name == "cache_aware" then
-        local trees = self.impl.trees or {}
-        local tenants = 0
-        for _, tree in pairs(trees) do
-            local counts = tree:get_tenant_char_count()
-            for _ in pairs(counts) do
-                tenants = tenants + 1
-            end
-        end
-        observability.gauge("smg_cache_aware_tenant_count", {}, tenants)
-    end
     if self.name ~= "manual" then
         return
     end
     local d = dict()
     local count = 0
-    local keys = d:get_keys(0)
+    -- 见 DICT_SCAN_LIMIT：lr_policy 除 manual: 还有 rr:/snapshot:/policy:generation 这些
+    -- 只增不减的行，整字典扫描的长度不由被数的东西决定，而由字典历史上写过多少行决定。
+    local keys = d:get_keys(DICT_SCAN_LIMIT)
     for i = 1, #keys do
         if keys[i]:sub(1, 7) == "manual:" then
             count = count + 1
@@ -768,21 +849,52 @@ end
 
 local eviction_started = false
 
+---Gap between two eviction ticks when the previous one ran out of its leaf budget.
+---With worker_processes 1 the tick and the forwarding share one core, so the gap is
+---the only thing that keeps requests from queueing behind a drain.
+local EVICT_CONTINUE_DELAY_SECS = 0.5
+
+---Set when a tick ran out of budget: the next tick is an eviction-only continuation
+---(no gauges, no snapshot, no boundary recompute). Module-level rather than a local
+---of the timer because sweep_standalone is the one that reports into it.
+local eviction_backlog = false
+
 ---Per-tick work for the standalone policies. cache_aware runs the LRU sweep the
 ---Rust eviction thread owns and then writes the tree snapshot back (evict first:
 ---the dump only fits once the tree shrinks). bucket recomputes its boundaries on
 ---its own, faster interval.
-local function sweep_standalone(inst)
+---@param inst table
+---@param evict_only boolean|nil @ true = run the eviction and skip the snapshot write,
+---        the boundary recompute and the gauge scans (see eviction_backlog)
+---@return boolean more_work @ eviction still has work left after this tick
+local function sweep_standalone(inst, evict_only)
     local impl = inst.impl
+    local more_work = false
     if not impl then
-        return
+        return more_work
     end
     if type(impl.evict_all) == "function" then
-        local ok, err = pcall(impl.evict_all, impl)
+        -- Budget and the node dimension come from cfg (the positional args win over
+        -- cache_aware's own config). What matters is catching more_work: once eviction
+        -- is incremental, "this tick did not finish" is the normal case, not an error,
+        -- and the caller decides whether to run another tick soon. The previous version
+        -- drained the whole heap in one tick, which under worker_processes 1 is seconds
+        -- of the single forwarding core (doc/gap-cpu-idle-burn.md, CPU line item 2).
+        local cfg = inst.cfg or {}
+        local ok, more = pcall(impl.evict_all, impl,
+            cfg.max_tree_size, cfg.max_tree_nodes, cfg.evict_budget)
         if not ok then
             ngx.log(ngx.ERR, "luarouter: ", inst:name_instance(),
-                " evict_all failed: ", tostring(err))
+                " evict_all failed: ", tostring(more))
+        elseif more then
+            more_work = true
         end
+    end
+    if evict_only then
+        -- A continuation tick evicts and does nothing else. Rescheduling 120 s ->
+        -- 0.5 s must not also multiply the frequency of the boundary recompute, the
+        -- per-instance gauge scans and the snapshot DFS; those stay on the interval.
+        return more_work
     end
     if inst._next_adjust == nil then
         inst._next_adjust = ngx.now()
@@ -800,6 +912,107 @@ local function sweep_standalone(inst)
             inst.cfg.bucket_adjust_interval_secs or 5)
     end
     inst:save_snapshot()
+    return more_work
+end
+
+---The set of model/entry names that are still alive: advertised by some worker,
+---plus whatever the operator declared in the hot config. The registry read is the
+---authoritative one and is **required**: an unreadable registry returns nil, which
+---makes the reclaimer a no-op. Only ever consulting the config document would be the
+---unsafe direction -- a worker pool seeded through SMG_WORKER_URLS (the 21.k shape),
+---or a config read that momentarily fails, would look like "no model exists", and the
+---sweep would then drop the affinity state of live traffic.
+---@return table|nil set @ name -> true, or nil when the worker set could not be read
+local function live_model_names()
+    local set = {}
+    local ok, models = pcall(registry.all_models)
+    if not ok or type(models) ~= "table" then
+        return nil
+    end
+    for i = 1, #models do
+        local name = models[i]
+        if type(name) == "string" and name ~= "" then
+            set[name] = true
+        end
+    end
+    if store_ok and type(store.models_document) == "function" then
+        local d_ok, rows = pcall(store.models_document)
+        if d_ok and type(rows) == "table" then
+            for i = 1, #rows do
+                local row = rows[i]
+                local name = type(row) == "table" and row.model or nil
+                if type(name) == "string" and name ~= "" then
+                    set[name] = true
+                end
+            end
+        end
+    end
+    return set
+end
+
+---Reclaim policy instances that nothing points at any more (doc/gap-cpu-idle-burn.md S2).
+---
+---An instance is only dropped when **all four** hold, which is what makes this safe to
+---run on the shared timer rather than behind a flag:
+---  * it is not the global default instance (that one is the fallback every request
+---    shares; dropping it would throw away affinity for models that never had a hint);
+---  * its model/entry name is not the default bucket;
+---  * no worker advertises that name and the hot config does not declare it either
+---    (so an operator-configured entry whose workers are all temporarily down keeps
+---    its tree, exactly like today);
+---  * no select has happened for cfg.policy_instance_ttl_secs (a name still receiving
+---    traffic is never touched, however odd its worker set looks).
+---When neither name source can be read the sweep does nothing at all: an unreadable
+---registry must not be allowed to wipe affinity. The snapshot rows in lr_policy are
+---deliberately left alone, so a model that comes back restores the same tree it had
+---before (same semantics as the for_model has_workers==false path).
+---@return number dropped
+function _M.reclaim_instances()
+    local cfg = (_M.default and _M.default.cfg) or nil
+    local ttl = cfg and tonumber(cfg.policy_instance_ttl_secs) or 0
+    if ttl <= 0 then
+        return 0
+    end
+    local names = live_model_names()
+    if not names then
+        return 0
+    end
+    local now = now_secs()
+    local doomed = {}
+    local total = 0
+    for key, inst in pairs(_M.instances or {}) do
+        total = total + 1
+        local model = inst.model
+        if inst ~= _M.default and type(model) == "string" and model ~= ""
+            and model ~= "default" and names[model] == nil
+            and (tonumber(inst.last_used) or 0) + ttl < now then
+            doomed[#doomed + 1] = key
+        end
+    end
+    for i = 1, #doomed do
+        local inst = _M.instances[doomed[i]]
+        -- Drop it only if the same object is still there: a concurrent re-select
+        -- could have replaced the entry (reconfigure swaps the key).
+        if inst and _M.instances[doomed[i]] == inst then
+            _M.instances[doomed[i]] = nil
+            ngx.log(ngx.INFO, "luarouter: reclaimed idle policy instance ", doomed[i])
+        end
+    end
+    return #doomed
+end
+
+---The tail of one eviction tick: drop what nothing points at, then say how many
+---instances survive. Its own function so a unit run can drive it without a timer
+---(test/unit/test_state_bounds.lua); the sweep calls it through pcall.
+---@return number alive
+function _M.sweep_tick_report()
+    pcall(_M.reclaim_instances)
+    local alive = 0
+    for _ in pairs(_M.instances or {}) do
+        alive = alive + 1
+    end
+    observability.gauge("smg_policy_instances", {}, alive)
+    return alive
 end
 
 local function sweep_max_idle(self_premature)
@@ -813,10 +1026,16 @@ local function sweep_max_idle(self_premature)
     -- pairs() yields keys, so the instance has to be the second variable: read as
     -- `for inst in pairs(...)` it walks the *names*, and indexing a string returns
     -- nil, which silently skips both the standalone sweep and the gauges.
+    local cont = eviction_backlog
+    eviction_backlog = false
     for _, inst in pairs(_M.instances or {}) do
         if inst.impl then
-            sweep_standalone(inst)
-            inst:publish_gauges()
+            if sweep_standalone(inst, cont) then
+                eviction_backlog = true
+            end
+            if not cont then
+                inst:publish_gauges()
+            end
         end
         if inst.name == "manual" then
             -- Touch every manual key so ngx.shared TTL expiry is the eviction
@@ -825,9 +1044,27 @@ local function sweep_max_idle(self_premature)
             inst:publish_gauges()
         end
     end
+    -- 亲和体量跨实例求和后只发一次（见 collect_affinity_stats 的注释：这些 gauge 没有
+    -- label，逐实例各发一次会让遍历顺序决定谁覆盖谁，读数会指向空实例而不是真正
+    -- 装着请求树的默认实例）。manual 那一族是每实例各自的名字，逐实例发是对的。
+    _M.publish_affinity_gauges()
+
     local inst = default_inst
-    local again, err = ngx.timer.at(inst and inst.eviction_interval_secs or 120,
-        sweep_max_idle)
+    local interval = inst and inst.eviction_interval_secs or 120
+    -- Incremental eviction makes "not finished this tick" the normal answer. Do not
+    -- drain the tree inside the tick -- that is the shape that pinned the core -- come
+    -- back early instead: the gap between ticks is what keeps forwarding unqueued while
+    -- a few ticks still catch up with the backlog.
+    if eviction_backlog then
+        interval = math.min(interval, EVICT_CONTINUE_DELAY_SECS)
+    else
+        -- The reclaim and the instance-count gauge ride the normal interval only: a
+        -- backlog tick is the cheap one. Wrapped so a broken reclaim can never stop
+        -- the timer (losing the sweep is worse than keeping one stale instance, and
+        -- the TTL bounds it as soon as the registry is readable again).
+        pcall(_M.sweep_tick_report)
+    end
+    local again, err = ngx.timer.at(interval, sweep_max_idle)
     if not again then
         eviction_started = false
         ngx.log(ngx.ERR, "luarouter: eviction timer stopped: ", tostring(err))

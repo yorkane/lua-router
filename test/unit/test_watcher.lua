@@ -1924,6 +1924,145 @@ do
     eq(stats.probe_removes or 0, 0, "and the pass records no probe eviction")
 end
 
+--------------------------------------------------------------------------
+-- 24. 每轮探测的预算闸门（doc/gap-cpu-idle-burn.md CPU 线第 1 条）
+--------------------------------------------------------------------------
+new_case("the per-pass probe budget knobs have defaults, overrides and clamps")
+do
+    local defaults = watcher.new_config(function() return nil end, 30000, 29000)
+    eq(defaults.max_candidates, 32, "32 fresh candidates per pass by default")
+    eq(defaults.pass_budget_secs, 5, "one pass costs at most 5 s of wall clock")
+    eq(defaults.probe_fanout, 8, "the probe pool is 8 wide")
+    -- 预算不得超过间隔：interval 缺省 15，所以 5 原样保留
+    eq(defaults.pass_budget_secs <= defaults.interval_secs, true,
+        "a pass cannot outlive its interval")
+
+    local overrides = watcher.new_config(function(name)
+        local table_of = {
+            SMG_WATCHER_INTERVAL_SECS = "60",
+            SMG_WATCHER_MAX_CANDIDATES = "5",
+            SMG_WATCHER_PASS_BUDGET_SECS = "30",
+            SMG_WATCHER_PROBE_FANOUT = "16",
+        }
+        return table_of[name]
+    end, 30000, 0)
+    eq(overrides.max_candidates, 5, "SMG_WATCHER_MAX_CANDIDATES override")
+    eq(overrides.pass_budget_secs, 30, "SMG_WATCHER_PASS_BUDGET_SECS override")
+    eq(overrides.probe_fanout, 16, "SMG_WATCHER_PROBE_FANOUT override")
+
+    -- 0 = 不限制（旧行为），不是"一个都不探"
+    local off = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_MAX_CANDIDATES" then return "0" end
+        if name == "SMG_WATCHER_PASS_BUDGET_SECS" then return "0" end
+        return nil
+    end, 30000, 0)
+    eq(off.max_candidates, 0, "an explicit 0 means unbudgeted")
+    eq(off.pass_budget_secs, 0, "and so does the wall-clock one")
+
+    -- 负数按"不限制"处理：钳成 0/负数的"一个都不探"会静默关掉整个发现层，
+    -- 那是比烧核更糟的故障形状，所以这一侧的钳制方向必须是往"关"而不是往"1"。
+    local neg = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_MAX_CANDIDATES" then return "-7" end
+        if name == "SMG_WATCHER_PASS_BUDGET_SECS" then return "-7" end
+        return nil
+    end, 30000, 0)
+    eq(neg.max_candidates, 0, "a negative count is the off switch, not a blackout")
+    eq(neg.pass_budget_secs, 0, "same for the wall clock")
+
+    -- 一轮墙钟不得超过间隔本身，否则 single-flight 锁会悄悄跳轮
+    local tight = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_INTERVAL_SECS" then return "4" end
+        if name == "SMG_WATCHER_PASS_BUDGET_SECS" then return "30" end
+        return nil
+    end, 30000, 0)
+    eq(tight.pass_budget_secs, 4, "the pass budget is clamped to the interval")
+
+    -- 池宽钳到 [1,32]：0 会让 probe_pool 一个候选都不拨
+    local wide = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_PROBE_FANOUT" then return "0" end
+        return nil
+    end, 30000, 0)
+    eq(wide.probe_fanout, 1, "fanout floors at 1")
+    local wider = watcher.new_config(function(name)
+        if name == "SMG_WATCHER_PROBE_FANOUT" then return "999" end
+        return nil
+    end, 30000, 0)
+    eq(wider.probe_fanout, 32, "fanout caps at 32")
+end
+
+new_case("a budget-cut probe is the gateway saying nothing, not the worker failing")
+do
+    -- run_pass 把被预算切掉的候选交给这条理由。它必须落在"与对方无关"那一档：
+    -- 既不计入摘除滞回、也不推进 missing_since 宽限，否则一次限流就会把活 worker 摘干净。
+    eq(watcher.probe_verdict("probe skipped: pass budget"), nil,
+        "the budget reason says nothing about the service")
+    eq(watcher.probe_verdict("probe skipped: pass budget"),
+        watcher.probe_verdict("no probe transport"),
+        "it sits in the same bucket as a missing transport")
+    -- 相邻文案不得误档：漏登记会掉进 "count"（攒两次就摘），那是最贵的错法。
+    eq(watcher.probe_verdict("probe skipped: nothing else"), "count",
+        "an unregistered probe-skipped wording stays conservative")
+end
+
+
+new_case("plan_probes: the owned prefix is exempt from both budget knobs")
+do
+    -- 每轮探测预算切错的代价不对称：切到台账活体 = 这一轮没人看过它，活 worker 会被摘
+    -- （或僵尸活得更久）；切到噪音尾巴只是少一轮观测。所以「尾巴可切、活体不可切」必须
+    -- 钉在最纯的一层（无 ngx、无字典、无端口）：在 live.run_pass 里切错，线上要几十轮才看得出来。
+    local urls = {}
+    for i = 1, 10 do
+        urls[#urls + 1] = "http://127.0.0.1:3" .. string.format("%02d", 20 + i)
+    end
+    local owned = { [urls[4]] = true, [urls[9]] = true }
+
+    local order, protected, cut = watcher.plan_probes(urls, owned, 0)
+    eq(#order, #urls, "unbudgeted: everything is dialled")
+    eq(protected, 2, "the exempt prefix is exactly the owned pool")
+    eq(order[1], urls[4], "owned first, in stable (sorted) order")
+    eq(order[2], urls[9], "both owned rows lead the list")
+    eq(next(cut) == nil, true, "and nothing is cut when the cap is off")
+
+    local order2, protected2, cut2 = watcher.plan_probes(urls, owned, 3)
+    eq(protected2, 2, "the cap never shrinks the owned prefix")
+    eq(#order2, 5, "owned + the capped fresh head")
+    eq(cut2[urls[4]], nil, "an owned url is never in the cut set")
+    eq(cut2[urls[9]], nil, "not even the owned row that sat mid-list")
+    local ncut = 0
+    for _ in pairs(cut2) do ncut = ncut + 1 end
+    eq(ncut, 5, "the trimmed tail is reported by name")
+    for i = 1, protected2 do
+        check(owned[order2[i]] == true,
+            "the protected prefix only ever holds owned rows", tostring(order2[i]))
+    end
+    for url in pairs(cut2) do
+        check(owned[url] == nil, "the budget cuts noise, never the pool", url)
+    end
+
+    -- 台账里躺着一行现在已被自端口/排除规则过滤掉的 url：plan_probes 必须再认一次候选集，
+    -- 否则等于绕过头顶那道过滤器去拨路由器自己（第二个真缺陷形状：自拨号）。
+    local order3, protected3 = watcher.plan_probes(
+        { "http://127.0.0.1:9001" }, { ["http://127.0.0.1:9000"] = true }, 0)
+    eq(#order3, 1, "a ledger row outside the filtered candidate set is not dialled")
+    eq(protected3, 0, "and it does not consume the protected prefix either")
+    eq(order3[1], "http://127.0.0.1:9001", "only the surviving candidate is probed")
+end
+
+new_case("a cut candidate says nothing; a dialled one keeps its own verdict")
+do
+    -- probe() 的取值顺序是这条修复的另一半：只有被预算切掉的 url 才回答「本轮没拨」。
+    -- 早先用整轮一个哨兵理由，会把「拨过但对端 5xx」一起吞掉 —— 那是滞回里最保守的一档，
+    -- 吞掉它就等于让永远 5xx 的 worker 长生不老。
+    local env = harness({ candidates = { candidate("http://127.0.0.1:8321") } })
+    env.probed["http://127.0.0.1:8321"] = nil
+    env.probe_reason["http://127.0.0.1:8321"] = "no /v1/models answer"
+    local info, reason = env.state.probe("http://127.0.0.1:8321")
+    eq(info, nil, "dialled-and-refused keeps the classify() reason")
+    eq(reason, "no /v1/models answer", "it is not masked by the budget reason")
+    eq(watcher.probe_verdict(reason), "count", "and it still counts toward eviction")
+end
+
+
 io.write(string.format("\n=== %d checks, %d failed ===\n", passed, failed))
 for i = 1, #failures do
     io.write("FAILED: " .. failures[i] .. "\n")

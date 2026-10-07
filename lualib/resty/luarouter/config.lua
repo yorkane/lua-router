@@ -184,7 +184,24 @@ function _M.load()
         balance_abs_threshold = num("SMG_BALANCE_ABS_THRESHOLD", 64),
         balance_rel_threshold = num("SMG_BALANCE_REL_THRESHOLD", 1.5),
         max_tree_size = num("SMG_MAX_TREE_SIZE", 67108864),
+        -- 亲和树的**节点数**上限（doc/gap-cpu-idle-burn.md）。max_tree_size 管的是
+        -- 「每租户（= 每个 worker URL）的字符数」，同一批 worker 可以合法地各背满它，
+        -- 于是总占用 = 树数 × 租户数 × max_tree_size，没有任何一维约束节点个数。
+        -- 单 worker 进程里真正把转发核压住的是节点数（每节点一张表 + 一份 prompt 尾巴），
+        -- 所以这里补一维。200000 的量级选择：每节点约 200-400 B，最坏约 60 MB/树，
+        -- 相对 8801 事故现场的 1.9 GB 是可接受的天花板；<=0 关闭这一维。
+        max_tree_nodes = num("SMG_MAX_TREE_NODES", 200000),
+        -- 单次淘汰最多弹多少个叶子（增量淘汰的硬上界）。0 = 用 tree.lua 的缺省 2000。
+        -- 这条是给「树已经失控」的现场用的：没有预算时那淘汰的一拍本身就能占秒级核时。
+        evict_budget = num("SMG_EVICT_BUDGET", 0),
 
+        -- 策略实例（_M.instances 里一条 <policy>:<模型/入口名>）的空闲回收 TTL。
+        -- 实例原本只在 for_model 的 has_workers==false 分支删除，而 router/candidates.lua
+        -- 的 profile-forced 路径直接 policy_mod.new 建实例，绕过那条回收 —— 于是每
+        -- 一个曾经出现过的入口名都留下一条实例，背后还挂着整棵亲和树。20h 的进程里
+        -- 这就是「没人记得它为什么还在」的那部分内存。<=0 关闭回收（回到旧行为）。
+        policy_instance_ttl_secs = num("SMG_POLICY_INSTANCE_TTL_SECS", 1800),
+        
         -- prefix_hash knobs (Rust --prefix-token-count / --prefix-hash-load-factor;
         -- the Lua tree counts characters, documented deviation).
         prefix_token_count = num("SMG_PREFIX_TOKEN_COUNT", 256),
@@ -380,8 +397,28 @@ function _M.validate(cfg)
     if cfg.load_metrics_path:sub(1, 1) ~= "/" then
         cfg.load_metrics_path = "/" .. cfg.load_metrics_path
     end
-    if cfg.max_retries < 0 then
-        cfg.max_retries = 0
+   if cfg.max_retries < 0 then
+       cfg.max_retries = 0
+   end
+    -- 亲和树闸门的取值边界。eviction_interval_secs 从来没有 >=1 的钳制（历史上就是个
+    -- 雷：设 0 就等于每拍重跑一遍全树淘汰 + 落盘），新加的两维不能踩同一个坑。
+    if cfg.eviction_interval_secs < 1 then
+        cfg.eviction_interval_secs = 1
+    end
+    if cfg.max_tree_nodes < 0 then
+        cfg.max_tree_nodes = 0
+    end
+    if cfg.max_tree_nodes > 5000000 then
+        cfg.max_tree_nodes = 5000000   -- 设到千万级就等于没设，且单拍成本失控
+    end
+    if cfg.evict_budget < 0 then
+        cfg.evict_budget = 0
+    end
+    if cfg.evict_budget > 200000 then
+        cfg.evict_budget = 200000
+    end
+    if cfg.policy_instance_ttl_secs < 0 then
+        cfg.policy_instance_ttl_secs = 0     -- 0/负数 = 不回收（兼容旧部署）
     end
     -- Pool knobs: Rust validation.rs rejects connect_timeout_secs == 0 and
     -- tcp_keepalive_secs == 0 outright (config/validation.rs:316-327). A Lua

@@ -158,6 +158,12 @@ function _M.new()
     local self = setmetatable({}, Tree)
     self.root = new_node("", nil)
     self.tenant_char_count = {}
+    -- 体积计数：非 root 节点的个数与它们的 text_chars 总和。
+    -- 存在的唯一理由是把「这棵树要不要淘汰」的判定从 O(全树 DFS 建堆) 降到 O(1) ——
+    -- 见 needs_eviction。单 worker 进程里这两个数就是亲和状态的体量，
+    -- 也由 publish_gauges 直接发成 gauge，免得下次再靠 smaps 猜。
+    self.live_nodes = 0
+    self.live_chars = 0
     return self
 end
 
@@ -199,6 +205,9 @@ function Tree:insert(text, tenant, epoch_override)
             node.tenant_last_access[tenant] = epoch
             self.tenant_char_count[tenant] = self.tenant_char_count[tenant] + remaining_chars
             prev.children[first] = node
+            self.live_nodes = self.live_nodes + 1
+            self.live_chars = self.live_chars + remaining_chars
+            self.node_evict_stalled = false         -- 同上：有新叶子就重新尝试节点维度
             return
         end
 
@@ -230,6 +239,8 @@ function Tree:insert(text, tenant, epoch_override)
             matched_node.text = suffix_text
             matched_node.text_chars = matched_chars - shared
             matched_node.parent = node
+            self.live_nodes = self.live_nodes + 1   -- 字符总量不变：前缀 + 后缀 = 原文
+            self.node_evict_stalled = false         -- 长出新节点，节点维度重新有得清
 
             -- 分裂节点是中间节点：补登记租户但不写 epoch
             if node.tenant_last_access[tenant] == nil then
@@ -302,8 +313,14 @@ function Tree:prefix_match_with_counts(text)
     end
 
     -- 1/8 概率回写时间戳（降低写放大；LRU 只需近似准确）
+    --
+    -- 但兜底的假租户 EMPTY_TENANT 不参与：它只是「这条路径还没人认领」的返回值，
+    -- 在 tenant_char_count 里根本没有条目，写进去既不产生 LRU 价值，又会永久堵住
+    -- detach_if_empty（该函数要求 tenant_last_access 为空才摘节点）。冷前缀越多，
+    -- 被这个槽位钉住的中间节点就越多 —— 骨架永不收缩的第二个原因。
+    -- 路由决策不变：返回值仍是 EMPTY_TENANT，cache_aware 那边照样落到 min load 分支。
     local epoch = next_epoch()
-    if epoch % 8 == 0 then
+    if epoch % 8 == 0 and tenant ~= EMPTY_TENANT then
         curr.tenant_last_access[tenant] = epoch
     end
 
@@ -352,7 +369,12 @@ function Tree:prefix_match_tenant(text, tenant)
 end
 
 --- 从父节点摘掉空节点（对齐 Rust 的 remove empty nodes）
-local function detach_if_empty(node)
+---
+--- 之所以是 Tree 方法而不是 local 函数：节点数/字符数是树上的字段，摘掉节点必须
+--- 在同一处回收，否则 node_count 只涨不跌，后面新增的 SMG_MAX_TREE_NODES 上限就成了
+--- 摆设。原本 detach 的触发条件（无子且无租户）在 trie 骨架长出来后几乎不成立，
+--- 骨架因此永不收缩 —— 这是本次改动要修的形状之一。
+function Tree:detach_if_empty(node)
     if node.parent == nil then
         return
     end
@@ -363,9 +385,21 @@ local function detach_if_empty(node)
         return
     end
     local first = utf8_first(node.text)
-    if first ~= nil then
-        node.parent.children[first] = nil
+    if first == nil then
+        return
     end
+    node.parent.children[first] = nil
+    node.parent = nil
+    self.live_nodes = self.live_nodes - 1
+    if self.live_nodes < 0 then
+        self.live_nodes = 0
+    end
+    local chars = node.text_chars or 0
+    self.live_chars = self.live_chars - chars
+    if self.live_chars < 0 then
+        self.live_chars = 0
+    end
+    node.text_chars = 0
 end
 
 --- 对齐 remove_tenant：自叶子向上清租户，最后清 tenant_char_count
@@ -407,7 +441,7 @@ function Tree:remove_tenant(tenant)
             curr.last_tenant = nil
         end
         local parent = curr.parent
-        detach_if_empty(curr)
+        self:detach_if_empty(curr)
 
         if parent ~= nil and parent.tenant_last_access[tenant] ~= nil then
             local has_child_with = false
@@ -428,8 +462,65 @@ function Tree:remove_tenant(tenant)
 end
 
 --- 对齐 evict_tenant_by_size：按租户字符数总量做叶子 LRU 淘汰
-function Tree:evict_tenant_by_size(max_size)
+--
+-- 在原语义（每租户字符数上限）之外加了三件事，都不改变「限额内不改动」这条既有行为：
+--
+--   1. 廉价前置判定 over_limit()。原先每拍都要先把**全部节点** DFS 进一个小顶堆，
+--      单 worker 进程里这就是 O(亲和状态总量) 的常驻成本；累积到百万节点时它本身就
+--      是烧核来源。现在先用 O(租户数) 的 tenant_char_count 与 O(1) 的 live_nodes/
+--      live_chars 判一次「有没有超标」，没超标就直接返回，一行 DFS 都不做。
+--   2. 节点数维度 max_nodes。字符维度的语义是「每租户」，同一批 worker URL 可以合法
+--      堆 len(tenants) x max_size 字符，且没有任何维度约束**节点个数**；而真正压垮
+--      单核与 RSS 的是节点数（每节点一张 6 字段表 + children 哈希 + 一份 prompt 尾巴
+--      字符串）。max_nodes <= 0 表示不设这一维（兼容只想用字符闸的部署）。
+--   3. 增量预算 max_pops。原先一旦超标就要弹空整棵堆，单 tick 可以跑到秒级并卡死
+--      唯一的转发核；现在每拍最多弹 max_pops 个，剩下的下一拍接着清（追平即可）。
+local DEFAULT_EVICT_BUDGET = 2000
+
+--- 是否已经越过字符/节点上限。只用增量计数与租户表，不做 DFS。
+---@param max_size number @ 每租户字符上限
+---@param max_nodes number|nil @ 节点数上限；nil/<=0 = 不看这一维
+---@return boolean
+function Tree:over_limit(max_size, max_nodes)
+    local count = 0
+    for _, used in pairs(self.tenant_char_count) do
+        if used > max_size then
+            return true
+        end
+        count = count + 1
+        if count > 4096 then   -- 租户数本身就异常，直接判定需要清（不做全表遍历）
+            return true
+        end
+    end
+    -- 节点维度带一个停摆位：树里不能摘的骨架节点（还有子节点）永远不会被
+    -- detach_if_empty 摘掉，于是 live_nodes 可能降不到 max_nodes 以下。若这里不加
+    -- 判断，每一拍都会「以为还能清」而重建一次全树堆 —— 那正是本次要消掉的 O(累积
+    -- 状态) 常驻成本。清到弹不动时置位，下次有新的插入再复位。
+    if max_nodes and max_nodes > 0 and self.live_nodes > max_nodes
+        and not self.node_evict_stalled then
+        return true
+    end
+    if self.live_nodes < 0 then self.live_nodes = 0 end
+    if self.live_chars < 0 then self.live_chars = 0 end
+    return false
+end
+
+---@param max_size number @ 每租户字符上限（Rust evict_tenant_by_size 的语义）
+---@param max_nodes number|nil @ 全树节点数上限（新增维度；nil/<=0 = 不限）
+---@param budget number|nil @ 本次最多淘汰多少个叶子（增量，默认 2000）
+---@return boolean more_work @ 是否仍有活没清完（调用方可提前再来一拍）
+function Tree:evict_tenant_by_size(max_size, max_nodes, budget)
     max_size = max_size or 0
+    max_nodes = max_nodes or 0
+    local max_pops = budget or DEFAULT_EVICT_BUDGET
+    if max_pops < 1 then max_pops = 1 end
+
+    -- (1) 廉价闸：没超标就立刻返回，绝不建堆
+    if not self:over_limit(max_size, max_nodes) then
+        return false
+    end
+
+    local over_nodes = max_nodes > 0 and self.live_nodes > max_nodes or false
 
     local pq = heap.new()
     local stack = { self.root }
@@ -445,14 +536,21 @@ function Tree:evict_tenant_by_size(max_size)
         end
     end
 
+    local pops = 0
     while pq:size() > 0 do
         local entry = pq:pop()
         local tenant, node = entry.tenant, entry.node
 
         local used = self.tenant_char_count[tenant]
-        if used ~= nil and used <= max_size then
+        -- (2) 节点维度生效时，字符没超标的租户也要能被淘汰；否则只看字符就 continue，
+        --     live_nodes 永远降不下来，新增的 max_nodes 闸就成了摆设。
+        if used ~= nil and used <= max_size and not over_nodes then
             goto continue
         end
+        if pops >= max_pops then
+            return true           -- (3) 本 tick 预算用完，剩下的下一拍接着清
+        end
+        pops = pops + 1
 
         -- 复核：该节点此刻仍是该租户的叶子才允许淘汰
         if not is_leaf_for(node, tenant) then
@@ -472,7 +570,7 @@ function Tree:evict_tenant_by_size(max_size)
         end
 
         local parent = node.parent
-        detach_if_empty(node)
+        self:detach_if_empty(node)
 
         if parent ~= nil and parent.tenant_last_access[tenant] ~= nil then
             local has_child_with = false
@@ -489,6 +587,17 @@ function Tree:evict_tenant_by_size(max_size)
 
         ::continue::
     end
+
+    -- 一拍里什么都没弹掉却仍判超标，说明超标来自摘不动的骨架：置停摆位，
+    -- 之后不再为节点维度重建全树堆（有字符维度的活照做，那部分由 over_limit 判）。
+    if pops == 0 and over_nodes then
+        self.node_evict_stalled = true
+        return false
+    end
+
+    -- 堆空了但计数仍在上限之上（例如 detach 因共享前缀没摘掉节点）：
+    -- 让调用方知道还有活，下一拍接着做，而不是在一拍里死磕。
+    return self:over_limit(max_size, max_nodes)
 end
 
 --------------------------------------------------------------------------
@@ -534,15 +643,55 @@ end
 
 --- 把树压成「租户叶子全文 + epoch」列表，用于跨重启的 JSON 快照。
 --- 重建时按 epoch 升序回放 insert，即可复原同样的节点拓扑与 LRU 相对顺序。
-function Tree:serialize()
+--
+-- max_chars 是**边走边估**的预算。原实现先把整棵树拼成条目表、再 cjson.encode 成
+-- 最多 3 MB 的字符串，**然后才**由 encode_snapshot 判是否超限（cache_aware.lua:
+-- encode_snapshot），也就是说树越大，那一次注定被丢弃的分配就越大 —— 单 worker
+-- 进程每 120s 制造一次数百 MB 垃圾正是这个形状，它同时解释烧核与 RSS 只涨不降。
+-- 现在先按增量计数粗筛（O(1)），再边 DFS 边累计字符量，越预算立刻返回 nil 并置
+-- snapshot_oversized（调用方据此只 WARN 一次），完全不建条目表。
+-- 一条条目至少 "t":"<text>","tnt":"<url>","e":<n>，即 text + url + 约 24 字节开销，
+-- 再乘一个安全系数。
+local SNAPSHOT_JSON_SLACK = 3
+local SNAPSHOT_URL_ALLOWANCE = 128
+local SNAPSHOT_MAX_ENTRIES = 200000
+
+---@param max_chars number|nil @ 允许落盘的字节预算；nil = 不设预算（单测与内部调用）
+---@return table|nil snapshot
+function Tree:serialize(max_chars)
+    if max_chars ~= nil then
+        if self.live_chars * SNAPSHOT_JSON_SLACK > max_chars then
+            -- 粗筛：光字符数就不可能塞进预算，一次 DFS 都不走
+            self.snapshot_oversized = true
+            return nil
+        end
+    end
     local entries = {}
+    local seen = 0
     local stack = { { node = self.root, path = "" } }
     while #stack > 0 do
         local frame = table.remove(stack)
         local node, path = frame.node, frame.path
+        if max_chars ~= nil and node.parent ~= nil then
+            seen = seen + #node.text
+            if seen * SNAPSHOT_JSON_SLACK > max_chars then
+                self.snapshot_oversized = true
+                return nil
+            end
+        end
         local full = path .. node.text
         for tenant, epoch in pairs(node.tenant_last_access) do
             if is_leaf_for(node, tenant) then
+                if #entries >= SNAPSHOT_MAX_ENTRIES then
+                    self.snapshot_oversized = true
+                    return nil
+                end
+                if max_chars ~= nil
+                    and (seen + #tenant + SNAPSHOT_URL_ALLOWANCE)
+                        * SNAPSHOT_JSON_SLACK > max_chars then
+                    self.snapshot_oversized = true
+                    return nil
+                end
                 entries[#entries + 1] = { t = full, tnt = tenant, e = epoch }
             end
         end
@@ -551,6 +700,7 @@ function Tree:serialize()
         end
     end
     table.sort(entries, function(a, b) return a.e < b.e end)
+    self.snapshot_oversized = false
     return { leaves = entries, epoch = epoch_counter }
 end
 
@@ -561,6 +711,11 @@ function Tree:restore(snapshot)
     end
     self.root = new_node("", nil)
     self.tenant_char_count = {}
+    -- restore 换掉整棵树，增量计数必须一起归零：下面的 insert 回放会给新节点重新记一次，
+    -- 不重置就等于把旧账加在新树上（live_nodes 虚高 -> 节点闸误触发、gauge 也不可信）。
+    self.live_nodes = 0
+    self.live_chars = 0
+    self.node_evict_stalled = false
     local max_epoch = 0
     local entries = {}
     for i = 1, #snapshot.leaves do

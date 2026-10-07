@@ -419,7 +419,15 @@ function M.power_samples()
     if type(d.get_keys) ~= "function" then
         return out
     end
-    for _, key in ipairs(d:get_keys(0)) do
+    -- Bounded: this is a render-time read (the /metrics power section and the UI pool
+    -- table), and get_keys(0) walks the whole lr_workers dict inside the single
+    -- forwarding worker on every scrape. Rows only leave lr_workers when a worker is
+    -- deleted, so the scan length tracks the pool's history rather than its size.
+    -- 4096 is ~500x the largest pool we run; a dict that big is the case where a
+    -- cheaper scrape is the point. Power rows are also the only key family here that
+    -- a *worker* writes every pass, so truncation shows up as missing watts, never as
+    -- a mis-routed request.
+    for _, key in ipairs(d:get_keys(4096)) do
         if type(key) == "string" and #key > #K_POWER
             and string.sub(key, 1, #K_POWER) == K_POWER then
             local value = d:get(key)
