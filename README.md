@@ -20,8 +20,8 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261006-051452.log`（tier=full、`KEEP_GOING=1`、
-`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `66a891f`）。代码基线：
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261008-080618.log`（tier=full、`KEEP_GOING=1`、
+`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `71ac5d4`）。代码基线：
 `lualib/` **75 个 Lua 文件 / 36 110 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
 单测 16 文件、契约 **691 项 / 24 段**、文档 30 份。
 

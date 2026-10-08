@@ -22,12 +22,13 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-06，树 HEAD `66a891f`）：**全量门禁 22/22 全绿 / 0 skipped**（tier=full，锚点
-`/data/tmp/lr-gates/gates-20261006-051452.log`；含契约 **691 项 / 24 段**（新增 `caps` 段 25 项）、
-`e2e_caps` **175 checks**、`test_caps_routing` **157 checks**、`test_gpu_load` **402 checks**）。代码：
-**`lualib/` 75 个 Lua 文件 / 34 608 行**（七个域 = facade + 子模块，其余单文件；行数口径
-`find lualib -name '*.lua' | xargs wc -l`），单测 13 个文件（门禁 luajit 12 + resty 4 口径）。
-文档 29 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
+基线（2026-10-08，树 HEAD `71ac5d4`）：**全量门禁 22/22 全绿 / 0 skipped**（tier=full，锚点
+`/data/tmp/lr-gates/gates-20261008-080618.log`；含契约 **691 项 / 24 段**、`e2e_caps` **175 checks**、
+`test_caps_routing` **157 checks**、`test_gpu_load` **402 checks**、`e2e_models_advertisement` **210 checks**
+（S12 卡片档位勾选）、`test_profiles` **907** / `test_models_shape` **124**）。代码：
+**`lualib/` 75 个 Lua 文件 / 36 110 行**（七个域 = facade + 子模块，其余单文件；行数口径
+`find lualib -name '*.lua' | xargs wc -l`），单测 16 个文件（门禁 luajit 15 + resty 4 口径）。
+文档 30 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
 
@@ -71,7 +72,7 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
         观测与 mesh handler + server 级 preflight_guard
     router/reqlog.lua(167)      log_inference_request 组装一条 RequestRecord + finish_request 收尾
     router/host.lua(45)         进程级惰性访问器 cfg() / limit() / store()——不进导出契约
-  config_store.lua(132) facade：require + 68 个导出逐名 re-export
+  config_store.lua(133) facade：require + 69 个导出逐名 re-export
     config_store/persistence.lua(540)  硬边界：全模块只有本文件碰 shdict / 后端 / 文件 IO
         （三层读写 + CAS 冲突 409 + persist + migrate_once + 四枚 revision token 读点）
     config_store/snapshot.lua(801)     空快照语义 + sync_virtual_view / new_card / snapshot_of /
@@ -123,7 +124,7 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
                          （幻影键修复的正确性依赖这些同域）
     mesh/sync.lua(481)   cosocket http_request + sync_with + ROUTES/dispatch + SMG_MESH_* + 单例
     mesh/handlers.lua(425) /_mesh/internal/* 四条 + 13 条 /ha/* · wire.lua(151) 编解码 · rate.lua(127) 限流窗
-  observability.lua(1318) facade：写侧原语（counter/observe/gauge + 键文法）+ record_* + HELP 权威表 +
+  observability.lua(1469) facade：写侧原语（counter/observe/gauge + 键文法）+ record_* + HELP 权威表 +
     prometheus_text —— 与导出器同域不拆（键文法是隐式契约，契约门只测最终文本）
     observability/logstore.lua(600)  请求日志环形缓冲 + 查询 DSL + /_ui/logs 三 handler + stats()
     observability/inflight.lua(246)   在飞年龄 tracker（lr_stats 的 1024 定长槽）
@@ -135,7 +136,7 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
       唯一生产读者，只换回显的 n_ctx / n_ctx_train）
     · limit.lua(209) 全局并发闸门 + 排队 · store_*{dispatcher,file,sqlite,postgres} 配置后端
     · policies/（6 文件 2314 行）tree/cache_aware/bucket/consistent_hashing/prefix_hash + utils
-  单测 test/unit/ 13 个文件：门禁跑 luajit 12（tree/policies/hash/mesh/watcher/gpu_load/routing_dyn/
+  单测 test/unit/ 16 个文件：门禁跑 luajit 15（tree/tree_bounds/state_bounds/observability/policies/hash/mesh/watcher/gpu_load/routing_dyn/
   profiles/caps_routing/models_shape/models_advertise/effort_layers）+ resty 4（tree/policies/hash/
   integration），其中 tree/policies/hash 双口径各跑一次。
 
