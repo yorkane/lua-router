@@ -315,3 +315,10 @@ tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); paddin
 .q-btn.bg-primary.text-white,
 .q-btn.bg-primary .q-btn__content,
 .q-btn-toggle .q-btn.bg-primary.text-white { color: #06210f !important; }
+
+/* ── 左侧菜单栏主题色=绿色（2026-10-08 用户追加裁定）──
+   深色底与右侧内容页保持原始暗紫灰（见上 :root）；仅左侧 q-drawer 的品牌块、
+   激活菜单项、激活圆点用绿色系作为菜单强调色。未激活菜单文字保持原始紫灰。 */
+.brand-mark { border: 1px solid rgba(52, 211, 153, .34); background: linear-gradient(145deg, #34d399, #15803d); box-shadow: 0 8px 22px rgba(21, 128, 61, .28); }
+.menu-item-active { color: #fff !important; background: linear-gradient(90deg, rgba(52, 211, 153, .24), rgba(34, 197, 94, .10)) !important; box-shadow: inset 2px 0 #4ade80; }
+.active-dot { background: #4ade80; box-shadow: 0 0 0 4px rgba(74, 222, 128, .12); }
