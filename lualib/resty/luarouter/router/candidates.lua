@@ -23,6 +23,59 @@ local profile_model_group = profiles.profile_model_group
 local profile_worker_list = profiles.profile_worker_list
 local is_array_table = profiles.is_array_table
 local default_policy
+
+--- 「隐藏」门（用户裁定 2026-10-08）的本趟读数：一次取好，整趟候选装配共用。
+---
+--- 返回 **nil** = 这一趟没有任何隐藏声明，调用方因此**一个字都不必做**（隐藏名册连构造
+--- 都不发生）。这就是「没声明 hidden 的部署逐字节不变」那条硬约束在热路径上的形状：
+--- config_store 侧的整表判据（any_hidden）替全场答一次「没人说过隐藏」，这里据此跳过。
+--- 返回表 = 有两种读法：`blocked` 是「客户端所名的这个入口/模型整个被藏起来」——
+--- 候选一律不给（调用方落回既有的「无候选」503 路径）；`member(name)` 问的是「这一组里
+--- 的这个**实际模型**还被服务吗」，组门与绑定按它逐个成员收窄。
+---
+--- 两个读法都走 config_store 的**同一份判定**（readers.lua 的 model_is_hidden：卡片
+--- hidden=true 或入口 hidden=true），本函数一个判据都不复刻。store 缺席、reader 缺席
+--- （半程发布的旧 build）、pcall 出错，一律答 nil = 没有这道门 —— 一个读不出来的隐藏
+--- 声明绝不该把一台在服务的实例从池里抹掉（AGENTS.md 硬规则 4 的同一姿态）。
+---
+--- 落点在**切片区间之外**是有意的：本文件的函数体被 test_caps_routing 与 test_profiles 11b
+--- 按字符串锚点切出去配桩加载，切片环境里没有 config_store。于是切片里 `hidden_pass`
+--- 是一个 nil 全局，调用点的 `hidden_pass ~= nil and ...` 直接短路成「没有这道门」，
+--- 那两份单测继续跑在改动前的行为上；真模块口径（本目录的 require）才有这道门。
+---@param model string|nil @ route_inference 传下来的解析结果（组入口下 = 代表值/组头）
+---@param profile table|nil @ 入口 profile（组路径的策略桶名 = profile.model）
+---@param is_group boolean|nil @ 这一趟是**组**选路（profile_model_group 非空）
+---@return table|nil
+local function hidden_pass(model, profile, is_group)
+    local ok_store, store_mod = pcall(require, "resty.luarouter.config_store")
+    if not ok_store or type(store_mod) ~= "table" then return nil end
+    local any_reader = store_mod.any_hidden
+    local asked_reader = store_mod.model_is_hidden
+    if type(any_reader) ~= "function" or type(asked_reader) ~= "function" then return nil end
+    local ok_any, flagged = pcall(any_reader)
+    if not ok_any or flagged ~= true then return nil end
+    -- 到这里才有人真的说过隐藏（没说过时上面已经 return nil，一次表都不构造）。此后每问
+    -- 一句走的都是 config_store 那份带 revision/TTL 记忆的名册（一次哈希查表 + 一次
+    -- revision 令牌读，与本文件既有热路径上的 shdict 读数同档），而且整趟只建这一份闭包。
+    -- 组入口每趟的问句数量 = 组内成员数 + 每台候选的绑定判定，量级仍是"几个名字"。
+    local function asked(name)
+        if type(name) ~= "string" or name == "" then return false end
+        local ok_ask, verdict = pcall(asked_reader, name)
+        return ok_ask and verdict == true
+    end
+    -- 「整个入口/模型被藏」只在两个名字上判：**入口自己的名字**（一个入口一棵亲和树、
+    -- 对外那一行也叫这个名字，操作员勾的就是它），以及**非组路径下客户端所名的落点名**
+    -- （裸模型、legacy 单目标入口、手写脏行 —— 那条路上 model 就是要服务的真实模型）。
+    --
+    -- 组路径刻意**不**问 model：那是 profile 的代表值（组头），不是客户端报的名字，
+    -- 拿它当整组判据会让「勾掉组里一台」变成「整组一个候选都不给」。组里的成员由
+    -- member 逐个收窄（下面的组门），这正是「藏一台、其余照常服务」的形状。
+    if asked(type(profile) == "table" and profile.model)
+        or (not is_group and asked(model)) then
+        return { blocked = true }
+    end
+    return { member = asked }
+end
 -- Policy selection, per model.
 --
 -- The Rust gateway owns one PolicyRegistry that keys policies by model
@@ -429,6 +482,37 @@ local function candidates_for(model, profile, counted)
         in_group = {}
         for i = 1, #group do in_group[group[i]] = true end
     end
+    -- 「隐藏」门（用户裁定 2026-10-08）：整趟只问 config_store 一次，判据只有一份（文件头的
+    -- hidden_pass）。按代价从低到高排三件事：先问「有没有人说过隐藏」—— 没说过就是 hid=nil，
+    -- 下面每一支都短路，选路路径与改动前逐字节相同、连一次 shdict 读都不多；再说「这个入口
+    -- 被整个藏起来」—— 这一趟**不给任何候选**，调用方落回既有的「无候选」503 路径（forward
+    -- 按 #candidates==0 出文案：一条被操作员抹掉的名字与「池里没有这个模型」对外同形，正是
+    -- 「不再被服务」的语义。刻意不复用 refused 那条组专属文案 —— 「没有这个服务」与「有这个
+    -- 服务但引擎都不接」是两句不同的话，操作员据此该查的东西也相反）；最后是按成员收窄。
+    --
+    -- 排在 group 之后是必需的：组与否决定了「客户端所名的那个算不算一个模型」这一判
+    -- （见 hidden_pass 的 is_group），两处必须用同一个 group 读数，不能各问一次。
+    --
+    -- hidden_pass 在**切片口径**下是 nil 全局（test_caps_routing / test_profiles 11b 把
+    -- candidates_for 连这一带切出去配桩加载，那个沙箱没有 config_store），于是 hid 恒 nil、
+    -- hidden_name 恒 false，那两份单测继续跑在改动前的行为上；锚点区间里因此对切片环境
+    -- 零新增要求（只有一个 nil 全局 + 一个本函数内的 local 闭包）。
+    local hid = hidden_pass ~= nil and hidden_pass(model, profile, group ~= nil) or nil
+    if hid ~= nil and hid.blocked then
+        -- 空数组就是答案：调用方（forward）按 #candidates==0 落**既有的「无候选」503 路径**
+        -- （用户裁定要的那句「按现有无候选路径 503」），文案一字不改。三个计数全给 0 是
+        -- 如实报数：这一趟一次引擎谓词都没问（没 refused）、没问容量（没 capped）、没让位
+        -- （没 idle）；刻意不带 group 旗标 —— 那条专属文案要求 refused>0，这里给 0 就永远
+        -- 不触发它，也就不会替操作员编一句「引擎回绝了你的 targets」（真相是操作员自己藏的）。
+        return {}, { capped = 0, refused = 0, idle = 0 }
+    end
+    ---@param name any @ 实际模型名（组内成员 / 绑定名 / record.model_id）
+    ---@return boolean
+    local function hidden_name(name)
+        if hid == nil then return false end
+        if type(name) ~= "string" or name == "" then return false end
+        return hid.member(name) == true
+    end
     -- Registry-side cap predicate (doc/gap-worker-caps.md). Read-only from here:
     -- the two numbers it compares are this gateway's own in-flight counter and
     -- gpu_load's watt samples, both maintained elsewhere. Absent (a stripped unit
@@ -530,7 +614,11 @@ local function candidates_for(model, profile, counted)
         if keep and group then
             local serve, serving = nil, 0
             for i = 1, #group do
-                if registry.candidate_allows_model(record, group[i]) then
+                -- 被藏起来的组名**整个从这一趟的组里消失**：既不能成为 serve 候选，
+                -- 也不能被选作转发绑定名。刻意做在 candidate_allows_model **之前** ——
+                -- 后者是引擎的 fail-open 谓词（没探过的实例一律算可路由），把操作员的话
+                -- 排在它前面，「藏起来的模型即使从没被探过也不冒出来」才是结构性的。
+                if not hidden_name(group[i]) and registry.candidate_allows_model(record, group[i]) then
                     serving = serving + 1
                     if serve == nil then
                         serve = group[i]
@@ -544,7 +632,9 @@ local function candidates_for(model, profile, counted)
                 -- An explicit binding is operator intent and outranks the engine's
                 -- answer, but only for a name inside the group (the store refuses the
                 -- others at write time, this guards a hand-edited document).
-                if binding ~= nil and not in_group[binding] then
+                -- 隐藏压过操作员绑定：绑到一个被藏起来的模型 = 这个绑定这一趟不作数，
+                -- 退回引擎愿意服务的另一个组名（一个都不剩时上面的 serving==0 已经排掉）。
+                if binding ~= nil and (not in_group[binding] or hidden_name(binding)) then
                     binding = serve
                 elseif binding == nil then
                     -- Prefer the name the worker leads with: two candidates that both
@@ -552,12 +642,29 @@ local function candidates_for(model, profile, counted)
                     -- "their" model, and a worker serving the group through its primary
                     -- name forwards the same id it advertises today.
                     local primary = record.model_id
-                    if primary ~= nil and in_group[primary] and primary ~= "unknown" then
+                    if primary ~= nil and in_group[primary] and primary ~= "unknown"
+                        and not hidden_name(primary) then
                         binding = primary
                     else
                         binding = serve
                     end
                 end
+            end
+        end
+        -- 非组路径的「隐藏」门（组路径上面已按成员与绑定收窄，这里管 legacy 单目标、
+        -- 无入口的裸模型、以及手写脏行）：这台实例对外所服务的名字被藏起来，就不进候选。
+        -- 绑定优先看绑定名（转发时真正发出去的那个名字），没有绑定看 record.model_id；
+        -- "unknown" 占位永不判隐藏 —— 它不是任何模型的名字，把它否掉就是让「还没被探到」
+        -- 这台实例替一个它并不持有的名字受罚（与旁边的模型许可门同一理由，且 IGW 下
+        -- get_by_model("unknown") 那条老契约要靠它活着）。
+        -- 计进 refused 而不是 capped：它是「这个名字不给服务」，不是「容量到顶」，
+        -- 于是 429 的判据（forward 只看 why.capped）不会被它污染。
+        if keep and hid ~= nil then
+            local served = binding
+            if served == nil then served = record.model_id end
+            if served ~= nil and served ~= "unknown" and hidden_name(served) then
+                keep = false
+                refused = refused + 1
             end
         end
         if keep then

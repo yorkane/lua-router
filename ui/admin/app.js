@@ -54,6 +54,8 @@ const app = Vue.createApp({
     // 用 logs 页抽出的同一个 window.lmrTokenStats.summarizeWindow（./token-stats.js）现算，
     // 保证侧栏与日志页两个 tok/s 永远同函数同口径。null = 从未成功过（展示占位 —）。
     const throughput = ref(null)
+    // 面板折叠态（收起时只剩标题行）。刻意不持久化：每次打开管理台默认展开。
+    const throughputOpen = ref(true)
     let unsubscribeLocale
     let statusTimer
 
@@ -304,6 +306,7 @@ const app = Vue.createApp({
       throughputIn,
       throughputLine,
       throughputOut,
+      throughputOpen,
       toggleDrawer,
       toggleIcon,
       toggleLabel,

@@ -250,6 +250,91 @@ function _M.card_supports_tool_use(model)
     return nil
 end
 
+-- ------------------------------------------------------------ 「隐藏」（用户裁定 2026-10-08）
+--
+-- 「这个模型名 / 入口名是不是被操作员藏起来了」的**唯一实现**。三处联动（/v1/models 的广告、
+-- watcher 的注册与保留、路由候选）都必须经这里，各写一套必然漂移：一处还广告、另一处已不服务，
+-- 就是 2026-10-07 那次「广告与路由互相矛盾」故障的翻版（见 inject_virtual_models 的遮蔽理由）。
+--
+-- 判定口径（用户裁定的原话）：卡片 hidden=true **或** 虚拟入口 hidden=true，即算隐藏。
+-- 两条来源取**或**是刻意的：入口名与真实模型名可以同名遮蔽（root ruling 2026-10-07 方案 A），
+-- 那时「卡片说藏」与「入口说藏」说的是同一个对外名字，任何一条成立就都得藏住。
+--
+-- 三态纪律：只有**真布尔 true** 才算隐藏。nil（没说）与 false（说了不隐藏）在读取侧走同一条
+-- 「照旧」支路，两者在**磁盘上**仍然分家（见 snapshot_of / profiles 的写出侧）——读取侧合并它们
+-- 不损失任何信息，因为 false 与 nil 的行为本来就该一致。非布尔的垃圾值（脏手改出来的字符串、
+-- cjson 的 null 哨兵）一律按「没说」处理，绝不因一条坏字节把一台在跑的实例判成不存在。
+--
+-- 便宜的「有没有人声明过隐藏」整表判据走一份按 revision 失效的记忆（与 policy_state 同一族：
+-- 有 shdict 时靠 revision token 跨进程失效，没有就靠 SNAPSHOT_TTL 界住陈旧度）。这一份存在的
+-- 理由只有一个：**没声明隐藏的部署必须一个字节的额外开销都不付**（AGENTS.md「新开关缺省零行为
+-- 变化」）。选路热路径每趟只问一次 `any`，答案是 false 就连那张隐藏名册都不构造。
+local hidden_view = { token = nil, at = 0, any = false, models = nil, aliases = nil }
+
+local function hidden_state()
+    local token = CS_FACADE.policy_revision()
+    local now = (ngx and ngx.now) and ngx.now() or os.time()
+    -- 失效条件与 policy_state 同族：跨进程靠 revision token（每次写入 shared:incr 一下，
+    -- 所有 worker 都看得见），本进程的写方自己靠 _policy_view_dirty 兜住（写方与 policy_state
+    -- 共用它兜底）。两位各管一段：_hidden_view_dirty 只有本模块的写方（mutators 的
+    -- commit_snapshot / apply_upstreams / apply_document）置起、也只由我清，所以「apply 完
+    -- 马上读」一定读到新名册；_policy_view_dirty 是既有写路径都会置的那一位，白捡一层
+    -- 覆盖（它被 policy_state 抢先清掉也不影响正确性，最多退回 SNAPSHOT_TTL 的陈旧度）。
+    -- 刻意**不清** _policy_view_dirty —— 清了会把 policy_state 的失效通知吃掉。
+    -- 两条都不成立时靠 SNAPSHOT_TTL 界住陈旧度，与本模块其它读数的容差口径一致
+    -- （没有 shdict 的单测里 token 恒 nil，于是只剩「比 TTL + 两位脏位」）。
+    local fresh = (now - hidden_view.at) < CS_LEXICON.SNAPSHOT_TTL
+        and not (CS_FACADE._hidden_view_dirty or CS_FACADE._policy_view_dirty)
+    if fresh and (token == nil or hidden_view.token == token) then
+        return hidden_view
+    end
+    CS_FACADE._hidden_view_dirty = nil
+    local cfg = CS_FACADE.current()
+    local models, aliases, any = {}, {}, false
+    for model, card in pairs(cfg.model_configs or {}) do
+        if type(card) == "table" and card.hidden == true then
+            models[model] = true
+            any = true
+        end
+    end
+    for alias, profile in pairs(cfg.virtual_profiles or {}) do
+        if type(profile) == "table" and profile.hidden == true then
+            aliases[alias] = true
+            any = true
+        end
+    end
+    hidden_view.token = token
+    hidden_view.at = now
+    hidden_view.any = any
+    hidden_view.models = models
+    hidden_view.aliases = aliases
+    return hidden_view
+end
+
+--- 整表便宜判据：有没有任何一个名字被声明过 hidden=true。false = 全场照旧，调用方可以
+--- 据此一次跳过所有隐藏逻辑（热路径的零开销保证就靠它）。
+---@return boolean
+function _M.any_hidden()
+    return hidden_state().any == true
+end
+
+--- 对外的那个统一判定：卡片或入口任一说了 hidden=true 即算隐藏（名字两边都查）。
+--- 这是**唯一**的对外判定，刻意不另开「只看卡片」/「只看入口」的分面读法：三处联动问的都
+--- 是「这个名字还对外吗」，把判据拆成两半就会有人挑错那一半（组门问成员只问卡片、入口行问
+--- 入口只问条目），而这两半必须同时生效才叫「藏住了」。名册内部仍分两张表存
+--- （state.models / state.aliases），判定口径因此写在一条式子里，而不是两处各写一遍。
+--- 同名遮蔽（root ruling 2026-10-07 方案 A）下这条「或」尤其要紧：入口 X 被藏时，真实模型
+--- X 的路由也一并 blocked（入口名那一问），于是它的真实行也必须消失，否则就是「广告了却
+--- 每个请求 503」。
+---@param name string|nil @ 真实模型名或入口名（同名遮蔽时两者是同一个对外名字）
+---@return boolean
+function _M.model_is_hidden(name)
+    if type(name) ~= "string" or name == "" then return false end
+    local state = hidden_state()
+    if not state.any then return false end
+    return state.models[name] == true or state.aliases[name] == true
+end
+
 --- 虚拟模型条目的能力/档位声明（卡片级的读数由卡片自己出，这里只给条目这一层）。
 --- 接受别名或 profile 表——router 手上往往已经有 profile_for 的拷贝，省一次回查。
 --- 返回的是新表，调用方改不坏存储（与 profile_for 的拷贝纪律同口径）。

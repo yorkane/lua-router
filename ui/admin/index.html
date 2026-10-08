@@ -51,13 +51,20 @@
       font-weight: 620;
       letter-spacing: .08em;
       text-transform: uppercase;
+      min-width: 0;
+      flex-shrink: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .menu-throughput .tok-v {
-      font-size: clamp(15px, .9vw + 10px, 19px);
+      /* 数字整体一行（nowrap + 不可压缩），标签让步；上限收到 18px 让 4~6 位在 220px 侧栏放得下 */
+      font-size: clamp(14px, .85vw + 9px, 18px);
       font-weight: 530;
       letter-spacing: -.03em;
       font-variant-numeric: tabular-nums;
-      overflow-wrap: anywhere;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .menu-throughput .tok-in { color: var(--text); }
     .menu-throughput .tok-out { color: var(--green, var(--teal)); }
@@ -125,14 +132,14 @@
                （既有裁定 2026-10-05：后端拿采样桶数当分母，稀疏流量会外推出夸张瞬时值），
                所以壳层自己拉 /_ui/logs 日志行现算。纯展示，不参与导航。 -->
           <div class="menu-throughput menu-copy">
-            <div class="tok-head">
+            <div class="tok-head" style="cursor:pointer" @click="throughputOpen = !throughputOpen">
               <span>{{ t.throughputTitle }}</span>
-              <span class="tok-window">{{ t.throughputWindow }}</span>
+              <span class="tok-window">{{ t.throughputWindow }}<span aria-hidden="true">{{ throughputOpen ? ' ▾' : ' ▸' }}</span></span>
             </div>
-            <div class="tok-row"><span class="tok-k">{{ t.throughputIn }}</span><b class="tok-v tok-in">{{ throughputIn }}</b></div>
-            <div class="tok-row"><span class="tok-k">{{ t.throughputOut }}</span><b class="tok-v tok-out">{{ throughputOut }}</b></div>
-            <div class="tok-row"><span class="tok-k">{{ t.throughputCache }}</span><b class="tok-v tok-cache">{{ throughputCache }}</b></div>
-            <div class="tok-line" :class="{ err: throughputHasErrors }">{{ throughputLine }}</div>
+            <div class="tok-row" v-show="throughputOpen"><span class="tok-k">{{ t.throughputIn }}</span><b class="tok-v tok-in">{{ throughputIn }}</b></div>
+            <div class="tok-row" v-show="throughputOpen"><span class="tok-k">{{ t.throughputOut }}</span><b class="tok-v tok-out">{{ throughputOut }}</b></div>
+            <div class="tok-row" v-show="throughputOpen"><span class="tok-k">{{ t.throughputCache }}</span><b class="tok-v tok-cache">{{ throughputCache }}</b></div>
+            <div class="tok-line" v-show="throughputOpen" :class="{ err: throughputHasErrors }">{{ throughputLine }}</div>
           </div>
 
           <div class="shell-status">

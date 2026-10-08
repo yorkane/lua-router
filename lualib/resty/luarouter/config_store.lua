@@ -77,6 +77,15 @@ _M.snapshot_of = CS_SNAPSHOT.snapshot_of
 -- readers
 _M.card_supports_tool_use = CS_READERS.card_supports_tool_use
 _M.card_effort_ladder = CS_READERS.card_effort_ladder
+-- 「隐藏」判定（用户裁定 2026-10-08）的对外读面：三处联动（/v1/models 广告、watcher 的
+-- 注册与保留、路由候选）都经这里，实现只有一份（config_store/readers.lua 的 hidden_state）。
+-- 只导两个，都是必需的：model_is_hidden 是**唯一**判定（卡片或入口任一说了 hidden 即藏），
+-- any_hidden 是热路径的整表便宜判据（先问它，没人声明过隐藏就一次表查询都不付）。
+-- 刻意**不**再导一个「只看卡片」或「只看入口」的分面读法：三处联动问的都是「这个名字还
+-- 对外吗」，把判据拆成两半就会有人挑错那一半（组内成员问卡片、入口行问入口），而这两半
+-- 恰恰必须同时生效才算「藏住了」。少一个导出面 = 少一种漂移方式。
+_M.any_hidden = CS_READERS.any_hidden
+_M.model_is_hidden = CS_READERS.model_is_hidden
 _M.ctx_cap = CS_READERS.ctx_cap
 _M.current = CS_READERS.current
 _M.entry_declaration = CS_READERS.entry_declaration

@@ -412,6 +412,15 @@ local function build_entry_declarations(alias, entry)
         if ferr then return nil, ferr end
         if value ~= nil then out[field] = value end
     end
+    -- 「隐藏」（用户裁定 2026-10-08）：**不并进上面那个循环**。那五位是能力位，对外读数会
+    -- 因为它们变化（capabilities.supports_*），而 hidden 不是对外读数 —— 它是「这个入口
+    -- 连被发现的资格都没有」，同一份字节形状却完全不同的一族语义。复用同一个循环会把
+    -- 「加一条能力位」变成「顺手加一条服务开关」的隐患；单独一句也让 UI 侧将来接这一位时
+    -- 在源码里看得见它的不同。解析口径照抄（build_entry_supports_flag 就是 absent/null→nil、
+    -- 真布尔→值、其它→400），文案家族因此也一致。
+    local hidden_val, herr = build_entry_supports_flag(alias, "hidden", rawget(entry, "hidden"))
+    if herr then return nil, herr end
+    if hidden_val ~= nil then out.hidden = hidden_val end
     if next(out) == nil then return nil end
     return out
 end
@@ -727,6 +736,9 @@ local function profile_from_entry(alias, entry, shadow)
         profile.supports_reasoning = declarations.supports_reasoning
         profile.supports_vision = declarations.supports_vision
         profile.supports_reasoning_effort = declarations.supports_reasoning_effort
+        -- 「隐藏」走同一条往返链：它是入口级的声明位，装配 / 落盘 / 读回 / 展示四位一体，
+        -- 热路径上的读法只有 config_store 的那一份判定（readers.lua 的 model_is_hidden）。
+        profile.hidden = declarations.hidden
     end
     return profile, nil
 end

@@ -23,6 +23,16 @@ local _M = {}
 local function commit_snapshot(cfg)
     local saved, err, cur = CS_PERSISTENCE.write_snapshot(CS_SNAPSHOT.snapshot_of(cfg))
     if not saved then return nil, CS_PERSISTENCE.store_conflict_message(err, cur) end
+    -- 「隐藏」名册的**本进程**失效通知（readers.lua 的 hidden_state）：卡片与入口是隐藏的
+    -- 两个写入面，都走这里，所以通知挂在 commit_snapshot 而不是各 apply_* 里。
+    -- 跨进程那一半由 write_snapshot 的 shared:incr(REV_KEY) 覆盖 —— token 是每次现读 shdict，
+    -- 写方自己也立刻看见新值，因此有 shdict 时本位只是双保险；真正需要它的是**没有 shdict**
+    -- 的口径（裸 luajit 单测：token 恒 nil，新鲜度判据退化成「比 TTL」，同一秒内 apply 完马上读
+    -- 会读到上一份名册）。刻意不复用 _policy_view_dirty：那一位会被 policy_state 抢先清掉，
+    -- 两个缓存互相吃掉对方的通知。apply_upstreams / apply_document 两条直调 write_snapshot
+    -- 的路径上各自也补了这一句 —— 整文档替换同样能改到卡片与入口，漏一处就是「保存完
+    -- 马上读还是旧的」。
+    CS_FACADE._hidden_view_dirty = true
     return CS_SNAPSHOT.snapshot_of(CS_FACADE.current()), nil
 end
 
@@ -219,6 +229,10 @@ function _M.profile_for(model)
     out.supports_reasoning = profile.supports_reasoning
     out.supports_vision = profile.supports_vision
     out.supports_reasoning_effort = profile.supports_reasoning_effort
+    -- 「隐藏」（用户裁定 2026-10-08）与那五位走同一条热路径拷贝。判定本体在 readers.lua
+    -- （读的是存储里的那份 profile），这里带出来只是为了让 router 手上已经拿着 profile 时
+    -- 不必回查一次；三态不塌缩（false 与 nil 分家一路到底）。
+    out.hidden = profile.hidden
     return out
 end
 
@@ -258,6 +272,11 @@ function _M.profiles_list()
                                  "supports_reasoning_effort" }) do
             if profile[field] ~= nil then entry[field] = profile[field] end
         end
+        -- 「隐藏」走同一条 UI 往返链，而且**必须**在这里：apply -> profiles_list -> apply 是
+        -- 管理台与 POST /config/profiles 的既有循环，漏这一条等于操作员勾了「隐藏」、保存、
+        -- 再从列表页存一次，那句话就被抹掉了（与旁边那条 supports_tool_use=false 的往返纪律
+        -- 同一个失败形状）。缺席 = 没说 = 不写键。
+        if profile.hidden ~= nil then entry.hidden = profile.hidden end
         if profile.context_window then entry.context_window = profile.context_window end
         out[#out + 1] = entry
     end
@@ -318,6 +337,9 @@ function _M.apply_upstreams(entries)
     local saved, serr, scur = CS_PERSISTENCE.write_snapshot(CS_SNAPSHOT.snapshot_of(cfg))
     if not saved then return nil, CS_PERSISTENCE.store_conflict_message(serr, scur) end
     local summary = CS_FACADE.reconcile_upstreams()
+    -- 与 commit_snapshot 同一句：本路径直调 write_snapshot、不经 commit_snapshot，
+    -- 「隐藏」名册（readers.lua 的 hidden_state）的本进程缓存必须一并作废。
+    CS_FACADE._hidden_view_dirty = true
     return summary, nil
 end
 
@@ -436,6 +458,8 @@ function _M.apply_document(doc)
         and (rawget(doc, "upstreams") ~= nil or rawget(doc, "virtual_models") ~= nil) then
         summary = CS_FACADE.reconcile_upstreams()
     end
+    -- 整文档替换能一次改动卡片与入口，因此也是隐藏的写入面（理由同 apply_upstreams）。
+    CS_FACADE._hidden_view_dirty = true
     return CS_SNAPSHOT.snapshot_of(CS_FACADE.current()), nil, summary
 end
 
