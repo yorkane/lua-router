@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Round 5: /_ui error contract (503 no workers, 502 dead worker, upstream 4xx)."""
+"""Round 5: webui-alias error contract (503 no workers, 502 dead worker, upstream 4xx).
+
+The alias side is the /u/ family (conf/ui.conf exact locations over the ui.lua
+handlers): each scenario fires the same body through the klib inference entry
+/v1/chat/completions and the webui alias, and both must get the identical answer.
+The /_ui prefix was cancelled by the 2026-10-08 admin-to-root move, so it is not
+an entry any more -- its old names now answer from the 404 sink.
+"""
 import json, os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (free_port, http, check, start_mock, mock_lines, start_router,
@@ -12,11 +19,11 @@ port = start_router({"SMG_POLICY": "round_robin", "SMG_DISABLE_HEALTH_CHECK": "0
 time.sleep(1.0)
 st, b1, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
                  {"model": "alpha", "messages": [{"role": "user", "content": "x"}]})
-st2, b2, h2 = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st2, b2, h2 = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                    {"model": "alpha", "messages": [{"role": "user", "content": "x"}]})
 check("[503] /v1 503 no_available_workers", st == 503 and "no_available_workers" in b1,
       "%s %s" % (st, b1[:200]))
-check("[503] /_ui same contract", st2 == 503 and "no_available_workers" in b2,
+check("[503] /u/ same contract", st2 == 503 and "no_available_workers" in b2,
       "%s %s" % (st2, b2[:200]))
 check("[503] X-SMG-Error-Code set",
       h2.get("X-SMG-Error-Code", h2.get("x-smg-error-code")) == "no_available_workers", str(h2))
@@ -44,9 +51,9 @@ if st == 503:
     st, b, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
                     {"model": "alpha", "messages": [{"role": "user", "content": "x"}]})
 check("[4xx] upstream 400 passed through on /v1", st == 400 and "MOCK_400" in b, "%s %s" % (st, b[:200]))
-st2, b2, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st2, b2, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                   {"model": "alpha", "messages": [{"role": "user", "content": "x"}]})
-check("[4xx] same 400 body through /_ui", st2 == 400 and "MOCK_400" in b2, "%s %s" % (st2, b2[:200]))
+check("[4xx] same 400 body through /u/", st2 == 400 and "MOCK_400" in b2, "%s %s" % (st2, b2[:200]))
 hits = mock_lines(pa, "/v1/chat/completions")
 check("[4xx] 4xx not retried (2 requests total)", hits == 2, hits)
 # 502: kill the worker, request must fail as 502 with the upstream error code
@@ -55,9 +62,9 @@ st, b, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
                 {"model": "alpha", "messages": [{"role": "user", "content": "x"}]},
                 headers=None)
 check("[502] dead worker -> 5xx", st in (502, 503), "%s %s" % (st, b[:200]))
-st2, b2, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st2, b2, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                   {"model": "alpha", "messages": [{"role": "user", "content": "x"}]})
-check("[502] /_ui reports the same 5xx", st2 == st, "%s %s" % (st2, b2[:200]))
+check("[502] /u/ reports the same 5xx", st2 == st, "%s %s" % (st2, b2[:200]))
 check("[502] no lua errors", "lua entry thread aborted" not in logs(name), logs(name)[-500:])
 stop_router(name)
 

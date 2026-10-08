@@ -64,6 +64,8 @@ EXPOSE 端口；21.k 所有 LLM 服务都有宿主映射口，关掉无损。
   （原版 webui）；/_ui/config/policy → cache_aware 链正常
   （口径 2026-10-05：页面入口是 /a/ 与 /u/；旧页面入口 /_ui/admin/、/_ui 由 conf 各 302
   过去，/_ui/* 的精确 API 别名——config / logs / stats / props——照旧 200）
+  （口径 2026-10-08 admin 迁根，现役：管理台入口是 /（站点根）、/u/ 不变；旧 /a、/a/
+  各 302 到 /；/_ui/* 全部取消、落 404 sink；数据面在根：/config /logs /stats /props）
 - POST /v1/chat/completions（model=q38fn-kv8）→ 200，usage 与 smg_router_tokens_total 对账一致
   （prompt=14 / completion=16 / reasoning=17）
 - 边缘入口 https://8801-248.ai-t.wtvdev.com/a/ → 200（再验旧入口 /_ui/admin/ 应回 302）
@@ -276,7 +278,7 @@ health OK；2 个 worker 全部 `smg_worker_health=1`、`cb_state=0`；q38fn 推
 - 设为 0 或负数 = 不跳过（兼容旧行为）
 - 探活开关仍是 SMG_DISABLE_HEALTH_CHECK，未改动
 
-### 2. /_ui/logs 查询过滤
+### 2. /logs 查询过滤（旧名 /_ui/logs，2026-10-08 迁根）
 
 带过滤参数时返回完整元信息：returned / total_matched / earliest_seq / latest_seq /
 truncated_buffer / truncated_page。不带过滤参数时返回体逐字节不变。
@@ -285,7 +287,7 @@ truncated_buffer / truncated_page。不带过滤参数时返回体逐字节不�
 model（虚拟入口名，匹配 requested_model 或 model）、forwarded_model、worker、
 status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、session。
 
-**踩过的坑**：/_ui/logs 被 conf/ui.conf 的 location 接管，调用的是 observability.handle_logs()，
+**踩过的坑**：/logs 被 conf/ui.conf 的 location 接管，调用的是 observability.handle_logs()，
 不是 router.lua 的 ui_logs_handler。改 handler 没用，必须改 handle_logs()。
 
 ## 2026-10-06 容量新口径部署提示
@@ -296,7 +298,7 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 
 ### 三个字段怎么配
 
-配在 worker 记录 / `upstreams` 声明行上（`POST|PUT /workers`、`/_ui/config` 的 JSON、config 声明层三条路都通）：
+配在 worker 记录 / `upstreams` 声明行上（`POST|PUT /workers`、`/config` 的 JSON、config 声明层三条路都通）：
 
 | 字段 | 取值域 | 缺席时 | 清除（已配过之后） |
 |---|---|---|---|

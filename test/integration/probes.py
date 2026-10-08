@@ -88,7 +88,7 @@ port = start_probe({"LMR_EFFORT_MAP": "low:medium,high:xhigh;minimal:low",
                     "LMR_MODEL_EFFORT_LEVELS": "alpha:low+medium+high,beta:max",
                     "LMR_VIRTUAL_MODELS": "alias-a:alpha,alias-b:beta",
                     "LMR_DEFAULT_EFFORT": "medium"}, name)
-st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
+st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
 doc = json.loads(body) if st == 200 else {}
 cfg = doc.get("config", doc) if isinstance(doc, dict) else {}
 

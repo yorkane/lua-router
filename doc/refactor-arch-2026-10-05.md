@@ -6,7 +6,7 @@
 ## 0. 总目标与不变量
 
 **目标**：把 7 个 2000+ 行的大文件拆成「facade + 子模块」层级，抽出公共模块，UI 三页改造，
-入口迁移 /u/ 与 /a/。**对外行为零变化**是唯一验收口径。
+入口迁移 /u/ 与 /a/（其中 /a/ 已于 2026-10-08 由 admin 迁根取代，见 doc/architect.md）。**对外行为零变化**是唯一验收口径。
 
 **不可违反的不变量**（违反任何一条 = 重做）：
 
@@ -146,7 +146,10 @@
   六个三态 select + modalities、广告范围块（advertise 开关族）。
 - 保存链路不变：`configVirtual`（POST /_ui/config/virtual 整表）。**请求形状逐字节不变**
   （`test/integration/e2e_profiles.py` 钉着）。
-- 校验逻辑（`validateVirtualRow` / `virtualCtxOverflow` / 提交前的 Blocking 判据）原样保留，搬进对话框提交流程。
+- 校验逻辑（`validateVirtualRow`：入口名非空、`context_window` 正整数等基本校验）原样保留，搬进对话框提交流程。
+  本节当初与它并列的那道「声明窗口 vs 卡片输出上限」比较校验及其提交前的 Blocking 判据（UI 预校验）已于
+  2026-10-08 移除——两个量不可比：`context_window` 是对外声明的上下文总窗口，卡片那格是单次输出 token 上限
+  （口径见 [gap-virtual-models.md](gap-virtual-models.md) §4）。
 
 ### 5.2 控件密度与 radio 化
 

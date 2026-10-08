@@ -10,7 +10,7 @@
 {added,updated,removed,skipped}）：
 
   S1 whitelist   两个同模型 mock（alpha）+ 一个 REQUIRE_AUTH 远程（remote-g），
-                 SMG_ENABLE_IGW=1 让候选按 model 收窄，一次 POST /_ui/config/virtual
+                 SMG_ENABLE_IGW=1 让候选按 model 收窄，一次 POST /config/virtual
                  写 5 条新形状 profile：
                    vm-w  白名单=worker1 规范化 url → 20 发只落 worker1；转发 body 的
                          model 是 target 真名 alpha
@@ -21,7 +21,7 @@
                          模型一样摊开，route_type 全是当前生效策略，且解析期 warn
                    vm-gp 组入口（显式 targets）+ model_policy[入口名]=prefix_hash
                          → 停用字段的替代入口仍然生效：20 发全砸一个 mock、
-                         route_type 全 prefix_hash、GET /_ui/config/policy 列出
+                         route_type 全 prefix_hash、GET /config/policy 列出
                          入口那一行 source=model；同时 model=alpha 同形状流量必须
                          仍摊开（入口级覆盖不得泄漏到真实模型上）
                    vm-c  effort=high               → 同 ruling 停用：请求体不再被
@@ -31,15 +31,15 @@
                          gated worker 走白名单：200 + mock 的 /last_auth 记录
                          Authorization == "Bearer sk-G-123"
                  另测 /v1/models 广告全部别名、白名单全不命中 → 503
-                 no_available_workers、GET /_ui/config 回显 workers/policy/effort。
+                 no_available_workers、GET /config 回显 workers/policy/effort。
   S1b env_seed   第二个容器只带 LMR_UPSTREAMS_FILE（无 POST、无 SMG_WORKER_URLS）：
                  种子条目必须被 bootstrap reconcile 投进池（discovery=config +
                  model_id），document 脱敏回显 has_api_key，转发注入种子 key。
   S2 keyctl      upstreams 全生命周期（IGW=1，清除 key 后的 401 才有判别力）。
-                 POST /_ui/config/upstreams 是整表替换语义，所以每一步都提交完整
+                 POST /config/upstreams 是整表替换语义，所以每一步都提交完整
                  期望表：加带 key 的 R（reconcile.added==1）→ /workers 有
                  discovery=config 且不回显明文 → document 条目 api_key null +
-                 has_api_key true（/_ui/config、/_ui/props 同样无明文）→ 转发注入
+                 has_api_key true（/config、/props 同样无明文）→ 转发注入
                  Bearer → key 三连：null 保留、覆盖新值、空串清除（401 透传 +
                  mock auth_denied 计数 + has_api_key 转 false）→ bootstrap url 混进
                  upstreams 只能 skipped（model_id 不被 hijacked 改写、流量正常）→
@@ -65,7 +65,7 @@
                  契约 3.1 的误删自愈：手工 DELETE 掉一个 config 成员，等 30 s
                  定时器（代码常量，无 env knob）补回；不补回时用同表重提交做判别
                  探针，把缺口钉在「定时器没检出变更」还是「reconcile 本身坏」。
-  S4 apply       POST /_ui/config/apply 一次写 virtual_models(新形状)+upstreams：
+  S4 apply       POST /config/apply 一次写 virtual_models(新形状)+upstreams：
                  响应顶层 reconcile 摘要 + 文档回显 profile 字段 + vm-doc 端到端
                  打穿 gated mock；随后一次「无效整体拒绝」：坏条目（alias 指向
                  alias）与合法改动（G 带 api_key:"" 洗 key、诱饵 upstream）同车
@@ -73,8 +73,8 @@
                  （再来一发 200 + Bearer sk-X-999）、池里无诱饵、文档无 vm-bad。
                  另测未知 profile policy 400 与旧形状 {model,target} 兼容。
 
-观察通道：mock 计数、/last_auth 自省、GET /workers、GET /_ui/config、
-/_ui/logs route_type、lr_watch_* 计数；端口全部随机；容器一律
+观察通道：mock 计数、/last_auth 自省、GET /workers、GET /config、
+/logs route_type、lr_watch_* 计数；端口全部随机；容器一律
 NGINX_WORKER_PROCESSES=1（跨进程一致性是 e2e_routing_dyn 的门，这里不重复计费）。
 """
 import json
@@ -208,7 +208,7 @@ def wait_all_healthy(port, want=2, timeout=40):
 
 
 def config_doc(port):
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
     if st != 200:
         return None, body
     doc = json.loads(body)
@@ -230,29 +230,29 @@ def post_json(port, path, body):
 
 
 def post_profiles(port, entries):
-    return post_json(port, "/_ui/config/virtual", {"entries": entries})
+    return post_json(port, "/config/virtual", {"entries": entries})
 
 
 def post_upstreams(port, entries):
-    return post_json(port, "/_ui/config/upstreams", {"entries": entries})
+    return post_json(port, "/config/upstreams", {"entries": entries})
 
 
 def post_apply(port, doc):
-    return post_json(port, "/_ui/config/apply", doc)
+    return post_json(port, "/config/apply", doc)
 
 
 def post_effort(port, patch):
-    return post_json(port, "/_ui/config/effort", patch)
+    return post_json(port, "/config/effort", patch)
 
 
 def put_policy(port, patch):
-    """PUT /_ui/config/policy {policy?, model_policies?, model_policy?}.
+    """PUT /config/policy {policy?, model_policies?, model_policy?}.
 
     The routing page is the *only* place a scheduling policy is configured since
     root ruling 2026-10-02 removed the per-alias override, so the replacement-entry
     case has to go through this endpoint rather than through virtual_models.
     """
-    st, body, _ = http("PUT", "http://127.0.0.1:%d/_ui/config/policy" % port, patch)
+    st, body, _ = http("PUT", "http://127.0.0.1:%d/config/policy" % port, patch)
     try:
         return st, json.loads(body)
     except ValueError:
@@ -260,8 +260,8 @@ def put_policy(port, patch):
 
 
 def policy_rows(port):
-    """GET /_ui/config/policy -> {model: row} of the per-model chain document."""
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config/policy" % port)
+    """GET /config/policy -> {model: row} of the per-model chain document."""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config/policy" % port)
     if st != 200:
         return {}
     try:
@@ -313,7 +313,7 @@ def hits(pa, pb, base_a, base_b):
 
 
 def route_types(port, requested_model):
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs?cursor=0&limit=300" % port)
+    st, body, _ = http("GET", "http://127.0.0.1:%d/logs?cursor=0&limit=300" % port)
     if st != 200:
         return []
     try:
@@ -398,7 +398,7 @@ def scenario_whitelist():
         {"model": "vm-g", "target": "remote-g", "workers": [url_g]},
     ]
     st, doc = post_profiles(port, profiles5)
-    check("[S1] POST /_ui/config/virtual (new shape) 200", st == 200,
+    check("[S1] POST /config/virtual (new shape) 200", st == 200,
           "%s %s" % (st, str(doc)[:300]))
     st, body, _ = http("GET", "http://127.0.0.1:%d/v1/models" % port)
     check("[S1] /v1/models advertises the aliases",
@@ -628,7 +628,7 @@ def scenario_keyctl():
     st, resp = post_upstreams(port, [{"url": url_r, "model_id": "remote-a",
                                        "api_key": KEY_A, "priority": 30,
                                        "labels": {"team": "gpu"}}])
-    check("[S2] POST /_ui/config/upstreams 200", st == 200, "%s %s" % (st, str(resp)[:250]))
+    check("[S2] POST /config/upstreams 200", st == 200, "%s %s" % (st, str(resp)[:250]))
     check("[S2] reconcile.added == 1", st == 200 and rc_count(resp, "added") == 1,
           json.dumps(resp)[:300] if st == 200 else "")
     check("[S2] upstream worker enters the pool", wait_urls(port, [url_r], 30), logs(name)[:300])
@@ -645,9 +645,9 @@ def scenario_keyctl():
     check("[S2] document entry: api_key null + has_api_key true",
           entry.get("api_key") is None and entry.get("has_api_key") is True,
           json.dumps(entry)[:250])
-    check("[S2] /_ui/config leaks no plaintext", KEY_A not in json.dumps(doc), "")
-    st, pbody, _ = http("GET", "http://127.0.0.1:%d/_ui/props" % port)
-    check("[S2] /_ui/props leaks no plaintext", st == 200 and KEY_A not in pbody,
+    check("[S2] /config leaks no plaintext", KEY_A not in json.dumps(doc), "")
+    st, pbody, _ = http("GET", "http://127.0.0.1:%d/props" % port)
+    check("[S2] /props leaks no plaintext", st == 200 and KEY_A not in pbody,
           "%s %s" % (st, pbody[:200]))
 
     reset_mock(pr)

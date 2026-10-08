@@ -1,8 +1,8 @@
 /*
   lua-router 管理控制台 · 请求层（仿 authz/admin/api.js）
 
-  所有端点都用绝对路径。页面挂在 /a/ 下（refactor-arch-2026-10-05.md §5.3 从 /_ui/admin/ 迁来），因此：
-    · 网关自带 API 走 /_ui/*（conf/ui.conf 的精确 location）
+  所有端点都用绝对路径。admin 管理台现挂在根路径 /（2026-10-08 迁根），因此：
+    · 网关自带数据面 API（config / logs / stats / props）走根路径的 exact location
     · 控制面 API 走根路径 /workers（router.lua 的 klib 路由表）
   全部无鉴权（网关鉴权层已随 doc/scope-trim.md 删除），所以不带 credentials / CSRF。
 
@@ -12,7 +12,8 @@
   抛出的 Error 带 status / code，页面据此提示。
 */
 (function () {
-  const UI_BASE = '/_ui'
+  // 2026-10-08 admin 迁根：/_ui/ 入口取消，数据面走根路径
+  const UI_BASE = ''
   const API_BASE = ''
 
   async function request (path, options, base) {
@@ -67,7 +68,7 @@
     updateWorker: (id, patch) => put(`/workers/${encodeURIComponent(id)}`, patch),
     removeWorker: id => del(`/workers/${encodeURIComponent(id)}`),
 
-    // ── 模型覆盖（/_ui/config 家族，均返回整份 document） ──
+    // ── 模型覆盖（/config 家族，均返回整份 document） ──
     config: () => get('/config', UI_BASE),
     configEffort: patch => post('/config/effort', patch, UI_BASE),
     configCtx: (model, ctx) => post('/config/ctx', { model, ctx }, UI_BASE),
@@ -79,7 +80,7 @@
     // 模型改名映射（直接调 /model-map）；body 支持 {"orig":"new"} 形状，空值即删除
     configModelMap: mapping => post('/model-map', mapping),
 
-    // ── 路由策略（/_ui/config/policy，doc/gap-routing-dyn.md） ──
+    // ── 路由策略（/config/policy，doc/gap-routing-dyn.md） ──
     // GET 返回策略链文档（候选策略 + 全局 + per-model 行），PUT 提交变更并回显新文档。
     configPolicy: () => get('/config/policy', UI_BASE),
     configPolicyApply: patch => put('/config/policy', patch, UI_BASE),

@@ -22,9 +22,11 @@ local function new_cfg()
         default_effort = nil,
         effort_map = {},
         model_ctx = {},
-        -- 平铺层的「服务实际上下文限制」（与 model_ctx 同形状）：卡片上的
-        -- context_limit 优先，这里是没有卡片时的兜底读数。
-        model_context_limit = {},
+        -- 平铺层的「单次输出预算上限」（与 model_ctx 同形状）：卡片上的
+        -- max_output_tokens 优先，这里是没有卡片时的兜底读数。对外落到
+        -- /v1/models 的 capabilities.max_output_tokens（用户裁定 2026-10-08：原
+        -- context_limit 字段改名，不再参与 context_length 的决定）。
+        model_max_output_tokens = {},
         model_effort = {},
         model_configs = {},
         virtual_models = {},
@@ -108,15 +110,15 @@ local function effort_pairs(map)
 end
 
 local function new_card()
-    -- context_limit is the *engine's* real capability (what the serving process can
-    -- actually hold), declared by the operator from the engine's own report -- it is
-    -- not the client-facing window an entry advertises. It exists only to validate
-    -- declared context_window values at configuration time; nothing on the hot path
-    -- clamps with it (root ruling 2026-10-04: the gateway rewrites no output budget).
+    -- max_output_tokens 是操作员替这台引擎声明的**单次输出预算上限**（用户裁定
+    -- 2026-10-08，原名 context_limit）：它唯一的去处是 /v1/models 的
+    -- capabilities.max_output_tokens 声明层，压过引擎自报的那一份。它不参与任何
+    -- max_tokens 改写（root ruling 2026-10-04: the gateway rewrites no output budget），
+    -- 也不再影响 capabilities.context_length —— 那条链只由 ctx（声明窗口）与引擎自报决定。
     -- 五个能力位都是三态：nil = 操作员没说（该维度让位给引擎自报），false = 说了不支持。
     -- 显式写成 nil 是为了把「这张卡片存在」与「这张卡片声明过能力位」分开——前者由
     -- new_card 决定，后者只看这些键上有没有真布尔（读侧一律 type == "boolean" 判定）。
-    return { ctx = nil, context_limit = nil, default_effort = nil,
+    return { ctx = nil, max_output_tokens = nil, default_effort = nil,
              effort_map = {}, modalities = nil, supports_tool_use = nil,
              supports_streaming = nil, supports_reasoning = nil,
              supports_vision = nil, supports_reasoning_effort = nil,
@@ -152,11 +154,12 @@ local function cfg_from_env()
         local ctx = CS_LEXICON.parse_positive_int(pair[2])
         if ctx then cfg.model_ctx[pair[1]] = ctx end
     end
-    -- 平铺层的真实上下文限制，与 LMR_MODEL_CTX 同一形状（model=value）。它只是
-    -- 「操作员从引擎自报读数里抄来的真实能力」，用来校验声明窗口，不参与任何钳制。
-    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_CONTEXT_LIMIT"))) do
+    -- 平铺层的单次输出预算上限，与 LMR_MODEL_CTX 同一形状（model=value）。它是操作员
+    -- 替这台引擎声明的 max_output_tokens 读数，唯一去处是 /v1/models 的
+    -- capabilities.max_output_tokens 声明层；不参与任何钳制，也不决定 context_length。
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_MAX_OUTPUT_TOKENS"))) do
         local limit = CS_LEXICON.parse_positive_int(pair[2])
-        if limit then cfg.model_context_limit[pair[1]] = limit end
+        if limit then cfg.model_max_output_tokens[pair[1]] = limit end
     end
     for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_EFFORT"))) do
         local effort = CS_FACADE.normalize_effort(pair[2])
@@ -245,10 +248,10 @@ local function snapshot_of(cfg)
     for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_ctx)) do
         model_ctx[#model_ctx + 1] = { model = model, ctx = cfg.model_ctx[model] }
     end
-    local model_context_limit = {}
-    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_context_limit)) do
-        model_context_limit[#model_context_limit + 1] = {
-            model = model, context_limit = cfg.model_context_limit[model],
+    local model_max_output_tokens = {}
+    for _, model in ipairs(CS_LEXICON.sorted_keys(cfg.model_max_output_tokens)) do
+        model_max_output_tokens[#model_max_output_tokens + 1] = {
+            model = model, max_output_tokens = cfg.model_max_output_tokens[model],
         }
     end
     local model_effort = {}
@@ -265,7 +268,7 @@ local function snapshot_of(cfg)
         model_configs[#model_configs + 1] = {
             model = model,
             ctx = CS_LEXICON.nul(card.ctx),
-            context_limit = CS_LEXICON.nul(card.context_limit),
+            max_output_tokens = CS_LEXICON.nul(card.max_output_tokens),
             default_effort = CS_LEXICON.nul(card.default_effort),
             effort_map = CS_LEXICON.arr(map),
             modalities = CS_LEXICON.nul(card.modalities),
@@ -404,7 +407,7 @@ local function snapshot_of(cfg)
         default_effort = CS_LEXICON.nul(cfg.default_effort),
         effort_map = CS_LEXICON.arr(effort_map),
         model_ctx = CS_LEXICON.arr(model_ctx),
-        model_context_limit = CS_LEXICON.arr(model_context_limit),
+        model_max_output_tokens = CS_LEXICON.arr(model_max_output_tokens),
         model_effort = CS_LEXICON.arr(model_effort),
         model_configs = CS_LEXICON.arr(model_configs),
         virtual_models = CS_LEXICON.arr(virtual_models),
@@ -454,28 +457,30 @@ local function merge_model_patch(card, patch)
         end
     end
 
-    -- 服务真实上下文限制（引擎自报能力，操作员抄录）。解析口径照抄 ctx：absent =
-    -- leave alone, null = clear back to "unknown"（未知即不校验）。它不参与任何
-    -- max_tokens 钳制（2026-10-04 裁定），唯一用途是配置期校验声明窗口。
-    if patch.context_limit ~= nil then
-        local raw = patch.context_limit
+    -- 单次输出预算上限（操作员替这台引擎声明的读数，原名 context_limit，
+    -- 用户裁定 2026-10-08）。解析口径照抄 ctx：absent = leave alone,
+    -- null = clear back to "unknown"（未知即让位给引擎自报）。它不参与任何
+    -- max_tokens 钳制（2026-10-04 裁定），唯一去处是 /v1/models 的
+    -- capabilities.max_output_tokens 声明层。
+    if patch.max_output_tokens ~= nil then
+        local raw = patch.max_output_tokens
         if raw == JSON_NULL then
-            card.context_limit = nil
+            card.max_output_tokens = nil
         elseif type(raw) == "number" then
             local n = CS_LEXICON.parse_positive_int(raw)
-            if not n then return nil, "context_limit must be greater than zero" end
-            card.context_limit = n
+            if not n then return nil, "max_output_tokens must be greater than zero" end
+            card.max_output_tokens = n
         elseif type(raw) == "string" then
             local s = CS_LEXICON.trim(raw)
             if s == "" then
-                card.context_limit = nil
+                card.max_output_tokens = nil
             else
                 local n = CS_LEXICON.parse_positive_int(s)
-                if not n then return nil, string.format("context_limit must be a number: %s", s) end
-                card.context_limit = n
+                if not n then return nil, string.format("max_output_tokens must be a number: %s", s) end
+                card.max_output_tokens = n
             end
         else
-            return nil, "context_limit must be a number or null"
+            return nil, "max_output_tokens must be a number or null"
         end
     end
 
@@ -608,68 +613,6 @@ local function merge_model_patch(card, patch)
     return true
 end
 
---- Configuration-time check for the *declared* window of a virtual-model entry.
----
---- 背景（生产 21.k:8801，2026-10-04）：操作员给入口写 context_window=350000，而该组里的
---- 引擎实际只装得下 262144（SGLang 报 context_length 524288，但反复告警 derived
---- context_length 262144，模型 config 的 original_max_position_embeddings 也是 262144）。
---- 老版本网关还会把这个声明值当输出预算塞进 max_tokens，于是「输入 + 350000」超过真实窗口
---- 直接 400。router 侧已经不再改写任何输出预算（commit 75ecc37），这里补上另一半：声明窗口
---- 必须在**配置期**就落在服务真实能力之内，让操作员当场看到矛盾，而不是等线上 400。
----   * 只在条目真的写了 context_window、且组内**至少一张**卡声明了 context_limit 时判定；
----     谁都没声明 = 不知道引擎真实能力 = 不校验（宽容，不假装知道）；
----   * 组内多个读数取**最小值**：一组由该入口不控制的引擎提供服务，只有按最窄的那台才算安全
----     口径（与 virtual_ctx_cap 取最小值同一个理由）；
----   * 比较是**严格小于**：声明值等于真实限制同样拒绝（整窗都占满 = 没有余量）。
---- 读数来源与 ctx_cap 同形状：卡片的 context_limit 优先，其次平铺的 cfg.model_context_limit。
----
---- 只在两条**入口写入**路径上调用（apply_profiles 与 apply_document）。两处刻意不判：
----   * cfg_from_document —— 它同时是磁盘快照的读路径，在那里拒绝会让一份已经落盘的配置在下次
----     reload 整体退回 env 默认（等于把网关配置抹平）。矛盾要让操作员在保存时看到，不能让已经
----     跑着的实例在重启时失去配置；
----   * apply_model_config（单卡写入）—— 那正是操作员**登记引擎真实读数**的动作。若在这里拦下
----     「已有入口配得过宽」，就变成「因为存在坏入口，所以永远记不下它到底能装多少」，操作员
----     只能先猜一个数再改回来，等于把修复顺序堵死。读数一登记完，下一次入口保存就被拦。
----@param cfg table @ 即将生效的配置（map 形态，卡片与条目都已装配好）
----@return boolean ok, string|nil err
-local function validate_declared_context_windows(cfg)
-    if type(cfg) ~= "table" then return true end
-    local limits = cfg.model_context_limit or {}
-    local cards = cfg.model_configs or {}
-    for _, alias in ipairs(CS_LEXICON.sorted_keys(cfg.virtual_profiles or {})) do
-        local profile = cfg.virtual_profiles[alias]
-        local declared = type(profile) == "table" and profile.context_window or nil
-        if type(declared) == "number" and declared >= 1 then
-            -- 判定范围 = 这个入口的服务组；没有组的单绑定行退到代表值，与 virtual_ctx_cap
-            -- 的「组只有一个成员就是它自己」同口径。
-            local group
-            if type(profile.targets) == "table" and #profile.targets > 0 then
-                group = profile.targets
-            elseif type(profile.target) == "string" and profile.target ~= "" then
-                group = { profile.target }
-            else
-                group = {}
-            end
-            local narrowest, narrowest_model
-            for i = 1, #group do
-                local model = group[i]
-                local card = cards[model]
-                local limit = (card and card.context_limit) or limits[model]
-                if type(limit) == "number" and limit >= 1
-                    and (narrowest == nil or limit < narrowest) then
-                    narrowest, narrowest_model = limit, model
-                end
-            end
-            if narrowest ~= nil and declared >= narrowest then
-                return nil, string.format(
-                    "virtual model %s declares context_window %d, but service %s can only hold %d: the declared window must be strictly smaller than the real context_limit",
-                    alias, declared, tostring(narrowest_model), narrowest)
-            end
-        end
-    end
-    return true
-end
-
 --- Whole-document build (used by apply_document and from_snapshot): every
 --- section is rebuilt from the payload, absent sections stay empty.
 ---@param doc table @ decoded document / stored snapshot
@@ -677,7 +620,8 @@ end
 ---@param shadow table|nil @ 同名遮蔽判据上下文，透传给 build_profiles。**磁盘快照的读路径
 ---  （config_store/readers.lua 的 current()）必须传 new_shadow_context{reload=true}**：那份
 ---  路径上新增的任何拒绝都会让一份已落盘的配置在下次 reload 整体退回 env 默认（等于把网关
----  配置抹平），与 validate_declared_context_windows 刻意不挂读路径同一条理由。缺省（nil）是
+---  配置抹平）——与已移除的配置期校验（原 validate_declared_context_windows，2026-10-08）
+---  刻意不挂读路径同一条理由。缺省（nil）是
 ---  **写入侧**口径：现查 registry 的引擎背书，所以 JSON 编辑器的整文档保存与 /_ui/config/virtual
 ---  两条链共用同一道判据，不会因为走的是不同入口而一边严一边松。
 local function cfg_from_document(doc, previous, shadow)
@@ -737,25 +681,26 @@ local function cfg_from_document(doc, previous, shadow)
         end
     end
 
-    -- 平铺层的「服务实际上下文限制」，解析口径照抄 model_ctx 那一套：行形状
-    -- {model, context_limit}，值必须是正整数（缺值或非法值与 model_ctx 同文案家族报错）。
-    -- 卡片上的 context_limit 优先，这一层是没有卡片时的兜底读数。
-    if doc.model_context_limit ~= nil then
-        if not CS_LEXICON.is_array(doc.model_context_limit) then
-            return nil, "model_context_limit must be an array"
+    -- 平铺层的「单次输出预算上限」，解析口径照抄 model_ctx 那一套：行形状
+    -- {model, max_output_tokens}，值必须是正整数（缺值或非法值与 model_ctx 同文案家族报错）。
+    -- 卡片上的 max_output_tokens 优先，这一层是没有卡片时的兜底读数。对外落到
+    -- /v1/models 的 capabilities.max_output_tokens（用户裁定 2026-10-08 由 context_limit 改名）。
+    if doc.model_max_output_tokens ~= nil then
+        if not CS_LEXICON.is_array(doc.model_max_output_tokens) then
+            return nil, "model_max_output_tokens must be an array"
         end
-        for _, entry in ipairs(doc.model_context_limit) do
+        for _, entry in ipairs(doc.model_max_output_tokens) do
             local model = CS_LEXICON.trim(entry.model)
             if model ~= "" then
-                local raw = entry.context_limit
+                local raw = entry.max_output_tokens
                 if raw == nil or raw == JSON_NULL then
-                    return nil, string.format("model_context_limit for %s needs a numeric context_limit", model)
+                    return nil, string.format("model_max_output_tokens for %s needs a numeric max_output_tokens", model)
                 end
                 local limit = CS_LEXICON.parse_positive_int(raw)
                 if not limit then
-                    return nil, string.format("model_context_limit for %s must be greater than zero", model)
+                    return nil, string.format("model_max_output_tokens for %s must be greater than zero", model)
                 end
-                cfg.model_context_limit[model] = limit
+                cfg.model_max_output_tokens[model] = limit
             end
         end
     end
@@ -891,6 +836,5 @@ _M.merge_model_patch = merge_model_patch
 _M.new_card = new_card
 _M.snapshot_of = snapshot_of
 _M.sync_virtual_view = sync_virtual_view
-_M.validate_declared_context_windows = validate_declared_context_windows
 
 return _M

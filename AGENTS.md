@@ -60,14 +60,24 @@
 >    一律原样透传，调用方给多少转发多少；调用方没给时网关也不替它填一个数。
 > 2. **`context_window` 回归本义**：入口**对外声明的上下文总窗口（输入+输出）**，作用是让客户端更早
 >    触发压缩；不参与任何 max_tokens 计算，只保留解析 / 落盘 / 往返 / UI 展示。
-> 3. **新增模型卡片字段 `context_limit`**＝**服务实际能承受的上下文限制**（引擎真实能力，操作员按引擎
->    启动参数抄录）；平铺写法 `model_context_limit`、env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层。
-> 4. **配置期校验**：条目的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则
->    拒绝保存；组内没有任何卡片声明读数 = 不知道引擎能力 = 不校验也不报错。实现
->    `config_store.validate_declared_context_windows`（只挂在 `apply_profiles` / `apply_document` 两条入口
->    写入路径上：磁盘快照的读路径不判，否则一份已落盘的配置会在下次 reload 整体退回 env 默认；
->    单卡写入的 `apply_model_config` 也不判，那正是操作员登记引擎读数的动作）。口径见
->    doc/gap-virtual-models.md §4。
+>
+> 本裁定原先的第 3 / 4 条（模型卡片 `context_limit` 与它的配置期校验）**已由用户裁定 2026-10-08
+> 改写**，现行口径就是下面这两条：
+>
+> 3. **模型卡片字段 `max_output_tokens`**（原名 `context_limit`，2026-10-08 改名）＝**声明给下游 agent 的
+>    单次最大输出 token 数**，是一份**纯对外 advertisement**：唯一去处是 `/v1/models` 的
+>    `capabilities.max_output_tokens`（操作员声明压过引擎自报），**不参与任何校验、钳制或 max_tokens 运算**，
+>    也不声称引擎的真实能力（引擎能吐多少是引擎的事，这里说的是网关替它对外承诺多少）。平铺写法
+>    `model_max_output_tokens`、env `LMR_MODEL_MAX_OUTPUT_TOKENS`，卡片优先于平铺层；写了卡片就清掉同模型的
+>    平铺行，免得留一条谁都不再看作生效的隐形地雷。
+>    `capabilities.context_length` 与此无关，它只由两档决定：操作员声明的窗口（卡片 `ctx` / 平铺
+>    `model_ctx`，经 `config_store.ctx_cap`）**优先于**引擎自报，两者都没有就整个键省略。
+> 4. **不再有「声明窗口 vs 输出上限」这类配置期校验**：条目的 `context_window` 是**上下文总窗口**，卡片的
+>    `max_output_tokens` 是**单次输出预算**，两个量不可比，拿一个去判另一个就是重犯 2026-10-04 那次把三个
+>    量当一个数的错误。因此原 `config_store.validate_declared_context_windows`（挂在 `apply_profiles` /
+>    `apply_document` 两条写入路径上）连同 UI 侧同款的前端预校验（虚拟入口页的橙色徽章、编辑框报错、
+>    保存按钮禁用）已于 2026-10-08 **一并移除**：`context_window` 只做解析 / 落盘 / 往返 / 展示，网关与 UI
+>    都不据它拒绝任何东西。口径见 doc/gap-virtual-models.md §4。
 
 与 Rust 版的行为对拍是护住既有行为的手段，不是目标；排期与新功能优先对齐以上四点。
 

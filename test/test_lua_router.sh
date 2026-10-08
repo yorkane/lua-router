@@ -908,11 +908,11 @@ if section gate; then
         && pass "syntax gate: nginx-lua-router.conf" \
         || fail "syntax gate: nginx-lua-router.conf"
 
-    # The test conf includes conf/ui.conf, so the /_ui contract is exercised on
+    # The test conf includes conf/ui.conf, so the UI + root data-plane contract is exercised on
     # the same listener (exact locations outrank `location /`).
     grep -q "include /repo/conf/ui.conf;" \
         "$REPO_ROOT/test/conf/nginx-lua-router.conf" \
-        && pass "test conf wires conf/ui.conf (the /_ui surface)" \
+        && pass "test conf wires conf/ui.conf (UI + root data plane)" \
         || fail "test conf does not include conf/ui.conf"
 
     docker run --rm -v "$REPO_ROOT:/repo:ro" --entrypoint openresty "$IMAGE" \
@@ -971,9 +971,9 @@ if section public; then
     assert_json "empty GET /workers encodes workers as []" '.workers | type' "array"
     assert_json "empty GET /workers total" '.total' "0"
     assert_json "empty GET /workers regular_count" '.stats.regular_count' "0"
-    request "$BASE" GET /_ui/logs/backends
-    assert_eq "empty /_ui/logs/backends is 200" "$STATUS" "200"
-    assert_json "empty /_ui/logs/backends encodes []" '.backends | type' "array"
+    request "$BASE" GET /logs/backends
+    assert_eq "empty /logs/backends is 200" "$STATUS" "200"
+    assert_json "empty /logs/backends encodes []" '.backends | type' "array"
 
     # Register a worker: 202 contract first, then the public plane lights up.
     register_worker "$BASE" "{\"url\":\"$MOCK_URL\",\"model_id\":\"test-model\"}"
@@ -1263,7 +1263,7 @@ if section inference; then
 
     # round_robin: two consecutive pinned-mock requests are both served, and an
     # unpinned pair spreads over the pool (distinct selections in the log).
-    request "$BASE" GET /_ui/logs
+    request "$BASE" GET /logs
     assert_json "round_robin selected from the pool" \
         '[.requests[] | .selected] | unique | length >= 1 | tostring' "true"
 fi
@@ -1620,19 +1620,19 @@ if section observability; then
     request "$BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
         -H "x-smg-target-worker: $MOCK_ID" \
         --data '{"model":"test-model","stream":true,"messages":[{"role":"user","content":"s"}]}' >/dev/null
-    request "$BASE" GET /_ui/logs
-    assert_eq "/_ui/logs status" "$STATUS" "200"
-    assert_json "/_ui/logs has cursor" '.cursor | type' "number"
-    assert_json "/_ui/logs has capacity" '.capacity' "1000"
-    assert_json "/_ui/logs requests is an array" '.requests | type' "array"
-    assert_json "/_ui/logs recorded the chat" '.requests | length >= 1 | tostring' "true"
-    assert_json "/_ui/logs record fields" \
+    request "$BASE" GET /logs
+    assert_eq "/logs status" "$STATUS" "200"
+    assert_json "/logs has cursor" '.cursor | type' "number"
+    assert_json "/logs has capacity" '.capacity' "1000"
+    assert_json "/logs requests is an array" '.requests | type' "array"
+    assert_json "/logs recorded the chat" '.requests | length >= 1 | tostring' "true"
+    assert_json "/logs record fields" \
         '.requests[0] | has("id") and has("ts_ms") and has("method") and has("path") and has("endpoint") and has("status") and has("stream") and has("model") and has("worker") and has("route_type") and has("duration_ms") and has("prompt_tokens") and has("completion_tokens") and has("candidates") | tostring' "true"
-    assert_json "/_ui/logs sse usage was parsed" \
+    assert_json "/logs sse usage was parsed" \
         '([.requests[] | select(.stream and .completion_tokens > 0)] | length) > 0 | tostring' "true"
     # The buffered path must record the worker's usage too (a `f() or g()` return
     # truncated the multi-valued usage helper and logged 0 completion tokens).
-    assert_json "/_ui/logs buffered usage was parsed" \
+    assert_json "/logs buffered usage was parsed" \
         '([.requests[] | select((.stream | not) and .completion_tokens > 0)] | length) > 0 | tostring' "true"
 
     BASE=$MAIN_BASE
@@ -1678,31 +1678,31 @@ if section observability; then
     request "$SESS_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
         -H "x-smg-target-worker: $SESS_MOCK_ID" --data "$CHAT_BODY" >/dev/null
 
-    request "$SESS_BASE" GET /_ui/logs
-    assert_json "/_ui/logs records carry a session field" \
+    request "$SESS_BASE" GET /logs
+    assert_json "/logs records carry a session field" \
         '.requests[0] | has("session") | tostring' "true"
-    assert_json "/_ui/logs session is the sha256 of prompt_cache_key" \
+    assert_json "/logs session is the sha256 of prompt_cache_key" \
         '.requests[0].session' "$ALPHA_SHA"
-    assert_json "/_ui/logs a second cache key fingerprints differently" \
+    assert_json "/logs a second cache key fingerprints differently" \
         '.requests[1].session' "$BETA_SHA"
-    assert_json "/_ui/logs message-derived session hashes role NUL content" \
+    assert_json "/logs message-derived session hashes role NUL content" \
         '.requests[2].session' "$SEED_SHA"
-    assert_json "/_ui/logs the same first message keeps the session" \
+    assert_json "/logs the same first message keeps the session" \
         '.requests[3].session' "$SEED_SHA"
-    assert_json "/_ui/logs another first message opens another session" \
+    assert_json "/logs another first message opens another session" \
         '.requests[4].session' "$OTHER_SHA"
-    assert_json "/_ui/logs a single turn without a key has no session" \
+    assert_json "/logs a single turn without a key has no session" \
         '.requests[5].session == null | tostring' "true"
-    assert_json "/_ui/logs every session is 64-hex or null" \
+    assert_json "/logs every session is 64-hex or null" \
         '[.requests[] | select(.session != null) | .session] | all(test("^[0-9a-f]{64}$")) | tostring' "true"
 
     # reasoning_tokens: Rust reads usage.completion_tokens_details.reasoning_tokens
     # and falls back to usage.reasoning_tokens
     # (observability/request_log.rs:304-309, :918-922). The mock reports neither, so
     # its rows have to read 0 rather than the field going missing.
-    assert_json "/_ui/logs rows carry reasoning_tokens" \
+    assert_json "/logs rows carry reasoning_tokens" \
         '.requests[0] | has("reasoning_tokens") | tostring' "true"
-    assert_json "/_ui/logs reasoning_tokens defaults to zero" \
+    assert_json "/logs reasoning_tokens defaults to zero" \
         '[.requests[] | .reasoning_tokens] | all(. == 0) | tostring' "true"
 
     # A worker that reports reasoning tokens: only a non-zero value proves the field
@@ -1718,51 +1718,51 @@ if section observability; then
     request "$SESS_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
         -H "x-smg-target-worker: $REASON_ID" \
         --data '{"model":"reason-model","messages":[{"role":"user","content":"think"}]}' >/dev/null
-    request "$SESS_BASE" GET /_ui/logs
-    assert_json "/_ui/logs reads reasoning_tokens from the usage details" \
+    request "$SESS_BASE" GET /logs
+    assert_json "/logs reads reasoning_tokens from the usage details" \
         '.requests[-1].reasoning_tokens' "7"
-    assert_json "/_ui/logs the reasoning row keeps its other usage counts" \
+    assert_json "/logs the reasoning row keeps its other usage counts" \
         '.requests[-1] | .prompt_tokens == 3 and .completion_tokens == 12 | tostring' "true"
     BASE=$MAIN_BASE
 
     # Layer-2 duration is recorded where Rust records it (a request that reached a
     # worker and came back 2xx, routers/http/router.rs:249-251), and the same
-    # sample feeds /_ui/stats.avg_duration_ms.
+    # sample feeds /stats.avg_duration_ms.
     request "$BASE" GET /metrics
     assert_contains "/metrics has the router duration histogram" \
         "$BODY" "smg_router_request_duration_seconds_count{"
 
-    request "$BASE" GET /_ui/stats
-    assert_eq "/_ui/stats status" "$STATUS" "200"
-    assert_json "/_ui/stats inflight" '.inflight | type' "number"
+    request "$BASE" GET /stats
+    assert_eq "/stats status" "$STATUS" "200"
+    assert_json "/stats inflight" '.inflight | type' "number"
     # Rust's avg_duration_ms is an Option<f64>: null while the sliding window holds
     # no 2xx sample (request_log.rs Stats::avg_duration_ms), so the type is either.
-    assert_json "/_ui/stats avg_duration_ms is a number or null" \
+    assert_json "/stats avg_duration_ms is a number or null" \
         '(.avg_duration_ms == null) or (.avg_duration_ms | type == "number") | tostring' "true"
-    assert_json "/_ui/stats uptime_s" '.uptime_s | type' "number"
-    assert_json "/_ui/stats requests_total" '.requests_total | type' "number"
-    assert_json "/_ui/stats window fields" \
+    assert_json "/stats uptime_s" '.uptime_s | type' "number"
+    assert_json "/stats requests_total" '.requests_total | type' "number"
+    assert_json "/stats window fields" \
         'has("output_tok_s") and has("input_tok_s") and has("window_s") and has("requests_window") and has("errors_window") and has("avg_ttft_ms") and has("avg_duration_ms") and has("tokens_estimated_share") and has("capacity") and has("buffered") and has("started_at_ms") | tostring' "true"
 
-    request "$BASE" GET /_ui/logs/backends
-    assert_eq "/_ui/logs/backends status" "$STATUS" "200"
-    assert_json "/_ui/logs/backends list" '.backends | length' "2"
-    assert_json "/_ui/logs/backends fields" \
+    request "$BASE" GET /logs/backends
+    assert_eq "/logs/backends status" "$STATUS" "200"
+    assert_json "/logs/backends list" '.backends | length' "2"
+    assert_json "/logs/backends fields" \
         '.backends[0] | has("url") and has("model") and has("gpu") | tostring' "true"
 
-    # /_ui/logs/stream is registered by conf/ui.conf only, so probe it on a
+    # /logs/stream is registered by conf/ui.conf only, so probe it on a
     # ui.conf instance: open the SSE read, generate a request, then check what
     # landed on the wire (the follower replays from the head it read at connect).
     start_container lr-stream-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1
     register_worker "$BASE" "{\"url\":\"$MOCK_URL\",\"model_id\":\"test-model\"}"
     wait_healthy_worker "$BASE" 25 || fail "stream instance worker never became healthy"
-    curl -sS -N -m 8 "$BASE/_ui/logs/stream" -o "$TMP_DIR/logs-stream" >/dev/null 2>&1 &
+    curl -sS -N -m 8 "$BASE/logs/stream" -o "$TMP_DIR/logs-stream" >/dev/null 2>&1 &
     STREAM_PID=$!
     sleep 1
     request "$BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
         -H "x-smg-target-worker: $MOCK_ID" --data "$CHAT_BODY" >/dev/null
     wait $STREAM_PID 2>/dev/null || true
-    assert_contains "/_ui/logs/stream pushes a data frame" "$(<"$TMP_DIR/logs-stream")" 'data: {'
+    assert_contains "/logs/stream pushes a data frame" "$(<"$TMP_DIR/logs-stream")" 'data: {'
 fi
 
 # ==========================================================================
@@ -1985,7 +1985,7 @@ if section policy_hint; then
             --data '{"model":"hint-model-c","messages":[{"role":"user","content":"c"}]}' >/dev/null
     done
 
-    request "$POL_BASE" GET /_ui/logs
+    request "$POL_BASE" GET /logs
     assert_json "policy hint: the hinted model A reports round_robin" \
         '[.requests[] | select(.model == "hint-model-a") | .route_type] | unique | .[0]' "round_robin"
     assert_json "policy hint: the hinted model B reports cache_aware" \
@@ -2007,7 +2007,7 @@ if section policy_hint; then
     request "$POL_BASE" POST /v1/chat/completions -H 'Content-Type: application/json' \
         -H 'x-smg-routing-key: hint-tenant' \
         --data '{"model":"hint-model-c","messages":[{"role":"user","content":"c"}]}' >/dev/null
-    request "$POL_BASE" GET /_ui/logs
+    request "$POL_BASE" GET /logs
     assert_json "policy hint: model C keeps its own pin after more traffic" \
         '([.requests[] | select(.model == "hint-model-c") | .worker] | unique | length)' "1"
 
@@ -2018,139 +2018,135 @@ fi
 
 # ==========================================================================
 if section ui_fixed; then
-    # /_ui/* lives in conf/ui.conf, so this section uses the derived conf.
+    # The root data plane (/config* /logs* /stats /props) and the /u/ webui
+    # aliases live in conf/ui.conf, so this section uses the derived conf.
     start_container lr-ui-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1 LMR_UI_DIR=/repo/ui
     UI_BASE=$BASE
     register_worker "$UI_BASE" "{\"url\":\"$MOCK_URL\",\"model_id\":\"test-model\"}"
     assert_eq "ui instance: worker registered" "$STATUS" "202"
     wait_healthy_worker "$UI_BASE" 25 || fail "ui instance worker never became healthy"
 
-    request "$UI_BASE" GET /_ui/slots
-    assert_eq "/_ui/slots status" "$STATUS" "200"
-    assert_eq "/_ui/slots body" "$BODY" "[]"
-    request "$UI_BASE" GET /_ui/tools
-    assert_eq "/_ui/tools body" "$BODY" "[]"
-    request "$UI_BASE" GET /_ui/v1/streams/lookup
-    assert_eq "/_ui/v1/streams/lookup body" "$BODY" "[]"
+    request "$UI_BASE" GET /slots
+    assert_eq "/slots status" "$STATUS" "200"
+    assert_eq "/slots body" "$BODY" "[]"
+    request "$UI_BASE" GET /tools
+    assert_eq "/tools body" "$BODY" "[]"
+    request "$UI_BASE" GET /v1/streams/lookup
+    assert_eq "/v1/streams/lookup body" "$BODY" "[]"
 
-    request "$UI_BASE" GET /_ui/v1/stream
-    assert_eq "/_ui/v1/stream is 501" "$STATUS" "501"
-    assert_json "/_ui/v1/stream error" '.error | startswith("llama.cpp server stream") | tostring' "true"
-    request "$UI_BASE" GET /_ui/v1/chat/completions/control
-    assert_eq "/_ui/v1/chat/completions/control is 501" "$STATUS" "501"
-    request "$UI_BASE" POST /_ui/v1/chat/completions/control
-    assert_eq "/_ui/v1/chat/completions/control (POST) is 501" "$STATUS" "501"
+    request "$UI_BASE" GET /v1/stream
+    assert_eq "/v1/stream is 501" "$STATUS" "501"
+    assert_json "/v1/stream error" '.error | startswith("llama.cpp server stream") | tostring' "true"
+    request "$UI_BASE" GET /v1/chat/completions/control
+    assert_eq "/v1/chat/completions/control is 501" "$STATUS" "501"
+    request "$UI_BASE" POST /v1/chat/completions/control
+    assert_eq "/v1/chat/completions/control (POST) is 501" "$STATUS" "501"
 
-    request "$UI_BASE" POST /_ui/models/load
-    assert_eq "/_ui/models/load status" "$STATUS" "200"
-    assert_json "/_ui/models/load success" '.success | tostring' "true"
-    request "$UI_BASE" POST /_ui/models/unload
-    assert_eq "/_ui/models/unload is 400" "$STATUS" "400"
-    assert_contains "/_ui/models/unload explains in Chinese" "$BODY" "不能卸载"
+    request "$UI_BASE" POST /models/load
+    assert_eq "/models/load status" "$STATUS" "200"
+    assert_json "/models/load success" '.success | tostring' "true"
+    request "$UI_BASE" POST /models/unload
+    assert_eq "/models/unload is 400" "$STATUS" "400"
+    assert_contains "/models/unload explains in Chinese" "$BODY" "不能卸载"
 
-    request "$UI_BASE" GET /_ui/v1/models
-    assert_eq "/_ui/v1/models status" "$STATUS" "200"
-    assert_json "/_ui/v1/models object" '.object' "list"
-    assert_json "/_ui/v1/models data is an array" '(.data | type)' "array"
-    assert_json "/_ui/v1/models is non-empty" '(.data | length) > 0 | tostring' "true"
-    assert_json "/_ui/v1/models advertises loaded" \
+    request "$UI_BASE" GET /u/v1/models
+    assert_eq "/u/v1/models status" "$STATUS" "200"
+    assert_json "/u/v1/models object" '.object' "list"
+    assert_json "/u/v1/models data is an array" '(.data | type)' "array"
+    assert_json "/u/v1/models is non-empty" '(.data | length) > 0 | tostring' "true"
+    assert_json "/u/v1/models advertises loaded" \
         '[.data[].id] | index("test-model") != null | tostring' "true"
-    assert_json "/_ui/v1/models status.value" '.data[0].status.value' "loaded"
+    assert_json "/u/v1/models status.value" '.data[0].status.value' "loaded"
 
-    request "$UI_BASE" GET /_ui/props
-    assert_eq "/_ui/props status" "$STATUS" "200"
-    assert_json "/_ui/props advertises router role" '.role // "none"' "router"
-    assert_json "/_ui/props model" '.model' "test-model"
+    request "$UI_BASE" GET /props
+    assert_eq "/props status" "$STATUS" "200"
+    assert_json "/props advertises router role" '.role // "none"' "router"
+    assert_json "/props model" '.model' "test-model"
 
-    request "$UI_BASE" GET /_ui/config
-    assert_eq "/_ui/config GET" "$STATUS" "200"
-    assert_json "/_ui/config has env_defaults" 'has("env_defaults") | tostring' "true"
+    request "$UI_BASE" GET /config
+    assert_eq "/config GET" "$STATUS" "200"
+    assert_json "/config has env_defaults" 'has("env_defaults") | tostring' "true"
 
-    request "$UI_BASE" GET /_ui/stats
-    assert_eq "/_ui/stats via ui.conf" "$STATUS" "200"
-    assert_json "/_ui/stats inflight via ui.conf" '.inflight | type' "number"
-    request "$UI_BASE" GET /_ui/logs
-    assert_eq "/_ui/logs via ui.conf" "$STATUS" "200"
-    assert_json "/_ui/logs capacity via ui.conf" '.capacity' "1000"
-    request "$UI_BASE" GET /_ui/logs/backends
-    assert_eq "/_ui/logs/backends via ui.conf" "$STATUS" "200"
+    request "$UI_BASE" GET /stats
+    assert_eq "/stats via ui.conf" "$STATUS" "200"
+    assert_json "/stats inflight via ui.conf" '.inflight | type' "number"
+    request "$UI_BASE" GET /logs
+    assert_eq "/logs via ui.conf" "$STATUS" "200"
+    assert_json "/logs capacity via ui.conf" '.capacity' "1000"
+    request "$UI_BASE" GET /logs/backends
+    assert_eq "/logs/backends via ui.conf" "$STATUS" "200"
 
     # method gating on the ui.conf locations (axum-style 405 + Allow)
-    request "$UI_BASE" GET /_ui/models/load
-    assert_eq "/_ui/models/load GET is 405" "$STATUS" "405"
-    assert_eq "/_ui/models/load Allow header" "$(header_of Allow)" "POST"
-    request "$UI_BASE" POST /_ui/v1/models
-    assert_eq "/_ui/v1/models POST is 405" "$STATUS" "405"
-    assert_eq "/_ui/v1/models Allow header" "$(header_of Allow)" "GET"
-    request "$UI_BASE" POST /_ui/stats
-    assert_eq "/_ui/stats POST is 405" "$STATUS" "405"
+    request "$UI_BASE" GET /models/load
+    assert_eq "/models/load GET is 405" "$STATUS" "405"
+    assert_eq "/models/load Allow header" "$(header_of Allow)" "POST"
+    request "$UI_BASE" POST /u/v1/models
+    assert_eq "/u/v1/models POST is 405" "$STATUS" "405"
+    assert_eq "/u/v1/models Allow header" "$(header_of Allow)" "GET"
+    request "$UI_BASE" POST /stats
+    assert_eq "/stats POST is 405" "$STATUS" "405"
 
     # the chat aliases go through the shared pipeline
-    request "$UI_BASE" POST /_ui/v1/chat/completions -H 'Content-Type: application/json' \
+    request "$UI_BASE" POST /u/v1/chat/completions -H 'Content-Type: application/json' \
         --data '{"model":"test-model","messages":[{"role":"user","content":"ui chat"}]}'
-    assert_eq "/_ui/v1/chat/completions status" "$STATUS" "200"
-    assert_json "/_ui/v1/chat/completions object" '.object' "chat.completion"
-    assert_contains "/_ui/v1/chat/completions routed to the worker" "$BODY" "ui chat"
+    assert_eq "/u/v1/chat/completions status" "$STATUS" "200"
+    assert_json "/u/v1/chat/completions object" '.object' "chat.completion"
+    assert_contains "/u/v1/chat/completions routed to the worker" "$BODY" "ui chat"
     # M3: an empty-array "tools"/"stop" must reach the worker as an array.
     # A decode/encode round trip turns [] into {} (cjson cannot tell them apart),
-    # so the /_ui aliases have to forward the caller's bytes.
-    request "$UI_BASE" POST /_ui/v1/chat/completions -H 'Content-Type: application/json' \
+    # so the webui chat aliases have to forward the caller's bytes.
+    request "$UI_BASE" POST /u/v1/chat/completions -H 'Content-Type: application/json' \
         --data '{"model":"test-model","tools":[],"stop":[],"messages":[{"role":"user","content":"arrays"}]}'
-    assert_eq "/_ui/v1/chat/completions with empty arrays status" "$STATUS" "200"
-    assert_json "/_ui/v1/chat/completions keeps tools as an array" '.echo_body.tools | type' "array"
-    assert_json "/_ui/v1/chat/completions keeps stop as an array" '.echo_body.stop | type' "array"
-    request "$UI_BASE" POST /_ui/v1/chat/completions -H 'Content-Type: application/json' \
+    assert_eq "/u/v1/chat/completions with empty arrays status" "$STATUS" "200"
+    assert_json "/u/v1/chat/completions keeps tools as an array" '.echo_body.tools | type' "array"
+    assert_json "/u/v1/chat/completions keeps stop as an array" '.echo_body.stop | type' "array"
+    request "$UI_BASE" POST /u/v1/chat/completions -H 'Content-Type: application/json' \
         --data '{"messages":[{"role":"user","content":"default model"}]}'
-    assert_eq "/_ui/v1/chat/completions without a model status" "$STATUS" "200"
-    assert_json "/_ui/v1/chat/completions fills the default model" '.model' "test-model"
-    request "$UI_BASE" POST /_ui/v1/completions -H 'Content-Type: application/json' \
+    assert_eq "/u/v1/chat/completions without a model status" "$STATUS" "200"
+    assert_json "/u/v1/chat/completions fills the default model" '.model' "test-model"
+    request "$UI_BASE" POST /u/v1/completions -H 'Content-Type: application/json' \
         --data '{"model":"test-model","prompt":"ui prompt"}'
-    assert_eq "/_ui/v1/completions status" "$STATUS" "200"
-    request "$UI_BASE" POST /_ui/v1/chat/completions -H 'Content-Type: application/json' --data 'zz'
-    assert_eq "/_ui/v1/chat/completions bad JSON is 400" "$STATUS" "400"
-    assert_contains "/_ui/v1/chat/completions bad JSON message" "$BODY" "invalid chat request"
+    assert_eq "/u/v1/completions status" "$STATUS" "200"
+    request "$UI_BASE" POST /u/v1/chat/completions -H 'Content-Type: application/json' --data 'zz'
+    assert_eq "/u/v1/chat/completions bad JSON is 400" "$STATUS" "400"
+    assert_contains "/u/v1/chat/completions bad JSON message" "$BODY" "invalid chat request"
 
-    # static bundle and the UI entry migration (doc/refactor-arch-2026-10-05.md 5.3):
-    # /_ui redirects to the new webui entry /u/, /_ui/admin redirects to the new
-    # console entry /a/. The old /_ui/ surface keeps working (the shipped bundle
-    # hardcodes /_ui/props and /_ui/v1/*, and e2e_ui_bridge pins them).
+    # 入口拓扑（用户裁定 2026-10-08：admin 管理台迁到站点根 /，/u/ webui 一行不动，
+    # /_ui/* 全部取消）。裸 / 的 admin 静态由 conf/nginx.conf.template 的 location / 提供
+    # （root = LMR_UI_DIR/admin/ + try_files 回落 @lmr_klib），而测试 conf
+    # (test/conf/nginx-lua-router.conf) 的 location / 仍是 klib handle()，所以本段只验
+    # ui.conf 自己拥有的名字：/u 与 /u/ 的 webui 静态、/a 与 /a/ 的兼容 302，以及
+    # /_ui/* 一律落 404 sink。admin 根静态本体由入口脚本渲染路径覆盖（prometheus 段）。
     # Edge-safe redirects: behind a TLS-terminating edge the visible Host is the
     # upstream address, so an absolute Location would send the client to
     # http://127.0.0.1:PORT. Exact-equality is the guard -- assert_contains on
-    # "/u/" also passes when the bug is present (the absolute URL ends in it).
-    request "$UI_BASE" GET /_ui
-    assert_eq "/_ui redirects to /u/" "$STATUS" "302"
-    assert_eq "/_ui Location stays a relative reference" "$(header_of Location)" "/u/"
+    # "/" also passes when the bug is present (the absolute URL ends in it).
     request "$UI_BASE" GET /u
     assert_eq "/u redirects to the directory" "$STATUS" "302"
     assert_eq "/u Location stays a relative reference" "$(header_of Location)" "/u/"
     request "$UI_BASE" GET /u/
     assert_eq "/u/ serves the SPA" "$STATUS" "200"
     assert_contains "/u/ is html" "$CONTENT_TYPE" "text/html"
-    request "$UI_BASE" GET /_ui/admin
-    assert_eq "/_ui/admin redirects to /a/" "$STATUS" "302"
-    assert_contains "/_ui/admin redirect is not cacheable" "$(header_of Cache-Control)" "no-store"
-    assert_eq "/_ui/admin Location stays a relative reference" "$(header_of Location)" "/a/"
-    request "$UI_BASE" GET /_ui/admin/
-    assert_eq "/_ui/admin/ redirects to /a/" "$STATUS" "302"
-    assert_eq "/_ui/admin/ Location stays a relative reference" "$(header_of Location)" "/a/"
+    # /a 与 /a/ —— 管理台旧入口的兼容 302（admin 现在只在站点根 /）。
     request "$UI_BASE" GET /a
-    assert_eq "/a redirects to the directory" "$STATUS" "302"
-    assert_eq "/a Location stays a relative reference" "$(header_of Location)" "/a/"
+    assert_eq "/a redirects to the console root" "$STATUS" "302"
+    assert_eq "/a Location stays a relative reference" "$(header_of Location)" "/"
+    assert_contains "/a redirect is not cacheable" "$(header_of Cache-Control)" "no-store"
     request "$UI_BASE" GET /a/
-    assert_eq "/a/ serves the console" "$STATUS" "200"
-    assert_contains "/a/ is html" "$CONTENT_TYPE" "text/html"
-    request "$UI_BASE" GET /_ui/
-    assert_eq "/_ui/ serves the SPA" "$STATUS" "200"
-    assert_contains "/_ui/ is html" "$CONTENT_TYPE" "text/html"
-    # The legacy tool pages are gone (doc/ui-trim-legacy-pages.md): the admin
-    # console covers them, so each must now answer from the static 404 sink.
-    for gone in /_ui/logs.html /_ui/metrics.html /_ui/config.html /_ui/lmr-tabs.js; do
+    assert_eq "/a/ redirects to the console root" "$STATUS" "302"
+    assert_eq "/a/ Location stays a relative reference" "$(header_of Location)" "/"
+    # /_ui 入口已取消（无 302、无别名、无静态块）：由 404 sink 回答 not_found。
+    for gone in /_ui /_ui/ /_ui/props /_ui/config /_ui/logs.html; do
+        request "$UI_BASE" GET "$gone"
+        assert_eq "$gone is removed (404)" "$STATUS" "404"
+    done
+    # 旧根目录工具页随 doc/ui-trim-legacy-pages.md 一并移除（/logs.html 是现役管理台
+    # 页，由上面的静态入口与 e2e 覆盖，不在这里验）。
+    for gone in /metrics.html /config.html /lmr-tabs.js; do
         request "$UI_BASE" GET "$gone"
         assert_eq "$gone is removed" "$STATUS" "404"
     done
-    request "$UI_BASE" GET /_ui/definitely-missing.js
-    assert_eq "/_ui/ static miss is 404" "$STATUS" "404"
+    # 前缀下的未知静态名照样 404，不许出现前缀兜底。
     request "$UI_BASE" GET /u/definitely-missing.js
     assert_eq "/u/ static miss is 404" "$STATUS" "404"
     request "$UI_BASE" GET /a/definitely-missing.js
@@ -2229,10 +2225,10 @@ TLSWRAP
         assert_eq "tls: streaming over TLS" "$STATUS" "200"
         assert_contains "tls: stream terminates with [DONE]" "$BODY" "data: [DONE]"
 
-        # /_ui/props proxies /props through config_store.raw_request, the third
+        # /props proxies /props through config_store.raw_request, the third
         # call path that had no TLS at all.
-        request "$TLS_BASE" GET /_ui/props
-        assert_eq "tls: /_ui/props proxied over TLS" "$STATUS" "200"
+        request "$TLS_BASE" GET /props
+        assert_eq "tls: /props proxied over TLS" "$STATUS" "200"
         assert_json "tls: /props body came from the https worker" '.model' "tls-model"
 
         # A cleartext client must not be able to use the TLS port: proves the
@@ -2558,10 +2554,13 @@ if section prometheus; then
     assert_eq "prometheus listener stays minimal (404)" "$STATUS" "404"
     request "$PROM_MAIN" GET /metrics
     assert_eq "/metrics also on the main listener" "$STATUS" "200"
-    request "$PROM_MAIN" GET /_ui/stats
+    request "$PROM_MAIN" GET /stats
     assert_eq "entrypoint container wires ui.conf" "$STATUS" "200"
-    request "$PROM_MAIN" GET /_ui/
-    assert_eq "entrypoint container serves the static bundle" "$STATUS" "200"
+    # admin 迁根后的管理台壳：`location /` 的 root 落到 `<LMR_UI_DIR>/admin/`，裸 `/` 必须回答管理台首页（入口脚本渲染路径，裸 conf 没有这条）。
+    request "$PROM_MAIN" GET /
+    assert_eq "entrypoint container serves the admin console at /" "$STATUS" "200"
+    assert_contains "/ is html" "$CONTENT_TYPE" "text/html"
+    assert_contains "/ is the admin shell" "$BODY" "llm-router Admin"
 
     # ---- entrypoint defaults (the render, not the runtime) ----
     # A second entrypoint container that names nothing except the Rust-style UI
@@ -2598,8 +2597,9 @@ if section prometheus; then
     assert_contains "entrypoint honours SMG_LOG_LEVEL" "$RENDER" "error_log /dev/stderr info;"
     request "$EBASE" GET /metrics
     assert_eq "entrypoint-defaults /metrics on the main listener" "$STATUS" "200"
-    request "$EBASE" GET /_ui/
-    assert_eq "SMG_UI_DIR alone locates the static bundle" "$STATUS" "200"
+    request "$EBASE" GET /
+    assert_eq "SMG_UI_DIR alone locates the admin console at /" "$STATUS" "200"
+    assert_contains "SMG_UI_DIR maps onto the admin shell too" "$BODY" "llm-router Admin"
 
     # SMG_METRICS_PORT=0 switches the extra listener off, which is what the e2e
     # suites need on a host that already runs a gateway on 29000.
@@ -2726,25 +2726,26 @@ if section cors; then
     request "$BASE" OPTIONS /workers -H 'Origin: http://client.example'
     assert_eq "cors preflight on the control plane is 200" "$STATUS" "200"
 
-    # The /_ui/* locations are served by conf/ui.conf, and each one opens with its
+    # The root data-plane locations (/config* /logs* /stats) come from conf/ui.conf
+    # and each one opens with its
     # own method gate, so a preflight that reached the location would answer 405.
     # handle() never sees those requests either (ui.conf bypasses the dispatcher),
     # which is why the guard runs in the server-level rewrite phase instead.
-    for path in /_ui/ /_ui/stats /_ui/config /_ui/props /_ui/v1/chat/completions; do
+    for path in /u/ /stats /config /props /u/v1/chat/completions; do
         request "$BASE" OPTIONS "$path" -H 'Origin: http://client.example'
         assert_eq "cors preflight on $path is 200" "$STATUS" "200"
         assert_eq "cors preflight on $path is empty" "${#BODY}" "0"
     done
 
-    # A plain /_ui/* response also carries the CORS headers: the rewrite guard
+    # A plain root data-plane response also carries the CORS headers: the guard
     # stamps them before the ui.conf location answers, which is what the browser
     # needs to read the webui across origins.
-    request "$BASE" GET /_ui/stats -H 'Origin: http://client.example'
-    assert_eq "cors: a /_ui response allows the origin" \
+    request "$BASE" GET /stats -H 'Origin: http://client.example'
+    assert_eq "cors: a /stats response allows the origin" \
         "$(header_of Access-Control-Allow-Origin)" "*"
-    assert_eq "cors: a /_ui response exposes x-request-id" \
+    assert_eq "cors: a /stats response exposes x-request-id" \
         "$(header_of Access-Control-Expose-Headers)" "*"
-    request "$BASE" GET /_ui/
+    request "$BASE" GET /u/
     assert_eq "cors: the static bundle is CORS-decorated too" \
         "$(header_of Access-Control-Allow-Origin)" "*"
 
@@ -3396,10 +3397,10 @@ fi
 # ==========================================================================
 if section profiles_upstreams; then
     # Section 23: the virtual-model profile + upstreams surface from
-    # doc/gap-virtual-models.md 3.5. The /_ui/config document grows a
+    # doc/gap-virtual-models.md 3.5. The /config document grows a
     # new-shape virtual_models array (model/target/workers/policy/effort, old
     # {model,target} rows stay valid) and an upstreams array whose api_key is
-    # never echoed; POST /_ui/config/upstreams replaces the pool and reconciles
+    # never echoed; POST /config/upstreams replaces the pool and reconciles
     # it into the worker registry as discovery=config. Own containers: the flow
     # rewrites whole documents repeatedly and must not leak config state into
     # the shared main instance (the section may also run under TEST_ONLY).
@@ -3425,20 +3426,20 @@ if section profiles_upstreams; then
         return 1
     }
 
-    # ---- 1. GET /_ui/config document shape ---------------------------------
-    request "$PR_BASE" GET /_ui/config
-    assert_eq "profiles: /_ui/config GET" "$STATUS" "200"
+    # ---- 1. GET /config document shape ---------------------------------
+    request "$PR_BASE" GET /config
+    assert_eq "profiles: /config GET" "$STATUS" "200"
     assert_json "profiles: the new sections are a superset of the old keys" \
         '(["default_effort","effort_map","model_ctx","model_effort","model_configs","virtual_models","policy","model_policies","env_defaults","watcher","persist","models"] - keys | length) == 0 | tostring' "true"
     assert_json "profiles: document carries an upstreams array" '(.upstreams | type)' "array"
     assert_json "profiles: document carries a virtual_models array" '(.virtual_models | type)' "array"
-    request "$PR_BASE" HEAD /_ui/config
+    request "$PR_BASE" HEAD /config
     assert_eq "profiles: HEAD mirrors the GET status" "$STATUS" "200"
     assert_contains "profiles: HEAD keeps the JSON content type" "$CONTENT_TYPE" "application/json"
 
-    # ---- 2. POST /_ui/config/virtual (whole-table replace) -----------------
+    # ---- 2. POST /config/virtual (whole-table replace) -----------------
     # New profile shape: all five fields round-trip through the echoed document.
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data "{\"entries\":[{\"model\":\"vm-full\",\"target\":\"test-model\",\"workers\":[\"$URL_A\"],\"policy\":\"round_robin\",\"effort\":\"high\"}]}"
     assert_eq "profiles: new-shape entries accepted" "$STATUS" "200"
     assert_json "profiles: response echoes the document with the profile" \
@@ -3454,7 +3455,7 @@ if section profiles_upstreams; then
 
     # The old two-field rows keep working: replacement is whole-table, so both
     # shapes ride the same submission and both must come back.
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data "{\"entries\":[{\"model\":\"vm-old\",\"target\":\"test-model\"},{\"model\":\"vm-full\",\"target\":\"test-model\",\"workers\":[\"$URL_A\"],\"policy\":\"round_robin\",\"effort\":\"high\"}]}"
     assert_eq "profiles: old-shape entries still accepted" "$STATUS" "200"
     assert_json "profiles: old row keeps model and target" \
@@ -3463,43 +3464,43 @@ if section profiles_upstreams; then
     # Rejections: chained alias, self-alias, malformed workers, unknown
     # policy/effort. Error text shape matches the existing handlers (nonempty
     # .error); the chain message has to name one of the two models involved.
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data '{"entries":[{"model":"vm-p1","target":"vm-p2"},{"model":"vm-p2","target":"test-model"}]}'
     assert_eq "profiles: an alias targeting another alias is 400" "$STATUS" "400"
     assert_matches "profiles: the chain error names the model involved" "$BODY" 'vm-p[12]'
 
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data '{"entries":[{"model":"vm-same","target":"vm-same"}]}'
     assert_eq "profiles: alias == target is 400" "$STATUS" "400"
     assert_contains "profiles: the self-alias error names it" "$BODY" "vm-same"
 
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data '{"entries":[{"model":"vm-w","target":"test-model","workers":"http://pool.invalid"}]}'
     assert_eq "profiles: workers as a bare string is 400" "$STATUS" "400"
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data '{"entries":[{"model":"vm-w2","target":"test-model","workers":["ok",123]}]}'
     assert_eq "profiles: a non-string workers member is 400" "$STATUS" "400"
 
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data '{"entries":[{"model":"vm-pol","target":"test-model","policy":"roundabout"}]}'
     assert_eq "profiles: an unknown profile policy is 400" "$STATUS" "400"
     assert_json "profiles: the policy rejection carries error text" \
         '.error | length > 0 | tostring' "true"
-    request "$PR_BASE" POST /_ui/config/virtual -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/virtual -H 'Content-Type: application/json' \
         --data '{"entries":[{"model":"vm-eff","target":"test-model","effort":"mega"}]}'
     assert_eq "profiles: an unknown profile effort is 400" "$STATUS" "400"
 
     # A rejected replace must leave the previous table alone (no half-apply):
     # none of the rejected aliases landed, the accepted pair survived.
-    request "$PR_BASE" GET /_ui/config
+    request "$PR_BASE" GET /config
     assert_eq "profiles: the document answers after the rejection run" "$STATUS" "200"
     assert_json "profiles: rejected aliases never landed" \
         '[.virtual_models[] | select(.model == "vm-p1" or .model == "vm-same" or .model == "vm-w" or .model == "vm-w2" or .model == "vm-pol" or .model == "vm-eff")] | length' "0"
     assert_json "profiles: accepted rows survived the rejected batches" \
         '[.virtual_models[] | select(.model == "vm-old" or .model == "vm-full")] | length' "2"
 
-    # ---- 3. POST /_ui/config/upstreams + reconcile -------------------------
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    # ---- 3. POST /config/upstreams + reconcile -------------------------
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data "{\"entries\":[{\"url\":\"$URL_A\",\"model_id\":\"test-model\",\"api_key\":\"$SECRET\"},{\"url\":\"$URL_B\",\"model_id\":\"sink-model\",\"priority\":70,\"cost\":2.5,\"disable_health_check\":false}]}"
     assert_eq "upstreams: valid entries accepted" "$STATUS" "200"
     assert_json "upstreams: response carries the reconcile summary" \
@@ -3517,7 +3518,7 @@ if section profiles_upstreams; then
     assert_json "upstreams: GET /workers exposes no api_key value" \
         '[.workers[] | .api_key] | unique | tostring' "[null]"
     assert_not_contains "upstreams: no secret in /workers" "$BODY" "$SECRET"
-    request "$PR_BASE" GET /_ui/config
+    request "$PR_BASE" GET /config
     assert_not_contains "upstreams: no secret in the document" "$BODY" "$SECRET"
     assert_json "upstreams: document api_key stays null" \
         '[.upstreams[] | select(.url == "'"$URL_A"'")][0].api_key | tostring' "null"
@@ -3525,7 +3526,7 @@ if section profiles_upstreams; then
     # Validation rejections (contract 3.5): url dedup after normalization, the
     # 256-entry cap, and a non-http(s) scheme. None of them may mutate the
     # accepted pool.
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data "{\"entries\":[{\"url\":\"$URL_A\"},{\"url\":\"$URL_A/\"}]}"
     assert_eq "upstreams: two entries normalizing to one url are refused" "$STATUS" "400"
     python3 - "$TMP_DIR" <<'PY'
@@ -3537,10 +3538,10 @@ json.dump({"virtual_models": [],
            "upstreams": [{"url": "http://127.0.0.1:%d" % (21000 + i)} for i in range(300)]},
           open(tmp + "/apply-over-cap.json", "w"))
 PY
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data @"$TMP_DIR/up-many.json"
     assert_eq "upstreams: more than 256 entries are refused" "$STATUS" "400"
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data '{"entries":[{"url":"ftp://pool-member.invalid:2121"}]}'
     assert_eq "upstreams: a non-http(s) scheme is refused" "$STATUS" "400"
     request "$PR_BASE" GET /workers
@@ -3552,7 +3553,7 @@ PY
     # keep, not a re-add. updated=0 (change-counting) or 1 (unconditional
     # re-apply) are both contract-legal here; the exact keep-the-key behaviour
     # is pinned by e2e_profiles against a REQUIRE_AUTH mock.
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data "{\"entries\":[{\"url\":\"$URL_A\",\"model_id\":\"test-model\",\"api_key\":null},{\"url\":\"$URL_B\",\"model_id\":\"sink-model\",\"priority\":70,\"cost\":2.5,\"disable_health_check\":false}]}"
     assert_eq "upstreams: a null api_key resubmit answers 200, never 500" "$STATUS" "200"
     assert_json "upstreams: the null resubmit adds nobody" '.reconcile.added' "0"
@@ -3564,13 +3565,13 @@ PY
     assert_json "upstreams: the response document still hides the key" \
         '[.upstreams[] | select(.url == "'"$URL_A"'")][0].api_key | tostring' "null"
 
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data "{\"entries\":[{\"url\":\"$URL_A\",\"model_id\":\"test-model\",\"api_key\":\"\"},{\"url\":\"$URL_B\",\"model_id\":\"sink-model\",\"priority\":70,\"cost\":2.5,\"disable_health_check\":false}]}"
     assert_eq "upstreams: an empty-string api_key is accepted (clear semantics)" "$STATUS" "200"
 
     # Teardown path: an empty replace removes exactly the discovery=config
     # members and counts them (3.1: other origins are never touched).
-    request "$PR_BASE" POST /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" POST /config/upstreams -H 'Content-Type: application/json' \
         --data '{"entries":[]}'
     assert_eq "upstreams: an empty replace is accepted" "$STATUS" "200"
     assert_json "upstreams: the removed members are counted" '.reconcile.removed' "2"
@@ -3578,7 +3579,7 @@ PY
     request "$PR_BASE" GET /workers
     assert_json "upstreams: the pool is empty after teardown" '.total' "0"
 
-    # ---- 5. POST /_ui/config/apply is atomic across both new sections ------
+    # ---- 5. POST /config/apply is atomic across both new sections ------
     # Own instance: the rejection checks below compare the whole document
     # before/after, which needs a state nobody else writes to.
     start_container lr-apl-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1
@@ -3586,7 +3587,7 @@ PY
     AP_GW=$(container_gateway lr-apl-$SUIT)
     URL_C="http://$AP_GW:$MOCK_PORT"
 
-    request "$AP_BASE" POST /_ui/config/apply -H 'Content-Type: application/json' \
+    request "$AP_BASE" POST /config/apply -H 'Content-Type: application/json' \
         --data "{\"virtual_models\":[{\"model\":\"ap-a\",\"target\":\"test-model\",\"workers\":[],\"policy\":\"bucket\",\"effort\":\"medium\"}],\"upstreams\":[{\"url\":\"$URL_C\",\"model_id\":\"test-model\"}]}"
     assert_eq "apply: whole document with virtual_models + upstreams" "$STATUS" "200"
     assert_json "apply: the answer echoes the profile" \
@@ -3608,26 +3609,26 @@ PY
     done
     assert_json "apply: the reconciled worker carries discovery=config" \
         '[.workers[] | select(.url == "'"$URL_C"'")][0].discovery' "config"
-    request "$AP_BASE" GET /_ui/config
+    request "$AP_BASE" GET /config
     assert_eq "apply: GET after the successful apply" "$STATUS" "200"
     OK_DOC=$(jq -c '[.virtual_models, .upstreams]' "$TMP_DIR/body")
 
     # An invalid policy fragment anywhere in the document rejects the whole
     # write: virtual_models keeps ap-a (no ap-x) and upstreams keeps URL_C, so
     # neither the good nor the bad section was half-applied.
-    request "$AP_BASE" POST /_ui/config/apply -H 'Content-Type: application/json' \
+    request "$AP_BASE" POST /config/apply -H 'Content-Type: application/json' \
         --data '{"virtual_models":[{"model":"ap-x","target":"test-model","policy":"notapolicy"}],"upstreams":[]}'
     assert_eq "apply: an invalid policy fragment rejects the document" "$STATUS" "400"
-    request "$AP_BASE" GET /_ui/config
+    request "$AP_BASE" GET /config
     assert_eq "apply: the rejected document kept virtual_models and upstreams" \
         "$(jq -c '[.virtual_models, .upstreams]' "$TMP_DIR/body")" "$OK_DOC"
 
     # Same through the upstreams side: an over-cap batch must not half-apply
     # (the empty virtual_models fragment must not clear the surviving profile).
-    request "$AP_BASE" POST /_ui/config/apply -H 'Content-Type: application/json' \
+    request "$AP_BASE" POST /config/apply -H 'Content-Type: application/json' \
         --data @"$TMP_DIR/apply-over-cap.json"
     assert_eq "apply: an over-limit upstreams batch rejects the document" "$STATUS" "400"
-    request "$AP_BASE" GET /_ui/config
+    request "$AP_BASE" GET /config
     assert_eq "apply: the second rejection also changed nothing" \
         "$(jq -c '[.virtual_models, .upstreams]' "$TMP_DIR/body")" "$OK_DOC"
 
@@ -3635,18 +3636,18 @@ PY
     # The two POST-only sections gate like their siblings (ui.conf
     # method_only("POST") -> axum-style 405 + Allow), and the GET-family
     # endpoints answer HEAD through the GET route.
-    request "$PR_BASE" GET /_ui/config/upstreams
+    request "$PR_BASE" GET /config/upstreams
     assert_eq "upstreams: GET is refused" "$STATUS" "405"
     AL_UP=$(header_of Allow)
     assert_eq "upstreams: Allow names POST only" "$AL_UP" "POST"
-    request "$PR_BASE" GET /_ui/config/virtual
+    request "$PR_BASE" GET /config/virtual
     assert_eq "virtual: GET is refused like the sibling gate" "$STATUS" "405"
     assert_eq "virtual: the Allow shape matches /config/upstreams" \
         "$(header_of Allow)" "$AL_UP"
-    request "$PR_BASE" PUT /_ui/config/upstreams -H 'Content-Type: application/json' \
+    request "$PR_BASE" PUT /config/upstreams -H 'Content-Type: application/json' \
         --data '{"entries":[]}'
     assert_eq "upstreams: PUT is refused too" "$STATUS" "405"
-    request "$PR_BASE" HEAD /_ui/config/policy
+    request "$PR_BASE" HEAD /config/policy
     assert_eq "policy: HEAD keeps answering the GET route" "$STATUS" "200"
 fi
 

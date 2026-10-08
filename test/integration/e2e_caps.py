@@ -50,7 +50,7 @@
             or GPU-util limit)"；对照"非上限造成的 503"（熔断/不健康）文案保持原样。
   S5d       声明层三字段自动化（2026-10-06 §1 的 POST 面）：min>=max 拒、util=0 保留、
             util=101 拒、旧 max_power_w 被 warn 丢弃且不落盘——四条都必须过真 HTTP 的
-            POST /_ui/config/upstreams（探针 lr_caps_store_probe.lua 的边界组上闸）。
+            POST /config/upstreams（探针 lr_caps_store_probe.lua 的边界组上闸）。
   S5c       缺省配置（不设上限、不设 candidates）老行为零变化：spread 照旧、排除计数
             与绿灯优先让位计数都为 0。
   S1 交集    candidates 与旧 workers 同时存在时取交集（candidates_for 的 2026-10-01
@@ -238,7 +238,7 @@ def put_json(port, path, body):
 
 
 def post_virtual(port, entries):
-    return post_json(port, "/_ui/config/virtual", {"entries": entries})
+    return post_json(port, "/config/virtual", {"entries": entries})
 
 
 def post_upstreams(port, entries):
@@ -248,7 +248,7 @@ def post_upstreams(port, entries):
     registry.update 写 model_id，而 patch_record 正是**在 model_id 变化时**把
     models_verified 清零（"换主模型就是换了一次身份陈述"），这条判定只有这条路能触发。
     """
-    return post_json(port, "/_ui/config/upstreams", {"entries": entries})
+    return post_json(port, "/config/upstreams", {"entries": entries})
 
 
 def metric_lines(port, name):
@@ -522,7 +522,7 @@ def scenario_bindings(igw):
 
     bindings = [{"worker": url_a, "model": "alpha"}, {"worker": url_b, "model": "beta"}]
     st, doc = post_virtual(port, [{"model": "vm-multi", "candidates": bindings}])
-    check("[%s] POST /_ui/config/virtual candidates-only accepted (target derived)" % tag,
+    check("[%s] POST /config/virtual candidates-only accepted (target derived)" % tag,
           st == 200, "%s %s" % (st, json.dumps(doc)[:300]))
     entry = [e for e in (doc.get("virtual_models") or []) if e.get("model") == "vm-multi"]
     check("[%s] document round-trips both bindings and invents no target" % tag,
@@ -1477,7 +1477,7 @@ def scenario_caps_persistence():
     # 声明层整表替换：两行都是 protected。A 只写并发上限；B 写一个 GPU 利用率上限
     # （本场景没有负载源 -> 读数未知 -> 永不生效，只用来验字段下发）和一个冒充改名的
     # model_id。2026-10-06 §1：max_power_w 退役，声明层的新字段是 max_gpu_util。
-    st, doc = post_json(port, "/_ui/config/upstreams", {"entries": [
+    st, doc = post_json(port, "/config/upstreams", {"entries": [
         {"url": url_a, "model_id": "alpha", "max_concurrency": 1},
         {"url": url_b, "model_id": "renamed-by-declaration", "max_gpu_util": 60},
     ]})
@@ -1791,21 +1791,21 @@ def scenario_all_capped_503():
 
 
 def scenario_declaration_bounds():
-    """声明层三字段的边界组（2026-10-06 §1）过真 HTTP POST /_ui/config/upstreams。
+    """声明层三字段的边界组（2026-10-06 §1）过真 HTTP POST /config/upstreams。
 
     这四条此前只有 /data/tmp/lr_caps_store_probe.lua 那份一次性 luajit 探针覆盖，
-    探针不进门禁 = 没有自动化。全部走声明层的整表替换（POST /_ui/config/upstreams，
+    探针不进门禁 = 没有自动化。全部走声明层的整表替换（POST /config/upstreams，
     与 JSON 编辑器同一条 apply_upstreams 写入口），因为设计书钉的校验就挂在这两条
     入口（apply_profiles / apply_document）上：
 
       * min_concurrency >= max_concurrency → 400，且错误点名两个字段（"must be less
         than"）——绿灯阈与红格顶不许重叠或倒置；
       * max_gpu_util = 0 → 200 且**逐字段回显 0**（cap_limit 的 <=0 折叠会把它抹成
-        缺席；util_limit 必须保住这一档）；GET /_ui/config 的 upstreams 行同样回显 0，
+        缺席；util_limit 必须保住这一档）；GET /config 的 upstreams 行同样回显 0，
         投影进池行也是整数 0；
       * max_gpu_util = 101 → 400（它不可能是一个整数百分比）；
       * 旧行携带 max_power_w → 200（可读入、不 400），但该键被**丢弃**：文档回显、
-        GET /_ui/config、GET /workers 都不许再有它，warn-once 日志点名 retired。
+        GET /config、GET /workers 都不许再有它，warn-once 日志点名 retired。
 
     判别性：写成"util=0 折成不限"的实现红在第 2 条（回显缺席而非 0）；不做 min<max
     校验的红在第 1 条（200 而非 400）；把 max_power_w 照旧接受/迁移的红在第 4 条
@@ -1854,7 +1854,7 @@ def scenario_declaration_bounds():
           st == 200 and row.get("max_gpu_util") == 0
           and row.get("min_concurrency") == 1 and row.get("max_concurrency") == 8,
           "%s %s" % (st, json.dumps(row)[:250]))
-    st, cfgtext, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
+    st, cfgtext, _ = http("GET", "http://127.0.0.1:%d/config" % port)
     try:
         cfgdoc = json.loads(cfgtext)
     except ValueError:
@@ -1863,7 +1863,7 @@ def scenario_declaration_bounds():
     for u in (cfgdoc.get("upstreams") or []):
         if u.get("url") == url_a:
             grows = u
-    check("[%s] GET /_ui/config echoes the 0 gate verbatim (declared zero, not absent)" % tag,
+    check("[%s] GET /config echoes the 0 gate verbatim (declared zero, not absent)" % tag,
           st == 200 and grows.get("max_gpu_util") == 0,
           "%s %s" % (st, json.dumps(grows)[:250]))
     deadline = time.time() + 25
@@ -1895,8 +1895,8 @@ def scenario_declaration_bounds():
     check("[%s] the retired key is dropped, not migrated (no phantom util number)" % tag,
           "max_power_w" not in row4 and row4.get("max_gpu_util") == 60,
           json.dumps(row4)[:250])
-    st, cfgtext, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
-    check("[%s] GET /_ui/config returns no max_power_w anywhere" % tag,
+    st, cfgtext, _ = http("GET", "http://127.0.0.1:%d/config" % port)
+    check("[%s] GET /config returns no max_power_w anywhere" % tag,
           st == 200 and "max_power_w" not in cfgtext,
           "%s %s" % (st, cfgtext[:150]))
     st, raw_w, _ = http("GET", "http://127.0.0.1:%d/workers" % port)

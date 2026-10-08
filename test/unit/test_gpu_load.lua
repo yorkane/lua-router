@@ -951,7 +951,7 @@ for key in pairs(stats_store) do
     if key:find("lr_gpu_load_failures_total", 1, true) then saw_fail = true end
 end
 check(saw_fail, "a failed scrape bumps the failure counter")
-eq(gpu_load.last().failed, 1, "and the last pass is readable for /_ui")
+eq(gpu_load.last().failed, 1, "and the last pass is readable via gpu_load.last()")
 
 new_case("start refuses every shape that should not run")
 reset_store()

@@ -217,7 +217,7 @@ def scenario_required_fields():
     check("[%s] worker registered" % tag, st in (200, 202), str(st))
     check("[%s] worker healthy" % tag, wait_healthy(port, [url]), logs(name)[:400])
     # 入口行也要一起判：它没有引擎，created 的取值来源完全不同。
-    st, doc = post_json(port, "/_ui/config/virtual",
+    st, doc = post_json(port, "/config/virtual",
                         {"entries": [{"model": "vm-plain", "target": "plain-model"}]})
     check("[%s] virtual entry accepted" % tag, st == 200, "%s %s" % (st, str(doc)[:200]))
     st, doc, raw = models_doc(port)
@@ -386,8 +386,8 @@ def scenario_omission():
 
 
 def get_json_cfg(port):
-    """GET /_ui/config -> (status, decoded document)."""
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
+    """GET /config -> (status, decoded document)."""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
     if st != 200:
         return st, None
     try:
@@ -397,7 +397,7 @@ def get_json_cfg(port):
 
 
 def row_of_models_document(cfg):
-    """{model: row} for the /_ui/config models section (one card per model)."""
+    """{model: row} for the /config models section (one card per model)."""
     out = {}
     for entry in (cfg or {}).get("models", []):
         if isinstance(entry, dict) and entry.get("model"):
@@ -410,7 +410,7 @@ def scenario_card_effort_ladder():
     """探测到的档位进管理台面，操作员勾选的那份接管 /v1/models 的对外阶梯。
 
     这份与 unit 的 G11 分工不同：G11 在配桩的 registry 上测判定，这份钉**真 HTTP 采集链**
-    ——档位必须真的从 mock 的 /v1/models 经 registry 探针落到 /_ui/config 的卡片行上
+    ——档位必须真的从 mock 的 /v1/models 经 registry 探针落到 /config 的卡片行上
     （那是勾选框唯一的基线来源），再证明勾选/取消过一遍 POST 之后对外字节真的变了。
     接线错在这条链上的表现是「勾选框永远是空的」或「勾了但对外一个字没变」，两侧各一组
     断言把它夹住。
@@ -425,7 +425,7 @@ def scenario_card_effort_ladder():
     check("[%s] worker healthy" % tag, wait_healthy(port, [url]), logs(name)[:400])
     check("[%s] 采集链路把能力送到了外表面" % tag, wait_caps(port, "ladder-model"), logs(name)[:400])
 
-    # ── 1. 探测：引擎原话同时出现在对外行与 /_ui/config 的卡片行上 ──
+    # ── 1. 探测：引擎原话同时出现在对外行与 /config 的卡片行上 ──
     st, doc, raw = models_doc(port)
     e = row(doc, "ladder-model") or {}
     ladder = e.get("reasoning_efforts") or []
@@ -446,7 +446,7 @@ def scenario_card_effort_ladder():
         st, cfg = get_json_cfg(port)
     card_row = card_row or {}
     detected = card_row.get("detected_reasoning_efforts")
-    check("[%s] /_ui/config 的卡片行带出**引擎原话**（勾选框的基线来源）" % tag,
+    check("[%s] /config 的卡片行带出**引擎原话**（勾选框的基线来源）" % tag,
           isinstance(detected, list) and [r.get("value") for r in detected]
           == ["low", "medium", "high", "max"], json.dumps(card_row)[:400])
     check("[%s] 未勾过时卡片行的 reasoning_efforts 是 null（= 自动，不与[] 混）" % tag,
@@ -454,11 +454,11 @@ def scenario_card_effort_ladder():
           json.dumps(card_row.get("reasoning_efforts"))[:120])
 
     # ── 2. 勾选：取消 medium、手动加引擎从没报过的 xhigh、预选挪到 high ──
-    st, doc = post_json(port, "/_ui/config/model",
+    st, doc = post_json(port, "/config/model",
                         {"model": "ladder-model",
                          "reasoning_efforts": [{"value": "low"}, {"value": "high", "default": True},
                                                {"value": "xhigh"}]})
-    check("[%s] POST /_ui/config/model 带勾选表被接受" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
+    check("[%s] POST /config/model 带勾选表被接受" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
     e = {}
     deadline = time.time() + 12
     while time.time() < deadline:
@@ -489,7 +489,7 @@ def scenario_card_effort_ladder():
           == ["low", "medium", "high", "max"], json.dumps(saved)[:400])
 
     # ── 3. 非法档位名整条拒绝，且不留下半截状态 ──
-    st, doc = post_json(port, "/_ui/config/model",
+    st, doc = post_json(port, "/config/model",
                         {"model": "ladder-model", "reasoning_efforts": ["low", "turbo"]})
     check("[%s] 未知档位名被 400 拒绝" % tag, st == 400, "%s %s" % (st, str(doc)[:200]))
     st, doc, raw = models_doc(port)
@@ -499,7 +499,7 @@ def scenario_card_effort_ladder():
           json.dumps(e.get("reasoning_efforts"))[:200])
 
     # ── 4. 清除回自动：null 之后阶梯整份退回引擎原话 ──
-    st, doc = post_json(port, "/_ui/config/model",
+    st, doc = post_json(port, "/config/model",
                         {"model": "ladder-model", "reasoning_efforts": None})
     check("[%s] POST null 被接受（清除回自动）" % tag, st == 200, "%s %s" % (st, str(doc)[:200]))
     e = {}
@@ -540,11 +540,11 @@ def scenario_config_priority():
     engine = caps_of(row(doc, "rich-model")).get("context_length")
     check("[%s] 写入前引擎读数确实是 1000000" % tag, engine == 1000000,
           "%r of %s" % (engine, raw[:300]))
-    st, doc = post_json(port, "/_ui/config/model",
+    st, doc = post_json(port, "/config/model",
                         {"model": "rich-model", "ctx": 524288,
                          "context_limit": 300000, "modalities": ["text", "image", "video"],
                          "default_effort": "high"})
-    check("[%s] POST /_ui/config/model 卡片被接受" % tag, st == 200,
+    check("[%s] POST /config/model 卡片被接受" % tag, st == 200,
           "%s %s" % (st, str(doc)[:300]))
     # 快照有 0.5 s 的 worker 侧 TTL，给一次重试窗口而不是直接判死。
     deadline = time.time() + 12
@@ -592,7 +592,7 @@ def scenario_virtual_entries():
     got_a = wait_caps(port, "alpha")
     got_b = wait_caps(port, "beta")
     check("[%s] 两台引擎的能力读数都被采到了" % tag, got_a and got_b, logs(name)[:300])
-    st, doc = post_json(port, "/_ui/config/virtual", {"entries": [
+    st, doc = post_json(port, "/config/virtual", {"entries": [
         {"model": "vm-one", "target": "alpha"},
         {"model": "vm-group", "targets": ["alpha", "beta"]}]})
     check("[%s] both entries accepted" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
@@ -679,7 +679,7 @@ def scenario_group_missing_reading():
     got = {m: wait_caps(port, m) for m in ("alpha", "beta", "gamma")}
     check("[%s] 三台的 capabilities 都被采到（beta 只缺两个长度读数）" % tag,
           all(got.values()), json.dumps(got))
-    st, doc = post_json(port, "/_ui/config/virtual", {"entries": [
+    st, doc = post_json(port, "/config/virtual", {"entries": [
         {"model": "vm-half", "targets": ["alpha", "beta"]},
         {"model": "vm-wide", "targets": ["alpha", "gamma"]}]})
     check("[%s] 两个入口都收下" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
@@ -893,7 +893,7 @@ def scenario_switch_off_is_byte_identical():
     register_pair(port, gw, tag, (("solo-alpha", pa), ("solo-beta", pb)))
     got = {m: wait_caps(port, m) for m in ("solo-alpha", "solo-beta")}
     check("[%s] 前提：两台的 capabilities 都被采到" % tag, all(got.values()), json.dumps(got))
-    st, doc = post_json(port, "/_ui/config/virtual", {"entries": [
+    st, doc = post_json(port, "/config/virtual", {"entries": [
         {"model": "vm-solo-a", "target": "solo-alpha"},
         {"model": "vm-solo-group", "targets": ["solo-alpha", "solo-beta"]}]})
     check("[%s] 两个入口都收下" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
@@ -973,7 +973,7 @@ def scenario_switch_on_advertises_only_entries():
     # wait_caps 那种「看对外有没有 capabilities」的等法就永远等不到了。
     got = {m: wait_caps(port, m) for m in ("real-a", "real-b")}
     check("[%s] 前提：两台的 capabilities 都被采到" % tag, all(got.values()), json.dumps(got))
-    st, doc = post_json(port, "/_ui/config/virtual", {"entries": [
+    st, doc = post_json(port, "/config/virtual", {"entries": [
         {"model": "gate-a", "target": "real-a"},
         {"model": "gate-ab", "targets": ["real-a", "real-b"]}]})
     check("[%s] 两个入口都收下" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
@@ -982,7 +982,7 @@ def scenario_switch_on_advertises_only_entries():
     check("[%s] 前提：拨开关之前真实模型两行都在" % tag,
           sorted(ids_of(doc)) == ["gate-a", "gate-ab", "real-a", "real-b"],
           json.dumps(sorted(ids_of(doc))))
-    # 最后才写开关：见本节头的顺序纪律。「开关能活过 /_ui/config 保存」由 S11 专测。
+    # 最后才写开关：见本节头的顺序纪律。「开关能活过 /config 保存」由 S11 专测。
     write_cfg(cfg_dir, '{"models_virtual_only": true}')
     st, doc, raw = poll_models(port, lambda s, d, r: s == 200 and not (set(ids_of(d)) & {"real-a", "real-b"}))
     check("[%s] 开关开后 /v1/models 200" % tag, st == 200, "%s %s" % (st, str(raw)[:200]))
@@ -1110,7 +1110,7 @@ def scenario_disk_and_env_layers():
     port, name, gw = start_conf_cfg({"LMR_CONFIG_FILE": CFG_IN_CONTAINER,
                                      "LMR_MODELS_VIRTUAL_ONLY": "true"}, tag, cfg_dir)
     register_pair(port, gw, tag, (("env-model", pa),))
-    st, doc = post_json(port, "/_ui/config/virtual",
+    st, doc = post_json(port, "/config/virtual",
                         {"entries": [{"model": "vm-env", "target": "env-model"}]})
     check("[%s] 入口收下" % tag, st == 200, "%s %s" % (st, str(doc)[:200]))
     st, doc, raw = models_doc(port)
@@ -1132,7 +1132,7 @@ def scenario_disk_and_env_layers():
     port2, name2, gw2 = start_conf_cfg({"LMR_CONFIG_FILE": CFG_IN_CONTAINER,
                                         "LMR_MODELS_VIRTUAL_ONLY": "true"}, tag2, cfg_dir2)
     register_pair(port2, gw2, tag2, (("env-solo", pb),))
-    st, doc = post_json(port2, "/_ui/config/virtual",
+    st, doc = post_json(port2, "/config/virtual",
                         {"entries": [{"model": "vm-env2", "target": "env-solo"}]})
     check("[%s] 入口收下" % tag2, st == 200, "%s %s" % (st, str(doc)[:200]))
     st, doc, raw = poll_models(
@@ -1162,7 +1162,7 @@ def scenario_declared_file_is_authoritative():
     最后一条断言判「文件字节没被网关改写过」：整个过程没有任何配置写接口被调过，网关
     只该读它。真把这条打红的是那种越界的实现——比如在请求路径上顺手 persist 一份自己
     生成的快照，把操作员手写的文件覆盖掉（030dab5 的注释里就写着这个已知代价：从
-    /_ui/config 保存一次会抹掉这个键；那是写路径另一条线要收的，见本次回报）。
+    /config 保存一次会抹掉这个键；那是写路径另一条线要收的，见本次回报）。
     """
     tag = "S11-file"
     pa, pb = free_port(), free_port()
@@ -1211,12 +1211,12 @@ def scenario_declared_file_is_authoritative():
     after = open(os.path.join(cfg_dir, "config.json"), encoding="utf-8").read()
     check("[%s] 没人碰写接口时网关不改操作员那份文件" % tag, after == declared_text,
           "after=%s" % after[:250])
-    # ---- 开关必须活过 /_ui/config 的一次保存 ----
+    # ---- 开关必须活过 /config 的一次保存 ----
     # 030dab5 的注释里写着这个已知代价：整表替换走 cfg_from_document -> snapshot_of，
     # 未知键在两端都没有落点，于是「从管理台保存一次」就把操作员手写的开关擦掉。正解是
     # 读侧认这个键、写侧回写它，两条必须同时有（3728821 收的那条线）。这里两半各钉一条：
     # 磁盘上那个键还在，并且对外仍然只广告入口。
-    st, doc = post_json(port, "/_ui/config/virtual", {"entries": [
+    st, doc = post_json(port, "/config/virtual", {"entries": [
         {"model": "declared-group", "targets": ["declared-a", "declared-b"]},
         {"model": "declared-one", "target": "declared-b"},
         {"model": "declared-third", "target": "declared-a"}]})

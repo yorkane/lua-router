@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Round 3: textless requests, /_ui/v1/completions, effort null handling, model-less UI body."""
+"""Round 3: textless requests, the webui completion/chat aliases (/u/*), effort
+null handling and the model-less UI body.
+
+The UI-layer behaviours (default-model fill, empty/null effort clean-up, the
+405 + Allow method gate, the picker list with status.value) live in ui.lua and
+are reached through conf/ui.conf, i.e. the /u/ family and the root-attached
+names. The /_ui prefix went away with the 2026-10-08 admin-to-root move; the
+root /v1/* names belong to the klib inference plane and answer differently.
+"""
 import json, os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (free_port, http, check, start_mock, mock_lines, start_router,
@@ -29,50 +37,50 @@ check("[prefix_hash] ring_hit branch counted", 'branch="ring_hit"' in text or
 check("[prefix_hash] no lua errors", "lua entry thread aborted" not in logs(name), logs(name)[-300:])
 stop_router(name)
 
-# 2. /_ui/v1/completions + model-less UI body + explicit null effort
+# 2. /u/v1/completions + model-less UI body + explicit null effort
 pa = free_port(); start_mock(pa, "alpha")
 name = "lr-uicpl-" + RUN
 port = start_router({"SMG_POLICY": "cache_aware", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
                      "SMG_WORKER_URLS": "http://127.0.0.1:%d" % pa,
                      "LMR_DEFAULT_EFFORT": "ultra"}, name)
 check("[ui] healthy", wait_ready(port, 1), logs(name))
-st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/completions" % port,
+st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/completions" % port,
                    {"model": "alpha", "prompt": "ui completion prompt"})
 echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
-check("[ui] /_ui/v1/completions forwards + effort injected",
+check("[ui] /u/v1/completions forwards + effort injected",
       st == 200 and echo.get("reasoning_effort") == "ultra" and "prompt" in echo,
       "%s %s" % (st, json.dumps(echo)[:250]))
 # model-less body: ui.lua fills it from the worker list before the pipeline runs
-st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                    {"messages": [{"role": "user", "content": "no model given"}]})
 echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
 check("[ui] model-less body filled from the registry", st == 200 and echo.get("model") == "alpha",
       "%s %s" % (st, json.dumps(echo)[:250]))
 # explicit null effort is dropped by the UI layer, then re-filled by the policy
-st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                    {"model": "alpha", "reasoning_effort": None,
                     "messages": [{"role": "user", "content": "null effort"}]})
 echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
 check("[ui] null effort cleaned then defaulted", echo.get("reasoning_effort") == "ultra",
       json.dumps(echo)[:250])
 # empty-string effort takes the same path
-st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                    {"model": "alpha", "reasoning_effort": "",
                     "messages": [{"role": "user", "content": "empty effort"}]})
 echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
 check("[ui] empty-string effort defaulted", echo.get("reasoning_effort") == "ultra",
       json.dumps(echo)[:250])
 # GET on the chat alias is a 405 with Allow, per the axum gating
-st, body, hdrs = http("GET", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port)
+st, body, hdrs = http("GET", "http://127.0.0.1:%d/u/v1/chat/completions" % port)
 check("[ui] GET on chat alias 405 + Allow", st == 405
       and hdrs.get("Allow", hdrs.get("allow", "")) == "POST", "%s %s" % (st, body[:120]))
-# /_ui/v1/models advertises the real model
-st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/v1/models" % port)
-check("[ui] /_ui/v1/models 200", st == 200 and "alpha" in body, body[:150])
+# The webui picker advertises the real model
+st, body, _ = http("GET", "http://127.0.0.1:%d/u/v1/models" % port)
+check("[ui] /u/v1/models 200", st == 200 and "alpha" in body, body[:150])
 check("[ui] no lua errors", "lua entry thread aborted" not in logs(name), logs(name)[-400:])
 stop_router(name)
 
-# 3. inference-plane parity: same body through /v1 and /_ui must reach the same shape
+# 3. inference-plane parity: the same body through /v1 and /u/ reaches one shape
 pa = free_port(); start_mock(pa, "alpha")
 name = "lr-parity-" + RUN
 port = start_router({"SMG_POLICY": "round_robin", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
@@ -80,7 +88,7 @@ port = start_router({"SMG_POLICY": "round_robin", "SMG_HEALTH_CHECK_INTERVAL_SEC
                      "SMG_WORKER_URLS": "http://127.0.0.1:%d" % pa}, name)
 check("[parity] healthy", wait_ready(port, 1), logs(name))
 st1, b1, _ = chat(port, "alpha", "parity probe", extra={"max_tokens": 4096})
-st2, b2, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+st2, b2, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                   {"model": "alpha", "messages": [{"role": "user", "content": "parity probe"}],
                    "stream": False, "max_tokens": 4096})
 e1 = json.loads(b1).get("echo_body", {}) if st1 == 200 else {}
@@ -90,7 +98,7 @@ e2 = json.loads(b2).get("echo_body", {}) if st2 == 200 else {}
 # that LMR_MODEL_CTX=alpha:256 used to clamp it to. The env row stays configured on
 # purpose: it is the number a re-introduced clamp would read, which is what makes the
 # 4096 assertion discriminate instead of passing vacuously.
-check("[parity] /v1 and /_ui forward the caller's max_tokens untouched",
+check("[parity] /v1 and /u/ forward the caller's max_tokens untouched",
       st1 == 200 and st2 == 200 and e1.get("max_tokens") == 4096
       and e2.get("max_tokens") == 4096,
       "%s/%s %s %s" % (st1, st2, json.dumps(e1)[:160], json.dumps(e2)[:160]))
@@ -103,19 +111,19 @@ check("[parity] /v1 and /_ui forward the caller's max_tokens untouched",
 # body as the mock received it, so it carries no id/created_at/request-id of its own
 # (those live in the response envelope, not in echo_body), and both requests name the
 # same single worker, so the model rewrite lands on the same "alpha". stream rides
-# explicitly on the /_ui body because chat() always sends it -- that is the one shape
+# explicitly on the /u/ body because chat() always sends it -- that is the one shape
 # difference the two entry points would otherwise show for reasons unrelated to the
 # gateway. Nothing else may differ, and if a future gateway starts stamping a
 # per-request field into the body, this check is where it gets caught.
 check("[parity] both entries hand the worker the same bytes",
       st1 == 200 and st2 == 200 and e1 == e2 and bool(e1),
       "e1=%s e2=%s" % (json.dumps(e1)[:220], json.dumps(e2)[:220]))
-rows = json.loads(http("GET", "http://127.0.0.1:%d/_ui/logs" % port)[1]).get("requests", [])
+rows = json.loads(http("GET", "http://127.0.0.1:%d/logs" % port)[1]).get("requests", [])
 check("[parity] both paths land in the request log",
       len([r for r in rows if r.get("endpoint") == "chat"]) >= 2, json.dumps(rows[-2:])[:400])
-rows = json.loads(http("GET", "http://127.0.0.1:%d/_ui/logs" % port)[1]).get("requests", [])
-ui_rows = [r for r in rows if r.get("path", "").startswith("/_ui")]
-check("[parity] log row records the /_ui path", bool(ui_rows)
+rows = json.loads(http("GET", "http://127.0.0.1:%d/logs" % port)[1]).get("requests", [])
+ui_rows = [r for r in rows if r.get("path", "").startswith("/u/")]
+check("[parity] log row records the /u/ path", bool(ui_rows)
       and ui_rows[-1].get("endpoint") == "chat" and ui_rows[-1].get("status") == 200,
       json.dumps(ui_rows[-1] if ui_rows else rows[-2:])[:300])
 st, text, _ = http("GET", "http://127.0.0.1:%d/metrics" % port)
@@ -128,7 +136,7 @@ active = [float(l.split()[-1]) for l in text.splitlines()
 check("[parity] per-worker load released", active and max(active) == 0, str(active))
 stop_router(name)
 
-# 3. /_ui static bundle MIME types: browsers hard-fail ES module scripts served
+# 4. /u/ static bundle MIME types: browsers hard-fail ES module scripts served
 #    as application/octet-stream (strict MIME checking per HTML spec). The http{}
 #    block must include mime.types and add webmanifest/mjs mappings.
 import re as _re
@@ -141,13 +149,13 @@ for _ in range(60):
         break
     time.sleep(0.5)
 check("[ui-mime] healthy", _mime_up, logs(name))
-st, html, hdrs = http("GET", "http://127.0.0.1:%d/_ui/" % port)
+st, html, hdrs = http("GET", "http://127.0.0.1:%d/u/" % port)
 check("[ui-mime] index is text/html (%s)" % st, st == 200 and
       hdrs.get("Content-Type", "").startswith("text/html"), hdrs.get("Content-Type", "?"))
-js = _re.search(r'(?:src|href)="(?:\./|/_ui/)(_app/[^"]+\.js)"', html)
-css = _re.search(r'(?:src|href)="(?:\./|/_ui/)(_app/[^"]+\.css)"', html)
+js = _re.search(r'(?:src|href)="(?:\./|/u/)(_app/[^"]+\.js)"', html)
+css = _re.search(r'(?:src|href)="(?:\./|/u/)(_app/[^"]+\.css)"', html)
 if js:
-    st, _, hdrs = http("GET", "http://127.0.0.1:%d/_ui/%s" % (port, js.group(1)))
+    st, _, hdrs = http("GET", "http://127.0.0.1:%d/u/%s" % (port, js.group(1)))
     check("[ui-mime] module js served as javascript (%s)" % hdrs.get("Content-Type", "?"),
           st == 200 and hdrs.get("Content-Type", "") in
           ("application/javascript", "text/javascript"),
@@ -155,11 +163,11 @@ if js:
 else:
     check("[ui-mime] index references an _app js bundle", False, html[-200:])
 if css:
-    st, _, hdrs = http("GET", "http://127.0.0.1:%d/_ui/%s" % (port, css.group(1)))
+    st, _, hdrs = http("GET", "http://127.0.0.1:%d/u/%s" % (port, css.group(1)))
     check("[ui-mime] css served as text/css", st == 200 and
           hdrs.get("Content-Type", "").startswith("text/css"),
           "%s %s" % (st, hdrs.get("Content-Type", "?")))
-st, _, hdrs = http("GET", "http://127.0.0.1:%d/_ui/manifest.webmanifest" % port)
+st, _, hdrs = http("GET", "http://127.0.0.1:%d/u/manifest.webmanifest" % port)
 check("[ui-mime] webmanifest served as application/manifest+json",
       st == 200 and hdrs.get("Content-Type", "").startswith("application/manifest+json"),
       "%s %s" % (st, hdrs.get("Content-Type", "?")))

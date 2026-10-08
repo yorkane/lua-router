@@ -515,8 +515,8 @@ end
 --- `reload == true` 那份（磁盘快照的读路径）刻意**不查** registry，直接放行同名落点：这条
 --- 路径同时是「把已经落盘的配置读回来」，在那里新增一道拒绝会让一份当年合法的配置在某次
 --- 巡检空档（或那台实例被摘掉）之后整体读不回来，而 `current()` 读不回配置就**整份退回 env
---- 默认**——等于把网关的全部配置抹平。这正是 `validate_declared_context_windows` 刻意不挂
---- 在读路径上的同一条理由（见 snapshot.lua 那节注释），两条校验必须同生同灭。
+--- 默认**——等于把网关的全部配置抹平。这也是原先只挂两条入口写入路径的
+--- `validate_declared_context_windows`（已于 2026-10-08 移除）刻意不挂读路径的同一条理由。
 --- 写入侧（apply_profiles 与整文档 apply_document）照查：判据只在「谁能被写进来」这一头
 --- 说话，落盘之后的字节不再被追问。
 ---@param opts table|nil @{reload=true: 磁盘快照的读路径,不查引擎读数}
@@ -737,8 +737,8 @@ end
 ---@param existing table|nil @ live alias -> profile map for the cross-batch chain check
 ---@param shadow table|nil @ 同名遮蔽判据上下文（new_shadow_context）；nil = 写入侧口径，
 ---  现查 registry 的引擎背书。**磁盘快照的读路径必须显式传 {reload=true}**：在那里新增的
----  拒绝会让一份当年合法的配置在下次 reload 整体退回 env 默认（与 validate_declared_context_windows
----  刻意不挂读路径同一条理由）。
+---  拒绝会让一份当年合法的配置在下次 reload 整体退回 env 默认（与已移除的
+---  validate_declared_context_windows 刻意不挂读路径同一条理由）。
 ---@return table|nil built, string|nil err
 -- 前向声明：下面两个链守卫是 local function，定义在本函数之后。Lua 里没有这行声明的话，
 -- build_profiles 里的同名标识符会退化成**全局读**（nil），任何一次写 virtual_models 都会

@@ -9,11 +9,11 @@
 
   A. PUT 换策略后同请求分布变化（粘性消失）
      起容器 SMG_POLICY=cache_aware + 两个 mock；先证同前缀 10 发全部砸同一
-     mock（cache_aware 粘滞成立，基线），再 PUT /_ui/config/policy
+     mock（cache_aware 粘滞成立，基线），再 PUT /config/policy
      {"policy":"random"}，同一批同前缀请求重放：两个 mock 必须都拿到流量、且
      没有任何一个 mock 独吞（χ² 的弱化版判定：min>0 且 max<N）。这条断言之所
      以有效，是因为流量形状完全没变（同 model、同前缀、同 header），唯一变量
-     是策略名。同时读 /_ui/logs 的 route_type 与
+     是策略名。同时读 /logs 的 route_type 与
      smg_worker_selection_total{policy="random"}，证明分布变化确实由新策略产生
      而不是候选集抖动。
   B. 非法策略名 400 且不生效
@@ -25,7 +25,7 @@
      全局设为 cache_aware，alpha 设 random：alpha 的同前缀爆发要摊开、beta 的同
      前缀爆发要粘住（两段分开打，避免依赖并发交错）。然后再注册一个带
      labels.policy=round_robin 的 hint 实例（模型 hinted），只设全局 cache_aware，
-     GET /_ui/config/policy 的该行必须 source=global（运营覆盖压过 worker hint，
+     GET /config/policy 的该行必须 source=global（运营覆盖压过 worker hint，
      优先级链 model > global > hint > env 的可见证据）。
   D. 多 nginx 进程一致性（shdict 可见性）
      NGINX_WORKER_PROCESSES=4 + SMG_POLICY=round_robin 起容器；PUT
@@ -42,7 +42,7 @@
      全部覆盖清成 null / 空表后，行为必须回到 env 层（粘性复现），证明不是
      「最后一次 stamp 粘住」。
 
-观察通道：mock 的访问日志行（_lib.mock_lines）与 router 自己的 /_ui/logs
+观察通道：mock 的访问日志行（_lib.mock_lines）与 router 自己的 /logs
 route_type、/metrics 计数器；端口全部随机。
 """
 import json, os, sys, time
@@ -52,7 +52,7 @@ from _lib import (free_port, http, check, start_mock, mock_lines, start_router,
                   RESULTS, RUN, REPO)
 
 PREFIX = "routing-dyn-shared-prefix "
-UI = "/_ui/config/policy"
+UI = "/config/policy"
 
 
 def policy_get(port):
@@ -88,7 +88,7 @@ def fire(port, model, n, prefix, headers=None):
 
 
 def route_types(port, limit=200):
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs?cursor=0&limit=%d" % (port, limit))
+    st, body, _ = http("GET", "http://127.0.0.1:%d/logs?cursor=0&limit=%d" % (port, limit))
     if st != 200:
         return None
     try:
@@ -132,7 +132,7 @@ def start_two(policy, tag, worker_processes=None, config_file=""):
 # ---------------------------------------------------------------- A + B
 pa_port, name, pa, pb = start_two("cache_aware", "sticky")
 st, doc = policy_get(pa_port)
-check("[A] GET /_ui/config/policy 200", st == 200, "%s %s" % (st, doc))
+check("[A] GET /config/policy 200", st == 200, "%s %s" % (st, doc))
 check("[A] document advertises the eight policies",
       st == 200 and len(doc.get("policies") or []) == 8, doc.get("policies") if st == 200 else "")
 check("[A] no override configured by default",

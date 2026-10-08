@@ -534,7 +534,7 @@ check("[responses budget] worker healthy", wait_ready(bud_port, 1), logs(bud_nam
 # worker, declaring the same 350000. No card declares a context_limit anywhere in this
 # container, so the configuration-time window validator (aa9f7a3) deliberately stays
 # out of the way -- this section is about forwarding bytes, not about validation.
-st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/config/virtual" % bud_port,
+st, body, _ = http("POST", "http://127.0.0.1:%d/config/virtual" % bud_port,
                    {"entries": [{"model": "vm-bud", "target": "alpha",
                                   "context_window": 350000}]})
 check("[responses budget] entry with context_window=350000 accepted", st == 200,
@@ -556,7 +556,7 @@ def resp_budget_probe(bud_port, model, rid, **extra):
 
 def resp_log_row(bud_port, worker_needle):
     """The newest responses row of the request log (output_budget lives there)."""
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs?limit=200" % bud_port)
+    st, body, _ = http("GET", "http://127.0.0.1:%d/logs?limit=200" % bud_port)
     rows = json.loads(body).get("requests", []) if st == 200 else []
     rows = [r for r in rows if worker_needle in (r.get("worker") or "")
             and r.get("endpoint") == "responses"]

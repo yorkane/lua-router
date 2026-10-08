@@ -24,13 +24,13 @@ Per route:
 
 Two routes used to be pinned at a divergent value and are now asserted at the
 Rust one, which is what section 6 below checks:
-  * /_ui/config  — HEAD used to answer 400 because ui.conf's exact location ran
+  * /config  — HEAD used to answer 400 because ui.conf's exact location ran
     ``method_any("GET","POST")`` and then hard-picked ``ui.config_effort()`` for
     anything that was not the literal "GET", so HEAD reached the POST handler and
     its empty body was rejected. The branch now reads ``GET or HEAD``, matching
     axum's ``get(handler)``, so HEAD answers 200 with the GET headers.
   * /_ui/history went away with the conversation store (doc/scope-trim.md), so
-    section 6 now only pins the /_ui/config HEAD/GET fold.
+    section 6 now only pins the /config HEAD/GET fold.
 """
 import json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,7 +40,7 @@ from _lib import (free_port, http, check, start_mock, start_router, wait_ready,
 # Payloads that embed a clock or a live counter: two GETs of the same route do
 # not even agree with each other, so Content-Length cannot be pinned.
 DYNAMIC = {"/metrics", "/v1/loads", "/get_loads", "/server_info", "/get_server_info",
-           "/_ui/stats", "/_ui/logs"}
+           "/stats", "/logs"}
 # Per-request values that always differ between two requests.
 ALWAYS_SKIP = {"date", "x-request-id"}
 
@@ -111,21 +111,21 @@ head_case(port, "/workers/does-not-exist", get_status=400)
 # 3. Mesh surface with the feature off: HEAD rides the same 503 gate.
 head_case(port, "/ha/status", get_status=503)
 
-# 4. /_ui aliases from ui.conf (chunked JSON answers).
-for p in ("/_ui/v1/models", "/_ui/props", "/_ui/logs", "/_ui/stats", "/_ui/slots",
-          "/_ui/tools", "/_ui/logs/backends"):
+# 4. Root data-plane aliases from ui.conf (chunked JSON answers).
+for p in ("/u/v1/models", "/props", "/logs", "/stats", "/slots",
+          "/tools", "/logs/backends"):
     head_case(port, p, chunked=True)
 
-# A POST-only /_ui alias must refuse HEAD the same way it refuses GET.
-head_case(port, "/_ui/config/effort", get_status=405, chunked=True)
+# A POST-only ui.conf alias must refuse HEAD the same way it refuses GET.
+head_case(port, "/config/effort", get_status=405, chunked=True)
 
 # 5. The route that used to diverge (pinned during the head-routes round):
-# /_ui/config is read by ui.conf, whose exact location now folds HEAD into the GET
+# /config is read by ui.conf, whose exact location now folds HEAD into the GET
 # branch. The check is the regression gate for that fold. (/_ui/history and the
 # /v1/tokenizers trio were pinned here as well until the scope trim removed both
 # planes; they now answer from the 404 sink, covered by section 6 below.)
-head_case(port, "/_ui/config", get_status=200, chunked=True,
-          label="/_ui/config HEAD follows the GET branch")
+head_case(port, "/config", get_status=200, chunked=True,
+          label="/config HEAD follows the GET branch")
 
 # 6. The 404 sink answers HEAD without a body. The sink's message embeds the
 # request method, so the body length differs by the length of "HEAD" - only
@@ -138,8 +138,8 @@ check("[HEAD /nope] 404 sink answers HEAD with the same shape",
       and norm(h[2]).get("x-smg-error-code") == "not_found",
       "%s/%s %r" % (g[0], h[0], h[1][:120]))
 
-# 7. Static SPA root: HEAD on the served bundle.
-head_case(port, "/_ui/", chunked=False)
+# 7. Static bundle: HEAD on the served webui shell (conf/ui.conf ^~ /u/).
+head_case(port, "/u/", chunked=False)
 
 check("[HEAD] no lua errors", "lua entry thread aborted" not in logs(name),
       logs(name)[-500:])

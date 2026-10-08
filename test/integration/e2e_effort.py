@@ -8,7 +8,7 @@
 与 test/unit/test_effort_layers.lua 的分工（那份纯 luajit，无端口、可并发）：单测钉**三层
 查表的语义**与 router 的**接线形状**（能造「卡片只管 ctx」「脏档位」「未知 from」这些真
 HTTP 里造不出来的形状，也能直接看 profile_entry_fallback 交出去的那份读数）；这份钉**整条
-链真的把条目层送到了转发体上**——条目声明要经 /_ui/config/virtual 落盘、进 shdict 快照、
+链真的把条目层送到了转发体上**——条目声明要经 /config/virtual 落盘、进 shdict 快照、
 被 profile_for_alias 取回、交给 config_store.request_effort_for 的第三参，最后由
 set_top_field 写进转发体。任何一环断掉，转发的 reasoning_effort 就少改一次，而网关一声不
 吭（1e57618 的提交信息里点名的正是这种静默失效）。
@@ -25,12 +25,12 @@ set_top_field 写进转发体。任何一环断掉，转发的 reasoning_effort 
 
 配置面（三层各自实测可用的声明途径，键名照此）：
   全局层  env LMR_EFFORT_MAP=from>to,...（多条逗号分隔）/ LMR_DEFAULT_EFFORT=<档位>
-          等价 HTTP 面：POST /_ui/config/effort {effort_map:[{from,to}], default_effort}
+          等价 HTTP 面：POST /config/effort {effort_map:[{from,to}], default_effort}
   卡片层  env LMR_MODEL_EFFORT_MAP=<model>:<from>><to>（**只有它会建卡片**）、
           LMR_MODEL_CTX / LMR_MODEL_EFFORT；卡片的 default_effort 没有 env 层，只能
-          POST /_ui/config/model {model, default_effort}
+          POST /config/model {model, default_effort}
   条目层  env 表达不出来（LMR_VIRTUAL_MODELS 只有 alias:target 一种形状），走
-          POST /_ui/config/virtual {entries:[{model,target,default_effort,
+          POST /config/virtual {entries:[{model,target,default_effort,
           effort_map:[{from,to}]}]}
 """
 import fcntl
@@ -140,11 +140,11 @@ def post_json(port, path, body):
 
 
 def post_virtual(port, entries):
-    return post_json(port, "/_ui/config/virtual", {"entries": entries})
+    return post_json(port, "/config/virtual", {"entries": entries})
 
 
 def post_model(port, patch):
-    return post_json(port, "/_ui/config/model", patch)
+    return post_json(port, "/config/model", patch)
 
 
 def workers_by_url(port):
@@ -199,7 +199,7 @@ def decoys_intact(echo):
 def boot(env, tag, cards=None, entries=None, model_name=MODEL, want_model=None):
     """起一台网关 + 一个 mock 并声明好配置；失败返回 None（失败原因自己已经 check 过）。
 
-    注册走 POST /workers（dynamic 行），声明走 /_ui/config 的写入面；两者都必须在发请求
+    注册走 POST /workers（dynamic 行），声明走 /config 的写入面；两者都必须在发请求
     之前完成，否则第一发会读到半套配置。want_model 用来核对 mock 真的服务了那个名字。
     """
     pm = free_port()
@@ -216,13 +216,13 @@ def boot(env, tag, cards=None, entries=None, model_name=MODEL, want_model=None):
         return None
     for patch in (cards or []):
         st, doc = post_model(port, patch)
-        if not check("[%s] POST /_ui/config/model %s 被接受" % (tag, patch.get("model")),
+        if not check("[%s] POST /config/model %s 被接受" % (tag, patch.get("model")),
                      st == 200, "%s %s" % (st, json.dumps(doc)[:250])):
             stop(name)
             return None
     if entries is not None:
         st, doc = post_virtual(port, entries)
-        if not check("[%s] POST /_ui/config/virtual 被接受" % tag, st == 200,
+        if not check("[%s] POST /config/virtual 被接受" % tag, st == 200,
                      "%s %s" % (st, json.dumps(doc)[:300])):
             stop(name)
             return None
@@ -464,8 +464,8 @@ def scenario_declaration_round_trip():
     if not got:
         return
     port, name, pm, url = got
-    st, text, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
-    check("[%s] GET /_ui/config 200" % tag, st == 200, "%s %s" % (st, str(text)[:200]))
+    st, text, _ = http("GET", "http://127.0.0.1:%d/config" % port)
+    check("[%s] GET /config 200" % tag, st == 200, "%s %s" % (st, str(text)[:200]))
     rows = [e for e in (json.loads(text).get("virtual_models") or [])
             if e.get("model") == ALIAS]
     entry = rows[0] if rows else {}
@@ -499,7 +499,7 @@ def scenario_declaration_round_trip():
                                    "effort": "max", "default_effort": "xhigh"}])
     check("[%s] legacy 条目 effort 与新 default_effort 并存被接受" % tag, st == 200,
           "%s %s" % (st, json.dumps(doc)[:250]))
-    rows = [e for e in ((json.loads(http("GET", "http://127.0.0.1:%d/_ui/config" % port)[1])
+    rows = [e for e in ((json.loads(http("GET", "http://127.0.0.1:%d/config" % port)[1])
                         .get("virtual_models") or [])) if e.get("model") == ALIAS]
     check("[%s] legacy effort=max 照旧往返落盘（不与新位互相覆盖）" % tag,
           bool(rows) and rows[0].get("effort") == "max"

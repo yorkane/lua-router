@@ -96,8 +96,12 @@ admin/routing.html 承担（`/_ui/config/policy`）。
 
 ## 4. 后端：删什么、留什么
 
-**全部保留**。这三个页面对应的后端 API 同时是 `/_ui/admin/` 的数据面，删任何一个
+**全部保留**。这三个页面对应的后端 API 同时是管理台的数据面，删任何一个
 都会打断管理台：
+
+> 2026-10-08 更新：下面这张表里的 location 名是**写下那一轮**的写法。admin 现已迁到
+> 站点根 `/`，`/_ui/*` 全部取消；这一族数据面现在的名字是 `logs`、`logs/stream`、
+> `logs/backends`、`stats`、`config*`（现役口径见 doc/architect.md §1 与 README 的页面入口表）。
 
 | location（conf/ui.conf） | 现在的使用方 |
 |---|---|

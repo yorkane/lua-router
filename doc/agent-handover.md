@@ -15,7 +15,7 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 （原独立 llm-watcher 容器已合并退役）、GPU 负载双源 + 功率通道、路由策略热切换、token 核算、
 虚拟模型＝**对下游暴露的服务主入口**、1 对多映射一组实际模型（`targets[]`，由调度策略在这一整组里选路；
 条目级**只允许 `context_window`** 一个覆盖字段，per-alias `policy`/`effort` 已停用）、持久化 upstreams、
-每服务并发/功率上限（候选集硬排除）、Quasar UMD 管理控制台（页面入口 **/a/**，原版 webui 入口 **/u/**，旧入口 302 过来；
+每服务并发/功率上限（候选集硬排除）、Quasar UMD 管理控制台（页面入口 **/**（站点根，2026-10-08 admin 迁根），原版 webui 入口 **/u/**（不变）；旧入口 /a 与 /a/ 各 302 到 /，**/_ui/* 全部取消**；
 管理台四页：**服务池**（运行态池 + 声明层同页，原「远程服务」页已并入）/ **模型管理** /
 **路由策略** / **日志**）。
 
@@ -39,7 +39,7 @@ TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 | 编排 | /data/app/lua-router/docker-compose.yml（host 网络、unless-stopped、watcher 全开、docker.sock ro 挂载、配置持久化 /data/app/lua-router/config） |
 | 回滚 | `docker stop lua-router-8800 && docker start llm-router-8800`（Rust 版容器已停保留） |
 | 隧道 | https://8800-235.ai-t.wtvdev.com 经 authz 登录墙；直连 http://10.252.25.235:8800 或本机 127.0.0.1:8800 无墙 |
-| 信任边界 | 网关层**零鉴权**（auth 已删）：/workers、/_ui、/model-map 全开放，只许 authz 边缘之后/可信内网 |
+| 信任边界 | 网关层**零鉴权**（auth 已删）：/workers、根数据面（/config /logs /stats /props）、/model-map 全开放，只许 authz 边缘之后/可信内网 |
 | 勿碰 | authz 容器、SearXNG(8080)、qdrant-faces(6334 gRPC 口)、face-*/va-*/pg18/n8nc/resdown/wx-liushi-monitor 等生产容器 |
 
 ## 2. 代码地图
@@ -59,7 +59,7 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
         mapped models」也在这里）
     router/models_api.lua(969)  /v1/models 对外形状：models_handler / advertise_real_model /
         advertise_virtual_entry / fill_model_fields / inject_virtual_models / resolve_model_caps /
-        common_acceptance / declared_context_limit（AGENTS.md 硬规则 9 全在此文件）
+        common_acceptance / declared_max_output_tokens（AGENTS.md 硬规则 9 全在此文件）
     router/inference.lua(526)   推理面（别名解析、effort 三层继承、output_budget_of 纯读、
         apply_ctx_cap / entry_ctx_cap 两条恒「无改写」空壳）+ 公开面 health 族
     router/profiles.lua(305)    config_store 之上的 profile 读层缝：profile_model_group +
@@ -76,7 +76,8 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
     config_store/persistence.lua(540)  硬边界：全模块只有本文件碰 shdict / 后端 / 文件 IO
         （三层读写 + CAS 冲突 409 + persist + migrate_once + 四枚 revision token 读点）
     config_store/snapshot.lua(801)     空快照语义 + sync_virtual_view / new_card / snapshot_of /
-        cfg_from_document / cfg_from_env + 配置期校验 validate_declared_context_windows
+        cfg_from_document / cfg_from_env（原配置期校验 validate_declared_context_windows
+        已于 2026-10-08 移除：声明窗口与单次输出预算是两个不可比的量，不再互校）
     config_store/profiles.lua(783)     组装配：build_target_group / target_group_of /
         build_context_window / profile_from_entry（停用的 per-alias policy/effort 各在此 warn 一次）
         + assert_no_alias_chain 别名链守卫；explicit_target / explicit_targets 旗标同在此文件
@@ -126,12 +127,12 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
     mesh/handlers.lua(425) /_mesh/internal/* 四条 + 13 条 /ha/* · wire.lua(151) 编解码 · rate.lua(127) 限流窗
   observability.lua(1469) facade：写侧原语（counter/observe/gauge + 键文法）+ record_* + HELP 权威表 +
     prometheus_text —— 与导出器同域不拆（键文法是隐式契约，契约门只测最终文本）
-    observability/logstore.lua(600)  请求日志环形缓冲 + 查询 DSL + /_ui/logs 三 handler + stats()
+    observability/logstore.lua(600)  请求日志环形缓冲 + 查询 DSL + /logs 三 handler + stats()
     observability/inflight.lua(246)   在飞年龄 tracker（lr_stats 的 1024 定长槽）
   单文件（未拆）：hash.lua(964) BLAKE3 环位/ketama/粘滞键 · policy.lua(901) 策略分发（random/rr/pot/manual 内联）
     · init.lua(547) fork 前接线（env 快照 + hb/watcher/mesh/负载定时器 + on_log 兜底）
     · hb.lua(417) 健康巡检 + 熔断计数 + /v1/loads 扇出 + gpu_load 挂载点
-    · config.lua(394) env→配置对象 · ui.lua(348) /_ui 与 /u 的 API 别名 handler 族
+    · config.lua(394) env→配置对象 · ui.lua(348) 根数据面与 /u 的 API 别名 handler 族
     · props.lua(225) /props 快照与引擎代理（with_ctx 是 ctx_cap——模型卡 ctx / 平铺 model_ctx——的
       唯一生产读者，只换回显的 n_ctx / n_ctx_train）
     · limit.lua(209) 全局并发闸门 + 排队 · store_*{dispatcher,file,sqlite,postgres} 配置后端
@@ -141,19 +142,22 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
   integration），其中 tree/policies/hash 双口径各跑一次。
 
 ui/                  原版 llama.cpp webui（规范入口 /u/）+ ui/admin/（Quasar UMD 管理台四页，
-                     规范入口 /a/：模型管理/服务池/路由策略/日志；upstreams.html 只剩重定向占位，
+                     规范入口 /（站点根，由 conf/nginx.conf.template 的 `location /` 提供，try_files 未命中回落
+                     @lmr_klib 走 klib 路由表）：模型管理/服务池/路由策略/日志；upstreams.html 只剩重定向占位，
                      服务池同页呈现运行态池 + 声明层，上限以声明为准、cap_owner==='declared' 的行
-                     隐藏运行态编辑入口）。旧入口 /_ui 与 /_ui/admin/ 各 302 到新入口，
-                     /_ui/* 精确 API 别名与 /_ui/ 静态双活保留（当前 bundle 硬编码不受影响）。
+                     隐藏运行态编辑入口）。旧入口 /a 与 /a/ 各 302 到 /（相对引用 + no-store）；
+                     /_ui/* 全部取消：无 302、无别名、无静态块，落 404 sink（唯一例外：/_ui/logs、
+                     /_ui/stats、/_ui/logs/backends 仍在 klib 路由表里，router.lua 未动）。管理台数据面在根上的
+                     exact 别名族：/config* /logs* /stats /props。
                      控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField
                      渲染，实测 :hint 不生成 .q-field__bottom，toggle / option-group 的说明文字
                      只能并进 :label（声明对话框的两个 toggle 即按此实现）。
-  admin-inject.js    向原版 webui 左导航注入 Admin 入口（href 绝对路径 /a/；MutationObserver 防抖
+  admin-inject.js    向原版 webui 左导航注入 Admin 入口（href 绝对路径 /；MutationObserver 防抖
                      判重模式，别破坏；旧 Logs 入口随根目录工具页移除，差异见 doc/ui-trim-legacy-pages.md）
 conf/                nginx.conf.template（生产模板，envsubst）+ lua-router.conf（裸部署字面量）+
-                     ui.conf（/_ui 与 /u 的精确 API 别名 + /u/ 与 /a/ 静态 + 旧入口 302 + webui
-                     根挂载九端点；exact "=" 纪律：前缀 location 会 shadow 同名静态文件）
-docker-entrypoint.sh env 校验→envsubst→openresty -t→exec；cache_aware/mesh 时未显式给 worker 数则钉 1
+                     ui.conf（/u 的精确 API 别名 + /u/ 静态与 302 + /a、/a/ 兼容 302 + 管理台数据面的根
+                     exact 别名族（/config* /logs* /stats）+ webui 根挂载九端点；exact `=` 纪律：
+                     前缀 location 会 shadow 同名静态文件）
 ```
 
 ## 3. 测试工作流（最重要，先读这节）
@@ -318,9 +322,9 @@ cd /data/app/lua-router && docker compose up -d --force-recreate
 # 验证清单（全绿才算完）：
 curl -s http://127.0.0.1:8800/health                       # OK
 curl -s http://127.0.0.1:8800/workers                      # Q38 healthy，无测试残留
-curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/a/            # 200（管理台；旧 /_ui/admin/ 302）
-curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/u/             # 200（原版 webui；旧 /_ui 302）
-curl -s http://127.0.0.1:8800/_ui/config/policy            # 生效链 JSON
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/               # 200（管理台，admin 在根；旧 /a/ 302）
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/u/             # 200（原版 webui，入口不变）
+curl -s http://127.0.0.1:8800/config/policy                # 生效链 JSON（数据面在根）
 # 一条真实流式 chat + 指标确认 tokens_total 增长；日志 grep '\[error\]' 应为 0
 ```
 
@@ -343,7 +347,7 @@ curl -s http://127.0.0.1:8800/_ui/config/policy            # 生效链 JSON
    `models_verified`，`GET /workers` 因此拿不到它，管理台的「引擎已验证」徽章与
    `ui/admin/models.html` 的已验证计数恒不生效（后端补一个字段即通）。
 8. **功率三个 env 没进 config.lua/JSON/UI**（`SMG_LOAD_POWER` / `_KEYS` / `_QUERY` 由 gpu_load
-   自己 `os.getenv`）：不可热改、进不了 `/_ui/config`，与 AGENTS.md 重点 3/4 的口径不符（收尾项）。
+   自己 `os.getenv`）：不可热改、进不了 `/config`，与 AGENTS.md 重点 3/4 的口径不符（收尾项）。
 9. **虚拟模型 1 对多的残余缺口**（2026-10-02 本轮登记，口径见 doc/gap-virtual-models.md §9 与
    doc/gap-pool-merge.md §6）：
    ① **组里某个模型没有任何已验证实例时，落到它的请求 503**——组门用的是 registry 的 fail-open

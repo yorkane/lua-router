@@ -812,13 +812,13 @@ def round_random(have_rust):
         cnt = selection_counter(http("GET", base + "/metrics")[1], model, "random")
         check("[%s] worker_selection_total{policy=random} 计数 >= N" % tag, (cnt or 0) >= N_RANDOM,
               "counter=%s n=%d" % (cnt, N_RANDOM))
-        st_lg, body_lg, _ = http("GET", base + "/_ui/logs?limit=5")
+        st_lg, body_lg, _ = http("GET", base + "/logs?limit=5")
         routes = set()
         try:
             routes = {rec.get("route_type") for rec in json.loads(body_lg).get("requests", [])}
         except Exception:
             pass
-        check("[%s] /_ui/logs route_type 全为 random" % tag, routes == {"random"}, str(routes))
+        check("[%s] /logs route_type 全为 random" % tag, routes == {"random"}, str(routes))
         REPORT["random"]["lua"] = {"counts": dl, "chi2": round(cl, 3), "max_dev_pct": round(dev, 3),
                                    "selection_counter": cnt, "route_types": sorted(x or "-" for x in routes)}
     stop_router(name)

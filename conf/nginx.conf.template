@@ -199,17 +199,42 @@ http {
 ${TLS_SERVER_EXTRA}
 
         # 预检在 rewrite 阶段应答：nginx 还没选 location 就先跑 server 级 rewrite，
-        # 于是 ui.conf 那些自带方法门的 /_ui/* 与入口迁移新增的 /u/*、/a/* 也能吃到
-        # 统一的 CORS 预检（与 Rust 的 CorsLayer 最外层等价）。三份 conf 的同一段
-        # 注释保持同一形状（refactor-arch §5.3）。
+        # 于是 ui.conf 那些自带方法门的根数据面（/config* /logs* /stats）与 /u/* 的
+        # webui API 别名、/a/* 兼容 302 也能吃到统一的 CORS 预检（与 Rust 的
+        # CorsLayer 最外层等价）。三份 conf 的同一段注释保持同一形状（refactor-arch §5.3）。
         rewrite_by_lua_block {
             if require("resty.luarouter.router").preflight_guard() then
                 return ngx.exit(200)
             end
         }
 
-        # 全部端点（推理面 / 控制面 / 公开面 / _ui）由 klib.router 分发
+        # 根路径 = admin 管理台静态（<LMR_UI_DIR>/admin/），try_files 未命中（API 路由、
+        # 未知路径）才 fallback 到 named @lmr_klib 走 klib.router。exact location 优先级
+        # 高于本块，故 /props /config /logs 等根 exact 端点不受影响。
         location / {
+            set_by_lua_block $lmr_admin_root {
+                local ok, store = pcall(require, "resty.luarouter.config_store")
+                local dir = ok and store and store.env("LMR_UI_DIR") or os.getenv("LMR_UI_DIR")
+                if dir == nil or dir == "" then dir = "/usr/local/share/llama-ui" end
+                return (dir:gsub("/+$", "")) .. "/admin"
+            }
+            root $lmr_admin_root;
+            index index.html;
+            # 实时 gzip（照抄迁根前 ^~ /a/ 静态块）：bundle 不带 .br/.gz 兄弟文件，
+            # gzip_static 会对预取 404；缺了这组 admin 静态就明文下发（vendor 下的
+            # quasar-umd.js 单文件 722KB）。/u/ 的静态块自带同款指令，两边一致。
+            gzip on;
+            gzip_vary on;
+            gzip_min_length 256;
+            gzip_proxied any;
+            gzip_types application/javascript application/json application/manifest+json
+                       image/svg+xml text/css text/javascript text/plain;
+            try_files $uri $uri/ @lmr_klib;
+        }
+        # 推理面 / 控制面 / 公开面（/v1/models /v1/chat/completions /workers /model-map
+        # /health /metrics …）全部由 klib.router 分发：根静态块 try_files 未命中的请求
+        # 落到这里，handler 与迁根之前逐字一致（未注册路径仍由 404 sink 回 not_found JSON）。
+        location @lmr_klib {
             content_by_lua_block {
                 require("resty.luarouter.router").handle()
             }

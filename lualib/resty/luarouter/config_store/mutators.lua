@@ -131,10 +131,10 @@ function _M.apply_model_config(patch)
     if rawget(patch, "default_effort") ~= nil then cfg.model_effort[model] = nil end
     if rawget(patch, "ctx") ~= nil then cfg.model_ctx[model] = nil end
     -- 卡片与平铺行是同一个读数的两种拼法，所以照抄上面 ctx 的口径：写了卡片的
-    -- context_limit 就清掉平铺那一行。留着它是个隐形地雷——日后把卡片的读数清成
-    -- null 时，校验会悄悄改用一条谁都不再看作生效的旧数字（卡片说 262144、平铺说
-    -- 131072 的配置根本没法向操作员解释）。
-    if rawget(patch, "context_limit") ~= nil then cfg.model_context_limit[model] = nil end
+    -- max_output_tokens 就清掉平铺那一行。留着它是个隐形地雷——日后把卡片的读数清成
+    -- null 时，对外读数会悄悄改用一条谁都不再看作生效的旧数字（卡片说 8192、平铺说
+    -- 4096 的配置根本没法向操作员解释）。
+    if rawget(patch, "max_output_tokens") ~= nil then cfg.model_max_output_tokens[model] = nil end
     cfg.model_configs[model] = card
     return commit_snapshot(cfg)
 end
@@ -159,10 +159,6 @@ function _M.apply_profiles(entries)
     local cfg = CS_FACADE.current()
     cfg.virtual_profiles = built
     CS_SNAPSHOT.sync_virtual_view(cfg)
-    -- 声明窗口 vs 服务真实能力（2026-10-04）：用**将要生效**的那份配置判定，所以既看得见
-    -- 本批条目，也看得见磁盘上已有的卡片读数；被拒的批次绝不落盘。
-    local ok_ctx, ctx_err = CS_SNAPSHOT.validate_declared_context_windows(cfg)
-    if not ok_ctx then return nil, ctx_err end
     return commit_snapshot(cfg)
 end
 
@@ -433,10 +429,6 @@ function _M.apply_document(doc)
     local previous = CS_UPSTREAMS.previous_upstream_map(CS_FACADE.current())
     local cfg, err = CS_SNAPSHOT.cfg_from_document(doc, previous)
     if not cfg then return nil, err end
-    -- JSON 编辑器是权威面，因此这里也走同一道配置期校验：一份同时带着「声明窗口过宽」
-    -- 的条目与真实能力读数的文档不能整表落盘。
-    local ok_ctx, ctx_err = CS_SNAPSHOT.validate_declared_context_windows(cfg)
-    if not ok_ctx then return nil, ctx_err end
     local saved, serr, scur = CS_PERSISTENCE.write_snapshot(CS_SNAPSHOT.snapshot_of(cfg))
     if not saved then return nil, CS_PERSISTENCE.store_conflict_message(serr, scur) end
     local summary

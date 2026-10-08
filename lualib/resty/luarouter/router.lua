@@ -93,7 +93,7 @@ local finish_request = reqlog.finish_request
 --                    -> retry on 408/429/5xx with exponential backoff
 --   control plane    /workers CRUD, /flush_cache, /v1/loads
 --   public plane     /health /liveness /readiness /v1/models /server_info
---   observability    /metrics, /_ui/logs, /_ui/stats
+--   observability    /metrics (/logs /stats live in conf/ui.conf as root exacts)
 --
 -- Handler convention (klib.router): return a table for JSON, return a table plus
 -- a status for JSON with an explicit code, and return '' once the response has
@@ -204,11 +204,12 @@ local function build()
         app:register(r.path, mesh_disabled_handler, r.method)
     end
 
-    -- Observability reads owned by this module; /_ui/config and the chat page are
-    -- the UI agent's routes.
-    app:get("_ui/logs", ui_logs_handler)
-    app:get("_ui/stats", ui_stats_handler)
-    app:get("_ui/logs/backends", ui_backends_handler)
+    -- Observability reads live in conf/ui.conf as root exact locations
+    -- (/logs /logs/stream /logs/backends /stats, handlers in observability.lua);
+    -- the /_ui/* registrations went away with the 2026-10-08 admin-to-root move,
+    -- so /_ui/* now answers the 404 sink like any unregistered path. The three
+    -- handlers stay exported (ui_logs_handler / ui_stats_handler /
+    -- ui_backends_handler) for the UI agent's aliases and the unit tests.
 
     app:error_handle(404, function(ctx)
         -- Anchored prefixes (string.find with plain=true has no "^" magic, so the

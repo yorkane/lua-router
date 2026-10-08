@@ -64,7 +64,7 @@ local SNAPSHOT_TTL = 0.5  -- seconds a worker may reuse a snapshot read from dis
 --- no section keys *and* nothing but empty containers / nulls in it -- what a hand
 --- dropped {} or a wiped pre-store config looks like -- is silence.
 local SNAPSHOT_SECTIONS = {
-    "default_effort", "effort_map", "model_ctx", "model_context_limit",
+    "default_effort", "effort_map", "model_ctx", "model_max_output_tokens",
     "model_effort", "model_configs", "virtual_models", "policy",
     "model_policies", "upstreams", "models_virtual_only",
 }

@@ -170,7 +170,7 @@ def has_usage_frame(body):
 
 def worker_row(port, needle=None):
     """The newest request-log row for a worker whose url contains `needle`."""
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs?limit=200" % port)
+    st, body, _ = http("GET", "http://127.0.0.1:%d/logs?limit=200" % port)
     if st != 200:
         return {}
     rows = json.loads(body).get("requests", [])

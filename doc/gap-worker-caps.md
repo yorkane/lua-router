@@ -262,7 +262,7 @@ full 的 worker（e2e_caps S3 钉这条），hard gate 没有逃生口。
 
 **旧配置的处理**：声明层里还写着 `max_power_w` 的行，解析时 **warn 一次并丢弃该键**
 （`config_store/upstreams.lua` 的 `warn_retired_power_w`；warn-once memo 是必须的——`current()` 每请求
-重解析整份快照，逐条 warn 会把 error.log 写满），`/_ui/config` 的 GET 如实不返回它，容量判定不读它。
+重解析整份快照，逐条 warn 会把 error.log 写满），`/config` 的 GET 如实不返回它，容量判定不读它。
 **不做迁移**：新字段里没有与瓦特等价的东西，替操作员猜一个瓦特→利用率的换算等于替他决定一道门开多大。
 
 ## 7. 逐卡归属与「读数未知」在这里怎么落地
@@ -358,7 +358,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
 
 两块能力都按 AGENTS.md 重点 3/4 落到可视化与 JSON 面，不是只给 env：
 
-- `ui/admin/workers.html`（服务池，规范入口 `/a/`）：**状态列**的第二枚徽章读 `load_state`（idle 绿 /
+- `ui/admin/workers.html`（服务池，规范入口 `/`（站点根））：**状态列**的第二枚徽章读 `load_state`（idle 绿 /
   busy 黄 / full 红 + 满员图标；缺席 = 中性灰），**capacity 列**两段——第一段并发区间 `min–max`
   （min 缺席按 1、max 缺席 = 不限），第二段 GPU 利用率上限（0..100 整数百分比，缺席 = 不限），每段后面
   跟只读的实测（`inflight_requests` / `gpu_util`）。阈值与实测分行且视觉区分：实测一旦被当成配置回写，
@@ -374,7 +374,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
   紧凑统计条，腾出的整块给**输入/输出 tok/s（60s 均值）**大字卡；列序改为「时间 → 状态 → …… → CACHE →
   模型」；刷新零抖动（`:loading` 只在首屏空表时进、非首屏失败不清空 rows、cursor 无变化跳过整段替换、
   轮询定时器在 SSE 连上后降档）。
-- `/_ui/config` 的 JSON 视图无损读写三字段（含 protected 行的 caps-only 投影）；退役的 `max_power_w` 在
+- `/config` 的 JSON 视图无损读写三字段（含 protected 行的 caps-only 投影）；退役的 `max_power_w` 在
   GET 里如实不返回。
 
 ## 11. 已知限制与残余缺口
@@ -402,7 +402,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
 5. `registry/records.lua` 的 `all_models()` / `worker_models()` / `record_models()` 目前**暂无消费者**。
    写了但没接线这件事要登记在这里，别让人以为已经有读者。两条模型列表链各自用的是：对外
    `GET /v1/models` 走 `models()`（Rust 对拍钉住的那一列，`router/models_api.lua` 的 `models_handler`）；
-   管理台 `GET /_ui/v1/models` 走 `ui.lua` → `props.http_workers()`。两者都不吃上面那三个 reader。
+   管理台 `GET /u/v1/models` 走 `ui.lua` → `props.http_workers()`。两者都不吃上面那三个 reader。
 6. 全池到顶是 **429 而非排队**（§5）：没有「等一个槽位释放」的语义（与并发闸门的排队能力是两套东西）。
 7. `lr_workers` 2m 容量竞争：`gu:` / `pw:` 写失败只在 `set_gpu_util` / `set_power_w` 的 shdict 写分支各
    WARN 一行，后果是该 worker 在该采样 TTL 内退化成「无上限」。方向仍是「宁可少一层保护，也不因监控
@@ -411,7 +411,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
    `SMG_LOAD_UTIL_ENABLED` / `_QUERY` / `_KEYS` 走 `config.lua` 装配（fork 前解析，天然进 `/probe/config`），
    三份 conf 的 env 声明只是给 `util_config` 的 `os.getenv` 兜底分支放行，两条路都通；功率那三个
    （`SMG_LOAD_POWER` / `_KEYS` / `_QUERY`）**没进 `config.lua`**，由 gpu_load 现读 `os.getenv`，因此漏一份
-   conf 声明即静默失效、不可热改、进不了 `/_ui/config`。把功率三件套并进 config.lua / JSON / UI 仍是
+   conf 声明即静默失效、不可热改、进不了 `/config`。把功率三件套并进 config.lua / JSON / UI 仍是
    收尾项（AGENTS.md 重点 3/4 的欠账）。
 9. **利用率准入门是逐卡的，但「哪张卡归谁」目前只有 21.k 这一种已验证形状**（容器名带 `gpuN`，或命令行
    带 `--device-id` / `CUDA_VISIBLE_DEVICES`）。两者都不带的部署，逐卡归属只能靠 `lr_gpu_load_util_fallback_total`

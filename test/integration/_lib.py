@@ -291,25 +291,26 @@ def scenario_policy(policy, suffix, extra_env=None):
     check("[%s] /metrics has %s" % (tag, family),
           st == 200 and family in text, text[:200] if st != 200 else "missing")
 
-    # /_ui/* endpoints
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/props" % port)
-    check("[%s] /_ui/props 200" % tag, st == 200, "%s %s" % (st, body[:150]))
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
-    check("[%s] /_ui/config 200" % tag, st == 200, "%s %s" % (st, body[:150]))
-    st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+    # UI plane: the root data plane (/props /config /logs) plus the /u/ webui chat
+    # alias -- both ui.lua handler families.
+    st, body, _ = http("GET", "http://127.0.0.1:%d/props" % port)
+    check("[%s] /props 200" % tag, st == 200, "%s %s" % (st, body[:150]))
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
+    check("[%s] /config 200" % tag, st == 200, "%s %s" % (st, body[:150]))
+    st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                        {"model": "alpha", "messages": [{"role": "user", "content": "ui bridge probe"}]})
     ui_content = ""
     if st == 200:
         ui_content = json.loads(body).get("choices", [{}])[0].get("message", {}).get("content", "")
-    check("[%s] /_ui/v1/chat/completions forwards" % tag,
+    check("[%s] /u/v1/chat/completions forwards" % tag,
           st == 200 and (ui_content.startswith("echo[alpha]")
                          or ui_content.startswith("echo[beta]")),
           "%s %s" % (st, body[:250]))
-    st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port, "not json{{")
-    check("[%s] /_ui chat bad body 400" % tag, st == 400 and "invalid chat request" in body,
+    st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port, "not json{{")
+    check("[%s] /u chat bad body 400" % tag, st == 400 and "invalid chat request" in body,
           "%s %s" % (st, body[:150]))
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs" % port)
-    check("[%s] /_ui/logs 200" % tag, st == 200, "%s %s" % (st, body[:150]))
+    st, body, _ = http("GET", "http://127.0.0.1:%d/logs" % port)
+    check("[%s] /logs 200" % tag, st == 200, "%s %s" % (st, body[:150]))
     return port, name, pa, pb
 
 
@@ -352,8 +353,8 @@ def main():
     # through echo_body
     st, body, _ = http("GET", "http://127.0.0.1:%d/workers" % port)
     worker_ids = [w["id"] for w in json.loads(body).get("workers", [])]
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
-    check("[cache_aware] /_ui/config effort doc readable" , st == 200, "%s %s" % (st, body[:200]))
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
+    check("[cache_aware] /config effort doc readable" , st == 200, "%s %s" % (st, body[:200]))
     stop_router(name)
 
     # 2. consistent_hashing / round_robin
@@ -380,11 +381,11 @@ def main():
                          "LMR_EFFORT_MAP": "low:medium",
                          "LMR_MODEL_CTX": "alpha:128"}, "lr-alias1-" + RUN)
     if check("[alias] workers healthy", wait_ready(port)):
-        st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
+        st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
         doc = json.loads(body) if st == 200 else {}
         vms = {e.get("model"): e.get("target") for e in doc.get("config", {}).get("virtual_models", [])} \
             if isinstance(doc.get("config"), dict) else {}
-        check("[alias LMR_VIRTUAL_MODELS=alias-a:alpha] /_ui/config 200", st == 200,
+        check("[alias LMR_VIRTUAL_MODELS=alias-a:alpha] /config 200", st == 200,
               "%s %s" % (st, body[:300]))
         check("[alias] default_effort visible as high", "high" in json.dumps(doc), body[:300])
         # alias resolves and body model rewritten to worker id
@@ -422,16 +423,16 @@ def main():
               and "max_completion_tokens" not in echo,
               "%s %s" % (st, json.dumps(echo)[:300]))
         # ui pipeline keeps the alias in the log but forwards the real id
-        st, body, _ = http("POST", "http://127.0.0.1:%d/_ui/v1/chat/completions" % port,
+        st, body, _ = http("POST", "http://127.0.0.1:%d/u/v1/chat/completions" % port,
                            {"model": "alias-a", "messages": [{"role": "user", "content": "ui alias probe"}]})
         echo = json.loads(body).get("echo_body", {}) if st == 200 else {}
-        check("[alias] /_ui chat resolves alias + injects effort",
+        check("[alias] /u chat resolves alias + injects effort",
               st == 200 and echo.get("model") in ("alpha", "beta")
               and echo.get("reasoning_effort") == "high", "%s %s" % (st, json.dumps(echo)[:300]))
-        st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/v1/models" % port)
-        check("[alias] /_ui/v1/models advertises alias", st == 200 and "alias-a" in body,
+        st, body, _ = http("GET", "http://127.0.0.1:%d/u/v1/models" % port)
+        check("[alias] /u/v1/models advertises alias", st == 200 and "alias-a" in body,
               body[:200])
-        st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/logs" % port)
+        st, body, _ = http("GET", "http://127.0.0.1:%d/logs" % port)
         rows = json.loads(body).get("requests", []) if st == 200 else []
         row = [r for r in rows if r.get("requested_model") == "alias-a"]
         check("[alias] request log keeps alias + effort", bool(row)
@@ -447,8 +448,8 @@ def main():
                          "SMG_WORKER_URLS": "http://127.0.0.1:%d,http://127.0.0.1:%d" % (pa, pb),
                          "LMR_VIRTUAL_MODELS": "alias-a:alpha,alias-b:beta"}, "lr-alias2-" + RUN)
     check("[alias x2] healthy", wait_ready(port))
-    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
-    check("[alias x2 LMR_VIRTUAL_MODELS=alias-a:alpha,alias-b:beta] /_ui/config 200",
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
+    check("[alias x2 LMR_VIRTUAL_MODELS=alias-a:alpha,alias-b:beta] /config 200",
           st == 200, "%s %s" % (st, body[:400]))
     st, body, _ = chat(port, "alias-b", "second alias probe")
     echo = json.loads(body).get("echo_body", {}) if st == 200 else {}

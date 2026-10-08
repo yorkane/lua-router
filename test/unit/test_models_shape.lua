@@ -217,7 +217,7 @@ local function bare_store()
     return {
         virtual_models_list = function() return {} end,
         current = function()
-            return { model_configs = {}, model_context_limit = {}, model_effort = {} }
+            return { model_configs = {}, model_max_output_tokens = {}, model_effort = {} }
         end,
         ctx_cap = function() return nil end,
         modalities_for = function() return nil end,
@@ -471,10 +471,10 @@ store_tbl = bare_store()
 store_tbl.current = function()
     return {
         model_configs = { ["kimi-code/k3"] = {
-            ctx = 524288, context_limit = 300000, default_effort = "high",
+            ctx = 524288, default_effort = "high",
             modalities = { "text", "image", "video" },
         } },
-        model_context_limit = {}, model_effort = {},
+        model_max_output_tokens = {}, model_effort = {},
     }
 end
 store_tbl.ctx_cap = function(model)
@@ -505,22 +505,70 @@ end
 check("G5 操作员没声明的维度仍取引擎读数（每个维度独立取源）",
       read(e_p, "capabilities", "max_output_tokens") == 128000,
       tostring(read(e_p, "capabilities", "max_output_tokens")))
--- 卡片只写 context_limit（没有 ctx）：走 declared_context_limit 那一支。
-store_tbl.ctx_cap = function() return nil end
-local rep_p2 = M.models_handler()
-check("G5 只有卡片 context_limit 时它也压过引擎",
-      read(rep_p2.data[1], "capabilities", "context_length") == 300000,
-      tostring(read(rep_p2.data[1], "capabilities", "context_length")))
--- 平铺层 model_context_limit（完全没有卡片）。
+-- 用户裁定 2026-10-08：context_length 两份并存（模型对象根层一份 + capabilities 内一份），
+-- 同取 row.length，值必然一致；输出预算那一类键只挂在 capabilities 里，根层不冒充。
+check("G5 根层 context_length 与 capabilities 内那份并存且同值",
+      read(e_p, "context_length") == 524288
+      and read(e_p, "context_length") == read(e_p, "capabilities", "context_length"),
+      tostring(read(e_p, "context_length")))
+check("G5 根层不挂 max_output_tokens（输出预算只在 capabilities 里）",
+      rawget(e_p, "max_output_tokens") == nil
+      and read(e_p, "capabilities", "max_output_tokens") == 128000,
+      encode(e_p))
+-- 卡片只写 max_output_tokens（没有 ctx）：它是**单次输出预算**声明，唯一去处是
+-- capabilities.max_output_tokens，压过引擎自报的那一份（用户裁定 2026-10-08：原字段名
+-- context_limit 改名之后，它不再参与 context_length 的决定——那条链只由 ctx 声明与引擎
+-- 自报两档决定）。
 store_tbl = bare_store()
 store_tbl.current = function()
-    return { model_configs = {}, model_context_limit = { ["kimi-code/k3"] = 131072 },
+    return {
+        model_configs = { ["kimi-code/k3"] = { max_output_tokens = 300000 } },
+        model_max_output_tokens = {}, model_effort = {},
+    }
+end
+local rep_p2 = M.models_handler()
+check("G5 只有卡片 max_output_tokens 时它也压过引擎",
+      read(rep_p2.data[1], "capabilities", "max_output_tokens") == 300000,
+      tostring(read(rep_p2.data[1], "capabilities", "max_output_tokens")))
+check("G5 卡片 max_output_tokens 不冒充 context_length（仍取引擎自报的 1000000）",
+      read(rep_p2.data[1], "capabilities", "context_length") == 1000000
+      and read(rep_p2.data[1], "context_length") == 1000000,
+      tostring(read(rep_p2.data[1], "capabilities", "context_length")))
+-- 平铺层 model_max_output_tokens（完全没有卡片）。
+store_tbl = bare_store()
+store_tbl.current = function()
+    return { model_configs = {}, model_max_output_tokens = { ["kimi-code/k3"] = 131072 },
              model_effort = {} }
 end
 rep_p2 = M.models_handler()
-check("G5 平铺层 model_context_limit 也压过引擎",
-      read(rep_p2.data[1], "capabilities", "context_length") == 131072,
+check("G5 平铺层 model_max_output_tokens 也压过引擎",
+      read(rep_p2.data[1], "capabilities", "max_output_tokens") == 131072,
+      tostring(read(rep_p2.data[1], "capabilities", "max_output_tokens")))
+check("G5 平铺层 max_output_tokens 同样不冒充 context_length",
+      read(rep_p2.data[1], "capabilities", "context_length") == 1000000,
       tostring(read(rep_p2.data[1], "capabilities", "context_length")))
+-- 作废的旧字段名（卡片 context_limit / 平铺 model_context_limit）谁都不再读：磁盘上残留的
+-- 那一行必须整体惰性，两个读数都落回引擎自报（用户裁定 2026-10-08 的改名不留后门）。
+store_tbl = bare_store()
+store_tbl.current = function()
+    return {
+        model_configs = { ["kimi-code/k3"] = {
+            context_limit = 300000,
+        } },
+        model_context_limit = { ["kimi-code/k3"] = 131072 },
+        model_max_output_tokens = {}, model_effort = {},
+    }
+end
+local rep_legacy = M.models_handler()
+check("G5 旧名 context_limit / model_context_limit 是死键：max_output_tokens 落回引擎",
+      read(rep_legacy.data[1], "capabilities", "max_output_tokens") == 128000,
+      tostring(read(rep_legacy.data[1], "capabilities", "max_output_tokens")))
+check("G5 旧名是死键：context_length 也不被它们冒充（根层同值、整表无这两个数）",
+      read(rep_legacy.data[1], "capabilities", "context_length") == 1000000
+      and read(rep_legacy.data[1], "context_length") == 1000000
+      and encode(rep_legacy):find("300000", 1, true) == nil
+      and encode(rep_legacy):find("131072", 1, true) == nil,
+      encode(block(rep_legacy.data[1], "capabilities") or {}))
 
 print("=== G6 虚拟入口的能力来自组内聚合，只在口径一致时才声明 ===")
 -- legacy 红：老实现的入口行只有四个键，任何 capabilities 都填不出来。
@@ -884,7 +932,7 @@ local function card_store(ladder)
     s.current = function()
         return {
             model_configs = { ["kimi-code/k3"] = { reasoning_efforts = ladder } },
-            model_context_limit = {}, model_effort = {},
+            model_max_output_tokens = {}, model_effort = {},
         }
     end
     return s
@@ -980,7 +1028,7 @@ store_tbl.current = function()
         model_configs = { ["kimi-code/k3"] = {
             reasoning_efforts = TICKED, default_effort = "max",
         } },
-        model_context_limit = {}, model_effort = {},
+        model_max_output_tokens = {}, model_effort = {},
     }
 end
 local rep_forced = M.models_handler()
@@ -1002,7 +1050,7 @@ store_tbl.current = function()
             { value = "low", ["default"] = true },
             { value = "high", ["default"] = false },
         } } },
-        model_context_limit = {}, model_effort = {},
+        model_max_output_tokens = {}, model_effort = {},
     }
 end
 local rep_grp = M.models_handler()
@@ -1022,7 +1070,7 @@ store_tbl.current = function()
             { value = "high", ["default"] = true },
         } }
     end
-    return { model_configs = cards, model_context_limit = {}, model_effort = {} }
+    return { model_configs = cards, model_max_output_tokens = {}, model_effort = {} }
 end
 local rep_grp2 = M.models_handler()
 local e_grp2 = find(rep_grp2, "grp-l")

@@ -18,7 +18,7 @@
 --     -e 'package.path="/repo/lualib/?.lua;"..package.path
 --         dofile("/repo/test/unit/test_profiles.lua")'
 --
--- 真容器里的 HTTP 面（POST /_ui/config/upstreams 之后 /workers 出现 config 成员）
+-- 真容器里的 HTTP 面（POST /config/upstreams 之后 /workers 出现 config 成员）
 -- 由 test_lua_router.sh 的 profiles_upstreams 段与 e2e_profiles 负责。
 
 package.cpath = "/usr/local/openresty/lualib/?.so;" .. package.cpath
@@ -2382,14 +2382,14 @@ request_body(nil)
 eq(call_handler(ui.config_apply), 400, "an empty body to apply is a 400")
 eq(store.document().default_effort, "high", "none of the refused bodies wiped the document")
 
--- ---- GET /_ui/config 的键集合是旧断言的超集 -------------------------------
+-- ---- GET /config 的键集合是旧断言的超集 -------------------------------
 reset_env()
 status, payload = call_handler(ui.config_get)
-eq(status, 200, "GET /_ui/config answers 200")
+eq(status, 200, "GET /config answers 200")
 for _, key in ipairs({ "default_effort", "effort_map", "model_ctx", "model_effort",
                        "model_configs", "virtual_models", "policy", "model_policies",
                        "env_defaults", "watcher", "persist", "models", "upstreams" }) do
-    ok(rawget(payload, key) ~= nil, "GET /_ui/config still carries " .. key)
+    ok(rawget(payload, key) ~= nil, "GET /config still carries " .. key)
 end
 eq(type(payload.upstreams) == "table" and #payload.upstreams, 0,
     "an untouched upstreams section is an empty array")

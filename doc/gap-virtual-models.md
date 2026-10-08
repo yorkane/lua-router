@@ -40,7 +40,7 @@ per-alias 的 `policy` 与 `effort` **已停用**（2026-10-02）：仍接受、
 | `target` | string | 否 | 旧单值代表值，等价于 `targets` 长度为 1 的特例 |
 | `candidates` | `{worker, model?}[]` | 否 | 把某个实际模型显式绑到某个实例；`model` 必须在组内 |
 | `workers` | string[] | 否 | 旧实例白名单，与 `candidates` 取**交集** |
-| `context_window` | 正整数 | 否 | **唯一允许的条目级覆盖**：入口对外声明的上下文总窗口（输入+输出），供客户端决定何时压缩。**不改写任何输出预算**（2026-10-04 裁定）；配置期必须**严格小于**组内各卡片 `context_limit` 的最小值，否则拒绝保存 |
+| `context_window` | 正整数 | 否 | **唯一允许的条目级覆盖**：入口对外声明的上下文总窗口（输入+输出），供客户端决定何时压缩。**不改写任何输出预算**（2026-10-04 裁定）；原先挂在它身上的配置期校验（须严格小于组内各卡片读数）已于 2026-10-08 移除，前后端都只做正整数校验 |
 | `policy` / `effort` | string | 否 | **已停用**：仍接受、仍落盘、解析 warn、热路径不读 |
 
 `targets` 与 `candidates` 至少要有一个，否则 400。
@@ -119,7 +119,7 @@ consistent_hashing 的 ring key、bucket 的桶键全部自动收敛成「整组
 
 ## 4. context_window：对外声明的上下文总窗口（2026-10-04 改口径）
 
-**现行规则（用户裁定 2026-10-04，推翻 2026-10-02 的「统一钳制」定义）**：
+**现行规则（用户裁定 2026-10-04 推翻 2026-10-02 的「统一钳制」定义；第 3 / 4 条由用户裁定 2026-10-08 改写）**：
 
 1. **网关不改写调用方的输出预算。** `max_tokens` / `max_completion_tokens` / `/v1/responses` 用的
    `max_output_tokens` 一律原样透传：调用方给多少转发多少，调用方没给时网关也不替它填一个数。
@@ -127,13 +127,26 @@ consistent_hashing 的 ring key、bucket 的桶键全部自动收敛成「整组
 2. **`context_window` 是入口对外声明的上下文总窗口（输入+输出）**，作用是让客户端更早触发压缩。
    它不参与任何 max_tokens 计算，只保留解析（`build_context_window` `config_store.lua:561`，
    调用点 `config_store.lua:730` / `:732`）、落盘、往返与 UI 展示。
-3. **`context_limit`（模型卡片）= 服务实际能承受的上下文限制**，即引擎真实能力，由操作员按引擎启动
-   参数抄录（网关不从引擎自动读，也不校验抄得对不对）。卡片写法 `model_configs[].context_limit`，
-   平铺写法 `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层。
-4. **配置期校验**：条目的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，
-   否则**拒绝保存**；组内没有任何卡片声明读数 = 不知道引擎能力 = 不校验也不报错。
+3. **模型卡片上的输出预算声明**（用户裁定 2026-10-08：字段名 `context_limit` → `max_output_tokens`，
+   旧名那句「服务实际能承受的上下文限制」连同它冒充上下文窗口的用途一起作废）＝**声明给下游 agent 的
+   单次最大输出 token 数**，是一份纯对外 advertisement：唯一去处是 `/v1/models` 的
+   `capabilities.max_output_tokens`（操作员声明压过引擎自报），**不参与任何校验、钳制或 max_tokens 运算**，
+   也不声称引擎的真实能力。卡片写法 `model_configs[].max_output_tokens`，平铺写法
+   `model_max_output_tokens` / env `LMR_MODEL_MAX_OUTPUT_TOKENS`，卡片优先于平铺层（写了卡片就清掉同模型的平铺行）。
+   `context_length` 与此无关：它只由两档决定——操作员声明的窗口（卡片 `ctx` / 平铺 `model_ctx`，经
+   `config_store.ctx_cap`）**优先于**引擎自报，两者都没有就整个键省略。
+4. **不再有「声明窗口 vs 输出上限」这类配置期校验**（用户裁定 2026-10-08）：条目的 `context_window` 是
+   上下文总窗口，卡片的 `max_output_tokens` 是单次输出预算，两个量不可比，拿一个判另一个就是重犯下面 §4.2
+   那次把三个量当一个数的错误。原 `config_store.validate_declared_context_windows`（挂在 `apply_profiles` /
+   `apply_document` 两条写入路径上）连同 UI 侧同款前端预校验已一并移除：`context_window` 只做解析 / 落盘 /
+   往返 / 展示，网关与 UI 都不据它拒绝任何东西。
 
-### 4.1 校验的实现口径
+### 4.1 校验的实现口径（该校验已于 2026-10-08 移除，以下保留以说明它当初的口径）
+
+以下段落里的 `context_limit` / `model_context_limit` / `LMR_MODEL_CONTEXT_LIMIT` 都是**当时的字段名**：
+该字段已于 2026-10-08 改名 `max_output_tokens`（平铺 `model_max_output_tokens` / env
+`LMR_MODEL_MAX_OUTPUT_TOKENS`），语义也从「服务实际能承受的上下文限制」改为「声明给下游 agent 的单次最大
+输出 token 数」。原样保留只为说明这道已删校验当初读的是什么。
 
 `validate_declared_context_windows`（`config_store.lua:1574`）：
 
@@ -151,10 +164,13 @@ consistent_hashing 的 ring key、bucket 的桶键全部自动收敛成「整组
 - 卡片与平铺行是同一个读数的两种拼法：`apply_model_config` 写了卡片的 `context_limit` 就清掉平铺那行
   （`config_store.lua:2367`），避免日后卡片清成 null 时校验悄悄改用一条没人再看作生效的旧数字。
 
-UI 侧（`ui/admin/models.html`）复刻同一读数口径做**保存前**提示：`contextLimitOf`
-（`ui/admin/models.html:1026`，卡片优先、平铺层兜底）。声明窗口 ≥ 组内最小时该字段报错并禁用「保存入口表」，
-卡片表多一列「服务实际限制」，生效预览显示「声明窗口 / 服务实际限制（组内最小值）」两行对比，
-不再有复刻钳制的推算。
+UI 侧过去（`ui/admin/models.html`）复刻同一读数口径（卡片优先、平铺层兜底）做**保存前**提示：
+声明窗口 ≥ 组内最小时让该字段报错并禁用「保存入口表」，卡片表另有一列「服务实际限制」，生效预览显示
+「声明窗口 / 服务实际限制（组内最小值）」两行对比。**这套比较式预校验已于 2026-10-08 随上述后端硬拦一并移除**：
+入口的 `context_window` 是对外声明的上下文总窗口，卡片那一格是单次输出 token 上限，两量不可比。现行 UI 里
+卡片字段叫 `max_output_tokens`（输入框与表格列都是「最大输出 token 数」，读数口径 `maxOutputTokensOf`，与后端
+`declared_max_output_tokens` 一致），它只作为对外广告读数回显与落盘，UI 不再拿它和 `context_window` 做任何比较，
+`context_window` 本身只保留正整数校验。
 
 ### 4.2 已废止的旧口径（保留以解释现状）
 
@@ -179,8 +195,10 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
 
 `_M.ctx_cap` 的读者只在展示面两处：`/_ui/props` 的 `props.with_ctx`（`props.lua:129`，取值在 `props.lua:133`）
 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口；另一处是 §5 的 `/v1/models`
-合成层——`resolve_model_caps`（`router.lua:3744`）调 `store_mod.ctx_cap` 拿它当 `capabilities.context_length`
-的**声明层**读数，而且排在卡片 `context_limit` **之前**（顺序见 §5.1）。两处都不影响任何转发字节。同理 `_M.ctx_cap` 里那道「入口名命中 virtual_profiles / virtual_models 时返回 nil」
+合成层——`router/models_api.lua` 的 `resolve_model_caps` 调 `store_mod.ctx_cap` 拿它当 `context_length`
+的**声明层**读数（操作员声明优先于引擎自报。用户裁定 2026-10-08：卡片那一格已改名 `max_output_tokens`、
+只走 `capabilities.max_output_tokens`，不再参与 `context_length` 的决定，原先排在它之后的兜底环已删）。
+两处都不影响任何转发字节。同理 `_M.ctx_cap` 里那道「入口名命中 virtual_profiles / virtual_models 时返回 nil」
 的守卫仍在函数内，随它一起降级为只读用途：没有人再拿它决定转发体的数字。
 
 ## 5. /v1/models 广告（2026-10-04 形状扩容）
@@ -209,8 +227,10 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
   造出「在另一台上会被拒」的选项）；判定面取交集且必须含缺省档（`common_acceptance`）。任何一支凑不齐就删键。
   **单成员入口例外**：它就是那台引擎本身，读数原样透传（含上游自己「缺省档不在判定面里」那种自相矛盾），
   免得同一个模型在它的真实行与入口行上说出两种能力。
-- 入口对外声明的 `capabilities.context_length` 优先取条目自己写的 `context_window`（§1 第 3 条：让客户端更早触发压缩
-  的总窗口，**不参与任何 max_tokens 计算**），其次才是组内各实际模型读数取最窄。
+- 入口对外声明的 `context_length` 优先取条目自己写的 `context_window`（§1 第 3 条：让客户端更早触发压缩
+  的总窗口，**不参与任何 max_tokens 计算**），其次才是组内各实际模型读数取最窄。`context_length` 现在**两份并存**
+  （用户裁定 2026-10-08）：模型对象根层一份（给直接读顶层的客户端），`capabilities` 内一份，同取一个读数来源、
+  值必然一致；`max_output_tokens` 仍只在 `capabilities` 内。
 - **档位在上游有两种拼写、两个含义，各画各的**：picker 的 `reasoning_efforts`（带 `label` / `default`）画在顶层，
   判定面 `capabilities.reasoning_effort` 画在命名空间里，用引擎亲口说的可接受集合，**不把阶梯里的档位虚构进判定面**
   （实测样例两份就不一致：阶梯 low/medium/high/max，判定面只有 low/high/max）。
@@ -219,12 +239,16 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
 
 ### 5.1 能力数据的两个来源，以及 registry 侧为什么不读上游的 `context_window`
 
-- **操作员声明层**（`resolve_model_caps` `router.lua:3744` 读 `config_store` 快照）：模型卡片 `context_limit`＝引擎
-  真实能力（操作员按启动参数抄录；平铺写法 `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于
-  平铺层，`declared_context_limit` `router.lua:3649`）；卡片 `modalities`（`config_store.modalities_for`
-  `config_store.lua:2002`）；缺省档位取 `model_effort` 强制行 → 卡片 `default_effort` → 全局 `default_effort`。
-  注意 `context_length` 这一维**先问 `store_mod.ctx_cap`**（卡片 `ctx` / 平铺 `model_ctx`），它排在 `context_limit`
-  之前（`router.lua:3747-3753`）：同一份声明层里 `ctx` 说话更响，`context_limit` 只在没有 `ctx` 时兜住引擎读数。
+- **操作员声明层**（`router/models_api.lua` 的 `resolve_model_caps` 读 `config_store` 快照）：模型卡片
+  `max_output_tokens`＝**声明给下游 agent 的单次最大输出 token 数**（原名 `context_limit`，用户裁定 2026-10-08 改名；
+  平铺写法 `model_max_output_tokens` / env `LMR_MODEL_MAX_OUTPUT_TOKENS`，卡片优先于平铺层，读数经同文件的
+  `declared_max_output_tokens`）。它是纯对外 advertisement，**唯一去处**是 `capabilities.max_output_tokens`，
+  不参与校验、钳制或 max_tokens 运算，也不声称引擎真实能力。
+  卡片 `modalities`（`config_store.modalities_for` `config_store.lua:2002`）；缺省档位取 `model_effort` 强制行 →
+  卡片 `default_effort` → 全局 `default_effort`。
+  `context_length` 这一维与此无关，只由两档决定：操作员声明的窗口（卡片 `ctx` / 平铺 `model_ctx`，经
+  `store_mod.ctx_cap`）**优先于**引擎自报，两者都没有就整个键省略（原「卡片 `context_limit` 兜住引擎读数」那一环
+  随改名删除——输出预算读数不再冒充上下文总窗口）。
 - **引擎自报层**：worker 自己 `GET /v1/models` 的回答。`registry.probe_advertised_entries()`（`registry.lua:2913`）
   与覆盖探针**共用一次 GET**——「探到了哪些模型」与「它们各自能干什么」永远来自同一份回答，不会出现
   「列表说三条、能力说一条」的分裂。原文经 `model_caps_from_listing()`（`registry.lua:1137`）→
@@ -293,14 +317,16 @@ per-alias `policy` / `effort` 的停用是**读侧**的（热路径不读），*
 `/\_ui/config` 的 JSON 视图是权威面：
 - `vmRow` **不再白名单取键**，未知键与形状非法的已知键一律进 `row.extra` 原样带回——
   否则「打开 JSON 视图 → 应用」会静默清空新字段。
-- `targets` chip 编辑器 + `context_window` 输入（口径：对外声明的上下文总窗口，不是钳制）；模型卡
-  对话框另有 `context_limit` 输入（「服务实际上下文限制」）与卡片表的「服务实际限制」列，读数口径
-  `contextLimitOf`（`ui/admin/models.html:1026`）与后端校验一致；per-alias policy/effort 的编辑器已撤除，
-  但**序列化仍无损**。
-- 提交前只做中文体检（越组绑定、别名撞自身 target、`context_window` 非正整数、声明窗口 ≥ 组内
-  `context_limit` 最小值等）**只报错不改数据**，后端仍是权威（配置期硬拦在
-  `validate_declared_context_windows` `config_store.lua:1574`）。JSON 对话框的可编辑段含
-  `model_context_limit`。
+- `targets` chip 编辑器 + `context_window` 输入（口径：对外声明的上下文总窗口，不是钳制，只做正整数校验，
+  不与任何读数比较）；模型卡对话框另有 `max_output_tokens` 输入（「最大输出 token 数」，用户裁定 2026-10-08，
+  原名 `context_limit`「服务实际上下文限制」）与卡片表的「最大输出 token 数」列，语义是**声明给下游 agent 的
+  单次最大输出 token 数**——纯对外 advertisement，只进 `/v1/models` 的 `capabilities.max_output_tokens`，
+  不参与任何校验或钳制；读数口径 `maxOutputTokensOf`（卡片优先、平铺 `model_max_output_tokens` 兜底）与后端
+  `declared_max_output_tokens` 一致；per-alias policy/effort 的编辑器已撤除，但**序列化仍无损**。
+- 提交前只做中文体检（越组绑定、别名撞自身 target、`context_window` 非正整数等）**只报错不改数据**，
+  后端仍是权威。原先的「声明窗口 ≥ 组内卡片输出上限最小值」这项前端体检与它对应的后端配置期硬拦
+  （原 `validate_declared_context_windows`）已于 2026-10-08 一并移除（两量不可比，见 §4 第 4 条）。
+  JSON 对话框的可编辑段含 `model_max_output_tokens`。
 
 ## 9. 已知限制
 

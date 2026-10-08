@@ -1,15 +1,13 @@
 /*
-  lua-router：在官方 llama.cpp webui（/_ui/）左侧导航里注入 Admin 管理台入口。
+  lua-router：在官方 llama.cpp webui（/u/）左侧导航里注入 Admin 管理台入口。
   由 index.html 以 <script src="./admin-inject.js" defer></script> 引入。
 
   历史：本文件原名 logs-inject.js，同时注入 Logs 与 Admin 两个入口。根目录下的
-  /_ui/logs.html、/_ui/metrics.html、/_ui/config.html 三个工具页已移除（功能与
-  /_ui/admin/ 重叠，差异记录见 doc/ui-trim-legacy-pages.md），Logs 入口随之删除，
-  只保留 Admin。
+  早期独立工具页 logs.html、metrics.html、config.html 已移除（功能与 admin 管理台
+  重叠，差异记录见 doc/ui-trim-legacy-pages.md），Logs 入口随之删除，只保留 Admin。
 
-  入口迁移（doc/refactor-arch-2026-10-05.md §5.3）：管理台从 /_ui/admin/ 迁到 /a/，
-  webui 的规范入口是 /u/（旧 /_ui/ 照旧可用）。注入链接因此用绝对
-  路径 /a/：页面无论从 /_ui/ 还是 /u/ 打开，都落到同一个规范入口。
+  入口迁移（2026-10-08 admin 迁根）：管理台现在是站点根入口 /，webui 的规范入口是
+  /u/。注入链接因此用绝对路径 /：页面无论从 /u/ 打开都落到同一个规范入口。
 
   为什么需要 MutationObserver：导航容器（aside div[class*="px-2"][class*="flex-col"][class*="gap-1"]）
   由 Svelte 持有 children 引用，点「Expand navigation」展开/折叠侧栏会触发该区域重渲染，
@@ -42,10 +40,10 @@
       '<rect width="7" height="5" x="3" y="16" rx="1"/><path d="M21 16v-2a2 2 0 0 0-2-2h-3"/>' +
       '<path d="M7 16V8a2 2 0 0 1 2-2h7"/></svg>';
     /* Admin（Quasar 管理控制台）新开标签页，避免丢掉当前会话状态。
-       href 用绝对路径 /a/（管理台的新入口，refactor-arch §5.3），
-       不再相对于页面落在 /_ui/admin/ 那个旧位置。 */
+       href 用绝对路径 /（管理台的新根入口，2026-10-08 admin 迁根），
+       页面从任意位置打开都落到同一个入口。 */
     var ENTRIES = [
-      { mark: 'admin', label: 'Admin', icon: SVG_ADMIN, href: '/a/', blank: true }
+      { mark: 'admin', label: 'Admin', icon: SVG_ADMIN, href: '/', blank: true }
     ];
 
     function findNav() {
@@ -79,7 +77,7 @@
           btn.innerHTML = entry.icon;                            // 图标是本文内联常量，不含外部内容
           btn.addEventListener('click', (function (href, blank) {
             return function () {
-              // 用 baseURI 解析，保证在 /_ui/ 与 /_ui/index.html 两种 URL 下都指向 /_ui/<页>
+              // 用 baseURI 解析：href 是绝对路径，任意页面 URL 下都解析到同一站点入口
               try {
                 var url = new URL(href, document.baseURI).href;
                 if (blank) {

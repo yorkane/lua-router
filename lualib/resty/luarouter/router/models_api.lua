@@ -32,11 +32,13 @@ local text_response = inference.text_response
 -- 不塞 ngx.time()——那会让同一条目每次请求产出不同字节，把客户端缓存和
 -- 前后对比全打掉。
 --
--- 第二层是 capabilities 命名空间，旁边再加三个 effort 键。这些都不是官方字段：
--- vLLM、opencodex 这类服务器把它们挂在模型对象上，各家形状还不一样。收在
--- capabilities 下面是物理隔离，官方 SDK 只读它认识的四个键；顶层那三个
+-- 第二层是 capabilities 命名空间，旁边再加三个 effort 键与一个顶层 context_length。
+-- 这些都不是官方字段：vLLM、opencodex 这类服务器把它们挂在模型对象上，各家形状还
+-- 不一样。收在 capabilities 下面是物理隔离，官方 SDK 只读它认识的四个键；顶层那三个
 -- （supports_reasoning_effort / reasoning_effort / reasoning_efforts）沿用
 -- opencodex 已经在用的位置，让照它写死的客户端继续照旧读。
+-- context_length 两份并存（用户裁定 2026-10-08）：根层一份给直接读顶层的客户端，
+-- capabilities.context_length 原样保留，同取一个读数来源，值必然一致。
 --
 -- 填充纪律：宁可不报，不要猜。数据源优先级固定为
 --   操作员 config 声明 > 引擎自报（registry.model_caps）> 整个键省略。
@@ -114,21 +116,22 @@ local function config_snapshot()
     return nil
 end
 
---- 引擎真实上下文读数的正式读法：卡片 context_limit 优先，其次平铺层
---- model_context_limit。与 config_store.validate_declared_context_windows 里的
---- (card and card.context_limit) or limits[model] 同一口径（操作员按引擎启动参数
---- 抄录的那份）。走 current() 而不是新加 reader：本文件已经在用同一份快照，
+--- 操作员声明的单次输出预算上限的正式读法：卡片 max_output_tokens 优先，其次平铺层
+--- model_max_output_tokens（用户裁定 2026-10-08：原卡片字段 context_limit 改名为
+--- max_output_tokens，唯一去处就是 capabilities.max_output_tokens 的声明层）。它与
+--- config_store 的 (card and card.max_output_tokens) or limits[model] 同一口径。
+--- 走 current() 而不是新加 reader：本文件已经在用同一份快照，
 --- 不值得为这一个读数再开一个导出面。
 ---@param cfg table|nil
 ---@param model string
 ---@return number|nil
-local function declared_context_limit(cfg, model)
+local function declared_max_output_tokens(cfg, model)
     if type(cfg) ~= "table" or type(model) ~= "string" or model == "" then return nil end
     local cards = cfg.model_configs
     local card = type(cards) == "table" and cards[model] or nil
-    local limit = positive_int(type(card) == "table" and card.context_limit or nil)
+    local limit = positive_int(type(card) == "table" and card.max_output_tokens or nil)
     if limit then return limit end
-    local flat = cfg.model_context_limit
+    local flat = cfg.model_max_output_tokens
     return positive_int(type(flat) == "table" and flat[model] or nil)
 end
 
@@ -338,9 +341,13 @@ local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
         local ok, value = pcall(store_mod.ctx_cap, model)
         if ok then declared_ctx = positive_int(value) end
     end
-    row.length = declared_ctx or declared_context_limit(cfg, model)
-        or positive_int(caps and caps.context_length)
-    row.max_output_tokens = positive_int(caps and caps.max_output_tokens)
+    -- context_length 只由两档决定：操作员在卡片/平铺层声明的 ctx（store 的 ctx_cap），
+    -- 否则引擎自报（用户裁定 2026-10-08：原 declared_context_limit 一环删除——
+    -- 卡片的 max_output_tokens 是输出预算读数，不再冒充上下文总窗口）。
+    row.length = declared_ctx or positive_int(caps and caps.context_length)
+    -- 输出预算声明层优先：操作员声明（卡片 > 平铺）压过引擎自报。
+    row.max_output_tokens = declared_max_output_tokens(cfg, model)
+        or positive_int(caps and caps.max_output_tokens)
 
     -- 模态有两个来源，且**穷尽性不同**，因此对 supports_vision 的话语权也不同：
     --   * 操作员卡片的 modalities 是穷尽列表（config_store 的写入路径把 text 常开，
@@ -643,8 +650,12 @@ local function common_acceptance(rows, default_effort)
     return out
 end
 
---- 把一行能力读数摊到响应条目上：顶层三个 opencodex 键 + capabilities 命名空间。
---- 整行没有任何读数时什么都不加，条目回退成官方那四个 required 字段。
+--- 把一行能力读数摊到响应条目上：顶层三个 opencodex 键 + capabilities 命名空间，
+--- 外加一个顶层 context_length。整行没有任何读数时什么都不加，条目回退成官方那四个
+--- required 字段。
+--- context_length 两份并存（用户裁定 2026-10-08）：模型对象根层与 capabilities 内各一份，
+--- 同取 row.length，值必然一致。根层那份是给直接读顶层的客户端用的，capabilities 内那份
+--- 保持既有命名空间口径不动。
 local function fill_model_fields(entry, row)
     -- 顶层 supports_reasoning_effort：操作员声明（卡片 → 条目）优先，未声明时维持**原有
     -- 派生**——任一份档位读数（可选项、判定面、缺省档）都足以支撑「这台接受
@@ -668,6 +679,8 @@ local function fill_model_fields(entry, row)
     end
     local out = {}
     if row.length then out.context_length = row.length end
+    -- 根层副本：与 capabilities.context_length 同一来源（row.length），两份并存。
+    if row.length then entry.context_length = row.length end
     if row.max_output_tokens then out.max_output_tokens = row.max_output_tokens end
     if row.input then out.input_modalities = row.input end
     if row.output then out.output_modalities = row.output end
