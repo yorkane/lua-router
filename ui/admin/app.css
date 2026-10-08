@@ -1,34 +1,23 @@
 /*
   lua-router 管理控制台 · 共享样式（主壳 + 三个 iframe 页）
-  版式对齐 authz/admin（卡片 + 线性表格、无装饰动效）；配色 2026-10-08 改为绿色 + 深色底：深绿黑底、绿色主色。
+  设计对齐 authz/admin：暗紫灰底、卡片 + 线性表格、无装饰动效。
   页面级布局只有这里一份，Quasar 组件样式一律用框架自带能力。
 */
 :root {
-  --shell-bg: #0c1310;
-  --sidebar-bg: #0f1a15;
-  --page: #0e1613;
-  --surface: #152219;
-  --surface-soft: #1a2a20;
-  --line: rgba(110, 231, 183, .14);
-  --line-strong: rgba(110, 231, 183, .22);
-  --text: #eaf6ee;
-  --muted: #8aa898;
-  --green: #34d399;
-  --green-deep: #15803d;
+  --shell-bg: #171928;
+  --sidebar-bg: #1d2033;
+  --page: #191b2b;
+  --surface: #202337;
+  --surface-soft: #24273d;
+  --line: rgba(139, 145, 184, .16);
+  --line-strong: rgba(139, 145, 184, .24);
+  --text: #f1f2f8;
+  --muted: #969aaf;
+  --purple: #a56df5;
   --blue: #5aa7f8;
-  --teal: #2dd4bf;
+  --teal: #58d3c5;
   --red: #f06b82;
   --amber: #f2a056;
-  /* Quasar 框架色覆盖：各页 head 里 vendor 在前、app.css 在后，覆盖 :root 即全局生效 */
-  --q-primary: #34d399;
-  --q-secondary: #2dd4bf;
-  --q-accent: #4ade80;
-  --q-positive: #34d399;
-  --q-negative: #f06b82;
-  --q-info: #5aa7f8;
-  --q-warning: #f2a056;
-  --q-dark: #0f1a15;
-  --q-dark-page: #0e1613;
 }
 
 html,
@@ -55,7 +44,7 @@ body.shell-body { overflow: hidden; }
 
 .menu-shell { display: flex; flex-direction: column; min-width: 0; height: 100%; padding: 16px 10px 12px; box-sizing: border-box; }
 .brand-row { display: flex; align-items: center; gap: 6px; min-height: 42px; padding: 0 4px 14px; border-bottom: 1px solid var(--line); }
-.brand-mark { flex: 0 0 32px; border: 1px solid rgba(52, 211, 153, .34); background: linear-gradient(145deg, #34d399, #15803d); box-shadow: 0 8px 22px rgba(21, 128, 61, .28); }
+.brand-mark { flex: 0 0 32px; border: 1px solid rgba(177, 137, 255, .34); background: linear-gradient(145deg, #9b6cf6, #6950c7); box-shadow: 0 8px 22px rgba(91, 64, 166, .26); }
 .brand-label { min-width: 0; flex: 1; overflow: hidden; font-size: clamp(12px, .8vw + 11px, 14px); font-weight: 650; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
 .brand-sub { display: block; margin-top: 1px; color: var(--muted); font-size: 10.5px; font-weight: 400; letter-spacing: 0; }
 .collapse-button { flex: 0 0 28px; min-width: 28px; min-height: 28px; color: var(--muted); }
@@ -64,7 +53,7 @@ body.shell-body { overflow: hidden; }
 .menu-list::-webkit-scrollbar { width: 0; height: 0; display: none; }
 .menu-group-section { margin: 2px 0 10px; }
 .menu-group-title { padding: 6px 8px 2px; color: var(--muted); font-size: 10.5px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
-.menu-item { min-height: 44px; margin: 4px 0; padding: 0 8px; border-radius: 10px; color: #a4bdae; font-size: clamp(12px, .7vw + 11px, 13px); transition: color .16s ease, background .16s ease; }
+.menu-item { min-height: 44px; margin: 4px 0; padding: 0 8px; border-radius: 10px; color: #a9adc1; font-size: clamp(12px, .7vw + 11px, 13px); transition: color .16s ease, background .16s ease; }
 .menu-item .q-item__section--avatar { min-width: 28px; }
 .menu-item .q-item__section--main { min-width: 0; }
 .menu-item-label,
@@ -74,9 +63,9 @@ body.shell-body { overflow: hidden; }
 .collapse-button .q-icon,
 .footer-action .q-icon { padding-left: 8px; }
 .menu-item:hover { color: #fff; background: rgba(255, 255, 255, .035); }
-.menu-item-active { color: #fff !important; background: linear-gradient(90deg, rgba(52, 211, 153, .24), rgba(34, 197, 94, .1)) !important; box-shadow: inset 2px 0 #4ade80; }
-.menu-item-active .menu-item-note { color: rgba(234, 246, 238, .72); }
-.active-dot { display: block; width: 5px; height: 5px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 4px rgba(74, 222, 128, .12); }
+.menu-item-active { color: #fff !important; background: linear-gradient(90deg, rgba(139, 92, 246, .26), rgba(99, 102, 241, .12)) !important; box-shadow: inset 2px 0 #a678ff; }
+.menu-item-active .menu-item-note { color: rgba(243, 244, 251, .72); }
+.active-dot { display: block; width: 5px; height: 5px; border-radius: 50%; background: #b894ff; box-shadow: 0 0 0 4px rgba(184, 148, 255, .1); }
 
 .menu-footer-actions { display: flex; flex: 0 0 auto; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
 .footer-action { min-width: 0; min-height: 42px; flex: 1; border-radius: 9px; font-size: clamp(9px, .4vw + 8px, 10px); line-height: 1; color: var(--muted); }
@@ -115,15 +104,8 @@ body.shell-body { overflow: hidden; }
 
 .primary-button,
 .secondary-button { min-height: 34px; padding: 0 12px; border-radius: 10px; font-size: clamp(12px, .22vw + 11.5px, 13px); }
-.primary-button { background: var(--green); color: #06210f; box-shadow: 0 8px 20px rgba(21, 128, 61, .24); }
-/* 实心主色表面的标签色：vendor 给 color="primary" 的 q-btn 加的是 bg-primary + text-white，
-   两条都带 !important，所以亮绿底(#34d399)压白字只剩 1.9:1，操作员读不清按钮文字。
-   这里用更高特异性 + !important 把标签换成深绿黑 #06210f（对 #34d399 约 8.9:1）。只命中 .bg-primary，
-   不波及 .bg-teal-4 / .text-red-4 / .bg-amber-9 等语义色（它们不带 .bg-primary）。 */
-.q-btn.bg-primary.text-white,
-.q-btn.bg-primary .q-btn__content,
-.q-btn-toggle .q-btn.bg-primary.text-white { color: #06210f !important; }
-.secondary-button { border-color: var(--line-strong); color: #d3e2d8; }
+.primary-button { background: linear-gradient(135deg, #9564ed, #7356d8); color: #fff; box-shadow: 0 8px 20px rgba(100, 72, 183, .2); }
+.secondary-button { border-color: var(--line-strong); color: #d5d7e4; }
 .error-banner { border: 1px solid rgba(240, 107, 130, .22); background: rgba(240, 107, 130, .09); color: #ffb4c0; }
 .warn-banner { border: 1px solid rgba(242, 160, 86, .22); background: rgba(242, 160, 86, .07); color: #f2cda1; }
 .info-banner { border: 1px solid rgba(90, 167, 248, .18); background: rgba(90, 167, 248, .07); color: #bcd9f8; }
@@ -133,15 +115,14 @@ body.shell-body { overflow: hidden; }
 .stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .stat-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .stat-card,
-.surface-card { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: 0 10px 32px rgba(4, 12, 8, .08); }
+.surface-card { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: 0 10px 32px rgba(8, 10, 22, .08); }
 .stat-card { position: relative; min-height: 110px; overflow: hidden; }
-.stat-card::after { position: absolute; right: -34px; bottom: -52px; width: 118px; height: 118px; border: 1px solid rgba(52, 211, 153, .1); border-radius: 50%; content: ""; }
+.stat-card::after { position: absolute; right: -34px; bottom: -52px; width: 118px; height: 118px; border: 1px solid rgba(165, 109, 245, .1); border-radius: 50%; content: ""; }
 .stat-card .q-card__section { padding: 16px 18px; }
 .stat-icon { float: right; padding: 8px; border-radius: 10px; font-size: 20px; }
-.stat-icon.purple,
-.stat-icon.green { background: rgba(52, 211, 153, .12); color: var(--green); }
+.stat-icon.purple { background: rgba(165, 109, 245, .12); color: var(--purple); }
 .stat-icon.blue { background: rgba(90, 167, 248, .12); color: var(--blue); }
-.stat-icon.teal { background: rgba(45, 212, 191, .12); color: var(--teal); }
+.stat-icon.teal { background: rgba(88, 211, 197, .12); color: var(--teal); }
 .stat-icon.red { background: rgba(240, 107, 130, .12); color: var(--red); }
 .stat-icon.orange { background: rgba(255, 176, 92, .14); color: #ffb05c; }
 .stat-label { color: var(--muted); font-size: clamp(12px, .22vw + 11.5px, 13px); }
@@ -157,45 +138,45 @@ body.shell-body { overflow: hidden; }
 .search-input .q-field__control { height: 38px; }
 
 .linear-table { background: transparent; }
-.linear-table .q-table__middle { scrollbar-color: #2b4034 transparent; }
+.linear-table .q-table__middle { scrollbar-color: #3a3e58 transparent; }
 .linear-table thead tr { background: rgba(255, 255, 255, .018); }
-.linear-table th { height: 44px; color: #8fa898; font-size: clamp(11px, .2vw + 10.5px, 12px); font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
-.linear-table td { height: 52px; border-color: rgba(110, 231, 183, .1); color: #d8e8dd; font-size: clamp(12px, .22vw + 11.5px, 13px); }
+.linear-table th { height: 44px; color: #9196ad; font-size: clamp(11px, .2vw + 10.5px, 12px); font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.linear-table td { height: 52px; border-color: rgba(139, 145, 184, .1); color: #d9dbe7; font-size: clamp(12px, .22vw + 11.5px, 13px); }
 .linear-table tbody tr:hover { background: rgba(255, 255, 255, .018); }
 .linear-table .q-table__bottom { border-color: var(--line); color: var(--muted); font-size: 12px; }
 .linear-table tr.lmr-detail-row td { height: auto; background: var(--surface-soft); padding: 12px 18px; }
 .linear-table tbody tr.lmr-detail-row:hover { background: var(--surface-soft); }
-tr.lmr-group-row td { height: auto; background: rgba(52, 211, 153, .06); padding: 7px 18px; border-color: rgba(110, 231, 183, .12); }
+tr.lmr-group-row td { height: auto; background: rgba(165, 109, 245, .06); padding: 7px 18px; border-color: rgba(139, 145, 184, .12); }
 
 .group-heading { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.group-heading strong { font-size: 13.5px; font-weight: 620; color: #e6f4ea; }
+.group-heading strong { font-size: 13.5px; font-weight: 620; color: #eceef7; }
 .group-heading span { color: var(--muted); font-size: 11.5px; }
 
 .model-group { margin: 4px 0 18px; }
-.group-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 18px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: rgba(52, 211, 153, .06); color: #e6f4ea; }
+.group-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 18px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: rgba(165, 109, 245, .06); color: #eceef7; }
 .group-bar strong { font-size: 13.5px; font-weight: 620; letter-spacing: -.01em; }
 .group-bar .muted { font-size: 11.5px; }
 .model-group + .model-group { margin-top: 10px; }
 .identity-cell,
 .row-actions { display: flex; align-items: center; }
 .identity-cell { gap: 10px; min-width: 0; }
-.identity-cell strong { display: block; color: #eef8f0; font-size: 13px; font-weight: 560; overflow-wrap: anywhere; }
-.identity-cell span { display: block; margin-top: 2px; color: #84a08d; font-size: 12px; overflow-wrap: anywhere; }
+.identity-cell strong { display: block; color: #f2f3f9; font-size: 13px; font-weight: 560; overflow-wrap: anywhere; }
+.identity-cell span { display: block; margin-top: 2px; color: #858aa1; font-size: 12px; overflow-wrap: anywhere; }
 .row-actions { justify-content: flex-end; gap: 2px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-.code-pill { padding: 3px 7px; border: 1px solid rgba(110, 231, 183, .12); border-radius: 7px; background: #152119; color: #c9dcd0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.code-pill { padding: 3px 7px; border: 1px solid rgba(139, 145, 184, .12); border-radius: 7px; background: #1a1d2e; color: #c7cad9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .chip-soft { border-radius: 7px; font-size: 11.5px; }
 /* 标签/模型列表：允许换行，行高加大，避免把表格宽度撑破 */
 .label-cell { display: flex; flex-wrap: wrap; gap: 4px; max-width: 100%; }
 .label-cell .q-chip { margin: 0; }
 /* 模型列表：一行一个模型名，或逗号分隔但允许断行 */
 .served-models { display: flex; flex-wrap: wrap; gap: 4px; }
-.served-models .model-tag { display: inline-block; padding: 1px 6px; background: rgba(110,231,183,.12); border-radius: 6px; font-size: 11px; }
+.served-models .model-tag { display: inline-block; padding: 1px 6px; background: rgba(139,145,184,.12); border-radius: 6px; font-size: 11px; }
 
-.json-ta { width: 100%; min-height: 300px; padding: 10px 12px; border: 1px solid var(--line-strong, rgba(110, 231, 183, .22)); border-radius: 10px; background: #101b15; color: #d8e8dd; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; }
+.json-ta { width: 100%; min-height: 300px; padding: 10px 12px; border: 1px solid var(--line-strong, rgba(139, 145, 184, .22)); border-radius: 10px; background: #171a29; color: #d9dbe7; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; }
 .empty-state { display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--muted); font-size: 13px; padding: 26px 0; }
 
-.dialog-card { width: min(560px, calc(100vw - 28px)); padding: 5px; border: 1px solid var(--line-strong); border-radius: 16px; background: #17251a; color: var(--text); box-shadow: 0 24px 70px rgba(3, 8, 6, .42); }
+.dialog-card { width: min(560px, calc(100vw - 28px)); padding: 5px; border: 1px solid var(--line-strong); border-radius: 16px; background: #22253a; color: var(--text); box-shadow: 0 24px 70px rgba(5, 7, 18, .42); }
 .dialog-card .q-card__section { padding: 17px; }
 .dialog-card .q-card__actions { padding: 10px 14px 14px; }
 /* 声明层 JSON 面板比常规对话框宽：必须排在 .dialog-card 之后，同特异性下后来者才赢 */
@@ -213,9 +194,9 @@ tr.lmr-group-row td { height: auto; background: rgba(52, 211, 153, .06); padding
 .rows-head { color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
 
 /* 生效预览 */
-.preview-box { display: grid; gap: 10px; padding: 13px; border: 1px solid rgba(45, 212, 191, .18); border-radius: 12px; background: rgba(45, 212, 191, .055); }
+.preview-box { display: grid; gap: 10px; padding: 13px; border: 1px solid rgba(88, 211, 197, .18); border-radius: 12px; background: rgba(88, 211, 197, .055); }
 .preview-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.preview-out { display: grid; gap: 6px; color: #cceee6; font-size: 12.5px; }
+.preview-out { display: grid; gap: 6px; color: #cfeee8; font-size: 12.5px; }
 .preview-out .k { color: var(--muted); display: inline-block; min-width: 110px; }
 .preview-note { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
 
@@ -234,9 +215,9 @@ tr.lmr-group-row td { height: auto; background: rgba(52, 211, 153, .06); padding
 .kv .k { color: var(--muted); }
 .kv .v { overflow-wrap: anywhere; }
 .kv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 26px; }
-.detail-title { margin: 0 0 8px; font-size: 12px; font-weight: 620; color: #e6f4ea; }
-.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 4px rgba(45, 212, 191, .12); }
-.live-dot.off { background: #6f8877; box-shadow: none; }
+.detail-title { margin: 0 0 8px; font-size: 12px; font-weight: 620; color: #eceef7; }
+.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 4px rgba(88, 211, 197, .12); }
+.live-dot.off { background: #6b6f86; box-shadow: none; }
 .st-code { font-weight: 700; }
 .s2 { color: var(--teal); } .s4 { color: var(--amber); } .s5 { color: var(--red); } .sc { color: var(--muted); }
 .muted { color: var(--muted); }
@@ -301,7 +282,7 @@ tr.lmr-group-row td { height: auto; background: rgba(52, 211, 153, .06); padding
 .tok-hero-item { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; white-space: nowrap; }
 .tok-hero-item > i { color: var(--muted); font-size: 12px; font-style: normal; letter-spacing: .02em; }
 .tok-hero-item > b { font-size: clamp(26px, 1.6vw + 18px, 34px); font-weight: 540; letter-spacing: -.035em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.tok-hero-item.in > b { color: #e6f4ea; }
+.tok-hero-item.in > b { color: #eceef7; }
 .tok-hero-item.out > b { color: var(--teal); }
 
 @media (max-width: 820px) {
@@ -324,3 +305,13 @@ tr.lmr-group-row td { height: auto; background: rgba(52, 211, 153, .06); padding
   .tok-hero-item > b { font-size: clamp(20px, 6vw, 26px); }
   .tok-hero-card .tok-basis, .tok-hero-card .tok-totals { display: none; }
 }
+
+/* ── 主按钮绿色（2026-10-08 用户裁定：深色底保持原始暗紫灰，绿色只用于主要按钮）──
+   只覆盖「主要按钮」这一条语义：--q-primary 走亮绿（color=primary 的按钮/开关/单选/
+   toggle 选中态自动绿）；实心主色按钮白字压亮绿只有 1.9:1，用高特异性换深绿黑字。
+   其余一切（底色/品牌块/菜单高亮/stat-icon/表格/徽章）保持本文件上方的原始暗紫灰。 */
+:root { --q-primary: #34d399; }
+.primary-button { background: var(--q-primary); color: #06210f; box-shadow: 0 8px 20px rgba(16, 120, 80, .24); }
+.q-btn.bg-primary.text-white,
+.q-btn.bg-primary .q-btn__content,
+.q-btn-toggle .q-btn.bg-primary.text-white { color: #06210f !important; }
