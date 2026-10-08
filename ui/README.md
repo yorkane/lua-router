@@ -2,8 +2,12 @@
 
 来自 llama.cpp 官方发布包 `llama-b11215-ui.tar.gz`，解包后就地打两处补丁：
 
-1. `watcher/patch_ui.sh` —— 把相对 API 路径（./v1/... ./props）改写成绝对 /_ui/... 前缀，
-   让静态 ServeDir 下的页面能命中 router 的 /_ui 别名路由。
+1. 接口路径：webui 保持官方原版（相对路径 fetch 根路径），**不再做 /_ui/ 前缀改写**。
+   2026-10-08 起 router 侧 `/_ui/` 入口全部取消，页面从 `/u/` 挂载、请求根路径接口：
+   `/v1/chat/completions`、`/v1/chat/completions/control`、`/v1/stream`、`/v1/streams/lookup`
+   与 `/props` 均由 conf/ui.conf 的 exact location 提供；`/tools`、`/models/unload` 等本来就是相对路径。
+   （历史上 `watcher/patch_ui.sh` 曾把这些相对路径改写成绝对 /_ui/... 前缀以配合当时的别名路由，
+   该做法已随 `/_ui/` 入口一并作废；bundle 里残留的 6 处 `/_ui/` 前缀已改回根路径。）
 2. `watcher/patch_ui_effort.sh` —— 让思考强度（thinking effort）选择器在 router 后面真正可用：
    - 取值补齐：官方 default/off/low/medium/high/max 之外补 none / minimal / xhigh / ultra
      （枚举 + 选项数组 + 预算表三处都要改，少一处就会出现"有选项但选了没效果"）。
@@ -26,9 +30,9 @@
 升级方法：用新版 *-ui.tar.gz 覆盖 ui/ 后，依次重跑：
 
 ```bash
-bash ../watcher/patch_ui.sh ui
 bash ../watcher/patch_ui_effort.sh ui
 node --check _app/immutable/bundle.*.js   # 校验补丁未破坏语法
 ```
 
-两个脚本都幂等；若上游改了混淆变量名导致 anchor 失配，脚本会 assert 失败（而非静默跳过）。
+`patch_ui_effort.sh` 幂等；若上游改了混淆变量名导致 anchor 失配，脚本会 assert 失败（而非静默跳过）。
+覆盖后务必核对 `ui/sw.js` 里该 bundle 的 precache revision 等于新的 `md5sum` 值，否则 service worker 继续喂旧 bundle。
