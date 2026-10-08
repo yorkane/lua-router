@@ -14,10 +14,10 @@
     /* 虚拟模型「条目列表 + 编辑对话框」的页面专用样式（app.css 由并行任务维护，不动它）。
        .form-grid-3 的正式定义归 app.css（refactor-arch 5.2），这里给本页一份同定义兜底，
        并在本页自己的 820px 段做单列回落：两边一旦漂移，窄屏行为仍然成立。 */
-    .virtual-entry-row { display: grid; gap: 4px; padding: 9px 0; border-bottom: 1px dashed rgba(139, 145, 184, .18); }
+    .virtual-entry-row { display: grid; gap: 4px; padding: 9px 0; border-bottom: 1px dashed rgba(110, 231, 183, .18); }
     .virtual-entry-row:last-child { border-bottom: none; }
     .virtual-entry-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-left: 2px; }
-    .virtual-target-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid rgba(139, 145, 184, .16); border-radius: 8px; padding: 2px 6px; }
+    .virtual-target-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid rgba(110, 231, 183, .16); border-radius: 8px; padding: 2px 6px; }
     .virtual-dialog { width: min(860px, calc(100vw - 28px)); max-height: 92vh; overflow: auto; }
     .form-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     @media (max-width: 820px) {
@@ -54,7 +54,7 @@
           </q-banner>
           <div class="muted q-mb-md mono">{{ persistNote }}</div>
 
-          <q-spinner v-if="loading && !doc" color="purple-3" size="30px"></q-spinner>
+          <q-spinner v-if="loading && !doc" color="green-4" size="30px"></q-spinner>
 
           <!-- 虚拟模型：本页的主入口（root ruling 2026-10-02 语义反转）。
                一个虚拟名 = 日常服务入口，一对多映射一组实际模型，由调度策略在组内选路；
@@ -194,7 +194,7 @@
                   <div>
                     <div class="rows-head q-mb-xs">{{ tv('virtualModalitiesTitle') }}</div>
                     <q-option-group :model-value="virtualForm.modalities || []" type="checkbox" inline
-                                    :options="modalityOptions" color="purple-4" dense
+                                    :options="modalityOptions" color="primary" dense
                                     @update:model-value="value => setRowModalities(virtualForm, value)"></q-option-group>
                     <div class="muted" style="font-size:11px">{{ tv('virtualModalitiesHint') }}</div>
                     <div class="muted" style="font-size:11px;margin-top:4px">{{ tv('declarationDisclosure') }}</div>
@@ -442,7 +442,7 @@
                   <div>
                     <div class="rows-head q-mb-xs">{{ t.modalitiesTitle }}</div>
                     <q-option-group v-model="cardForm.modalities" type="checkbox" inline
-                                    :options="modalityOptions" color="purple-4" dense></q-option-group>
+                                    :options="modalityOptions" color="primary" dense></q-option-group>
                     <div class="muted" style="font-size:11px">{{ t.modalitiesHint }}</div>
                     <div class="muted" style="font-size:11px;margin-top:4px">{{ t.declarationDisclosure }}</div>
                   </div>

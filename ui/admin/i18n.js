@@ -33,6 +33,11 @@
         collapse: '收起菜单', expand: '展开菜单', language: 'English',
         online: '网关在线', offline: '网关不可达',
         healthySummary: '健康 {ok} / 共 {n}', propsLine: '{model} · n_ctx {ctx}',
+        // 侧栏实时吞吐面板（2026-10-08）：口径 = 日志页 summarizeWindow 的 60s 完成时刻窗口
+        throughputTitle: '实时吞吐', throughputWindow: '60s 窗口',
+        throughputIn: '入 tok/s（含 cache）', throughputOut: '出 tok/s', throughputCache: 'cache 命中',
+        throughputLine: '窗口请求 {n} · 错误 {e} · 平均 TTFT {t}',
+        dash: '—',
         frameTitle: '管理页面'
       },
       workers: {
@@ -348,6 +353,11 @@
         collapse: 'Collapse menu', expand: 'Expand menu', language: '中文',
         online: 'Gateway online', offline: 'Gateway unreachable',
         healthySummary: 'healthy {ok} of {n}', propsLine: '{model} · n_ctx {ctx}',
+        // Sidebar live-throughput panel (2026-10-08): same 60s completion-time window as the logs page summarizeWindow
+        throughputTitle: 'Live throughput', throughputWindow: '60s window',
+        throughputIn: 'in tok/s (incl. cache)', throughputOut: 'out tok/s', throughputCache: 'cache hit',
+        throughputLine: 'requests {n} · errors {e} · avg TTFT {t}',
+        dash: '—',
         frameTitle: 'Admin page'
       },
       workers: {

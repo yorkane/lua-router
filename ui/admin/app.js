@@ -48,6 +48,12 @@ const app = Vue.createApp({
     const workerSummary = ref('')
     const propsLine = ref('')
     const healthInterval = ref(30)
+    // 侧栏「实时吞吐」面板的读数（模板见 index.html .menu-throughput）。
+    // 口径裁定（2026-10-05，沿用日志监控页）：不信任后端 /_ui/stats 的 tok/s——
+    // 后端拿采样桶数当分母，稀疏流量时外推出夸张瞬时值；壳层自己拉 /_ui/logs 的日志行，
+    // 用 logs 页抽出的同一个 window.lmrTokenStats.summarizeWindow（./token-stats.js）现算，
+    // 保证侧栏与日志页两个 tok/s 永远同函数同口径。null = 从未成功过（展示占位 —）。
+    const throughput = ref(null)
     let unsubscribeLocale
     let statusTimer
 
@@ -55,6 +61,41 @@ const app = Vue.createApp({
       const dict = window.lmrI18n.messages[locale.value].shell
       return { ...dict, interval: healthInterval.value }
     })
+    // ── 侧栏吞吐面板的展示层：只做数字→字符串，算术全在 token-stats.js ──
+    // 千分位口径与 logs.html 的 fmtThousands 等价（不跨页 import 那个函数）：
+    // 速率用逗号千分位纯数字，不套 k 后缀。undefined/null 统一兜成 —。
+    function fmtTok (value) {
+      if (value === undefined || value === null) return t.value.dash
+      const n = Number(value)
+      if (!Number.isFinite(n)) return t.value.dash
+      return n.toLocaleString('en-US')
+    }
+    function fmtPct (value) {
+      // cacheHitPct 为 null = 窗口内 prompt 总量为 0（logs 页同口径：与「命中率 0%」区分开）
+      if (value === undefined || value === null) return t.value.dash
+      const n = Number(value)
+      if (!Number.isFinite(n)) return t.value.dash
+      return n.toFixed(1) + '%'
+    }
+    function fmtTtft (value) {
+      if (value === undefined || value === null) return t.value.dash
+      const n = Number(value)
+      if (!Number.isFinite(n)) return t.value.dash
+      return n >= 1000 ? (n / 1000).toFixed(2) + ' s' : Math.round(n) + ' ms'
+    }
+    const throughputLine = computed(() => {
+      const tp = throughput.value
+      if (!tp) return t.value.dash
+      return window.lmrI18n.translate(locale.value, 'shell', 'throughputLine', {
+        n: fmtTok(tp.requestsWindow),
+        e: fmtTok(tp.errorsWindow),
+        t: fmtTtft(tp.avgTtftMs)
+      })
+    })
+    const throughputIn = computed(() => throughput.value ? fmtTok(throughput.value.inputTokS) : t.value.dash)
+    const throughputOut = computed(() => throughput.value ? fmtTok(throughput.value.outputTokS) : t.value.dash)
+    const throughputCache = computed(() => throughput.value ? fmtPct(throughput.value.cacheHitPct) : t.value.dash)
+    const throughputHasErrors = computed(() => !!(throughput.value && Number(throughput.value.errorsWindow) > 0))
     // 原版聊天界面的规范入口（doc/refactor-arch-2026-10-05.md §5.3）：旧地址 /_ui/
     // 照旧可用，但壳里的链接统一指新入口 /u/。
     const chatHref = computed(() => '/u/')
@@ -187,6 +228,25 @@ const app = Vue.createApp({
       } catch (error) {
         propsLine.value = ''
       }
+      // 实时吞吐：跟着本函数每 10s 一起拉（复用 statusTimer，不新起第二个定时器）。
+      // 日志整体关闭时 /_ui/logs 回 503，或 token-stats.js 意外缺失——都走 catch：
+      // 保留上一次读数不清空（与 logs.html refreshStats 同一条策略），展示层把
+      // 从未成功的 null 兜成占位 —，不弹错误。
+      try {
+        const logPage = await window.lmrApi.logs(0, 500)
+        const rows = (logPage && logPage.requests) || []
+        const agg = window.lmrTokenStats.summarizeWindow(rows, Date.now(), window.lmrTokenStats.STATS_WINDOW_MS)
+        throughput.value = {
+          inputTokS: agg.inputTokS,
+          outputTokS: agg.outputTokS,
+          cacheHitPct: agg.cacheHitPct,
+          requestsWindow: agg.n,
+          errorsWindow: agg.errors,
+          avgTtftMs: agg.avgTtftMs
+        }
+      } catch (error) {
+        // 保留上一次值；面板展示占位 —
+      }
     }
 
     function applyLocale (nextLocale) {
@@ -238,6 +298,12 @@ const app = Vue.createApp({
       propsLine,
       select,
       t,
+      throughput,
+      throughputCache,
+      throughputHasErrors,
+      throughputIn,
+      throughputLine,
+      throughputOut,
       toggleDrawer,
       toggleIcon,
       toggleLabel,

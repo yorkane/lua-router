@@ -34,7 +34,7 @@
           </q-banner>
           <div class="muted q-mb-md mono">{{ persistNote }}</div>
 
-          <q-spinner v-if="loading && !doc" color="purple-3" size="30px"></q-spinner>
+          <q-spinner v-if="loading && !doc" color="green-4" size="30px"></q-spinner>
 
           <!-- 全局策略：生效链说明（左）与全局编辑（右）同卡两列。
                原来两张卡里「整卡只有一个 select」的独占行合掉，垂直高度省一张卡。 -->
@@ -260,7 +260,7 @@
         }
         function sourceColor (source) {
           if (source === 'model') return 'blue-4'
-          if (source === 'global') return 'purple-4'
+          if (source === 'global') return 'green-4'
           if (source === 'hint') return 'teal-4'
           return 'grey-6'
         }

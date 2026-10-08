@@ -11,6 +11,68 @@
   <script>window.LMR_UI_VERSION = '__UI_VERSION__';</script>
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
   <link rel="stylesheet" href="./app.css?v=__UI_VERSION__">
+  <style>
+    /* 侧栏实时吞吐面板（2026-10-08）：样式刻意写进页内，不进 app.css（该文件他人并行维护）。
+       绿色主题（--green）尚未落地时回退 --teal；尺寸对齐日志页 .strip-item / .tok-hero-item，
+       字号按 220px 侧栏收窄。无新字体、无外链资源、无动画。 */
+    .menu-throughput {
+      flex: 0 0 auto;
+      margin: 8px 0 10px;
+      padding: 9px 12px 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+      min-width: 0;
+    }
+    .menu-throughput .tok-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 10.5px;
+      font-weight: 620;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .menu-throughput .tok-head .tok-window { font-weight: 500; letter-spacing: .04em; }
+    .menu-throughput .tok-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+      padding: 1px 0;
+    }
+    .menu-throughput .tok-k {
+      color: var(--muted);
+      font-size: 10.5px;
+      font-weight: 620;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .menu-throughput .tok-v {
+      font-size: clamp(15px, .9vw + 10px, 19px);
+      font-weight: 530;
+      letter-spacing: -.03em;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+    .menu-throughput .tok-in { color: var(--text); }
+    .menu-throughput .tok-out { color: var(--green, var(--teal)); }
+    .menu-throughput .tok-cache { color: var(--text); }
+    .menu-throughput .tok-line {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 10.5px;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+    .menu-throughput .tok-line.err { color: var(--red); }
+    /* mini 栏整块隐藏：根节点已带 menu-copy 复用现成规则，这里再兜一条（根容器不是文字元素） */
+    .shell-drawer-mini .menu-throughput { display: none; }
+  </style>
 </head>
 <body class="shell-body">
   <div id="q-app">
@@ -57,6 +119,22 @@
             </section>
           </q-list>
 
+          <!-- 侧栏实时吞吐（2026-10-08）：最后一组菜单入口下方、状态行上方。
+               口径复用日志监控页抽出的同一个 window.lmrTokenStats.summarizeWindow
+               （./token-stats.js，60s 完成时刻窗口），不信任后端 /_ui/stats 的 tok/s
+               （既有裁定 2026-10-05：后端拿采样桶数当分母，稀疏流量会外推出夸张瞬时值），
+               所以壳层自己拉 /_ui/logs 日志行现算。纯展示，不参与导航。 -->
+          <div class="menu-throughput menu-copy">
+            <div class="tok-head">
+              <span>{{ t.throughputTitle }}</span>
+              <span class="tok-window">{{ t.throughputWindow }}</span>
+            </div>
+            <div class="tok-row"><span class="tok-k">{{ t.throughputIn }}</span><b class="tok-v tok-in">{{ throughputIn }}</b></div>
+            <div class="tok-row"><span class="tok-k">{{ t.throughputOut }}</span><b class="tok-v tok-out">{{ throughputOut }}</b></div>
+            <div class="tok-row"><span class="tok-k">{{ t.throughputCache }}</span><b class="tok-v tok-cache">{{ throughputCache }}</b></div>
+            <div class="tok-line" :class="{ err: throughputHasErrors }">{{ throughputLine }}</div>
+          </div>
+
           <div class="shell-status">
             <span class="dot" :class="{ bad: !online }"></span>{{ online ? t.online : t.offline }}
             <div v-if="workerSummary" class="menu-copy">{{ workerSummary }}</div>
@@ -83,8 +161,9 @@
   </div>
 
   <script src="./vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
-  <script src="./i18n.js?v=6"></script>
+  <script src="./i18n.js?v=7"></script>
   <script src="./api.js?v=6"></script>
-  <script src="./app.js?v=7"></script>
+  <script src="./token-stats.js?v=1"></script>
+  <script src="./app.js?v=8"></script>
 </body>
 </html>
