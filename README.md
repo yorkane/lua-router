@@ -22,8 +22,8 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 全量门禁权威日志：`/data/tmp/lr-gates/gates-20261006-051452.log`（tier=full、`KEEP_GOING=1`、
 `SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `66a891f`）。代码基线：
-`lualib/` **75 个 Lua 文件 / 34 608 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
-单测 13 文件、契约 **691 项 / 24 段**、文档 29 份。
+`lualib/` **75 个 Lua 文件 / 36 110 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
+单测 16 文件、契约 **691 项 / 24 段**、文档 30 份。
 
 > 锚点取在 2026-10-05 的重构树上：facade + 子模块拆分（router / config_store / registry /
 > watcher / gpu_load / mesh / observability）+ 公共传输库 `httpc.lua` + UI 入口迁移
@@ -39,9 +39,9 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
-| unit | luajit 12 + resty 4 口径 | luajit 侧 tree 67 / policies 118 / hash 795 / mesh 391 / watcher 385 / gpu_load 402 / routing_dyn 122 / profiles 797 / caps_routing 157 / models_shape 83 / models_advertise 70 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
+| unit | luajit 15 + resty 4 口径 | luajit 侧 tree 67 / tree_bounds 44 / state_bounds 51 / observability 35 / policies 118 / hash 795 / mesh 391 / watcher 425 / gpu_load 402 / routing_dyn 122 / profiles 907 / caps_routing 157 / models_shape 124 / models_advertise 74 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
 | contract | **691 / 0 failed / 2 notes** | 24 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
-| probes | 25 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写 |
+| probes | 26 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写、卡片档位 env 层穿透 worker |
 | e2e_stateful | 101 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
 | e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入 |
 | e2e_ui_bridge | 26 / 0 | `/v1` 与 `/_ui` 两条路径改写一致 |
@@ -56,7 +56,7 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry（mock 的 /metrics 带 `gpu` 标签，利用率通道走同一条路；逐卡归属与容量判定的断言在 e2e_caps S3/S3b） |
 | e2e_routing_dyn | 51 / 0 | 路由动态变更：全局与 per-model 策略热切换免重启、非法名 400 不生效 |
 | e2e_caps | 175 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务容量三态（S2 三态与 `load_state`、S3/S3b GPU 利用率上限与**逐卡归属**、S4 亲和被打断、S5 全池到顶 **429**、S5b 对照 503、S5c 缺省零变化、S5d 声明层三字段边界、S6 功率通道开关可见性、S8 caps 跨重启存活；读数缺失不排除、上限不摘健康） |
-| e2e_models_advertisement | 190 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 |
+| e2e_models_advertisement | 210 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 + S12 卡片档位勾选（探测基线 / 勾选接管 / 判定面只跟引擎说过的） |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
 契约 691 的 24 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
@@ -73,14 +73,14 @@ ratelimit 14、inflight_age 32、tls_server 19、profiles_upstreams 64。
 | `conf/ui.conf` | 全部 UI location：`/_ui/*` 与 `/u/*` 的精确 API 别名、`/u/` 与 `/a/` 静态、旧入口 302、原版 webui 所需端点的根挂载，由入口脚本按存在性 include 进 server{} |
 | `docker-entrypoint.sh` | env 校验 → envsubst → `openresty -t` → exec；缺省策略 `cache_aware`；cache_aware 或 mesh 开启且未显式给 `NGINX_WORKER_PROCESSES` 时把 worker 数收到 1；渲染独立 metrics 监听（缺省 `:29000`，`SMG_METRICS_PORT=0` 关闭） |
 | `Dockerfile` | `FROM authz:latest`，COPY lualib / 模板 / entrypoint / ui.conf / `ui/`→`/usr/local/share/llama-ui`，构建期跑一次 `-t` 门 |
-| `lualib/resty/luarouter/` | 实现（75 个 .lua / 34 608 行，`wc -l` 实测）：七个域是「facade + 同名子目录」——router(364)+12 子模块、config_store(132)+10、registry(174)+7、watcher(65)+7、gpu_load(80)+6、mesh(59)+5、observability(1328)+2，另有公共传输库 httpc.lua 与未拆的单文件（policy / policies 6 文件 / hash / hb / init / config / ui / props / limit / store_*），全部接进请求路径；模块地图见 doc/architect.md §3 |
+| `lualib/resty/luarouter/` | 实现（75 个 .lua / 36 110 行，`wc -l` 实测）：七个域是「facade + 同名子目录」——router(364)+12 子模块、config_store(133)+10、registry(174)+7、watcher(65)+7、gpu_load(80)+6、mesh(59)+5、observability(1469)+2，另有公共传输库 httpc.lua 与未拆的单文件（policy / policies 6 文件 / hash / hb / init / config / ui / props / limit / store_*），全部接进请求路径；模块地图见 doc/architect.md §3 |
 | `ui/` | 原版 llama.cpp webui（规范入口 `/u/`）+ `ui/admin/`（Quasar UMD 管理台四页，规范入口 `/a/`：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（href 指 `/a/`；旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`）。控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField 渲染，`:hint` 不生成 `.q-field__bottom`，说明文字只能并进 `:label` |
 | `test/final_gates.sh` | 22 门硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING` / `GATE_JOBS` / `GATE_DRY_RUN`） |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），24 段 |
-| `test/unit/` | 纯 Lua 单测 13 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑） |
+| `test/unit/` | 纯 Lua 单测 16 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑） |
 | `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps / models_advertisement（`models_advertisement` 钉 `/v1/models` 的对外形状，2026-10-04 随第 22 门加入 GATE_ORDER） |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
-| `doc/` | 现状文档 29 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
+| `doc/` | 现状文档 30 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
 
 ## 快速启动
 
@@ -188,11 +188,12 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
 | 顶层 | `supports_reasoning_effort` | 有任一份档位读数（阶梯 / 判定面 / 缺省档）才是 `true`，否则整个键省略 |
 | 顶层 | `reasoning_effort` | 缺省档位（picker 预选那一档），字符串 |
 | 顶层 | `reasoning_efforts` | 客户端 picker 的档位阶梯 `[{value,label,default}]`；`label` 只在引擎给了才写，`default` 恒唯一 |
+| 顶层 | （勾选接管） | 同一位置的成员与顺序可由**模型卡片 `reasoning_efforts`** 决定：操作员勾了哪几档就报哪几档，顺序即勾选顺序；`label` 仍逐档继承引擎说过的那份，引擎没提过的名字（手动补的 `xhigh`）不编 label。见〈档位阶梯：探测 + 手动勾选〉 |
 | `capabilities` | `context_length` | 上下文**总窗口（输入+输出）** |
 | `capabilities` | `max_output_tokens` | 单次输出预算上限，**只有引擎自报这一档**（config 层无对应声明字段，`router/models_api.lua` 的 `fill_model_fields` 直取 `caps.max_output_tokens`）。它只是把上游给的数往外报，绝不构成网关改写调用方预算的依据——输出预算三写法原样透传（用户裁定 2026-10-04） |
 | `capabilities` | `input_modalities` / `output_modalities` | 去重的非空字符串数组 |
 | `capabilities` | `supports_tool_use` / `supports_streaming` / `supports_reasoning` / `supports_vision` | 支持位，三态：`true` / `false` / 整个键省略 |
-| `capabilities` | `reasoning_effort` | 引擎**接受**的档位判定面，字符串数组（与顶层同名字段是两个含义，各画各的） |
+| `capabilities` | `reasoning_effort` | 引擎**接受**的档位判定面，字符串数组（与顶层同名字段是两个含义，各画各的）；操作员勾过时它是「引擎说过 ∩ 勾选集合」——**只收窄不扩面**，勾选表里引擎没提过的名字不会在这里被替它宣称接受 |
 | 顶层 | `owned_by_models` | 多目标入口的整组模型名数组 |
 
 档位在上游有两种拼写、两个含义，registry 刻意各留一份、输出面各画各位：picker 的阶梯带 label 与
@@ -202,6 +203,53 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
 丢掉，客户端反而没有缺省档可用，取并集又会报出下游可能不接受的名字，所以两份都留、各画各位。
 单目标入口透传引擎原话（含「缺省档不在判定面里」这种上游自带的自相矛盾）；多目标入口的判定面取交集，
 交集把缺省档挤掉就整个删键（同文件的 `common_acceptance`）。
+
+### 档位阶梯：探测 + 手动勾选（用户诉求 2026-10-08）
+
+上游允许的 `reasoning_effort` 档位（`low` / `medium` / `high` / `xhigh` / `max` …）先由网关**探测**出来，
+再由操作员在管理台**逐档勾选**增删，勾选结果反馈进 `/v1/models` 的对外声明。三份读数各有其主，不可互换：
+
+| 读数 | 来源 | 谁读它 |
+|---|---|---|
+| 引擎原话 | `registry.model_caps()`（健康巡检顺带 `GET /v1/models` 采到的 `reasoning_efforts` / `capabilities.reasoning_effort`） | 管理台勾选框的**基线**（`/_ui/config` 的 `models[].detected_reasoning_efforts`）、判定面的唯一来源 |
+| 操作员勾选 | 模型卡片 `model_configs[].reasoning_efforts`（平铺 env `LMR_MODEL_EFFORT_LEVELS`） | 决定对外 `reasoning_efforts`（picker）的成员与顺序 |
+| 对外读数 | `/v1/models` 合成结果 | 客户端看到的 picker、`supports_reasoning_effort` 的派生、`capabilities.reasoning_effort` 判定面 |
+
+基线**必须**取引擎原话而不是对外那份读数：对外读数一旦被勾就是勾选结果，拿它当基线会把操作员上一轮的
+勾选误读成「引擎说的」，于是取消勾选永远回不到引擎原始那一组。这是 `detected_reasoning_efforts` 与
+`reasoning_efforts` 在 `/_ui/config` 里分家存在的全部理由。
+
+**勾选接管的是 picker，不是判定面。** 判定面（`capabilities.reasoning_effort`）取「引擎说过 ∩ 勾选集合」，
+只能收窄不能扩面：勾掉一档是把引擎说过的事情少报一件（与旁边「组内取最窄」同方向的保守），而把引擎从没提过的
+名字（手动补的 `xhigh`）写进判定面，等于替引擎宣称它接受一个它没说过的档位——那正是硬规则 9 第 2 条禁止的猜。
+这种名字照旧进 picker（用户要的就是给欠配置的上游补档位），只是不进判定面。引擎压根没给判定面时，判定面退到
+勾选序列（与原来「退到阶梯序列」同一支路，序列换成了操作员那份）。
+
+三态与形状的其余口径：
+
+* 卡片没这张卡 / 键沉默 = 「没说」，两份读数全部让位引擎自报（与 `supports_*` 那五位同一条声明链）。
+  `null` = 清除回自动（管理台的「恢复自动」发的是它），数组 = 整条替换。
+* **空数组折回「没说」**：勾选全部取消等同从没勾过，对外退回引擎那一组，磁盘上不落 `[]`。热路径对空表答的
+  也是「没说」（`card_ladder` 与 `clean_string_list` / `clean_effort_ladder` 同一口径——报一份 `[]` 是一份
+  「一个都不支持」的肯定答复），若磁盘留 `[]` 就成了同一份配置两种说法。
+* `label` 由**引擎**决定：勾选只决定成员与顺序，每一档的 `label` 仍从引擎那份同名档位继承（一次勾选不该毁掉
+  别的字段），引擎没给过的名字不编 label。
+* `default` 至多一枚：勾选表上的预选（管理台「设为缺省档」下拉）优先，但让位 `model_effort` 强制行与卡片
+  `default_effort` 这两条专职字段；勾选表没标预选时继承引擎自己标的那一档（前提是该档仍在勾选集合里）。
+* 顺序按**勾选顺序**，后端不按词表重排：阶梯就是客户端 picker 的显示顺序，替他重排等于改他的声明。
+* 未知档位名（`turbo`）整条拒绝并 400，不悄悄丢档——一个拼错的名字会被客户端原样发给引擎并在那里 400，
+  比保存失败难查得多。
+* 虚拟入口（1 对多）仍按组内一致口径仲裁：成员间勾选表序列不一致 → 入口行的 picker 整个删键（`common_ladder`
+  原有的规则，勾选不放宽它）；判定面照旧逐成员收窄后取交集。
+* 勾选只改对外声明，**不改转发**：客户端照这里发 `reasoning_effort`，网关原样转给引擎；勾了引擎其实不收的
+  档位，收到的是引擎自己的 400（与 2026-10-04「网关不改写调用方意图」同向）。
+
+实现落点：解析与往返在 `config_store/lexicon.lua`（`normalize_effort_ladder`）+ `config_store/snapshot.lua`
+（`new_card` / `merge_model_patch` / `snapshot_of` / env 装配）；回显在 `config_store/handlers.lua`
+（`models_document` 的 `reasoning_efforts` + `detected_reasoning_efforts`）；接管点集中在
+`router/models_api.lua` 的四个文件级 local（`card_ladder` / `overlay_effort_ladder` /
+`intersect_strings` / `card_default_rung`），由 `resolve_model_caps` 在算档位那一支调用；
+勾选 UI 在 `ui/admin/models.html` 的卡片对话框。
 
 ### 填充纪律：宁可不报，不要猜
 
@@ -216,7 +264,7 @@ OpenAI 官方 `/v1/models` 的模型对象**只有** `id` / `object` / `created`
    取）：模型卡片 `context_limit`＝引擎真实能力，操作员按引擎启动参数抄录，平铺写法
    `model_context_limit` / env `LMR_MODEL_CONTEXT_LIMIT`，卡片优先于平铺层（同文件的
    `declared_context_limit`）；卡片 `modalities`（`config_store.modalities_for`）；缺省档位由
-   `model_effort` 强制行 → 卡片 `default_effort` → 全局 `default_effort` 给出。`context_length` 这一维
+   `model_effort` 强制行 → 卡片 `default_effort` → 全局 `default_effort` 给出；档位阶梯（picker 内容与顺序）另由卡片 `reasoning_efforts` 接管（见〈档位阶梯：探测 + 手动勾选〉）。`context_length` 这一维
    还多一个来源：先问 `store_mod.ctx_cap`（卡片 `ctx` / 平铺 `model_ctx`），它排在
    `context_limit` **之前**；两者都只是对外声明的读数，**不参与任何 max_tokens 计算**（用户裁定 2026-10-04）。
 2. **引擎自报层**：worker 自己 `GET /v1/models` 的回答，由 `registry/discovery.lua` 的
@@ -340,6 +388,7 @@ watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连�
 | `LMR_MODEL_CTX` | 每模型上下文上限，模型卡片 `model_configs[].ctx` 的平铺写法（同一份文档里叫 `model_ctx`）。**只用于展示，不参与转发改写**（用户裁定 2026-10-04，见下一行与 doc/gap-virtual-models.md §4）：网关不再拿它去动 `max_tokens` / `max_completion_tokens`。它现在的读者只有展示面两处：`/_ui/props` 的 `props.with_ctx` 用它覆盖回显的 `n_ctx` / `n_ctx_train`，让 llama.cpp webui 显示操作员声明的窗口；另一处是 `/v1/models` 的合成层——`router/models_api.lua` 的 `resolve_model_caps` 先问 `store_mod.ctx_cap` 拿它当 `capabilities.context_length` 的**声明层**读数（这一层里它排在卡片 `context_limit` **之前**），见〈`/v1/models` 的模型对象形状〉 |
 | `LMR_MODEL_CONTEXT_LIMIT` | 每模型**服务实际上下文限制**＝引擎真实能力（操作员按引擎启动参数抄录）。`model=value` 形状，与上一项同一解析口径；卡片写法是 `model_configs[].context_limit`，卡片优先于这一平铺层。**两个用途**：① 配置期校验——虚拟入口声明的 `context_window` 必须**严格小于**组内各卡片 `context_limit` 的最小值，否则 `/_ui/config` 拒绝保存（`config_store.validate_declared_context_windows`，挂在 `apply_profiles` / `apply_document` 两条写入路径）。② `/v1/models` 对外 `capabilities.context_length` 的**声明层**兜底读数——卡片 `context_limit` 缺席时由 `declared_context_limit` 读它，见〈`/v1/models` 的模型对象形状〉。两个用途都**不参与**转发改写与任何 max_tokens 计算；新 env 必须进 `config_store.ENV_NAMES`，否则 nginx 把它从 worker 环境里剥掉 |
 | `LMR_MODEL_EFFORT` / `LMR_MODEL_EFFORT_MAP` | 每模型覆盖，优先级高于上两项 |
+| `LMR_MODEL_EFFORT_LEVELS` | 每模型**对外声明的允许档位**＝卡片 `model_configs[].reasoning_efforts` 的平铺 env 写法，形状照 `LMR_MODEL_MODALITIES`：`model:low+medium+high`（多模型逗号分隔；值侧统一按「非字母」切，逗号 / 分号 / 空白 / 竖线都可）。档位名一律过八档词表，拼错的那一档整件丢弃——env 层的垃圾值历来是忽略，不替操作员猜一个近似名；空 value（`model=`）= 整行没说，不建卡。作用与卡片完全同一条：决定 `/v1/models` 的 picker 内容与顺序，判定面只收窄不扩面（见〈档位阶梯：探测 + 手动勾选〉与 doc/gap-effort-ladder.md）。已在 `config_store.ENV_NAMES` 登记（漏登记 = nginx 把它从 worker 环境剥掉，配了也不响） |
 | `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/_ui/config` 写。条目级 `context_window` 是**对外声明的上下文总窗口（输入+输出）**，作用只是让客户端更早触发压缩；它不是输出预算，也不参与 max_tokens 计算，且必须严格小于组内 `context_limit` 的最小值 |
 | `LMR_MODEL_MODALITIES` | `/_ui/props` 广告的能力位（`text,image`） |
 | `LMR_CONFIG_FILE` | RuntimeConfig 原子落盘路径，reload/重建后恢复；未设 = 内存态 |
@@ -573,7 +622,7 @@ grep -rn 'require *"resty\.luarouter\.<模块>"' lualib/resty/luarouter \
 
 ## 文档索引
 
-doc/ 现状文档 29 份。裁剪前平面的历史留档（feature-gap、verification、impl-*、fix-majors、
+doc/ 现状文档 30 份。裁剪前平面的历史留档（feature-gap、verification、impl-*、fix-majors、
 gap-{grpc,history,tokenizer,otel,discovery-watch,dp-jwt,auth-tls,http-semantics,core,integration,
 test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精简删除，需要时查 git 历史。
 
@@ -599,6 +648,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-metrics-final.md](doc/gap-metrics-final.md) | Prometheus 家族覆盖率口径基线 + `smg_worker_pool_size` 修复 |
 | [doc/gap-tls-chain.md](doc/gap-tls-chain.md) | 证书链 / SNI / 握手负例门与入口预检缺口 |
 | [doc/gap-virtual-models.md](doc/gap-virtual-models.md) | 虚拟模型服务主入口（1 对多 `targets` + 条目级 `context_window`＝对外声明的上下文总窗口 + 卡片 `context_limit` 配置期校验）与 upstreams 持久化接入 |
+| [doc/gap-effort-ladder.md](doc/gap-effort-ladder.md) | 档位阶梯：探测 + 手动勾选（卡片 `reasoning_efforts` / env `LMR_MODEL_EFFORT_LEVELS`）——三份读数（引擎原话 / 操作员勾选 / 对外读数）各有其主、勾选接管 picker 而判定面只收窄、空数组折回「没说」的三态口径、UI 契约与测试锚点 |
 | [doc/gap-pool-merge.md](doc/gap-pool-merge.md) | 服务池页：运行态与声明态的统一视图、归属徽章、上限的事实来源 |
 | [doc/caps-redesign-2026-10-06.md](doc/caps-redesign-2026-10-06.md) | 容量语义重设计的执行契约：三条裁定、字段/三态/绿灯优先/429 的逐节口径、UI 契约与波次文件所有权 |
 | [doc/gap-worker-caps.md](doc/gap-worker-caps.md) | 每服务容量三态：并发上下限 + GPU 利用率上限、候选集硬排除与绿灯优先、全池到顶 429、功率上限退役与残余缺口 |

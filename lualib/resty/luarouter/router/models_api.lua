@@ -207,12 +207,125 @@ local function apply_default_ladder_rung(ladder, wanted)
     end
 end
 
+--- 操作员勾选的档位表套到引擎自报的那份上（用户诉求 2026-10-08）。
+---
+--- 语义是**勾选决定成员、引擎决定描述**：以勾选的集合与顺序为准，每一档的 label 从引擎
+--- 那份同名的档位上继承（勾选框只勾名字，把 "Low Effort" 这类引擎原话丢掉，等于让一次
+--- 勾选顺手毁掉别的字段）；勾选表里没有的名字照原样出现、不带 label（**不替它编一个**，
+--- 硬规则 9 第 2 条）。
+---
+--- default 的来源是勾选表本身（存储层保证至多一个 true）；勾选表一个 true 都没有时，
+--- 才继承引擎标的那一档 —— 前提是那一档仍在勾选集合里。取消缺省档那次勾选因此会把
+--- 预选让给引擎仍支持的那一档，而不是让 picker 失去预选。
+---@param declared table @ 归一化后的勾选表（数组，可为空）
+---@param engine table|nil @ 引擎自报的阶梯
+---@return table|nil
+local function overlay_effort_ladder(declared, engine)
+    if type(declared) ~= "table" then return nil end
+    if #declared == 0 then return {} end
+    local by_name
+    if type(engine) == "table" then
+        by_name = {}
+        for i = 1, #engine do
+            local rung = engine[i]
+            if type(rung) == "table" and type(rung.value) == "string" then
+                by_name[rung.value:lower()] = rung
+            end
+        end
+    end
+    local out, seen, any_default = {}, {}, false
+    for i = 1, #declared do
+        local want = declared[i]
+        local value = type(want) == "table" and want.value or nil
+        if type(value) == "string" and value ~= "" then
+            local key = value:lower()
+            if not seen[key] then
+                seen[key] = true
+                local rung = { value = value }
+                local source = by_name and by_name[key] or nil
+                if source and type(source.label) == "string" and source.label ~= "" then
+                    rung.label = source.label
+                end
+                if want["default"] == true then
+                    rung["default"] = true
+                    any_default = true
+                end
+                out[#out + 1] = rung
+            end
+        end
+    end
+    if #out == 0 then return {} end
+    if not any_default and by_name then
+        for i = 1, #out do
+            local source = by_name[out[i].value:lower()]
+            if source and source["default"] == true then
+                out[i]["default"] = true
+                break
+            end
+        end
+    end
+    return out
+end
+
 local function ladder_values(ladder)
     if type(ladder) ~= "table" then return nil end
     local out = {}
     for i = 1, #ladder do out[i] = ladder[i].value end
     if #out == 0 then return nil end
     return out
+end
+
+--- 卡片上操作员勾选的档位表（config 声明层，用户诉求 2026-10-08）。存的时候已经过
+--- config_store 归一化：值一定在词表里、顺序即勾选顺序、至多一枚 default，且空数组在写入时
+--- 就被折成「没说」（merge_model_patch）。所以这里的 nil 有三种来源，且都是同一句话
+--- 「这一维让位引擎自报」：没有这张卡、键沉默、以及手改进磁盘的 [] ——最后一种不报空 []
+--- 而是退回引擎，与旁边的 clean_string_list / clean_effort_ladder 同一条填充纪律（[] 是一份
+--- 「一个都不支持」的肯定答复，而这里没有任何肯定可报）。
+---@param card table|nil
+---@return table|nil
+local function card_ladder(card)
+    if type(card) ~= "table" then return nil end
+    local raw = card.reasoning_efforts
+    if type(raw) ~= "table" then return nil end
+    local out, seen = {}, {}
+    for i = 1, #raw do
+        local rung = raw[i]
+        local value = type(rung) == "table" and rung.value or nil
+        if type(value) == "string" and value ~= "" and not seen[value:lower()] then
+            seen[value:lower()] = true
+            out[#out + 1] = { value = value, ["default"] = rung["default"] == true }
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+--- 判定面的交集：在引擎说过接受的那份里，只留操作员还留着的档位（顺序按引擎那份）。
+--- engine_face 为 nil（引擎没说判定面）时退到操作员那份序列 —— 与旁边「退到阶梯序列」
+--- 同一支路。洗空返回 nil = 删键，报 [] 等于宣称整组什么都收不了。
+---@param engine_face table|nil
+---@param kept table|nil
+---@return table|nil
+local function intersect_strings(engine_face, kept)
+    if type(engine_face) ~= "table" then return kept end
+    if type(kept) ~= "table" then return engine_face end
+    local out = {}
+    for i = 1, #engine_face do
+        if list_contains(kept, engine_face[i]) then out[#out + 1] = engine_face[i] end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+--- 勾选表里被操作员标为缺省的那一档（至多一个，存储层保证）。没有则 nil。
+---@param ladder table
+---@return string|nil
+local function card_default_rung(ladder)
+    if type(ladder) ~= "table" then return nil end
+    for i = 1, #ladder do
+        if ladder[i]["default"] == true then return ladder[i].value end
+    end
+    return nil
 end
 
 --- 单个**实际模型**的一行能力读数：操作员声明与引擎自报按优先级合成后的样子。
@@ -334,14 +447,30 @@ local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
     --   caps.reasoning_effort_values  下游真正**接受**的档位判定面
     -- 把判定面抄成阶梯是过度声称：引擎可能只接受 low/high/max，而 picker 里有 medium。
     -- 所以判定面优先用引擎亲口给的那份，只有它缺席时才退到阶梯序列。
-    local ladder = clean_effort_ladder(caps and caps.reasoning_efforts)
+    --
+    -- 操作员在卡片上勾过档位表时（reasoning_efforts，用户诉求 2026-10-08），它接管这一行的
+    -- 两份读数：picker 就是勾选表（label 仍从引擎那份同名档位继承，不替引擎编话），判定面
+    -- 取「勾选 ∩ 引擎判定面」。交集不是虚构——它是把引擎说过的事情**少报**一件，与旁边
+    -- 「组内取最窄」「宁可删键」同方向；反过来，勾选表里引擎从没提过的名字（手动补的 xhigh）
+    -- 只进 picker、**不进判定面**，否则就是替引擎宣称它接受一个它没说过的名字。
+    local engine_ladder = clean_effort_ladder(caps and caps.reasoning_efforts)
+    local chosen_ladder = card_ladder(card)
+    local ladder = chosen_ladder and overlay_effort_ladder(chosen_ladder, engine_ladder)
+        or engine_ladder
     local declared_default = type(caps) == "table" and caps.reasoning_effort or nil
     if type(declared_default) ~= "string" or declared_default == "" then
         declared_default = nil
     end
     if ladder then
         apply_default_ladder_rung(ladder,
-            model_scoped_effort(cfg, model) or global_effort(cfg) or declared_default)
+            -- 缺省档的定序（模型作用域 > 全局 > 操作员的勾选标记 > 引擎自报字符串 > 阶梯自己
+            -- 的标记）：勾选表上那枚 default 是**模型作用域**的操作员声明，压过全局缺省档；
+            -- 但让位给 default_effort / model_effort 这两条专职字段——它们就是为「哪档预选」
+            -- 这个具体问题而存在的，同一条陈述里专职字段赢。引擎那份的标记排在最后（由
+            -- overlay 继承进 ladder，再走 apply_default_ladder_rung 的兜底支）。
+            model_scoped_effort(cfg, model) or global_effort(cfg)
+            or (chosen_ladder and card_default_rung(chosen_ladder) or nil)
+            or declared_default)
         for i = 1, #ladder do
             if ladder[i].default == true then
                 row.default_effort = ladder[i].value
@@ -353,8 +482,14 @@ local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
         -- 只有缺省档、没有阶梯：引擎确实说了默认用哪档，照报；但客户端无从枚举。
         row.default_effort = declared_default
     end
-    row.accepted = clean_string_list(caps and caps.reasoning_effort_values)
-        or ladder_values(ladder)
+    -- 判定面的来源次序照旧是「引擎亲口给的那份优先」，只在操作员勾过时再与勾选表求交；
+    -- 引擎压根没给判定面时才退到（可能被勾选表替换过的）阶梯序列。
+    local engine_face = clean_string_list(caps and caps.reasoning_effort_values)
+    if chosen_ladder then
+        row.accepted = intersect_strings(engine_face, ladder_values(ladder))
+    else
+        row.accepted = engine_face or ladder_values(ladder)
+    end
     -- 顶层 supports_reasoning_effort 的声明层读数（卡片 → 条目）。它是一位**独立**的
     -- 对外说法，不是「有没有档位读数」那个派生的别名：派生只在两边都没说时才起作用
     -- （见 fill_model_fields，那条派生链的行为逐字节不变，包括它什么时候省略这个键）。

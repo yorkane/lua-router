@@ -2777,6 +2777,114 @@ verify_same_name_shadowing()
 
 
 --------------------------------------------------------------------------
+-- 12b. 卡片档位勾选（用户诉求 2026-10-08：探测上游允许的档位，可手动增删）
+--
+-- 钉的是**存储层**的五条纪律（输出面的形状由 test_models_shape 的 G11 钉）：
+--   L1 absent = 别动、null = 清除回自动、数组 = 整条替换（与旁边五个能力位同一套写入语义）
+--   L2 形状：字符串数组与对象数组两种拼法归一成同一形状；顺序按输入、不按词表重排；
+--      default 至多一枚；未知档位名整条拒绝（400），不悄悄丢档
+--   L3 空数组折回 nil：磁盘上不留 []（热路径对空表答的就是「没说」，存 [] 会造成
+--      磁盘一份、对外另一份的同配置两说法）
+--   L4 磁盘往返 + card_effort_ladder 返回拷贝
+--   L5 env 层 LMR_MODEL_EFFORT_LEVELS 装配 + ENV_NAMES 登记（硬规则 11③：漏登记的名字
+--      会被 nginx 从 worker 环境里剥掉，现象是「配了但静默走未配置」）
+--------------------------------------------------------------------------
+reset_env()
+local LAD = "effort-card-ladder"
+
+eq(select(2, store.apply_model_config({ model = LAD, reasoning_efforts = { "low", "high", "max" } })),
+    nil, "(L1) 字符串数组被接受")
+local ladder_card = store.current().model_configs[LAD]
+eq(ladder_card and #ladder_card.reasoning_efforts, 3, "(L1) 三档都进了卡片")
+eq(ladder_card and ladder_card.reasoning_efforts[1].value, "low",
+    "(L1) 顺序按输入而非词表（词表在 low 之前还有 none/minimal）")
+eq(select(2, store.apply_model_config({ model = LAD, ctx = 4096 })), nil, "(L1) 不带该键的 patch 被接受")
+eq(store.current().model_configs[LAD] and #store.current().model_configs[LAD].reasoning_efforts, 3,
+    "(L1) absent = 别动：阶梯没被旁边那次 ctx 写入抹掉")
+eq(select(2, store.apply_model_config({ model = LAD, reasoning_efforts = cjson.null })),
+    nil, "(L1) null 被接受（清除回自动）")
+eq(rawget(store.current().model_configs[LAD], "reasoning_efforts"), nil,
+    "(L1) null 之后键整个不在")
+
+local err_bad
+_, err_bad = store.apply_model_config({ model = LAD, reasoning_efforts = { "low", "turbo" } })
+ok(err_bad ~= nil and tostring(err_bad):find("reasoning_efforts", 1, true) ~= nil,
+    "(L2) 未知档位名整条拒绝并点名该字段", err_bad)
+eq(rawget(store.current().model_configs[LAD], "reasoning_efforts"), nil,
+    "(L2) 被拒的批次不落盘（阶梯仍是清除态，不是半截的新值）")
+eq(select(2, store.apply_model_config({ model = LAD, reasoning_efforts = {
+    { value = "low", label = "Low Effort" },
+    { value = "medium", label = "Medium Effort", ["default"] = true },
+    { value = "high", ["default"] = true },
+    { value = "xhigh" },
+} })), nil, "(L2) 对象数组被接受（从 /v1/models 抄回来的那份形状）")
+local rich = store.current().model_configs[LAD].reasoning_efforts
+eq(#rich, 4, "(L2) 四档都在")
+eq(rich[1].label, "Low Effort", "(L2) 引擎给过的 label 留着")
+eq(rich[2]["default"], true, "(L2) 第一个 default=true 赢")
+eq(rich[3]["default"] ~= true, true, "(L2) 后面那枚 true 被收掉（至多一个预选）")
+eq(rich[3].value, "high", "(L2) 顺序 = 勾选顺序：high 排在 xhigh 之前，没被词表重排")
+eq(select(2, store.apply_model_config({ model = LAD, reasoning_efforts = {
+    "low", "high", { value = "high", ["default"] = true }, "max",
+} })), nil, "(L2) 重复条目被接受")
+local dedup = store.current().model_configs[LAD].reasoning_efforts
+eq(#dedup, 3, "(L2) 重复的名字去重，不追加第二条")
+eq(dedup[2].value, "high", "(L2) 去重保首位次序")
+eq(dedup[2]["default"], true, "(L2) 落在重复条目上的 default 补进已有那一档")
+
+eq(select(2, store.apply_model_config({ model = LAD, reasoning_efforts = {} })),
+    nil, "(L3) 空数组被接受")
+eq(rawget(store.current().model_configs[LAD], "reasoning_efforts"), nil,
+    "(L3) 勾选全部取消 = 自动：键不在，而不是存一份对外读作[]的字节")
+
+reset_env()
+eq(select(2, store.apply_model_config({ model = LAD, reasoning_efforts = {
+    { value = "high", label = "High Effort" },
+    { value = "low", ["default"] = true },
+} })), nil, "(L4) 前提：写一张带阶梯的卡")
+local disk = cjson.decode((function()
+    local f = io.open(CONFIG_PATH, "r")
+    if not f then return "{}" end
+    local content = f:read("*a")
+    f:close()
+    return content
+end)())
+local disk_row
+for _, row in ipairs(disk.model_configs or {}) do
+    if row.model == LAD then disk_row = row end
+end
+ok(disk_row ~= nil, "(L4) 卡片落进磁盘镜像")
+eq(type(disk_row and disk_row.reasoning_efforts), "table", "(L4) 磁盘上阶梯是数组")
+eq(disk_row and #disk_row.reasoning_efforts, 2, "(L4) 两档都落盘")
+eq(disk_row and disk_row.reasoning_efforts[1]["default"], false, "(L4) 非预选档落 false")
+eq(disk_row and disk_row.reasoning_efforts[2]["default"], true, "(L4) 恰好一枚 true")
+shared.luarouter_config:flush_all()
+local revived = store.current().model_configs[LAD]
+eq(revived and #revived.reasoning_efforts, 2, "(L4) 清掉 shdict 后从磁盘读回同一份阶梯")
+eq(revived and revived.reasoning_efforts[2].value, "low", "(L4) 读回后预选仍在 low 那一档")
+local fetched = store.card_effort_ladder(LAD)
+fetched[1].value = "tampered"
+eq(store.card_effort_ladder(LAD)[1].value, "high", "(L4) card_effort_ladder 给拷贝，改不坏存储")
+eq(store.card_effort_ladder("no-such-card"), nil, "(L4) 没有卡片答 nil（沉默）")
+
+reset_env()
+_G.LMR_ENV_CACHE = {
+    LMR_CONFIG_FILE = CONFIG_PATH,
+    LMR_MODEL_EFFORT_LEVELS = "env-ladder:high+medium+bogus+low",
+}
+store._reset_pool_module_caches()
+local env_card = store.current().model_configs["env-ladder"]
+eq(env_card and #env_card.reasoning_efforts, 3, "(L5) env 层三档进卡（拼错的 bogus 整件丢弃）")
+eq(env_card and env_card.reasoning_efforts[1].value, "high", "(L5) env 的顺序按书写顺序")
+do
+    local registered = false
+    for _, name in ipairs(store.ENV_NAMES) do
+        if name == "LMR_MODEL_EFFORT_LEVELS" then registered = true end
+    end
+    ok(registered, "(L5) LMR_MODEL_EFFORT_LEVELS 在 ENV_NAMES 名册里")
+end
+reset_env()
+--------------------------------------------------------------------------
 -- 13. 收尾：未映射的 ngx.re 模式必须为空（否则上面的替身在骗人）
 --------------------------------------------------------------------------
 local seen_pattern = {}

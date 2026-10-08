@@ -80,6 +80,12 @@ port = start_probe({"LMR_EFFORT_MAP": "low:medium,high:xhigh;minimal:low",
                     "LMR_MODEL_CTX": "alpha:128,beta:256",
                     "LMR_MODEL_EFFORT_MAP": "alpha:low>medium,beta:high>xhigh",
                     "LMR_MODEL_MODALITIES": "alpha:text+image,beta:text+video",
+                    # 卡片档位勾选的 env 层（用户诉求 2026-10-08）。它跟着这一批一起设而不是
+                    # 另起一份容器：这条断言真正钉的是**名册登记**（config_store.ENV_NAMES 里
+                    # 那行），而名册只在 init_by_lua 的 capture_env 那一刻起作用 —— worker 里
+                    # os.getenv 读不到未登记的名字。删掉那一行，这里读到的就是「没有这张卡」，
+                    # 与「env 语法写错」两种失败在别处都无法区分（硬规则 11③）。
+                    "LMR_MODEL_EFFORT_LEVELS": "alpha:low+medium+high,beta:max",
                     "LMR_VIRTUAL_MODELS": "alias-a:alpha,alias-b:beta",
                     "LMR_DEFAULT_EFFORT": "medium"}, name)
 st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
@@ -110,6 +116,17 @@ check("[re_split] LMR_MODEL_MODALITIES caps split",
       mcards.get("alpha", {}).get("modalities") == ["text", "image"]
       and mcards.get("beta", {}).get("modalities") == ["text", "video"],
       json.dumps({k: v.get("modalities") for k, v in mcards.items()})[:200])
+def ladder_names(card_row):
+    rows = (card_row or {}).get("reasoning_efforts")
+    if not isinstance(rows, list):
+        return None
+    return [r.get("value") if isinstance(r, dict) else r for r in rows]
+
+
+check("[env] LMR_MODEL_EFFORT_LEVELS reaches the worker (ENV_NAMES roster)",
+      ladder_names(mcards.get("alpha")) == ["low", "medium", "high"]
+      and ladder_names(mcards.get("beta")) == ["max"],
+      json.dumps({k: ladder_names(v) for k, v in mcards.items()})[:240])
 st, body, _ = http("GET", "http://127.0.0.1:%d/probe/env" % port)
 check("[env] init snapshot present (capture_env ran)", '"cached_before": true' in body or
       json.loads(body).get("cached_before") is True, body[:200])

@@ -111,10 +111,79 @@ end
 
 -- ---------------------------------------------------------- registered models
 
+--- registry 的惰性取用（同 watcher_module 的姿势：取不到只是少一份读数，
+--- 绝不让整份文档塌掉）。
+local function registry_module()
+    local ok, mod = pcall(require, "resty.luarouter.registry")
+    if ok and type(mod) == "table" then return mod end
+    return nil
+end
+
+--- 引擎自报的档位阶梯（探测读数），给卡片表单画「上游到底说了哪几档」。
+---
+--- 为什么在文档里另列一份而不是让前端去抓 /v1/models：那份是**对外合成**的读数，
+--- 一旦操作员勾过表，它就是勾选结果本身，前端拿它当基线会把「操作员上一轮的勾选」
+--- 误读成「引擎说的」，取消勾选因此永远回不到引擎原始那一组。这里给的是 registry
+--- 采到的**引擎原话**（未过声明层），与对外读数分家。
+---
+--- 没有读数返回 nil（键省略），不写 [] —— 空数组是一份「引擎一个都不收」的肯定答复。
+---@param caps_by_model table|nil
+---@param model string
+---@return table|nil
+local function detected_effort_ladder(caps_by_model, model)
+    if type(caps_by_model) ~= "table" then return nil end
+    local caps = caps_by_model[model]
+    if type(caps) ~= "table" then return nil end
+    local raw = caps.reasoning_efforts
+    if type(raw) ~= "table" then return nil end
+    local out = {}
+    for i = 1, #raw do
+        local rung = raw[i]
+        if type(rung) == "table" and type(rung.value) == "string" and rung.value ~= "" then
+            out[#out + 1] = {
+                value = rung.value,
+                label = CS_LEXICON.nul(rung.label),
+                ["default"] = rung["default"] == true,
+            }
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+--- 卡片勾选表在文档里的字节形状：与 snapshot_of 同一份逐档重写（不回吐存储表引用），
+--- null = 「没说」，数组 = 操作员的结论。
+---@param card table|nil
+---@return table
+local function effort_ladder_rows(card)
+    if type(card) ~= "table" or type(card.reasoning_efforts) ~= "table" then
+        return JSON_NULL
+    end
+    local rows = {}
+    for _, rung in ipairs(card.reasoning_efforts) do
+        if type(rung) == "table" and type(rung.value) == "string" then
+            rows[#rows + 1] = {
+                value = rung.value,
+                label = CS_LEXICON.nul(rung.label),
+                ["default"] = rung["default"] == true,
+            }
+        end
+    end
+    return CS_LEXICON.arr(rows)
+end
+
 --- models section: registered + configured models merged, one card each.
 function _M.models_document()
     local cfg = CS_FACADE.current()
     local order, sources = {}, {}
+    -- 探测读数按整份文档取一次（而不是每模型一次）：registry.model_caps 跨 worker 汇总，
+    -- 逐行取会把 N 次汇总做成 N 次开销，而它对整份文档只有一个答案。
+    local registry = registry_module()
+    local caps_by_model
+    if registry and type(registry.model_caps) == "function" then
+        local ok, caps = pcall(registry.model_caps)
+        if ok and type(caps) == "table" then caps_by_model = caps end
+    end
     local function note(model)
         if sources[model] == nil then
             sources[model] = {}
@@ -145,6 +214,15 @@ function _M.models_document()
             default_effort = CS_LEXICON.nul(card and card.default_effort),
             effort_map = CS_LEXICON.arr(map),
             modalities = CS_LEXICON.nul(card and card.modalities),
+            -- 勾选表的回显（用户诉求 2026-10-08）：与 snapshot_of 同一份字节形状（逐档重写，
+            -- 不回吐存储表引用），三态照旧 —— null = 「没说，退回引擎自报」，数组 = 操作员的
+            -- 结论。管理台靠这一份把勾选框画回操作员实际保存的样子。
+            reasoning_efforts = effort_ladder_rows(card),
+            -- 引擎自报的那一份（探测基线）：勾选框画在它之上，操作员在它旁边加勾/取消。
+            -- 与上一行必须分家 —— 对外 /v1/models 里的 reasoning_efforts 一旦被勾过就是
+            -- 勾选结果，拿它当基线会让「取消勾选」再也回不到引擎原始那一组。
+            detected_reasoning_efforts = CS_LEXICON.nul(
+                detected_effort_ladder(caps_by_model, model)),
             -- Tri-state on the models page as well: null = unknown (fall back to what
             -- the engine reports), false = the operator said no. Never merge the two.
             supports_tool_use = CS_LEXICON.nul(card and card.supports_tool_use),

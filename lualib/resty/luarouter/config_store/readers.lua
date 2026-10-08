@@ -209,6 +209,32 @@ function _M.modalities_for(model)
     return nil
 end
 
+--- 操作员在模型卡片上勾选的档位阶梯（config 声明层，用户诉求 2026-10-08）。
+--- 返回**新表**（调用方改不坏存储，与 profile_for 的拷贝纪律同口径），形状
+--- { {value, label?, default}, ... }；没这张卡或这个键沉默 → nil = 「没说」，
+--- 对外读数让位引擎自报。返回空数组 = 操作员说过「一个都不收」，与 nil 必须可分。
+---@param model string
+---@return table|nil
+function _M.card_effort_ladder(model)
+    if type(model) ~= "string" or model == "" then return nil end
+    local card = CS_FACADE.current().model_configs[model]
+    if not card then return nil end
+    local raw = card.reasoning_efforts
+    if type(raw) ~= "table" then return nil end
+    local out = {}
+    for i = 1, #raw do
+        local rung = raw[i]
+        if type(rung) == "table" and type(rung.value) == "string" then
+            out[#out + 1] = {
+                value = rung.value,
+                label = rung.label,
+                ["default"] = rung["default"] == true,
+            }
+        end
+    end
+    return out
+end
+
 --- 操作员在模型卡片上声明的 tool use 能力（三态）。/v1/models 的合成侧
 --- （router.resolve_model_caps）把它填进 capabilities.supports_tool_use 的
 --- 「config 声明」优先位：声明了就用声明的，没声明（nil）才退引擎自报，

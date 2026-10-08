@@ -119,7 +119,12 @@ local function new_card()
     return { ctx = nil, context_limit = nil, default_effort = nil,
              effort_map = {}, modalities = nil, supports_tool_use = nil,
              supports_streaming = nil, supports_reasoning = nil,
-             supports_vision = nil, supports_reasoning_effort = nil }
+             supports_vision = nil, supports_reasoning_effort = nil,
+             -- 操作员勾选的档位阶梯（用户诉求 2026-10-08）。nil = 没说，该维度让位给引擎
+             -- 自报；非 nil = 整条替换对外读数。形状与 registry 归一化后的阶梯一致
+             -- （{value,label?,default}），所以对外那份读数分不出数字来自哪一层——这正是
+             -- 想要的：客户端不需要知道这个数字是谁说的。
+             reasoning_efforts = nil }
 end
 
 local function cfg_from_env()
@@ -175,6 +180,24 @@ local function cfg_from_env()
     for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_MODALITIES"))) do
         local caps = CS_LEXICON.parse_caps(pair[2])
         if caps then card_for(pair[1]).modalities = caps end
+    end
+    -- 卡片级档位勾选的 env 层（用户诉求 2026-10-08），形状照 LMR_MODEL_MODALITIES：
+    -- "model:low+medium+high"（parse_pairs 先按 model:值 切成一行，值侧的分隔符在这里自己切,
+    -- 因为 parse_pairs 是按逗号切行的 —— 值里再放逗号会把后面每个档位切成独立一行）。
+    -- 档位名一律过归一化器；一个拼错的名字会被客户端原样发给引擎并在那里 400，而 env 层的
+    -- 垃圾值历来是整条忽略，不替操作员猜一个近似名。整行洗不出任何档位 = 没说，不建卡。
+    for _, pair in ipairs(CS_LEXICON.parse_pairs(CS_ENV.env("LMR_MODEL_EFFORT_LEVELS"))) do
+        local ladder, seen = {}, {}
+        -- 值侧的分隔符一律归成 +：档位名只含字母（词表 low/medium/high/xhigh/max/…），
+        -- 所以按「非字母」切既容忍逗号/分号/空白/竖线，也不需要再操心转义。
+        for piece in ((pair[2] or ""):gsub("[^%a]+", "+")):gmatch("([^+]+)") do
+            local name = CS_LEXICON.normalize_effort(piece)
+            if name and name ~= false and not seen[name] then
+                seen[name] = true
+                ladder[#ladder + 1] = { value = name, ["default"] = false }
+            end
+        end
+        if #ladder > 0 then card_for(pair[1]).reasoning_efforts = ladder end
     end
     -- 卡片级 tool use 声明的 env 层：model=true|false。缺省不设 = 一个卡片都不建，
     -- 行为与改动前逐字节一致（新开关缺省零行为变化）。只认严格的小写 true/false，
@@ -246,6 +269,24 @@ local function snapshot_of(cfg)
             default_effort = CS_LEXICON.nul(card.default_effort),
             effort_map = CS_LEXICON.arr(map),
             modalities = CS_LEXICON.nul(card.modalities),
+            -- 档位阶梯的往返（用户诉求 2026-10-08）：与旁边的三态字段同一条纪律 —— null =
+            -- 「清除回自动」（让位引擎自报），数组 = 操作员的结论。逐档重写而不是原样回吐
+            -- 表引用：磁盘上那份字节必须由 normalize 后的形状决定，否则手改进来的多余键会
+            -- 一路活到 /v1/models。空数组刻意保留（它编码成 []，读作「这台一个档位都不收」，
+            -- 是一句肯定答复），「自动」由 null 表达，两者不合并。
+            reasoning_efforts = card.reasoning_efforts == nil and CS_LEXICON.nul(nil) or (function ()
+                local rows = {}
+                for _, rung in ipairs(card.reasoning_efforts) do
+                    if type(rung) == "table" and type(rung.value) == "string" then
+                        rows[#rows + 1] = {
+                            value = rung.value,
+                            label = CS_LEXICON.nul(rung.label),
+                            ["default"] = rung["default"] == true,
+                        }
+                    end
+                end
+                return CS_LEXICON.arr(rows)
+            end)(),
             -- Tri-state: absent/null = "unknown" (nul renders the JSON null the editor
             -- round-trips as "leave alone"), false = the operator said no. The two must
             -- never merge on the way to disk, hence nul() rather than a bare field.
@@ -537,6 +578,31 @@ local function merge_model_patch(card, patch)
             else
                 return nil, string.format("%s must be a boolean or null", field)
             end
+        end
+    end
+
+    -- 档位阶梯（用户诉求 2026-10-08）：absent = leave alone，null = clear 回「自动」
+    -- （让位引擎自报），数组 = 操作员的结论、整条替换。与旁边的三态字段同一套写入语义，
+    -- 区别只在值形状：那份是真布尔，这份是阶梯表，所以判定交给 lexicon 的归一化器，
+    -- 它返回 false 表示「形状不对 / 有未知档位名」，当场 400 而不是悄悄丢档。
+    if rawget(patch, "reasoning_efforts") ~= nil then
+        local raw = patch.reasoning_efforts
+        if raw == JSON_NULL then
+            card.reasoning_efforts = nil
+        else
+            local ladder = CS_LEXICON.normalize_effort_ladder(raw)
+            if ladder == false or ladder == nil then
+                return nil, string.format(
+                    "reasoning_efforts must be an array of effort names or null (want one of %s)",
+                    CS_LEXICON.EFFORT_LEVELS_JOIN)
+            end
+            -- 空数组折回 nil（= 清除回自动），磁盘上不留 []：热路径上 card_ladder 对空表
+            -- 答的就是「没说」（旁边的 clean_effort_ladder / clean_string_list 同一口径 ——
+            -- 洗不出东西一律 nil，绝不报一份 [] 冒充「一个都不支持」这个肯定结论）。若这里
+            -- 把 [] 存下来，磁盘上是一份、对外读数是另一份（退回引擎自报），同一份配置两种
+            -- 说法；折成 nil 后「跟上游」只有一种拼法，管理台勾选框把全部取消折成 null 也与
+            -- 这里对齐（见 ui/admin/models.html saveCard）。
+            card.reasoning_efforts = #ladder > 0 and ladder or nil
         end
     end
     return true

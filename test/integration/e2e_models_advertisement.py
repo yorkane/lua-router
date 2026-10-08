@@ -381,6 +381,146 @@ def scenario_omission():
     stop(name)
 
 
+
+
+
+
+def get_json_cfg(port):
+    """GET /_ui/config -> (status, decoded document)."""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/_ui/config" % port)
+    if st != 200:
+        return st, None
+    try:
+        return st, json.loads(body)
+    except ValueError:
+        return st, None
+
+
+def row_of_models_document(cfg):
+    """{model: row} for the /_ui/config models section (one card per model)."""
+    out = {}
+    for entry in (cfg or {}).get("models", []):
+        if isinstance(entry, dict) and entry.get("model"):
+            out[entry["model"]] = entry
+    return out
+
+
+# ============================================ S12 卡片档位勾选（用户诉求 2026-10-08）
+def scenario_card_effort_ladder():
+    """探测到的档位进管理台面，操作员勾选的那份接管 /v1/models 的对外阶梯。
+
+    这份与 unit 的 G11 分工不同：G11 在配桩的 registry 上测判定，这份钉**真 HTTP 采集链**
+    ——档位必须真的从 mock 的 /v1/models 经 registry 探针落到 /_ui/config 的卡片行上
+    （那是勾选框唯一的基线来源），再证明勾选/取消过一遍 POST 之后对外字节真的变了。
+    接线错在这条链上的表现是「勾选框永远是空的」或「勾了但对外一个字没变」，两侧各一组
+    断言把它夹住。
+    """
+    tag = "S12-card-ladder"
+    pm = free_port()
+    start_mock_env(pm, "ladder-model", {"MODELS_RICH": "1"})
+    port, name, gw = start_conf({}, tag)
+    url = "http://%s:%d" % (gw, pm)
+    st, _ = post_worker(port, url, "ladder-model")
+    check("[%s] worker registered" % tag, st in (200, 202), str(st))
+    check("[%s] worker healthy" % tag, wait_healthy(port, [url]), logs(name)[:400])
+    check("[%s] 采集链路把能力送到了外表面" % tag, wait_caps(port, "ladder-model"), logs(name)[:400])
+
+    # ── 1. 探测：引擎原话同时出现在对外行与 /_ui/config 的卡片行上 ──
+    st, doc, raw = models_doc(port)
+    e = row(doc, "ladder-model") or {}
+    ladder = e.get("reasoning_efforts") or []
+    check("[%s] 未勾选时对外阶梯 = mock 报的 4 档" % tag,
+          [r.get("value") for r in ladder] == ["low", "medium", "high", "max"],
+          json.dumps(ladder)[:300])
+    check("[%s] 未勾选时判定面 = mock 亲口说的 3 档（不掺 medium）" % tag,
+          caps_of(e).get("reasoning_effort") == ["low", "high", "max"],
+          json.dumps(caps_of(e))[:300])
+    st, cfg = get_json_cfg(port)
+    card_row = None
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        card_row = (row_of_models_document(cfg) or {}).get("ladder-model")
+        if card_row and card_row.get("detected_reasoning_efforts"):
+            break
+        time.sleep(0.5)
+        st, cfg = get_json_cfg(port)
+    card_row = card_row or {}
+    detected = card_row.get("detected_reasoning_efforts")
+    check("[%s] /_ui/config 的卡片行带出**引擎原话**（勾选框的基线来源）" % tag,
+          isinstance(detected, list) and [r.get("value") for r in detected]
+          == ["low", "medium", "high", "max"], json.dumps(card_row)[:400])
+    check("[%s] 未勾过时卡片行的 reasoning_efforts 是 null（= 自动，不与[] 混）" % tag,
+          "reasoning_efforts" not in card_row or card_row["reasoning_efforts"] is None,
+          json.dumps(card_row.get("reasoning_efforts"))[:120])
+
+    # ── 2. 勾选：取消 medium、手动加引擎从没报过的 xhigh、预选挪到 high ──
+    st, doc = post_json(port, "/_ui/config/model",
+                        {"model": "ladder-model",
+                         "reasoning_efforts": [{"value": "low"}, {"value": "high", "default": True},
+                                               {"value": "xhigh"}]})
+    check("[%s] POST /_ui/config/model 带勾选表被接受" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
+    e = {}
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st, doc, raw = models_doc(port)
+        e = row(doc, "ladder-model") or {}
+        if [r.get("value") for r in (e.get("reasoning_efforts") or [])] == ["low", "high", "xhigh"]:
+            break
+        time.sleep(0.5)
+    ladder = e.get("reasoning_efforts") or []
+    check("[%s] 对外阶梯 = 勾选的那 3 档（顺序 = 勾选顺序）" % tag,
+          [r.get("value") for r in ladder] == ["low", "high", "xhigh"], json.dumps(ladder)[:300])
+    check("[%s] 勾选档位的 label 仍从引擎那份继承（取消勾选没毁掉别的字段）" % tag,
+          [r.get("label") for r in ladder] == ["Low Effort", "High Effort", None],
+          json.dumps(ladder)[:300])
+    check("[%s] 预选落在操作员标的 high（顶层 reasoning_effort 与它自洽）" % tag,
+          [r.get("value") for r in ladder if r.get("default") is True] == ["high"]
+          and e.get("reasoning_effort") == "high", json.dumps(e)[:300])
+    check("[%s] 判定面 = 引擎说过 ∩ 勾选：medium 与 max 都不在，xhigh 不被虚构进去" % tag,
+          caps_of(e).get("reasoning_effort") == ["low", "high"],
+          json.dumps(caps_of(e))[:300])
+    st, cfg = get_json_cfg(port)
+    saved = (row_of_models_document(cfg) or {}).get("ladder-model") or {}
+    check("[%s] 勾选表落进配置文档（下次打开对话框回显的是操作员说的）" % tag,
+          [r.get("value") for r in (saved.get("reasoning_efforts") or [])] == ["low", "high", "xhigh"],
+          json.dumps(saved)[:400])
+    check("[%s] 基线与声明分家：detected 仍是引擎那 4 档（不随勾选漂移）" % tag,
+          [r.get("value") for r in (saved.get("detected_reasoning_efforts") or [])]
+          == ["low", "medium", "high", "max"], json.dumps(saved)[:400])
+
+    # ── 3. 非法档位名整条拒绝，且不留下半截状态 ──
+    st, doc = post_json(port, "/_ui/config/model",
+                        {"model": "ladder-model", "reasoning_efforts": ["low", "turbo"]})
+    check("[%s] 未知档位名被 400 拒绝" % tag, st == 400, "%s %s" % (st, str(doc)[:200]))
+    st, doc, raw = models_doc(port)
+    e = row(doc, "ladder-model") or {}
+    check("[%s] 被拒的批次没改动对外阶梯（仍是我方勾过的 3 档）" % tag,
+          [r.get("value") for r in (e.get("reasoning_efforts") or [])] == ["low", "high", "xhigh"],
+          json.dumps(e.get("reasoning_efforts"))[:200])
+
+    # ── 4. 清除回自动：null 之后阶梯整份退回引擎原话 ──
+    st, doc = post_json(port, "/_ui/config/model",
+                        {"model": "ladder-model", "reasoning_efforts": None})
+    check("[%s] POST null 被接受（清除回自动）" % tag, st == 200, "%s %s" % (st, str(doc)[:200]))
+    e = {}
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st, doc, raw = models_doc(port)
+        e = row(doc, "ladder-model") or {}
+        if [r.get("value") for r in (e.get("reasoning_efforts") or [])] == ["low", "medium", "high", "max"]:
+            break
+        time.sleep(0.5)
+    ladder = e.get("reasoning_efforts") or []
+    check("[%s] 清除后阶梯退回引擎那 4 档（与勾选前逐字节同形）" % tag,
+          [r.get("value") for r in ladder] == ["low", "medium", "high", "max"],
+          json.dumps(ladder)[:300])
+    check("[%s] 清除后判定面回到引擎那 3 档（xhigh 从未真的被接受过）" % tag,
+          caps_of(e).get("reasoning_effort") == ["low", "high", "max"],
+          json.dumps(caps_of(e))[:300])
+    check_no_abort(tag, name)
+    stop(name)
+
+
 # ================================================== S4 config 声明压过引擎
 def scenario_config_priority():
     """操作员卡片的读数必须压过引擎自报，且引擎那个数在响应里一个字都不出现。"""
@@ -1127,6 +1267,7 @@ def main():
         scenario_capabilities(262144)
         scenario_omission()
         scenario_config_priority()
+        scenario_card_effort_ladder()
         scenario_virtual_entries()
         scenario_group_missing_reading()
     if _want("adv"):

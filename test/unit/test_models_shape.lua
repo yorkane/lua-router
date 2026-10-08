@@ -863,5 +863,183 @@ check("G10 同名重复别名不重复 id，且保留名册里第一条",
 caps_table = nil
 store_tbl = bare_store()
 
+do
+print("=== G11 卡片档位勾选：操作员勾选接管对外阶梯，判定面只跟引擎说过的（用户诉求 2026-10-08）===")
+-- legacy 红：老实现没有 card.reasoning_efforts 这一族，勾选表要么整个不被读（picker 仍是引擎
+-- 那 4 档）、要么判定面被勾选表顶掉。两条判别各自把一组断言染红。
+local function rung_values(ladder)
+    if type(ladder) ~= "table" then return nil end
+    local out = {}
+    for i = 1, #ladder do out[i] = ladder[i].value end
+    return table.concat(out, ",")
+end
+local function rung_labels(ladder)
+    if type(ladder) ~= "table" then return nil end
+    local out = {}
+    for i = 1, #ladder do out[i] = ladder[i].label or "-" end
+    return table.concat(out, ",")
+end
+local function card_store(ladder)
+    local s = bare_store()
+    s.current = function()
+        return {
+            model_configs = { ["kimi-code/k3"] = { reasoning_efforts = ladder } },
+            model_context_limit = {}, model_effort = {},
+        }
+    end
+    return s
+end
+-- 引擎那份（UPSTREAM_K3）：阶梯 low/medium/high/max（medium 带 default + 4 个 label），
+-- 判定面只 low/high/max。勾选表故意做三件事：删掉 medium、加进引擎从没报过的 xhigh、
+-- 把预选挪到 high。
+models_list = { "kimi-code/k3" }
+advertise_listing(listing_of(UPSTREAM_K3))
+local TICKED = {
+    { value = "low", ["default"] = false },
+    { value = "high", ["default"] = true },
+    { value = "max", ["default"] = false },
+    { value = "xhigh", ["default"] = false },
+}
+store_tbl = card_store(TICKED)
+local rep_t = M.models_handler()
+local e_t = rep_t.data[1]
+check("G11 required 四字段仍齐（多出来的只是扩展位）",
+      #missing_required(e_t) == 0, encode(missing_required(e_t)))
+check("G11 picker = 勾选的那 4 档（顺序 = 勾选顺序，medium 被取消后消失）",
+      rung_values(e_t.reasoning_efforts) == "low,high,max,xhigh",
+      tostring(rung_values(e_t.reasoning_efforts)))
+check("G11 勾选档位的 label 从引擎那份继承（一次勾选不毁掉别的字段）",
+      rung_labels(e_t.reasoning_efforts) == "Low Effort,High Effort,Max Effort,-",
+      tostring(rung_labels(e_t.reasoning_efforts)))
+do
+    local n, value = rung_default_marked(e_t)
+    check("G11 预选落在操作员标的 high 上（恰好一枚 default）",
+          n == 1 and value == "high", n .. " -> " .. tostring(value))
+    check("G11 顶层 reasoning_effort 与预选自洽", e_t.reasoning_effort == "high",
+          tostring(e_t.reasoning_effort))
+end
+-- 判定面：引擎说过 low/high/max，勾选把 medium 取消（本来就不在判定面里）、加的 xhigh
+-- 引擎从没说过 —— 所以判定面必须仍是 low,high,max 三个，**不许**冒出 xhigh。
+check("G11 判定面 = 引擎说过 ∩ 勾选（xhigh 只进 picker、不进判定面）",
+      join(read(e_t, "capabilities", "reasoning_effort")) == "low,high,max",
+      join(read(e_t, "capabilities", "reasoning_effort")))
+-- 取消到判定面之外：勾掉 max（引擎判定面里的那一档）→ 判定面剩 low,high。
+store_tbl = card_store({
+    { value = "low", ["default"] = false },
+    { value = "high", ["default"] = true },
+    { value = "xhigh", ["default"] = false },
+})
+local rep_cut = M.models_handler()
+check("G11 勾掉引擎判定面里的一档，判定面同步收窄",
+      join(read(rep_cut.data[1], "capabilities", "reasoning_effort")) == "low,high",
+      join(read(rep_cut.data[1], "capabilities", "reasoning_effort")))
+-- 只勾引擎从没报过的档位（引擎连判定面都没给）：判定面这时退到勾选序列 —— 与原来
+-- 「退到阶梯序列」同一支路，只是序列换成了操作员那份。
+local UP_BARE = {
+    id = "kimi-code/k3", object = "model", created = 1700000000, owned_by = "vendor",
+    capabilities = { context_length = 1000000 },
+}
+advertise_listing(listing_of(UP_BARE))
+store_tbl = card_store({
+    { value = "minimal", ["default"] = true },
+    { value = "ultra", ["default"] = false },
+})
+local rep_blind = M.models_handler()
+local e_blind = rep_blind.data[1]
+check("G11 引擎什么都没报时，勾选表就是 picker 的唯一来源",
+      rung_values(e_blind.reasoning_efforts) == "minimal,ultra",
+      tostring(rung_values(e_blind.reasoning_efforts)))
+check("G11 无引擎 label 可用时不编一个（整列都该没有 label）",
+      rung_labels(e_blind.reasoning_efforts) == "-,-",
+      tostring(rung_labels(e_blind.reasoning_efforts)))
+check("G11 勾选撑起 supports_reasoning_effort（原来两侧都沉默时该键是省略的）",
+      e_blind.supports_reasoning_effort == true, tostring(e_blind.supports_reasoning_effort))
+check("G11 引擎无判定面时判定面退到勾选序列（不虚构、也不误删）",
+      join(read(e_blind, "capabilities", "reasoning_effort")) == "minimal,ultra",
+      join(read(e_blind, "capabilities", "reasoning_effort")))
+-- 清除回自动：键不在（null 语义） → 整条阶梯退回引擎原话，与 G4 逐字节一致。
+advertise_listing(listing_of(UPSTREAM_K3))
+store_tbl = card_store(nil)
+local rep_auto = M.models_handler()
+local e_auto = rep_auto.data[1]
+check("G11 卡片没勾 = 跟随引擎：阶梯回到那 4 档（判别性：读不到勾选表也读不到声明）",
+      rung_values(e_auto.reasoning_efforts) == "low,medium,high,max",
+      tostring(rung_values(e_auto.reasoning_efforts)))
+check("G11 卡片没勾时判定面也不被收窄",
+      join(read(e_auto, "capabilities", "reasoning_effort")) == "low,high,max",
+      join(read(e_auto, "capabilities", "reasoning_effort")))
+do
+    local n = rung_default_marked(e_auto)
+    check("G11 引擎的预选（medium）在自动态下不被勾选手势影响", n == 1, n)
+end
+-- 勾选表与专职字段打架：default_effort 卡片位压过勾选表上的 default 标记（同一条陈述里
+-- 专职字段赢，与 model_scoped_effort 的既有优先级一致）。
+store_tbl = card_store(TICKED)
+store_tbl.current = function()
+    return {
+        model_configs = { ["kimi-code/k3"] = {
+            reasoning_efforts = TICKED, default_effort = "max",
+        } },
+        model_context_limit = {}, model_effort = {},
+    }
+end
+local rep_forced = M.models_handler()
+do
+    local n, value = rung_default_marked(rep_forced.data[1])
+    check("G11 卡片 default_effort 压过勾选表上的预选标记",
+          n == 1 and value == "max", n .. " -> " .. tostring(value))
+end
+-- 组内一台勾过一台没勾：入口行的阶梯按组内一致口径判 —— 不一致删键（宁可不报）。
+local UP_G1 = copy_table(UPSTREAM_K3); UP_G1.id = "g1"
+local UP_G2 = copy_table(UPSTREAM_K3); UP_G2.id = "g2"
+models_list = { "g1", "g2" }
+advertise_listing(listing_of(UP_G1, UP_G2))
+store_tbl = bare_store()
+store_tbl.virtual_models_list = function() return { { "grp-l", "g1", "g2" } } end
+store_tbl.current = function()
+    return {
+        model_configs = { g1 = { reasoning_efforts = {
+            { value = "low", ["default"] = true },
+            { value = "high", ["default"] = false },
+        } } },
+        model_context_limit = {}, model_effort = {},
+    }
+end
+local rep_grp = M.models_handler()
+local e_grp_row = find(rep_grp, "grp-l")
+check("G11 组内只有一台勾过 -> 入口行的 picker 删键（成员间口径不齐）",
+      rawget(e_grp_row, "reasoning_efforts") == nil,
+      encode(e_grp_row.reasoning_efforts or {}))
+check("G11 删键不牵连真实模型那一行（g1 自己仍如实报勾选结果）",
+      rung_values(find(rep_grp, "g1").reasoning_efforts) == "low,high",
+      tostring(rung_values(find(rep_grp, "g1").reasoning_efforts)))
+-- 两台勾同一份：入口行恢复，且恰好一个预选。
+store_tbl.current = function()
+    local cards = {}
+    for _, id in ipairs({ "g1", "g2" }) do
+        cards[id] = { reasoning_efforts = {
+            { value = "low", ["default"] = false },
+            { value = "high", ["default"] = true },
+        } }
+    end
+    return { model_configs = cards, model_context_limit = {}, model_effort = {} }
+end
+local rep_grp2 = M.models_handler()
+local e_grp2 = find(rep_grp2, "grp-l")
+check("G11 组内勾选一致 -> 入口行的 picker 用勾选表",
+      rung_values(e_grp2.reasoning_efforts) == "low,high",
+      tostring(rung_values(e_grp2.reasoning_efforts)))
+do
+    local n, value = rung_default_marked(e_grp2)
+    check("G11 入口行的预选唯一且落在勾选标的 high",
+          n == 1 and value == "high", n .. " -> " .. tostring(value))
+end
+check("G11 判定面按组内交集（勾掉的那档从整组判定面消失）",
+      join(read(e_grp2, "capabilities", "reasoning_effort")) == "low,high",
+      join(read(e_grp2, "capabilities", "reasoning_effort")))
+caps_table = nil
+store_tbl = bare_store()
+
+end
 print(string.format("\n%d checks, %d failed", checks, fails))
 os.exit(fails == 0 and 0 or 1)

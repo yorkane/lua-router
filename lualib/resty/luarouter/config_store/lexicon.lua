@@ -240,6 +240,80 @@ local function is_array(v)
     return #v > 0 or next(v) == nil
 end
 
+--- 操作员勾选的 reasoning_effort 档位表（用户诉求 2026-10-08：探测上游允许的档位，
+--- 并允许手动添加 / 取消）。**nil = 没说**（该维度让位给引擎自报），**false = 形状不对、
+--- 整条拒绝** ——与 normalize_effort 同一套「nil 沉默 / false 结论」的三态口径，调用方据此
+--- 措辞报错。放在 is_array 之后：这两个是文件内 local，写成前向引用会掉到全局上。
+---
+--- 接受两种拼写，归一成 registry 阶梯的同一形状 { {value, label?, default}, ... }：
+---   * 字符串数组 ["low","high","max"]（管理台勾选框发的就是这个）
+---   * 对象数组 [{value,label,default}, ...]（从 /v1/models 抄回来的那份）
+--- 归一成同一形状的意义：对外读数里「操作员说的」与「引擎自报的」在客户端不可区分，
+--- 客户端不必知道这个数字是谁给的，也无需为此分叉两套读法。
+---
+--- 逐条纪律：
+---   * 档位名一律过 normalize_effort，未知名字 = 整条拒绝而不是悄悄丢掉。勾选框的值来自
+---     词表，正常路径不会触发；这个拒绝是为手改 JSON 的操作员准备的——一个拼错的档位名
+---     会被客户端原样发给引擎并在那里 400，比保存失败难查得多。
+---   * 输入顺序原样保留，**不按词表排序**：阶梯是客户端 picker 的显示顺序，操作员勾选的
+---     先后就是他希望客户端看到的先后，替他重排等于改他的声明。
+---   * default 至多一个为真：多余的 true 改 false（输出面 apply_default_ladder_rung 也做
+---     同样收口，这里先收是为了让磁盘上那份字节本身自洽，往返不产生抖动）。
+---
+--- 本函数**保留**洗空的 {}（不塌成 nil）：它把「形状判定」与「这一族的三态语义」分开，
+--- 后者由唯一写入者 merge_model_patch 收口 —— 那里把空数组折回「没说」（见其注释）。
+--- 洗成 nil 会让「合法但为空」与「形状不对」两种输入在调用点再也分不开。
+---@param value any
+---@return table|false|nil
+function _M.normalize_effort_ladder(value)
+    if value == nil then return nil end
+    if not is_array(value) then return false end
+    local out, seen = {}, {}
+    local has_default = false
+    for i = 1, #value do
+        local raw = value[i]
+        local name, label, is_default
+        if type(raw) == "string" then
+            name = raw
+        elseif type(raw) == "table" then
+            name = raw.value or raw.name or raw.effort
+            if type(raw.label) == "string" then
+                local candidate = trim(raw.label)
+                if candidate ~= "" then label = candidate end
+            end
+            is_default = raw["default"] == true or raw.is_default == true
+        else
+            return false
+        end
+        if type(name) ~= "string" then return false end
+        local normalized = _M.normalize_effort(name)
+        if normalized == false or normalized == nil then return false end
+        if seen[normalized] then
+            -- 重复的名字带着 default 而已在表里的那份没带：把标记补到已有的那一档，
+            -- 而不是追加一条重复项。丢标记会让 picker 没有预选，补标记才是重排输入的本意。
+            if is_default and not has_default then
+                for j = 1, #out do
+                    if out[j].value == normalized then
+                        out[j]["default"] = true
+                        has_default = true
+                        break
+                    end
+                end
+            end
+        else
+            seen[normalized] = true
+            local rung = { value = normalized }
+            if label then rung.label = label end
+            if is_default and not has_default then
+                rung["default"] = true
+                has_default = true
+            end
+            out[#out + 1] = rung
+        end
+    end
+    return out
+end
+
 local function nul(value)
     if value == nil then return JSON_NULL end
     return value

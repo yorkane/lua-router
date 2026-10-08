@@ -19,6 +19,9 @@ _M.ENV_NAMES = {
     "SMG_POLICY",
     "LMR_DEFAULT_EFFORT", "LMR_EFFORT_MAP", "LMR_MODEL_CTX", "LMR_MODEL_EFFORT",
     "LMR_MODEL_EFFORT_MAP", "LMR_MODEL_MODALITIES", "LMR_VIRTUAL_MODELS",
+    -- 卡片级档位勾选（用户诉求 2026-10-08）。漏登记的名字会被 nginx 从 worker 环境里剥掉、
+    -- capture_env 也只按名册抓，现象是「配了但静默走未配置」（硬规则 11③）。
+    "LMR_MODEL_EFFORT_LEVELS",
     -- 声明进 ENV_NAMES 是硬要求：nginx 会把未声明的变量从 worker 环境里剥掉，
     -- 漏了这一行则 LMR_MODEL_CONTEXT_LIMIT 只在 master 里可见，worker 读到 nil。
     "LMR_MODEL_CONTEXT_LIMIT",

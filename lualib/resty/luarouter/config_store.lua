@@ -76,6 +76,7 @@ _M.snapshot_of = CS_SNAPSHOT.snapshot_of
 
 -- readers
 _M.card_supports_tool_use = CS_READERS.card_supports_tool_use
+_M.card_effort_ladder = CS_READERS.card_effort_ladder
 _M.ctx_cap = CS_READERS.ctx_cap
 _M.current = CS_READERS.current
 _M.entry_declaration = CS_READERS.entry_declaration

@@ -358,6 +358,19 @@
               <template v-slot:body-cell-ctx="props"><q-td :props="props"><span class="code-pill">{{ props.row.ctx === null || props.row.ctx === undefined ? t.previewNoCtx : props.row.ctx }}</span></q-td></template>
               <template v-slot:body-cell-context_limit="props"><q-td :props="props"><span class="code-pill" :class="{ muted: contextLimitText(props.row) === t.contextLimitUnknown }">{{ contextLimitText(props.row) }}</span></q-td></template>
               <template v-slot:body-cell-default_effort="props"><q-td :props="props"><span class="muted">{{ effortText(props.row.default_effort) }}</span></q-td></template>
+              <!-- 档位勾选列（用户诉求 2026-10-08）：只在卡片勾过时画 chip。null / 缺键 =
+                   「跟随上游」——引擎自己报的那份，操作员一个字都没动,这一格必须与「勾了但
+                   全部取消」(画一个空集合的橙色 chip) 分得开 -->
+              <template v-slot:body-cell-efforts="props">
+                <q-td :props="props">
+                  <div v-if="ladderCell(props.row)" class="route-cell" style="flex-wrap:wrap;gap:4px">
+                    <q-chip v-for="one in ladderCell(props.row).values" :key="props.row.model + '-' + one" dense size="12px"
+                            :color="ladderCell(props.row).detected.indexOf(one) >= 0 ? 'teal-4' : 'blue-4'" class="chip-soft">{{ one }}</q-chip>
+                    <q-badge v-if="!ladderCell(props.row).values.length" outline color="orange-4" class="chip-soft">{{ t.effortLadderDetectedNone }}</q-badge>
+                  </div>
+                  <span v-else class="muted">{{ t.effortLadderAutoChip }}</span>
+                </q-td>
+              </template>
               <template v-slot:body-cell-effort_map="props">
                 <q-td :props="props">
                   <div v-if="(props.row.effort_map || []).length" class="route-cell" style="flex-wrap:wrap;gap:4px">
@@ -445,6 +458,41 @@
                                     :options="modalityOptions" color="purple-4" dense></q-option-group>
                     <div class="muted" style="font-size:11px">{{ t.modalitiesHint }}</div>
                     <div class="muted" style="font-size:11px;margin-top:4px">{{ t.declarationDisclosure }}</div>
+                  </div>
+                  <!-- 档位勾选（用户诉求 2026-10-08）：探测到的档位画成基线 chip，勾选框决定
+                       对外的 reasoning_efforts。基线刻意取 registry 采到的**引擎原话**
+                       （models_document 的 detected_reasoning_efforts）而不是对外 /v1/models 的
+                       那份：后者一旦被勾就是勾选结果，拿它当基线会把操作员上一轮的勾选误读成
+                       引擎说的，取消勾选因此永远回不到引擎原始那一组。 -->
+                  <div>
+                    <div class="rows-head q-mb-xs">{{ t.effortLadderTitle }}
+                      <!-- 「恢复自动」只在操作员勾过时出现：没勾过时无事可做,画一个按钮反而
+                           暗示这一格有状态可清 -->
+                      <q-btn v-if="!cardForm.reasoning_efforts_auto" flat dense no-caps size="sm"
+                             class="secondary-button q-ml-sm" :label="t.effortLadderRestore"
+                             @click="restoreEffortLadder"></q-btn>
+                    </div>
+                    <div class="muted" style="font-size:11px;margin-bottom:4px">{{ effortLadderBaselineText }}</div>
+                    <!-- 基线 chip 行：把「上游说过哪些档」逐档画出来。勾选项可以超出这一组
+                         （手动添加的档位没有引擎读数）,所以两者要分开展现 —— 操作员一眼能看出
+                         哪几档是探测来的、哪几档是自己硬加的、哪几档被自己取消了。 -->
+                    <div class="route-cell" style="flex-wrap:wrap;gap:4px;margin-bottom:6px">
+                      <q-badge v-for="one in effortUniverse" :key="'ladder-' + one.value" outline dense
+                               :color="one.ticked ? (one.detected ? 'teal-4' : 'blue-4') : 'grey-6'"
+                               class="chip-soft">
+                        {{ one.value }}<span v-if="one.ticked && !one.detected" class="muted"> · {{ t.effortLadderManual }}</span><span v-if="!one.ticked && one.detected" class="muted"> · {{ t.effortLadderRemoved }}</span></q-badge>
+                      <span v-if="!effortUniverse.length" class="muted">{{ t.effortLadderDetectedNone }}</span>
+                    </div>
+                    <q-option-group v-model="cardForm.reasoning_efforts" type="checkbox" inline
+                                    :options="effortLadderOptions" color="primary" dense
+                                    @update:model-value="onEffortToggles"></q-option-group>
+                    <div v-if="!cardForm.reasoning_efforts_auto && cardForm.reasoning_efforts.length"
+                         class="row-edit" style="margin-top:6px">
+                        <q-select v-model="cardForm.reasoning_effort_default" dense outlined dark
+                                  :options="effortLadderPickOptions" map-options emit-value clearable
+                                  :label="t.effortLadderSetDefault"></q-select>
+                    </div>
+                    <div class="muted" style="font-size:11px">{{ t.effortLadderDisclosure }}</div>
                   </div>
                 </div>
               </q-card-section>
@@ -722,7 +770,14 @@
         const cardForm = reactive({
           model: '', ctx: '', context_limit: '', default_effort: null, effort_map: [], modalities: [],
           supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
-          supports_vision: null, supports_reasoning_effort: null
+          supports_vision: null, supports_reasoning_effort: null,
+          // 档位勾选（用户诉求 2026-10-08）。三态刻意用**两个**字段而不是一个数组：
+          //   reasoning_efforts_auto = true  → 这张卡从没勾过（键不在 / null），对外跟随引擎
+          //   reasoning_efforts_auto = false → 操作员的结论，数组就是勾选集合（可为空数组，
+          //                                    那是「一个都不给」这句肯定话，与上一档必须可分）
+          // reasoning_effort_default 是勾选集合里的预选档（至多一个），null = 由引擎自报决定
+          reasoning_efforts: [], reasoning_efforts_auto: true, detected_efforts: [],
+          reasoning_effort_default: null
         })
         const preview = reactive({ model: '', effort: null, modelFilter: '' })
         const filteredModelOptions = ref([])
@@ -849,6 +904,9 @@
           { name: 'ctx', label: t.value.colCtx, field: 'ctx', align: 'left', sortable: true, style: 'width:120px' },
           { name: 'context_limit', label: t.value.colContextLimit, field: 'contextLimit', align: 'left', sortable: true, style: 'width:120px' },
           { name: 'default_effort', label: t.value.colDefaultEffort, field: 'default_effort', align: 'left', style: 'width:120px' },
+          // 档位勾选列：只在卡片勾过时画 chip，未勾过写「跟随上游」——操作员扫一眼就能
+          // 分清「这台是引擎自己报的档位」与「有人手动改过档位」
+          { name: 'efforts', label: tv('effortLadderTitle'), field: 'reasoning_efforts', align: 'left', style: 'width:170px' },
           { name: 'effort_map', label: t.value.colCardMap, field: 'effort_map', align: 'left' },
           { name: 'modalities', label: t.value.colModalities, field: 'modalities', align: 'left', style: 'width:150px' },
           { name: 'tool_use', label: t.value.colToolUse, field: 'supports_tool_use', align: 'left', style: 'width:110px' },
@@ -1718,7 +1776,15 @@
             supports_reasoning: typeof row.supports_reasoning === 'boolean' ? row.supports_reasoning : null,
             supports_vision: typeof row.supports_vision === 'boolean' ? row.supports_vision : null,
             supports_reasoning_effort: typeof row.supports_reasoning_effort === 'boolean'
-              ? row.supports_reasoning_effort : null
+              ? row.supports_reasoning_effort : null,
+            // 档位勾选的回显：这张卡没勾过 → 自动态，勾选框里铺的是**引擎原话**（基线，
+            // 显示为已勾）——操作员于是能直接在探测结果上做加减；勾消任意一个就转成手动态。
+            // 卡片勾过 → 手动态，画的就是操作员保存的那一份（包括他手动加的引擎没报的档）。
+            detected_efforts: detectedLadder(row),
+            reasoning_efforts_auto: !declaredLadder(row) || !declaredLadder(row).length,
+            reasoning_efforts: declaredLadder(row) && declaredLadder(row).length
+              ? declaredLadder(row) : detectedLadder(row),
+            reasoning_effort_default: declaredLadderDefault(row)
           })
           cardOpen.value = true
         }
@@ -1738,6 +1804,86 @@
         function contextLimitText (row) {
           const one = contextLimitOf(row && row.model)
           return one === null ? t.value.contextLimitUnknown : String(one)
+        }
+
+        // ── 档位勾选（用户诉求 2026-10-08）────────────────────────────────
+        // 三份读数各管一件事，彼此不可互换：
+        //   detected = registry 采到的**引擎原话**（models_document.detected_reasoning_efforts）
+        //   declared = 这张卡的勾选结果（models_document.reasoning_efforts，null = 从没勾过）
+        //   对外     = /v1/models 合成后的那份（勾过 = 勾选结果，没勾 = 引擎原话）
+        // 表单基线只用 detected。把对外那份当基线会让「取消一个勾」变成不可能：上一轮保存的
+        // 勾选会伪装成引擎的读数回来，操作员看到的"上游说的"其实是他自己上次的决定。
+        const EFFORT_CANONICAL = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+        function ladderNames (raw) {
+          if (!Array.isArray(raw)) return null // null / 缺键 = 「没说」
+          return raw.map(one => (typeof one === 'string' ? one : one && one.value)).filter(Boolean)
+        }
+        function declaredLadder (row) { return ladderNames(row && row.reasoning_efforts) }
+        function detectedLadder (row) { return ladderNames(row && row.detected_reasoning_efforts) || [] }
+        function declaredLadderDefault (row) {
+          const raw = row && row.reasoning_efforts
+          if (!Array.isArray(raw)) return null
+          const hit = raw.find(one => one && typeof one === 'object'
+            && (one.default === true || one.is_default === true))
+          return hit && hit.value ? hit.value : null
+        }
+        // 勾选框的候选全集 = 引擎报过的 ∪ 这张卡勾过的 ∪ 整个词表。「允许手动添加」就是要
+        // 让欠配置的上游被网关侧补齐：引擎没报 xhigh 也能勾上它。词表那部分是固定顺序，
+        // 所以界面稳定；勾选集合自身的顺序在保存时按点选顺序原样带上（后端不按词表重排）。
+        function effortUniverseOf (detected, declared) {
+          const all = [...new Set([...(detected || []), ...(declared || []), ...EFFORT_CANONICAL])]
+          return all.map(value => ({
+            value,
+            detected: (detected || []).indexOf(value) >= 0,
+            ticked: (declared || []).indexOf(value) >= 0
+          }))
+        }
+        // chip 行的 ticked 一律读**当前勾选模型**，而不是自动态标志：自动态下模型里铺的就是
+        // 引擎原话（openCard 把 detected 铺进去当基线），此时把每一档标成「已取消」是谎话 ——
+        // 操作员什么都没动。读模型让 chip 与勾选框恒等：勾着的没后缀，被取消的才显灰 +
+        // 「已取消」，手动加的显蓝 + 「已手动添加」。
+        const effortUniverse = computed(() => effortUniverseOf(
+          cardForm.detected_efforts, cardForm.reasoning_efforts))
+        // 手动添加的档位（引擎没报）在标签上带一个 +，与探测来的那一档区分开
+        const effortLadderOptions = computed(() => effortUniverse.value.map(one => ({
+          label: one.detected ? one.value : one.value + ' +', value: one.value
+        })))
+        const effortLadderPickOptions = computed(() => (cardForm.reasoning_efforts || [])
+          .map(value => ({ label: value, value })))
+        const effortLadderBaselineText = computed(() => {
+          const n = (cardForm.detected_efforts || []).length
+          return tv('effortLadderCopy', {
+            detected: n ? tv('effortLadderDetected', { n }) : tv('effortLadderDetectedNone')
+          })
+        })
+        // 表格那一列：null = 跟随上游（灰字，操作员一个字没动）；数组 = 勾过的集合，
+        // 空集合画成橙色「一个都没有」，两者必须一眼可分
+        function ladderCell (row) {
+          const declared = declaredLadder(row)
+          if (declared === null) return null
+          return { values: declared, detected: detectedLadder(row) }
+        }
+        function restoreEffortLadder () {
+          cardForm.reasoning_efforts_auto = true
+          // 恢复自动 = 回到基线（引擎原话显示为已勾,但保存时整份发 null），
+          // 不是把勾选框清空 —— 清空会让界面读成「操作员说要零档位」，而那正是自动态要否掉的说法
+          cardForm.reasoning_efforts = (cardForm.detected_efforts || []).slice()
+          cardForm.reasoning_effort_default = null
+        }
+        // 任何一次勾选变化都算「操作员说了话」（包括把最后一档取消）,所以自动态立刻关掉;
+        // 随后收一次预选档（见 syncEffortDefault 的理由）。
+        function onEffortToggles () {
+          cardForm.reasoning_efforts_auto = false
+          syncEffortDefault()
+        }
+        // 勾选集合的读写：checkbox 组只给「有哪些档」，预选档由旁边那个下拉单独表达。
+        // 取消预选所在的那一档时把预选一起清掉——留下一枚指向不在表里的档位，后端会照它的
+        // 收口规则挑别的档，界面上却还写着操作员选的那个，两处不一致。
+        function syncEffortDefault () {
+          if (cardForm.reasoning_effort_default
+            && (cardForm.reasoning_efforts || []).indexOf(cardForm.reasoning_effort_default) < 0) {
+            cardForm.reasoning_effort_default = null
+          }
         }
 
         async function saveCard () {
@@ -1762,7 +1908,22 @@
             supports_vision: (cardForm.supports_vision === true || cardForm.supports_vision === false)
               ? cardForm.supports_vision : null,
             supports_reasoning_effort: (cardForm.supports_reasoning_effort === true || cardForm.supports_reasoning_effort === false)
-              ? cardForm.supports_reasoning_effort : null
+              ? cardForm.supports_reasoning_effort : null,
+            // 档位勾选（用户诉求 2026-10-08）。null = 「清除回自动」：键删掉，对外读数退回
+            // 引擎自报；数组 = 操作员的结论，逐档带 default 标记（后端 normalize_effort_ladder
+            // 认对象数组，至多保留一个 default=true）。
+            //
+            // 空数组刻意折成 null：「把勾全消掉」与「从没勾过」在对外读数上是同一件事（都退回
+            // 引擎那份），存成 [] 只会多一份字节不同、行为相同的配置，还会让下次打开对话框时
+            // 「勾选框空着」与「跟随上游」两种说法互相打架。要在对外报「一个都不收」的操作员
+            // 走 JSON 面显式写 []（后端保留那份语义，见 lexicon.normalize_effort_ladder）。
+            reasoning_efforts: cardForm.reasoning_efforts_auto ? null : (cardForm.reasoning_efforts || [])
+              .map(value => ({
+                value,
+                // 整条阶梯是**一次写入**（后端 array = 替换），所以 default 标记天然跟着集合走：
+                // 清空预选下拉 = 所有 rung 的 default 都是 false，不需要额外的清除字段
+                default: value === cardForm.reasoning_effort_default
+              })),
           }
           const ok = await mutate(() => window.lmrApi.configModel(patch), 'cardSaved', { model: cardForm.model })
           if (ok) cardOpen.value = false
@@ -2160,6 +2321,10 @@
           // capSummary/capSummaryEmpty，漏一项就是那块 UI 静默消失（模板用 with(_ctx) 解析，
           // 编译期不报错；本项目这个坑踩过三次）
           cjText, capSummary, capSummaryEmpty,
+          // 档位勾选（用户诉求 2026-10-08）：模板引用的每一项都必须导出，漏一项就是那块 UI
+          // 静默消失（本页这个坑踩过三次——模板用 with(_ctx) 解析，编译期不报错）
+          effortUniverse, effortLadderOptions, effortLadderPickOptions, effortLadderBaselineText,
+          ladderCell, restoreEffortLadder, onEffortToggles,
           doc, effortOptions, effortText, filterModelOptions, load,
           loading, loadError, modelOptionLabel, modelOptions, modalityOptions,
           // 预览下拉的 :options 绑到它自己：模板用 with(_ctx) 解析，漏一项就是运行期 undefined，
