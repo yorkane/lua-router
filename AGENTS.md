@@ -13,9 +13,9 @@
    整组里选路，逐实例的 `candidates` 绑定名必须落在组内、否则 400，转发体的 model 用选中候选的
    绑定名；条目级只允许 `context_window` 一个覆盖字段——它是**对外声明的上下文总窗口（输入+输出）**，
    作用只是让客户端更早触发压缩，**不参与任何 max_tokens 计算**（用户裁定 2026-10-04，见本节末），
-   网关也不做任何条目级的输出预算改写），以及每服务并发/功率上限
-   （`max_concurrency` / `max_power_w` 在 `router.candidates_for` 装配候选时**硬排除**，即使 cache_aware
-   亲和命中也迁走；**功率读数未知 → 不排除**）。两者都刻意做到 `policies/` 零改动，口径见
+   网关也不做任何条目级的输出预算改写），以及每服务并发/利用率上限
+   （`max_concurrency` / `max_gpu_util` 在 `router.candidates_for` 装配候选时**硬排除**，即使 cache_aware
+   亲和命中也迁走；**GPU 利用率读数未知 → 不排除**；功率/瓦特一族已于 2026-10-09 整体移除）。两者都刻意做到 `policies/` 零改动，口径见
    doc/gap-worker-caps.md 与 doc/gap-virtual-models.md §1–§4。
 2. **覆盖与弥补下游请求的配置**：网关侧对请求做顶层改写与补齐（入口名解析成落点的实际模型名、
    effort 卡片、`stream_options`），让不完美或欠配置的
