@@ -432,6 +432,65 @@ function _M.util_fraction(value)
     return util
 end
 
+---Shared per-card reduce for one /metrics exposition (the metrics path's two
+---card scans: GPU utilization and load).
+---
+---同一次正文、同一套样本切分与 gpu 标签口径（只认纯数字 "0".."7"）。两条通道唯一的
+---差别是**筛子**，所以它是以函数形参传进来的：准入门（gu:）过 util_fraction()，打分
+---（xl:）过 normalize()。筛子在调用点现查 _M（而不是抓局部值），单测因此仍然可以 stub
+---gpu_load.util_fraction / gpu_load.normalize 来钉行为，与重构前一致。
+---@param text string|nil @ the exposition body
+---@param names table[]|string|nil @ gauge names to keep
+---@param screen fun(value: string|number|nil): number|nil @ usability + 0..1 normalisation
+---@param default_keys string[] @ roster used when names resolves to nothing
+---@return number|nil whole @ hottest card on the machine, 0..1
+---@return table @ by_card @ gpu id -> 0..1
+---@return boolean @ have_cards @ any usable series named a card
+local function gauge_by_card(text, names, screen, default_keys)
+    local whole, by_card, have_cards = nil, {}, false
+    if type(text) ~= "string" or text == "" then
+        return whole, by_card, have_cards
+    end
+    local wanted = {}
+    local list = _M.metric_key_list(names)
+    if #list == 0 then
+        list = _M.metric_key_list(default_keys)
+    end
+    for i = 1, #list do
+        wanted[list[i]] = true
+    end
+    for line in string.gmatch(text, "[^\r\n]+") do
+        if string.byte(line, 1) ~= 35 then
+            local identity, value_text, labelled = split_sample(line)
+            local name = canon(identity)
+            if name and wanted[name] then
+                local value = screen(value_text)
+                if value then
+                    if whole == nil or value > whole then
+                        whole = value
+                    end
+                    local labels = _M.parse_labels(labelled)
+                    local raw = labels and labels.gpu
+                    local gpu = nil
+                    if type(raw) == "string" or type(raw) == "number" then
+                        local t = string.match(tostring(raw), "^%s*(.-)%s*$")
+                        if t and string.match(t, "^%d+$") then
+                            gpu = t
+                        end
+                    end
+                    if gpu then
+                        have_cards = true
+                        if by_card[gpu] == nil or value > by_card[gpu] then
+                            by_card[gpu] = value
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return whole, by_card, have_cards
+end
+
 ---Per-card **utilization** readings for one /metrics exposition (the metrics
 ---path's util scan).
 ---
@@ -445,48 +504,28 @@ end
 ---@return table @ by_card @ gpu id -> 0..1
 ---@return boolean @ have_cards @ any usable series named a card
 function _M.util_by_card(text, names)
-    local whole, by_card, have_cards = nil, {}, false
-    if type(text) ~= "string" or text == "" then
-        return whole, by_card, have_cards
-    end
-    local wanted = {}
-    local list = _M.metric_key_list(names)
-    if #list == 0 then
-        list = _M.metric_key_list(DEFAULT_UTIL_METRIC_KEYS)
-    end
-    for i = 1, #list do
-        wanted[list[i]] = true
-    end
-    for line in string.gmatch(text, "[^\r\n]+") do
-        if string.byte(line, 1) ~= 35 then
-            local identity, value_text, labelled = split_sample(line)
-            local name = canon(identity)
-            if name and wanted[name] then
-                local util = _M.util_fraction(value_text)
-                if util then
-                    if whole == nil or util > whole then
-                        whole = util
-                    end
-                    local labels = _M.parse_labels(labelled)
-                    local raw = labels and labels.gpu
-                    local gpu = nil
-                    if type(raw) == "string" or type(raw) == "number" then
-                        local t = string.match(tostring(raw), "^%s*(.-)%s*$")
-                        if t and string.match(t, "^%d+$") then
-                            gpu = t
-                        end
-                    end
-                    if gpu then
-                        have_cards = true
-                        if by_card[gpu] == nil or util > by_card[gpu] then
-                            by_card[gpu] = util
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return whole, by_card, have_cards
+    return gauge_by_card(text, names, function(value)
+        return _M.util_fraction(value)
+    end, DEFAULT_UTIL_METRIC_KEYS)
+end
+
+---Per-card **load** readings for one /metrics exposition: the metrics path's
+---per-card counterpart of max_gauge(), the scoring channel's own逐卡归属.
+---
+---筛子是 normalize()（打分启发式：>1 当百分数、越界夹到 1、负数→nil），名册默认
+---**负载**名册 DEFAULT_METRIC_KEYS，与 max_gauge() 同一份（含 KV-cache 用量名）——
+---逐卡与整机必须读同一批 gauge，否则「本卡」与「回退值」量的是两个东西。整机口径
+---刻意不在这里给：runpass 的回退值仍是今天的 max_gauge() + normalize()（先取原始最大
+---值再归一），一份正文里不留第二个「整机 max」的定义，逐卡只是对它的精化。
+---@param text string|nil @ the exposition body
+---@param names table[]|string|nil @ gauge names to keep (default DEFAULT_METRIC_KEYS)
+---@return table @ by_card @ gpu id -> 0..1 (empty unless the body named cards)
+---@return boolean @ have_cards @ any usable series named a card
+function _M.load_by_card(text, names)
+    local _, by_card, have_cards = gauge_by_card(text, names, function(value)
+        return _M.normalize(value)
+    end, DEFAULT_METRIC_KEYS)
+    return by_card, have_cards
 end
 
 ---Split the label portion out of one sample identity ("name{k=\"v\"}").

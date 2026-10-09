@@ -21,6 +21,16 @@ local function new_stats(cfg)
     return {
         source = cfg.load_source or "none", probed = 0, matched = 0,
         failed = 0, unmatched = 0, skipped = 0, errors = 0,
+        -- 负载打分通道（registry 的 xl: 键 / lr_gpu_load{worker=} 一族）的逐卡覆盖率。
+        -- 与下面 util_per_card / util_fallback 同形的理由：只有 matched 一个数时，
+        -- 「八台各归各卡」与「八台共用一个整机 max」在 /metrics 上完全同形——21.k 生产
+        -- 8800 的 342.371 就是这么没被看见的：GPU7 忙到 100 % 时八条 lr_gpu_load{worker=}
+        -- 全读成 1，因为 prom 路按 host 折叠、而 SMG_LOAD_PROM_QUERY 把 gpu 标签聚合掉了。
+        -- load_per_card = 本 pass 真正按自己那张卡拿到负载读数的台数，load_fallback =
+        -- 骑在整机最热值上的台数（源无逐卡标签、worker 认不出卡、该卡无 series 三种情形
+        -- 合并计入，与 util 族同一口径）。两者并排读就是覆盖率；回退是**允许**的（打分
+        -- 侧的保守方向，见 cards.lua assign_load 上方），允许而不显形就是复刻那次故障。
+        load_per_card = 0, load_fallback = 0,
         -- GPU 利用率通道（doc/caps-redesign-2026-10-06.md §5，registry 的 gu: 键）的独立
         -- 计数：probed = metrics 路「正文可用并被扫过」的 worker 数 /
         -- prom 路「成功执行的利用率查询」数；matched = 真正写进 gu: 的读数数；failed =
@@ -39,6 +49,14 @@ local function new_stats(cfg)
     }
 end
 
+---One prom-path **load** query (the first PromQL, SMG_LOAD_PROM_QUERY).
+---
+---数值走 normalize()（经由 host_card_loads 的负载筛子），而不是利用率那一路的
+---util_fraction()：这是打分与准入的口径差别，不是笔误——lr_gpu_load 的既有归一语义
+---（>1 当百分数、越界夹到 1、负数→nil）必须逐字不变，所以折叠只是从 host_values()
+---换成同一条 vector 的逐卡展开，机器/卡的身份规则由 cards.lua 的 util_fold 单点持有。
+---逐卡表与逐卡源标记各归各的字段（by_card_load / load_card_hosts），与利用率那一路
+---完全对称。
 local function one(ctx, query, target)
             local ok_call, status, body, err = pcall(ctx.post, ctx.endpoint, ctx.timeout_ms,
                 ctx.headers, _M.query_body(query))
@@ -60,11 +78,23 @@ local function one(ctx, query, target)
                 _M.warn_dedup("prom", target, perr, ctx.stamp())
                 return
             end
-            local folded = _M.host_values(rows)
+            -- 逐卡展开（机器/卡的身份规则见 cards.lua 的 util_fold 上方；负载侧的筛子
+            -- 是 normalize()，所以整机那张表与改动前的 host_values() 同值）。
+            local folded, cards, card_hosts_of_query = _M.host_card_loads(rows, true)
             for host, load in pairs(folded) do
                 if ctx.by_host[host] == nil or load > ctx.by_host[host] then
                     ctx.by_host[host] = load
                 end
+            end
+            for key, load in pairs(cards) do
+                -- {host} 模板会发多条查询，同一个 host+gpu 键取最大：与 host 键同做法，
+                -- 也保证结果与查询到达顺序无关（同一份输入跑两遍必须逐字节相同）。
+                if ctx.by_card_load[key] == nil or load > ctx.by_card_load[key] then
+                    ctx.by_card_load[key] = load
+                end
+            end
+            for host in pairs(card_hosts_of_query) do
+                ctx.load_card_hosts[host] = true
             end
             ctx.stats.probed = ctx.stats.probed + 1
         end
@@ -178,6 +208,56 @@ local function scan_util_metrics(ctx)
     else
         stats.util_errors = stats.util_errors + 1
     end
+end
+
+---Refine a worker's whole-machine load reading with the reading of its own card.
+---
+---The metrics-path shape of the four-way rule.  The rule itself is not repeated
+---here: the body's per-card readings are handed to cards.assign_load() in the shape
+---it expects (a host-keyed whole-machine map plus card_key'd readings), so the
+---attribution has exactly one owner for both sources -- the prom side asks it about
+---the whole pool, this side asks it about one worker and one exposition.
+---
+---Returns (load, per_card): per_card true = the worker's own card series was used,
+---false = the whole-machine value it always got.  The whole-machine value is **never**
+---recomputed here -- it is the caller's max_gauge()+normalize(), passed through and
+---returned verbatim whenever the card cannot be used, so a body with no gpu labels
+---(or a worker whose card cannot be resolved) is byte-identical to before and merely
+---visible through lr_gpu_load_fallback_total.
+---
+---A url that will not name a host skips the attribution step rather than asking
+---assign_load about it: that function keys everything through split_host, so it
+---would answer "no reading" for a record the metrics path has always sampled without
+---needing the host at all. The whole-machine value is what such a worker gets, today
+---and after.
+---@param record table @ the worker record
+---@param body string @ the exposition already fetched
+---@param names table[]|string|nil @ the load roster (same as max_gauge's)
+---@param hints table|nil @ hint_index (compiled once per pass)
+---@param whole number @ the caller's whole-machine reading (0..1); the fallback value
+---@return number|nil load, boolean per_card
+local function load_for_worker(record, body, names, hints, whole)
+    local host = record and _M.split_host(record.url)
+    if host == nil or whole == nil then
+        return whole, false
+    end
+    local by_card, have_cards = _M.load_by_card(body, names)
+    if not have_cards then
+        -- 源根本没有逐卡标签（llama.cpp 的一行 gauge、一个 by(Hostname) 的 exporter）：
+        -- 整机口径就是它的正常口径，逐字节返回调用者那个数。
+        return whole, false
+    end
+    local cards = {}
+    for gpu, value in pairs(by_card) do
+        cards[_M.card_key(host, gpu)] = value
+    end
+    local assigned, _, per_card = _M.assign_load(
+        { record }, { [host] = whole }, cards, true, hints)
+    local own = assigned and assigned[record.id]
+    if own ~= nil and per_card == 1 then
+        return own, true
+    end
+    return whole, false
 end
 
 ---Prom-path utilization channel: query (deduped), fold, assign, write.
@@ -379,6 +459,25 @@ function _M.run_pass(cfg, opts)
                         _M.warn_dedup("metrics-nogauge", record.url,
                             "no gauge in " .. #body .. "B", stamp())
                     else
+                        -- 逐卡精化（打分侧的 assign_load 对应物，四路口径见 cards.lua）：
+                        -- 同一份正文里 worker 自己那张卡有可用 series 时写本卡值，否则
+                        -- **原样**写上面那个整机 max——回退值逐字节就是今天写进 xl: 的那个数，
+                        -- 所以一个没有 gpu 标签的 exporter（或认不出卡的 worker）看到的仍是
+                        -- 改动前的行为，差别只在 lr_gpu_load_fallback_total 会诚实地把它数出来。
+                        -- 整个精化包在 pcall 里：它出我们没预料的错，代价只能是退回整机值，
+                        -- 不能带走这一 tick 的负载读数。
+                        local ok_card, own, hit = pcall(load_for_worker, record, body,
+                            names, hints, load)
+                        if ok_card and hit and type(own) == "number" then
+                            load = own
+                            stats.load_per_card = stats.load_per_card + 1
+                        else
+                            if not ok_card then
+                                _M.warn_dedup("load-card-crash", record.url,
+                                    tostring(own), stamp())
+                            end
+                            stats.load_fallback = stats.load_fallback + 1
+                        end
                         write(record.id, load, stamp(), ttl_secs, record.url)
                         stats.matched = stats.matched + 1
                     end
@@ -430,27 +529,34 @@ function _M.run_pass(cfg, opts)
         end
         local has_load_query = type(template) == "string" and template ~= ""
         local headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }
+        -- 卡号快照（watcher 台账 g| 键）编一次成查找索引，负载与利用率两路共用同一份：
+        -- 一次 pass 读一次共享字典，worker 循环里只查不编。opts.gpu_hints 是测试注入面。
+        local raw_hints = opts.gpu_hints
+        if raw_hints == nil then
+            raw_hints = seams.default_gpu_hints()
+        end
+        local card_hints = _M.hint_index(raw_hints)
         local prom_ctx = {
             post = post, endpoint = endpoint, timeout_ms = timeout_ms,
             headers = headers, stats = stats,
             by_host = {},
+            -- 负载通道的逐卡表与逐卡源标记（与利用率那一路对称）。by_host 保持它一直
+            -- 以来的含义（整机最热），逐卡表只是精化；load_card_hosts 记录「这个 host
+            -- 的 vector 真的带了 gpu 标签」，assign_load 据此决定走逐卡还是整机口径。
+            by_card_load = {}, load_card_hosts = {},
             -- 利用率通道的独立表（第二条查询自己的 vector / 逐卡表 / 逐卡源标记），
             -- 以及它需要的 worker 名册、卡号提示快照与写 seam。两通道共用一次 pass 的
             -- ctx 容器但各用各的字段，一个通道的表读写不到另一个通道的账上。
             by_util = {}, by_card_util = {}, util_card_hosts = {},
             stamp = stamp,
             workers = workers, util = util, write_util = write_util,
+            gpu_hints = card_hints,
         }
 
         -- 利用率这一路（第二条查询）。整段包在 pcall 里：一个 tick 里两通道互不影响，
         -- util 采集出任何我们没预料的错，代价只能是 util 自己的读数，不能拖垮已经
         -- 跑完的负载 vector。
         if stats.util_enabled and util.query then
-            local u_hints = opts.gpu_hints
-            if u_hints == nil then
-                u_hints = seams.default_gpu_hints()
-            end
-            prom_ctx.gpu_hints = _M.hint_index(u_hints)
             local ok_util, err_util = pcall(run_util_prom, prom_ctx)
             if not ok_util then
                 stats.util_errors = (stats.util_errors or 0) + 1
@@ -478,7 +584,18 @@ function _M.run_pass(cfg, opts)
                         one(prom_ctx, query, record.url)
                     end
                     local host = _M.split_host(record.url)
-                    local load = host and prom_ctx.by_host[host]
+                    -- 逐卡分发同一条四路规则（cards.assign_load 是唯一持有者）：这一支按
+                    -- 机器展开查询，一份 vector 只属一台机器，所以拿单元素 worker 表去问一次
+                    -- 「这台 worker 该用哪个数」，matched / 写入口径与原来的
+                    -- 「by_host[host] 直取」逐字节一致（本卡没有 series 时回退值就是它），
+                    -- 多的只是把逐卡命中与回退如实计进 stats。unmatched 刻意不从这里取：
+                    -- 按机器展开时未匹配的 host 就是这台机器自己，原来不计，现在也不计。
+                    local assigned_one, _, l_pc, l_fb = _M.assign_load(
+                        { record }, prom_ctx.by_host, prom_ctx.by_card_load,
+                        prom_ctx.load_card_hosts, card_hints)
+                    stats.load_per_card = stats.load_per_card + l_pc
+                    stats.load_fallback = stats.load_fallback + l_fb
+                    local load = host and assigned_one[record.id]
                     if load ~= nil then
                         write(record.id, load, stamp(), ttl_secs, record.url)
                         stats.matched = stats.matched + 1
@@ -493,8 +610,16 @@ function _M.run_pass(cfg, opts)
             for i = 1, #workers do
                 url_for_id[workers[i].id] = workers[i].url
             end
-            local assigned, unmatched = _M.assign(prom_ctx.by_host, workers)
+            -- 按 worker 各自的卡分发（四路口径见 cards.lua 的 assign_load 上方注释）。
+            -- 逐卡命中数与回退数由 assign_load 一并给出，不在这里二次推断——同一件事
+            -- 在两处算只会长出口径分歧。source_has_cards 用的是**源**的逐卡标记
+            -- （load_card_hosts 集合），一台机器的监控形状不该关掉另一台机器的通道。
+            local assigned, unmatched, l_per_card, l_fallback = _M.assign_load(
+                workers, prom_ctx.by_host, prom_ctx.by_card_load,
+                prom_ctx.load_card_hosts, card_hints)
             stats.unmatched = unmatched
+            stats.load_per_card = l_per_card
+            stats.load_fallback = l_fallback
             for id, load in pairs(assigned) do
                 write(id, load, stamp(), ttl_secs, url_for_id[id])
                 stats.matched = stats.matched + 1

@@ -1356,6 +1356,297 @@ end
 end
 util_cases()
 
+--------------------------------------------------------------------------
+-- 17. 负载打分通道的逐卡归属（21.k 生产 8800 的 342.371 修复）
+--------------------------------------------------------------------------
+local function load_card_cases()
+-- UWORKERS / SEP live inside util_cases(); this block needs its own copies.
+local LWK = {
+    { id = "a1", url = "http://gpu-a:8800" },
+    { id = "a2", url = "http://gpu-a:8801" },
+    { id = "b1", url = "http://gpu-b:8800" },
+}
+local SEP = gpu_load.CARD_SEP
+new_case("host_card_loads keeps lr_gpu_load's normalize semantics verbatim")
+-- 筛子必须是 normalize()（打分启发式），不是 util_fraction()：这两支在同一个数上
+-- 会分岔，所以拿 1200 与负数把差别钉住。
+local LROWS = {
+    { labels = { instance = "gpu-a:9100", gpu = "0" }, value = 88 },
+    { labels = { instance = "gpu-a:9100", gpu = "1" }, value = 400 },
+    { labels = { instance = "gpu-b:9100" }, value = -5 },
+    { labels = { instance = "gpu-c:9100" }, value = 0 },
+    { labels = { instance = "gpu-d:9100", gpu = "3" }, value = 1200 },
+}
+local lb, lc, lh, hv = gpu_load.host_card_loads(LROWS, true)
+near(lb["gpu-a"], 1, "400 folds as a percent and clamps to fully busy (normalize)")
+near(lc["gpu-a" .. SEP .. "0"], 0.88, "card zero keeps its own reading")
+near(lc["gpu-a" .. SEP .. "1"], 1, "and the hottest card defines the host")
+eq(lb["gpu-b"], nil, "a negative row is not a load (host fold keeps refusing it)")
+eq(lc["gpu-b" .. SEP .. "0"], nil, "and the negative machine has no card keys at all")
+eq(lb["gpu-c"], 0, "an idle machine is a legal 0, not a missing reading")
+for key in pairs(lc) do
+    check(string.sub(key, 1, #("gpu-c" .. SEP)) ~= "gpu-c" .. SEP,
+        "a label-less row never becomes a card key: " .. key)
+end
+check(next(lc) ~= nil, "the fold always answers a usable card table")
+eq(lc["gpu-d" .. SEP .. "3"], 1, "a lying 1200 % gauge clamps to busy for the SCORING side")
+eq(hv, true, "the vector did expose card labels")
+check(lh["gpu-a"] and lh["gpu-d"], "hosts with a card series are marked")
+check(not lh["gpu-b"], "the negative-only machine proved nothing about labels")
+check(not lh["gpu-c"], "a label-less series proved nothing about cards either")
+-- 对照：同一份 rows 走 util 筛子时 1200 判未知（>MAX_PLAUSIBLE_UTIL_PERCENT），
+-- 而 gpu-d 那台机器根本不该有逐卡读数 —— 两把筛子的分工没有因共用折叠而糊掉。
+local ub, _, _, uhv = gpu_load.host_card_utils(LROWS)
+eq(ub["gpu-d"], nil, "the admission screen still refuses an implausible counter")
+check(uhv, "the util fold is unaffected by the load fold sharing its body")
+-- (parentheses: a multi-value call as the sole argument of next() would hand the
+--  per-card table over as the iteration key.)
+eq(next((gpu_load.host_card_loads(nil, true))), nil, "nil rows, no hosts")
+eq(next((gpu_load.host_card_loads({}, true))), nil, "and an empty vector")
+
+new_case("load_by_card reads the scoring roster, not the admission one")
+local lbc, lhc = gpu_load.load_by_card(
+    'vllm:gpu_cache_usage_perc{gpu="1"} 0.9\nvllm:gpu_cache_usage_perc{gpu="2"} 0.1\n', nil)
+near(lbc["1"], 0.9, "a KV-cache gauge counts for the SCORING channel")
+near(lbc["2"], 0.1, "and each card keeps its own fraction")
+eq(lhc, true, "the body named cards")
+local lbc2 = gpu_load.load_by_card('nvidia_gpu_utilization{gpu="0"} 93\n', nil)
+near(lbc2["0"], 0.93, "the percent gauge folds the same way max_gauge+normalize does")
+eq(next((gpu_load.load_by_card('nvidia_gpu_utilization{gpu="all"} 93\n', nil))), nil,
+    "a non-numeric gpu label never names a card")
+eq(next((gpu_load.load_by_card(nil, nil))), nil, "a nil body answers empty")
+eq((select(2, gpu_load.load_by_card("nvidia_gpu_utilization{gpu=\"all\"} 93\n", nil))),
+    false, "a non-numeric gpu label proves nothing about cards")
+eq(next((gpu_load.load_by_card("nvidia_gpu_utilization 40\n", nil))), nil,
+    "and a label-less body names no card")
+eq((select(2, gpu_load.load_by_card("nvidia_gpu_utilization 40\n", nil))), false,
+    "nor does it claim card coverage")
+
+new_case("assign_load: per-card hits, honest fallbacks, no cross-host bleed")
+local by_host_l = { ["gpu-a"] = 0.88, ["gpu-b"] = 0.2 }
+local cards_l = { ["gpu-a" .. SEP .. "0"] = 0.88, ["gpu-a" .. SEP .. "1"] = 0.06 }
+local hints_l = { ["http://gpu-a:8800"] = "1", ["http://gpu-b:8800"] = "0" }
+local out_l, unm_l, pc_l, fb_l = gpu_load.assign_load(
+    LWK, by_host_l, cards_l, { ["gpu-a"] = true, ["gpu-b"] = true }, hints_l)
+near(out_l.a1, 0.06, "the card owner reads its own card, not the neighbour's 88 %")
+near(out_l.a2, 0.88, "the card-less sibling rides the whole-machine max")
+near(out_l.b1, 0.2, "the other machine never borrows gpu-a's heat")
+eq(unm_l, 0, "every host in the vector had a worker")
+eq(pc_l, 1, "one per-card attribution")
+eq(fb_l, 2, "two rode the machine max, counted, never silent")
+-- 源根本没有逐卡标签：全员整机 max（老数据源逐字节保持 host_values()+assign() 的行为）
+local out_ll, unm_ll, pc_ll, fb_ll = gpu_load.assign_load(LWK, by_host_l, nil, false, nil)
+near(out_ll.a1, 0.88, "legacy source: machine max for a1")
+near(out_ll.b1, 0.2, "and the other machine keeps its own reading")
+eq(pc_ll, 0, "no per-card claims without per-card series")
+eq(fb_ll, 3, "all three are fallbacks, honestly counted")
+eq(unm_ll, 0, "the hosts were claimed")
+-- 卡认得出但 vector 没有该卡 series -> 回退整机 max（打分侧同样不留空）
+local out_lg, unm_lg, pc_lg, fb_lg = gpu_load.assign_load(
+    { { id = "c1", url = "http://gpu-c:8800" } }, { ["gpu-c"] = 0.5 },
+    { ["gpu-c" .. SEP .. "7"] = 0.5 }, true, { ["http://gpu-c:8800"] = "2" })
+near(out_lg.c1, 0.5, "a missing card series falls back instead of vanishing")
+eq(pc_lg, 0, "not credited as per-card")
+eq(fb_lg, 1, "counted as fallback")
+eq(unm_lg, 0, "the host was claimed")
+-- 向量里有机器却没有池内 worker：unmatched 保持「拓扑提示」原义
+local out_ln, unm_ln = gpu_load.assign_load(LWK, { ["gpu-z"] = 0.4 }, nil, false, nil)
+eq(next(out_ln), nil, "nobody on gpu-z, nobody assigned")
+eq(unm_ln, 1, "one unmatched host")
+eq(#gpu_load.assign_load(nil, by_host_l), 0, "no workers answers the empty shape")
+eq(#gpu_load.assign_load({}, nil, nil, nil, nil), 0, "and junk inputs stay junk-proof")
+
+new_case("the prom load path attributes each worker to its own card")
+-- 21.k 生产 8800 的故障体：一台机器八个 worker 全注册成 127.0.0.1，DCGM 的每张卡
+-- 一条 series。逐卡落地前八条 lr_gpu_load{worker=} 同值（GPU7 忙 100 % 时全读成 1）。
+reset_store()
+local LV = require("cjson.safe").encode({
+    status = "success",
+    data = {
+        resultType = "vector",
+        result = {
+            { metric = { Hostname = "gpu-pro", instance = "127.0.0.1:9400", gpu = "6" },
+              value = { 1700000000, "100" } },
+            { metric = { Hostname = "gpu-pro", instance = "127.0.0.1:9400", gpu = "7" },
+              value = { 1700000001, "4" } },
+        },
+    },
+})
+local LWORKERS = {
+    { id = "g6", url = "http://127.0.0.1:8006" },
+    { id = "g7", url = "http://127.0.0.1:8007" },
+}
+local _, seams_lc = counting_seams({ workers = LWORKERS,
+                                     post = { status = 200, body = LV } })
+seams_lc.gpu_hints = { ["http://127.0.0.1:8006"] = "6", ["http://127.0.0.1:8007"] = "7" }
+local st_lc = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)",
+    load_scale = 100, load_util_enabled = false,
+}, seams_lc)
+near(registry.external_load("g6"), 1, "the busy card reads 1.0 for its own worker")
+near(registry.external_load("g7"), 0.04,
+    "and the idle neighbour reads 0.04 -- the flat line is gone")
+eq(st_lc.matched, 2, "both workers sampled")
+eq(st_lc.load_per_card, 2, "both attributed to their own card")
+eq(st_lc.load_fallback, 0, "nothing rode the machine max")
+
+new_case("the same vector without card hints is a counted fallback, never a silent one")
+reset_store()
+local _, seams_lf = counting_seams({ workers = LWORKERS,
+                                     post = { status = 200, body = LV } })
+seams_lf.gpu_hints = {}
+local st_lf = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)",
+    load_scale = 100, load_util_enabled = false,
+}, seams_lf)
+near(registry.external_load("g6"), 1, "the whole-machine max is what both workers get")
+near(registry.external_load("g7"), 1, "exactly the pre-change number (conservative, not unknown)")
+eq(st_lf.matched, 2, "both still sampled: a monitoring gap never costs a worker")
+eq(st_lf.load_per_card, 0, "zero coverage")
+eq(st_lf.load_fallback, 2, "and the fallback says so (342.371's witness)")
+
+new_case("a gpu-aggregated prom query folds to one host value and falls back fully")
+reset_store()
+-- 操作员把 gpu 聚合掉了（21.k compose 里的那条查询）：源没有逐卡标签 -> 全员整机口径，
+-- 逐字节就是改动前 host_values()+assign() 的产物，只是这次 fallback 显形。
+local AGG = require("cjson.safe").encode({
+    status = "success",
+    data = { resultType = "vector", result = {
+        { metric = { instance = "127.0.0.1:9400" }, value = { 1, "100" } },
+    } },
+})
+local _, seams_agg = counting_seams({ workers = LWORKERS, post = { status = 200, body = AGG } })
+seams_agg.gpu_hints = { ["http://127.0.0.1:8006"] = "6" }
+local st_agg = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = "max (DCGM_FI_DEV_GPU_UTIL)", load_scale = 100,
+    load_util_enabled = false,
+}, seams_agg)
+near(registry.external_load("g6"), 1, "g6 reads the machine max even though it has a card")
+near(registry.external_load("g7"), 1, "and so does g7")
+eq(st_agg.load_per_card, 0, "the source never named a card, so nothing can be per-card")
+eq(st_agg.load_fallback, 2, "both counted as fallbacks")
+
+new_case("the {host} template branch attributes per card too")
+reset_store()
+local HV = require("cjson.safe").encode({
+    status = "success",
+    data = { resultType = "vector", result = {
+        { metric = { instance = "gpu-a:9100", gpu = "0" }, value = { 1, "88" } },
+        { metric = { instance = "gpu-a:9100", gpu = "1" }, value = { 1, "8" } },
+    } },
+})
+local _, seams_ht = counting_seams({
+    workers = { TWO_WORKERS[1], TWO_WORKERS[2] },
+    post = { status = 200, body = HV },
+})
+seams_ht.gpu_hints = { ["http://gpu-a:8800"] = "1" }
+local st_ht = gpu_load.run_pass({
+    load_source = "prom", load_prom_url = "http://prom:9090",
+    load_prom_query = 'load{hostname="{host}"}', load_scale = 100,
+    load_util_enabled = false,
+}, seams_ht)
+near(registry.external_load("a1"), 0.08, "the card owner reads its own card")
+near(registry.external_load("a2"), 0.88, "the cardless sibling rides the machine max")
+eq(st_ht.matched, 2, "both sampled")
+eq(st_ht.load_per_card, 1, "one per-card hit")
+eq(st_ht.load_fallback, 1, "one counted fallback")
+
+new_case("the metrics path refines the load with the worker's own card")
+reset_store()
+local LBODY = table.concat({
+    "# HELP nvidia_gpu_utilization GPU utilization in percent",
+    'nvidia_gpu_utilization{gpu="2"} 20',
+    'nvidia_gpu_utilization{gpu="3"} 90',
+    'vllm:gpu_cache_usage_perc{gpu="2"} 0.05',
+}, "\n")
+local _, seams_ml = counting_seams({
+    workers = {
+        { id = "m1", url = "http://gpu-m:8800", labels = { gpu = "2" } },
+        { id = "m2", url = "http://gpu-m:8801" },
+    },
+    get = function() return { status = 200, body = LBODY } end,
+})
+local st_ml = gpu_load.run_pass({
+    load_source = "metrics", load_interval_secs = 15, load_util_enabled = false,
+}, seams_ml)
+near(registry.external_load("m1"), 0.2,
+    "m1 reads its own card (20 %), not the neighbour's 90 %")
+near(registry.external_load("m2"), 0.9, "m2 reads the hottest card on the machine")
+eq(st_ml.matched, 2, "both stored")
+eq(st_ml.load_per_card, 1, "one per-card hit")
+eq(st_ml.load_fallback, 1, "one counted fallback")
+
+new_case("a cardless exporter keeps the exact pre-change metrics-path reading")
+-- 回退兼容的用例证据：正文里没有任何 gpu 标签（llama.cpp / 一个 by(Hostname) 的
+-- exporter），逐卡精化必须整步退化成今天的 max_gauge()+normalize()，数值逐字节不变。
+reset_store()
+local _, seams_fb = counting_seams({
+    workers = { { id = "k1", url = "http://gpu-k:8800", labels = { gpu = "5" } } },
+    get = function() return { status = 200, body = 'nvidia_gpu_utilization 82.5\n' } end,
+})
+local st_fb = gpu_load.run_pass({
+    load_source = "metrics", load_interval_secs = 15, load_util_enabled = false,
+}, seams_fb)
+near(registry.external_load("k1"), 0.825, "the same 0.825 the pass wrote before per-card existed")
+eq(st_fb.matched, 1, "still one sample")
+eq(st_fb.load_per_card, 0, "the source named no card, so nothing is credited")
+eq(st_fb.load_fallback, 1, "and the fallback is counted, not hidden")
+reset_store()
+local _, seams_kb = counting_seams({
+    workers = { { id = "k2", url = "http://gpu-k:8800" } },
+    get = function()
+        return { status = 200, body = 'vllm:gpu_cache_usage_perc{gpu="1"} 0.9\n' }
+    end,
+})
+local st_kb = gpu_load.run_pass({
+    load_source = "metrics", load_interval_secs = 15, load_util_enabled = false,
+}, seams_kb)
+near(registry.external_load("k2"), 0.9, "a card-labelled body with no resolvable card falls back")
+eq(st_kb.load_fallback, 1, "counted")
+eq(st_kb.load_per_card, 0, "and honest about having no coverage")
+
+new_case("the load coverage pair exports beside lr_gpu_load_workers")
+reset_store()
+local _, seams_lx = counting_seams({
+    workers = {
+        { id = "y1", url = "http://gpu-y:8800", labels = { gpu = "2" } },
+        { id = "y2", url = "http://gpu-y:8801" },
+    },
+    get = function() return { status = 200, body = LBODY } end,
+})
+gpu_load.run_pass({ load_source = "metrics", load_util_enabled = false }, seams_lx)
+local saw_workers, saw_per_card, saw_fallback = false, false, nil
+for key, hit in pairs(stats_store) do
+    if key:find("lr_gpu_load_workers", 1, true) then saw_workers = true end
+    if key:find("lr_gpu_load_per_card_workers", 1, true) then
+        saw_per_card = true
+        eq(hit.value, 1, "the per-card coverage gauge says one worker got its own card")
+    end
+    if key:find("lr_gpu_load_fallback_total", 1, true) then saw_fallback = hit.value end
+end
+check(saw_workers, "the pre-existing coverage gauge is still there")
+check(saw_per_card, "lr_gpu_load_per_card_workers is published")
+check(saw_fallback ~= nil and saw_fallback >= 1,
+    "lr_gpu_load_fallback_total counted the machine-max rider", tostring(saw_fallback))
+reset_store()
+local _, seams_lz = counting_seams({
+    workers = { { id = "z1", url = "http://gpu-z:8800" } },
+    get = function() return { status = 200, body = 'gpu_util 40\n' } end,
+})
+gpu_load.run_pass({
+    load_source = "metrics", load_metrics_keys = "gpu_util", load_util_enabled = false,
+}, seams_lz)
+for key in pairs(stats_store) do
+    check(not key:find("lr_gpu_load_per_card_workers", 1, true)
+        or stats_store[key].value == 0,
+        "an all-fallback pass reports zero per-card coverage: " .. key)
+end
+end
+load_card_cases()
+
 io.write(string.format("\n=== %d checks, %d failed ===\n", passed, failed))
 for i = 1, #failures do
     io.write("FAILED: " .. failures[i] .. "\n")

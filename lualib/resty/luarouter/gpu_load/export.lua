@@ -45,6 +45,20 @@ function _M.publish_metrics(stats)
             stats.unmatched)
     end
     pcall(observability.gauge, "lr_gpu_load_workers", {}, stats.matched or 0)
+    -- 负载打分通道的逐卡覆盖率，与利用率那一对 util_per_card_workers / util_fallback_total
+    -- 同族同位置（lr_gpu_load_workers 旁边）。理由同形而事故同源：只有 lr_gpu_load_workers
+    -- 一个数时，「八台各归各卡」与「八台共用一个整机 max」在 /metrics 上完全同形——21.k
+    -- 生产 8800 的 342.371 正是这样躲过了观测：GPU7 忙到 100 % 时八条 lr_gpu_load{worker=}
+    -- 全读成 1，而覆盖率那个数根本不存在。逐卡命中与整机回退都是**允许**的（打分侧的保守
+    -- 方向，见 cards.lua assign_load 上方），允许而不显形就是那次故障的复刻，所以两个数都
+    -- 要出：per_card_workers 为 0 而 fallback_total 非 0 = 逐卡归属一台都没接上（prom 查询
+    -- 把 gpu 聚合掉了，或 watcher 台账没有 g|<url> 键）。
+    pcall(observability.gauge, "lr_gpu_load_per_card_workers", {},
+        stats.load_per_card or 0)
+    if (stats.load_fallback or 0) > 0 then
+        pcall(observability.counter, "lr_gpu_load_fallback_total", {},
+            stats.load_fallback)
+    end
     -- GPU 利用率家族（registry 的 gu: 键 / max_gpu_util 上限的数据源）只在**启用**时
     -- 导出：缺省关闭的实例一个 series 都不写，/metrics 与改动前逐字节一致
     -- （SMG_LOAD_SOURCE=none 时连定时器都不跑，publish 早退）。

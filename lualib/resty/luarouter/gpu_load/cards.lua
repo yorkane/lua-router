@@ -133,6 +133,15 @@ end
 
 -------------------------------------------------------------------- util (0..1)
 
+---Default usability screen of the fold: what counts as a usable **utilization**
+---reading is decided by util_fraction() (0 is a legal reading; negatives, NaN, inf
+---and out-of-range values are refused).  The **load** channel swaps in normalize()
+---through the screen parameter rather than copying the fold.  Looked up at call time
+---through _M so a unit-test stub of gpu_load.util_fraction still bites.
+local function util_fraction_screen(value)
+    return _M.util_fraction(value)
+end
+
 ---Per-card utilization fold for one result vector.  Both sources come through
 ---here: the prom path hands it parsed PromQL rows, the metrics path hands it
 ---the rows read off one worker exposition.
@@ -156,7 +165,8 @@ end
 ---    把请求打到已经最热的那张卡上，取和会让「一张满载七张空闲」看起来仍然很闲。利用率
 ---    更没有「sum 出 800 %」这一档。
 ---
----What counts as a usable reading is decided by util_fraction(): **0 is a legal
+---What counts as a usable reading is decided by the screen parameter (default
+---util_fraction()): **0 is a legal
 ---reading** (an idle card really does report 0 %, and the admission gate has to
 ---read that as "far below any ceiling", which is exactly what it means);
 ---negatives, NaN, ±inf and out-of-range values are refused.
@@ -166,7 +176,7 @@ end
 ---@return table @ host..CARD_SEP..gpu -> utilization (empty unless expose_cards)
 ---@return table|nil @ host -> true for hosts with at least one card series
 ---@return boolean @ any usable series carried a numeric gpu label
-local function util_fold(rows, expose_cards)
+local function util_fold(rows, expose_cards, screen)
     local by_host, cards, card_hosts = {}, {}, {}
     local groups = {}
     local have_cards = false
@@ -188,7 +198,7 @@ local function util_fold(rows, expose_cards)
     end
     for i = 1, #rows do
         local row = rows[i]
-        local util = row and _M.util_fraction(row.value)
+        local util = row and (screen or util_fraction_screen)(row.value)
         if util and type(row.labels) == "table" then
             local lowered = {}
             for key, value in pairs(row.labels) do
@@ -409,6 +419,125 @@ end
 ---@return table @ host -> utilization (0..1, only usable readings)
 function _M.host_utils(rows)
     return util_fold(rows, false)
+end
+
+-------------------------------------------------------------------- load (0..1)
+
+---Default usability screen for the **load** side of the fold: normalize(), the
+---scoring heuristic (anything above 1 reads as a percent and is divided; a value
+---the division cannot rescue clamps to busy; negatives and NaN are nil).  This is
+---literally the screen host_values()/max_gauge()+normalize() used before per-card
+---attribution, so lr_gpu_load's既有归一语义 stays byte-for-byte: rows whose value
+---normalize() refuses drop out of the fold exactly as they dropped out of the old
+---host fold, and the whole-machine map is produced by the same max-fold it always
+---was.  Looked up at call time through _M so a unit-test stub of
+---gpu_load.normalize still bites.
+local function normalize_screen(value)
+    return _M.normalize(value)
+end
+
+---Fold a load result vector into per-card readings as well as per-host.
+---
+---Per-card counterpart of host_card_utils() for the **scoring** channel (registry's
+---xl: key / lr_gpu_load{worker=} family): the same fold with card keys exposed, the
+---only difference being the screen -- normalize() instead of util_fraction(), because
+---lr_gpu_load's normalization semantics (percent heuristic, clamp to 1) must stay
+---exactly what host_values() produced.  The machine-identity rules (case-folded
+---Hostname, loopback-instance adoption, cross-machine bleed guard) are not copied
+---here: they live in util_fold, which both channels share through the screen
+---parameter, so one owner keeps the 342.371 lesson intact for both.
+---
+---The operator-facing shape of the query is the same discipline as the util side:
+---SMG_LOAD_PROM_QUERY must keep gpu in its by (max by (Hostname,instance,gpu)
+---(DCGM_FI_DEV_GPU_UTIL)).  Aggregating gpu away = every worker on one machine
+---shares the hottest card's reading (342.371), and the gateway-side per-card
+---attribution silently becomes a full fallback -- visible, never silent, through
+---lr_gpu_load_fallback_total / lr_gpu_load_per_card_workers.
+---@param rows table[]|nil @ parse_prom_response() rows
+---@param expose_cards boolean|nil @ also fold per-card keys
+---@return table @ host -> load (whole-machine hottest, 0..1)
+---@return table @ host..CARD_SEP..gpu -> load (empty unless expose_cards)
+---@return table @ host -> true (hosts exposing at least one card series)
+---@return boolean @ any usable series carried a numeric gpu label
+function _M.host_card_loads(rows, expose_cards)
+    return util_fold(rows, expose_cards, normalize_screen)
+end
+
+---Map the load vector onto workers, preferring each worker's own card.
+---
+---Four-way attribution rule, structurally identical to assign_util() (see its
+---comment block; the wording difference is real, not cosmetic):
+---  * 源根本没有逐卡标签（source_has_cards 假）-> 整机最热卡的负载。老数据源
+---    （by(instance) 聚合串、只报一个整机 gauge 的引擎）唯一可能的口径，逐字节保持
+---    host_values()+assign() 改动前的行为。判据取自**源**，不取自 worker。
+---  * worker 认得出卡 + vector 有该卡 series -> 它自己那张卡的负载（per_card++）。
+---    这是 21.k 生产 8800 的修复本体：GPU7 忙到 100 % 时，八条 lr_gpu_load{worker=}
+---    不再同值。
+---  * worker 认不出卡 -> **回退整机 max**（fallback++）。
+---  * 卡认得出但 vector 没有该卡 series -> **回退整机 max**（fallback++）。
+---后两支回退而不是留空，与 util 侧同一个方向：负载是**打分**不是准入，但留空同样不对
+---——xl: 缺失会让这台 worker 在 power_of_two 里永远只按在途数排序，等于「当它永远不忙」，
+---而整机 max 至少诚实反映了同一张卡上的真实压力。回退必须显形：
+---lr_gpu_load_fallback_total 与 lr_gpu_load_per_card_workers 并排读就是逐卡覆盖率，
+---覆盖率不 100 % 时打分仍然生效，只是骑在整机最热值上（342.371 的口径由这两个数看守，
+---理由与 util 族的 util_fallback/util_per_card 完全同形）。
+---claimed[host] 仍取自 host 级可达性，所以负载的 unmatched 保持「这台机器的 series
+---匹配不到任何在池 worker」原义；source_has_cards 接受布尔（单源）或 host -> true
+---集合（prom 路跨机折叠），与 assign_util 同一形参纪律。
+---@param workers table[]|nil
+---@param by_host table|nil @ host -> whole-machine load (0..1)
+---@param cards table|nil @ card_key(host, gpu) -> load (0..1)
+---@param source_has_cards boolean|table|nil @ boolean, or host -> true
+---@param hints table|nil @ hint_index or raw url -> gpu id
+---@return table @ worker id -> load (0..1)
+---@return number @ unmatched host count
+---@return number @ per_card @ workers that got their own card's series
+---@return number @ fallback @ workers that got the whole-machine max
+function _M.assign_load(workers, by_host, cards, source_has_cards, hints)
+    local out, unmatched = {}, 0
+    local per_card, fallback = 0, 0
+    if type(workers) ~= "table" then
+        return out, unmatched, per_card, fallback
+    end
+    local claimed = {}
+    for i = 1, #workers do
+        local worker = workers[i]
+        local host = worker and _M.split_host(worker.url)
+        if host and type(by_host) == "table" and by_host[host] ~= nil then
+            claimed[host] = true
+            local load
+            local per_card_flag = source_has_cards
+            if type(per_card_flag) == "table" then
+                per_card_flag = per_card_flag[host] == true
+            end
+            if per_card_flag then
+                local gpu = _M.worker_card(worker, hints)
+                if gpu ~= nil and type(cards) == "table" then
+                    load = cards[_M.card_key(host, gpu)]
+                end
+                if load ~= nil then
+                    per_card = per_card + 1
+                end
+            end
+            if load == nil then
+                -- 整机 max 回退（代价方向见上方那一支）。源本身没有卡标签时也走
+                -- 这里——那本来就是整机口径，如实计入 fallback。
+                load = by_host[host]
+                fallback = fallback + 1
+            end
+            if load ~= nil and worker.id ~= nil then
+                out[worker.id] = load
+            end
+        end
+    end
+    if type(by_host) == "table" then
+        for host in pairs(by_host) do
+            if not claimed[host] then
+                unmatched = unmatched + 1
+            end
+        end
+    end
+    return out, unmatched, per_card, fallback
 end
 
 --- Utilization knobs for this pass, read from the config table with an env fallback.
