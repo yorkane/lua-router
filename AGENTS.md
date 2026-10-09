@@ -42,7 +42,7 @@
 > 旧口径是：条目级 `context_window` 显式配置恒定生效、与策略选中哪台实例无关，未配置时取整组模型卡
 > `ctx` 的最小值，转发前用它钳制 `max_tokens`。废止的原因是它把三个不同的量当成了同一个数——
 > `context_window` 的本意是入口对外声明的**上下文总窗口（输入+输出）**，却被当作**单次输出预算**写进
-> `max_tokens`。生产 21.k:8801 的故障即由此而来：转发链上的 `apply_ctx_cap` 字段表只有
+> `max_tokens`。21.k:8801（测试环境）的故障即由此而来：转发链上的 `apply_ctx_cap` 字段表只有
 > `{ max_tokens, max_completion_tokens }`，漏了 `/v1/responses` 用的 `max_output_tokens`，于是走 responses
 > 入口时 `body.max_tokens` 恒为 nil，命中「nil 就凭空写入 cap」那一支，网关替每一个 responses 请求造了
 > 一个 `max_tokens = 350000`（那条入口声明的 `context_window`），而服务的真实窗口只有 262144；
@@ -93,7 +93,8 @@
    发版、文档计数更新、生产镜像替换必须 `GATE_TIER=full` 全量 22 门全绿（快速档绿不算全绿锚点）。
 2. **临时文件一律 /data/tmp/**；生产验证文档更新进 doc/。
 3. **生产容器白名单**：本仓只许动 `lua-router-8800`（compose 在 /data/app/lua-router/）；
-   **21.k:8801 是生产，未经用户明确要求不得更新**——改动只在 21.k:8802（测试）上验证，用户确认后才推 8801；
+   **所有 8800 都是生产**（本机 `lua-router-8800`、21.k:8800、217.t:8800），未经用户明确要求一律不得更新；
+   **21.k 的 8801 / 8802 是测试环境**——改动先部署到这两个测试实例验证（compose 在 /data1/app/lua-router-8801 等），用户确认后才推生产；
    `authz`、`searxng-*`、`qdrant-faces`、`face-*`、`va-*`、`pg18-video`、`n8nc`、`resdown-*`、
    `wx-liushi-monitor` 及一切名字不带 lr- 的容器不许碰。已退役的 `llm-watcher`（Exited）不要重启。
 4. **设计红线**：推理体字节透传（顶层精确改写，不整表重编码）；**调用方的输出预算永远原样透传**
