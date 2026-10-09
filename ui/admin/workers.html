@@ -168,7 +168,8 @@
                     </div>
                   </q-td>
                 </template>
-                <template v-slot:body-cell-load="props"><q-td :props="props" class="mono">{{ props.row.inPool ? props.row.load : '—' }}</q-td></template>
+                <template v-slot:body-cell-inflight="props"><q-td :props="props" class="mono">{{ props.row.inPool ? (props.row.inflight_requests == null ? 0 : props.row.inflight_requests) : '—' }}<q-tooltip>{{ t.inflightHint }}</q-tooltip></q-td></template>
+                <template v-slot:body-cell-load="props"><q-td :props="props" class="mono">{{ props.row.inPool ? props.row.load : '—' }}<q-tooltip>{{ t.loadHint }}</q-tooltip></q-td></template>
                 <template v-slot:body-cell-priority="props"><q-td :props="props" class="mono">{{ props.row.priority }}</q-td></template>
                 <template v-slot:body-cell-cost="props"><q-td :props="props" class="mono">{{ formatCost(props.row.cost) }}</q-td></template>
                 <template v-slot:body-cell-capacity="props">
@@ -596,7 +597,8 @@
           { name: 'url', label: t.value.colUrl, field: 'url', align: 'left', sortable: true },
           { name: 'origin', label: t.value.colOrigin, field: 'origin', align: 'left', sortable: true, style: 'width:130px' },
           { name: 'status', label: t.value.colHealth, field: 'is_healthy', align: 'left', sortable: true, sort: row => (row.inPool ? (row.is_healthy ? 1 : 0) : -1) },
-          { name: 'load', label: t.value.colLoad, field: 'load', align: 'left', sortable: true, style: 'width:70px', sort: row => (Number.isFinite(Number(row.load)) ? Number(row.load) : -1) },
+          { name: 'inflight', label: t.value.colInflight, field: 'inflight_requests', align: 'left', sortable: true, style: 'width:64px', sort: row => (Number.isFinite(Number(row.inflight_requests)) ? Number(row.inflight_requests) : -1) },
+          { name: 'load', label: t.value.colLoad, field: 'load', align: 'left', sortable: true, style: 'width:64px', sort: row => (Number.isFinite(Number(row.load)) ? Number(row.load) : -1) },
           { name: 'priority', label: t.value.colPriority, field: 'priority', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'cost', label: t.value.colCost, field: 'cost', align: 'left', sortable: true, style: 'width:80px' },
           { name: 'capacity', label: t.value.colCapacity, field: 'max_concurrency', align: 'left', sortable: true, style: 'width:150px', sort: row => capacitySortValue(row) },
