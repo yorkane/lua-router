@@ -10,6 +10,14 @@
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
   <link rel="stylesheet" href="./app.css?v=__UI_VERSION__">
+  <style>
+    /* 实例级「模型配置」对话框：一屏要摆下多张模型卡片，比常规对话框宽，
+       且必须排在 app.css 的 .dialog-card 之后（同特异性下后来者才赢）。 */
+    .dialog-card.mc-card { width: min(920px, calc(100vw - 28px)); }
+    .mc-section { border: 1px solid var(--line-strong); border-radius: 12px; background: rgba(139, 145, 184, .05); }
+    .mc-section-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 14px !important; border-bottom: 1px solid var(--line); }
+    .mc-section-body { padding: 12px 14px 14px !important; display: grid; gap: 12px; }
+  </style>
 </head>
 <body>
   <div id="q-app">
@@ -230,6 +238,9 @@
                       <q-btn v-if="props.row.decl" flat round dense icon="mdi-file-document-edit-outline" :disable="unsupported" @click="openDeclEdit(props.row)">
                         <q-tooltip>{{ t.editDeclared }}</q-tooltip>
                       </q-btn>
+                      <q-btn v-if="canConfigureModels(props.row)" flat round dense icon="mdi-cog-outline" color="blue-3" @click="openModelCards(props.row)">
+                        <q-tooltip>{{ t.mcButton }}</q-tooltip>
+                      </q-btn>
                       <!-- 运行态入口只对「运行态是事实来源」的行开放：声明拥有的行连 priority/cost
                            /labels 都由自愈按声明写回（upstream_drifts 比较这些字段），给它一个 PUT
                            编辑框就是制造"改了但 30 秒后作废"的困惑，所以干脆只留声明层入口。 -->
@@ -377,6 +388,83 @@
               <q-card-actions align="right">
                 <q-btn flat no-caps :label="c.cancel" :disable="submitting" @click="editOpen = false"></q-btn>
                 <q-btn unelevated no-caps color="primary" class="primary-button" :loading="submitting" :disable="!editCapsOk" :label="t.updateSubmit" @click="submitEdit"></q-btn>
+              </q-card-actions>
+            </q-card>
+          </q-dialog>
+
+
+          <!-- 实例级「模型配置」：一行服务的每个模型各一张卡片（用户诉求 2026-10-09）。
+               卡片按**模型名**存在配置文档的 model_configs 里，所以这里编辑的就是「模型管理」页
+               那同一张卡：虚拟入口把实际模型成员归进这一行时，在这里也配得到同一张卡。
+               三态字段一律用下拉而不是勾选框（勾选框画不出「没说」那一档），留空 = 删键。 -->
+          <q-dialog v-model="mcOpen">
+            <q-card class="dialog-card mc-card">
+              <q-card-section>
+                <div class="dialog-title">{{ t.mcTitle }}</div>
+                <div class="dialog-copy">{{ mcCopyText }}</div>
+              </q-card-section>
+              <q-card-section>
+                <div class="dialog-fields">
+                  <q-banner v-if="!mcSections.length" rounded dense class="info-banner">
+                    <template v-slot:avatar><q-icon name="mdi-information-outline"></q-icon></template>
+                    {{ t.mcNoModels }}
+                  </q-banner>
+                  <div v-else class="muted" style="font-size:11px">{{ t.mcVirtualNote }}</div>
+                  <q-expansion-item
+                    v-for="section in mcSections"
+                    :key="'mc-' + section.model"
+                    :label="section.model"
+                    :caption="mcSectionCaption(section)"
+                    :model-value="mcExpanded[section.model]"
+                    dense
+                    dense-toggle
+                    switch-toggle-side
+                    header-class="mc-section-head"
+                    @update:model-value="value => { mcExpanded[section.model] = Boolean(value) }"
+                  >
+                    <q-card flat class="mc-section">
+                      <q-card-section class="mc-section-body">
+                        <div class="form-grid-2">
+                          <q-input v-model="section.form.ctx" dense outlined dark type="number" :label="mt('ctxField')" :hint="mt('ctxHint')" :rules="[value => ctxRuleOf(section.model, value)]"></q-input>
+                          <q-input v-model="section.form.max_output_tokens" dense outlined dark type="number" :label="mt('maxOutputTokensField')" :hint="mt('maxOutputTokensHint')" :rules="[value => maxOutputTokensRuleOf(section.model, value)]"></q-input>
+                          <q-select v-model="section.form.default_effort" dense outlined dark :options="effortOptions" map-options emit-value clearable
+                                    :label="mt('colDefaultEffort')" :hint="mt('cardDefaultEffortHint')"></q-select>
+                          <q-select v-model="section.form.supports_tool_use" dense outlined dark :options="triStateOptions" map-options emit-value clearable
+                                    :label="mt('cardToolUseField')" :placeholder="mt('toolUseUnknown')" :hint="mt('cardToolUseHint')"></q-select>
+                          <q-select v-model="section.form.supports_streaming" dense outlined dark :options="triStateOptions" map-options emit-value clearable
+                                    :label="t.mcStreamingField" :placeholder="mt('toolUseUnknown')" :hint="t.mcStreamingHint"></q-select>
+                          <q-select v-model="section.form.supports_reasoning" dense outlined dark :options="triStateOptions" map-options emit-value clearable
+                                    :label="t.mcReasoningField" :placeholder="mt('toolUseUnknown')" :hint="t.mcReasoningHint"></q-select>
+                          <q-select v-model="section.form.supports_vision" dense outlined dark :options="triStateOptions" map-options emit-value clearable
+                                    :label="t.mcVisionField" :placeholder="mt('toolUseUnknown')" :hint="t.mcVisionHint"></q-select>
+                          <q-select v-model="section.form.supports_reasoning_effort" dense outlined dark :options="triStateOptions" map-options emit-value clearable
+                                    :label="t.mcEffortSupportField" :placeholder="mt('toolUseUnknown')" :hint="t.mcEffortSupportHint"></q-select>
+                          <q-select v-model="section.form.hidden" dense outlined dark :options="yesNoOptions" map-options emit-value clearable
+                                    :label="t.mcHiddenField" :placeholder="mt('toolUseUnknown')" :hint="t.mcHiddenHint"></q-select>
+                          <q-select v-model="section.form.disabled" dense outlined dark :options="yesNoOptions" map-options emit-value clearable
+                                    :label="t.mcDisabledField" :placeholder="mt('toolUseUnknown')" :hint="t.mcDisabledHint"></q-select>
+                        </div>
+                        <div>
+                          <div class="rows-head q-mb-xs">{{ mt('cardEffortMapTitle') }}</div>
+                          <div class="rows-list">
+                            <div v-for="(one, index) in section.form.effort_map" :key="section.model + '-em-' + index" class="row-edit">
+                              <q-select v-model="one.from" dense outlined dark :options="effortOptions" map-options emit-value :label="mt('mapFrom')"></q-select>
+                              <q-select v-model="one.to" dense outlined dark :options="effortOptions" map-options emit-value :label="mt('mapTo')"></q-select>
+                              <span></span>
+                              <q-btn flat round dense icon="mdi-close" color="red-4" @click="section.form.effort_map.splice(index, 1)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
+                            </div>
+                            <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="t.mcMapAdd" @click="section.form.effort_map.push({ from: 'low', to: 'high' })"></q-btn></div>
+                          </div>
+                        </div>
+                      </q-card-section>
+                    </q-card>
+                  </q-expansion-item>
+                </div>
+              </q-card-section>
+              <q-card-actions align="right">
+                <span class="muted" style="margin-right:auto;font-size:11px">{{ mcSummary }}</span>
+                <q-btn flat no-caps :label="c.cancel" :disable="mcSaving" @click="mcOpen = false"></q-btn>
+                <q-btn unelevated no-caps color="primary" class="primary-button" :loading="mcSaving" :disable="!mcSections.length" :label="t.mcSaveAll" @click="saveModelCards"></q-btn>
               </q-card-actions>
             </q-card>
           </q-dialog>
@@ -1161,6 +1249,11 @@
             // 判成"没编辑过"，操作员在 JSON 面板里写了一半的草稿会被下一轮刷新抹掉。
             const wasDirty = jsonDirty()
             decls.value = (doc && Array.isArray(doc.upstreams)) ? doc.upstreams : []
+            // 卡片层与虚拟入口表在同一次 GET /config 里带回：实例行的「模型配置」对话框用它们
+            // 回显卡片、归并虚拟入口的实际模型成员，不必为打开对话框再发一次请求
+            modelCards.value = (doc && Array.isArray(doc.model_configs)) ? doc.model_configs : []
+            virtualEntries.value = (doc && Array.isArray(doc.virtual_models)) ? doc.virtual_models : []
+            flatMaxOutput.value = (doc && Array.isArray(doc.model_max_output_tokens)) ? doc.model_max_output_tokens : []
             unsupported.value = !(doc && Array.isArray(doc.upstreams))
             // 面板开着时一律不覆盖文本（用户可能正在改），只在关闭时静默跟随服务端
             if (!wasDirty && !jsonOpen.value) jsonText.value = prettyUpstreams(doc)
@@ -1446,6 +1539,260 @@
           waitingNotice.value = ''
         }
 
+
+        // ════════════════════════════════════════════════════════════════════════
+        // 实例级「模型配置」（用户诉求 2026-10-09）
+        //
+        // 模型卡片（model_configs）按**模型名**存在配置文档里，不按实例名：一个实例服务几个
+        // 模型，就有几张卡。这一节把「按模型名配」这件事搬到服务池的行上——行的模型名来自
+        // coveredModels(row)（池行的 models / model_id，或声明条目写的 models），另外再并入
+        // 虚拟入口按 worker（规范化 url 或 worker id）绑定到这一行的实际模型成员。虚拟入口的
+        // targets 只是「这个名字属于这一组」，卡片仍按真实模型名落在同一份 model_configs 里，
+        // 所以在这里改的就是「模型管理」页那张卡，两处不会有第二份状态。
+        //
+        // 三态纪律照抄 models.html 的卡片对话框：留空 = 未声明（写成 JSON null = 删键，
+        // 让位引擎自报），false 是结论，两者绝不互相冒充。hidden / disabled 也是三态，
+        // 但后端读的是「键缺席 vs false」，所以这里未选时同样发 null（后端 rawget 判缺席用
+        // 的是键在不在，null 走清除支路 —— 与 models.html 的卡片面完全一致）。
+        // ════════════════════════════════════════════════════════════════════════
+        const mcOpen = ref(false)
+        const mcSaving = ref(false)
+        const mcRow = ref(null)
+        const mcSections = ref([])
+        const mcExpanded = reactive({})
+        // 配置文档的卡片层随声明层同一次 GET /config 带回来（loadDeclsQuiet 顺手存一份），
+        // 打开对话框不再发第二个请求；20 秒一轮的刷新顺带把别人改的卡片带回表单
+        const modelCards = ref([])
+        const virtualEntries = ref([])
+        const flatMaxOutput = ref([])
+        // 本轮卡片层是不是真从服务端读到的（GET /config 成功）：false 时保存一律拒绝
+        const mcConfigFresh = ref(false)
+
+
+        // 卡片字段 label 复用 models 块（同一份口径，两处说同一句话）
+        function mt (key, values) { return window.lmrI18n.translate(locale.value, 'models', key, values) }
+        const effortOptions = computed(() => window.lmrApi.effortLevels.map(value => ({ label: value, value })))
+        // 三态下拉：真布尔做 value（不是 'true'/'false' 字符串），clearable 负责「留空 = 删键」
+        const triStateOptions = computed(() => [
+          { label: mt('toolUseYes'), value: true },
+          { label: mt('toolUseNo'), value: false }
+        ])
+        const yesNoOptions = computed(() => [
+          { label: t.value.mcYes, value: true },
+          { label: t.value.mcNo, value: false }
+        ])
+
+        // 虚拟入口归并进这一行的模型名：candidates 的 worker 按规范化 url 或 worker id 命中本行。
+        // 后端 norm_candidate 收两种写法（profiles.lua），这里必须同样两条都认，否则操作员在
+        // 入口页用 id 绑定、在这一页就看不见那张卡。
+        function virtualModelsForRow (row) {
+          const out = []
+          const key = row && row.key
+          const url = normUrl(row && row.url)
+          const id = String((row && row.id) || '').toLowerCase()
+          ;(virtualEntries.value || []).forEach(entry => {
+            const cands = entry && Array.isArray(entry.candidates) ? entry.candidates : []
+            cands.forEach(cand => {
+              if (!cand || typeof cand.model !== 'string' || cand.model.trim() === '') return
+              const worker = normKey(cand.worker || cand.url || '')
+              if ((worker && worker === key) || worker === url.toLowerCase() || (id && worker === id)) out.push(cand.model.trim())
+            })
+            // 旧形状：workers 白名单收窄整组（没有逐候选绑定），命中白名单就把整组 targets 认进来
+            if (!cands.length) {
+              const whitelist = Array.isArray(entry && entry.workers) ? entry.workers : []
+              if (!whitelist.length) return
+              const hit = whitelist.some(item => {
+                const cand = normKey(item)
+                return (cand && (cand === key || cand === url.toLowerCase())) || (id && cand === id)
+              })
+              if (!hit) return
+              const group = Array.isArray(entry.targets) ? entry.targets : []
+              group.forEach(name => { if (typeof name === 'string' && name.trim()) out.push(name.trim()) })
+            }
+          })
+          return out
+        }
+
+        // 行上有没有可配的模型名：池行/声明里的 models，或虚拟入口按地址或实例 id 绑定进来的
+        // 实际模型成员，任一非空即可配。两个来源都空的行画了按钮也只是打开一个空弹窗，
+        // 所以按钮干脆不出现（对话框里仍留有同一条告警兜底）。
+        function canConfigureModels (row) {
+          return coveredModels(row).length > 0 || virtualModelsForRow(row).length > 0
+        }
+
+        function blankCardForm () {
+          return {
+            ctx: '', max_output_tokens: '', default_effort: null, effort_map: [],
+            supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
+            supports_vision: null, supports_reasoning_effort: null,
+            hidden: null, disabled: null
+          }
+        }
+
+        // 回显：只有真布尔回填，脏值 / 缺键 / null 一律落「不知道」。打开一张从没配过的卡再保存
+        // 不会把它写成「不支持」（与 models.html openCard 同一条纪律）。
+        function cardFormFromConfig (model) {
+          const form = blankCardForm()
+          const card = (modelCards.value || []).find(row => row && row.model === model)
+          const tri = value => (value === true || value === false ? value : null)
+          // 平铺层 model_max_output_tokens 兜底，且**与有没有卡片无关**（models.html 的
+          // maxOutputTokensOf 同口径）：卡片从没建过时对外读数仍是平铺那一行，回显画空等于
+          // 让操作员以为没声明过，而他在这里保存会顺手建卡并清掉平铺行（后端那一条清理规则）
+          const flat = (flatMaxOutput.value || []).find(row => row && row.model === model)
+          const flatValue = flat && flat.max_output_tokens !== null && flat.max_output_tokens !== undefined
+            ? flat.max_output_tokens : null
+          const declared = card && card.max_output_tokens !== null && card.max_output_tokens !== undefined
+            ? card.max_output_tokens : flatValue
+          form.max_output_tokens = declared === null || declared === undefined ? '' : String(declared)
+          if (card) {
+            form.ctx = card.ctx === null || card.ctx === undefined ? '' : String(card.ctx)
+            form.default_effort = typeof card.default_effort === 'string' && card.default_effort ? card.default_effort : null
+            const map = card.effort_map
+            if (Array.isArray(map)) {
+              map.forEach(entry => {
+                if (entry && typeof entry.from === 'string' && typeof entry.to === 'string') form.effort_map.push({ from: entry.from, to: entry.to })
+              })
+            }
+            form.supports_tool_use = tri(card.supports_tool_use)
+            form.supports_streaming = tri(card.supports_streaming)
+            form.supports_reasoning = tri(card.supports_reasoning)
+            form.supports_vision = tri(card.supports_vision)
+            form.supports_reasoning_effort = tri(card.supports_reasoning_effort)
+            form.hidden = tri(card.hidden)
+            form.disabled = tri(card.disabled)
+          }
+          return form
+        }
+
+        function snapshotOf (form) {
+          return JSON.stringify({
+            ctx: form.ctx, max_output_tokens: form.max_output_tokens, default_effort: form.default_effort,
+            effort_map: form.effort_map, supports_tool_use: form.supports_tool_use,
+            supports_streaming: form.supports_streaming, supports_reasoning: form.supports_reasoning,
+            supports_vision: form.supports_vision, supports_reasoning_effort: form.supports_reasoning_effort,
+            hidden: form.hidden, disabled: form.disabled
+          })
+        }
+
+        async function openModelCards (row) {
+          mcRow.value = row
+          // 打开前重取一次文档：卡片层是别人也可能刚改过的数据。读失败也允许打开
+          // （清单来自池行，与文档无关），但保存会被 mcConfigFresh 拦住 —— 在过期/空的
+          // 快照上保存，等于把没读到的卡片当成「没人声明过」
+          mcConfigFresh.value = await loadDeclsQuiet()
+          const names = []
+          const origin = {}
+          coveredModels(row).forEach(model => {
+            const name = String(model || '').trim()
+            if (name && names.indexOf(name) < 0) { names.push(name); origin[name] = 'pool' }
+          })
+          virtualModelsForRow(row).forEach(model => {
+            const name = String(model || '').trim()
+            if (name && names.indexOf(name) < 0) { names.push(name); origin[name] = 'virtual' }
+          })
+          names.sort((a, b) => a.localeCompare(b))
+          mcSections.value = names.map(model => {
+            const form = cardFormFromConfig(model)
+            return { model, origin: origin[model], form, base: snapshotOf(form) }
+          })
+          mcExpanded.value = {}
+          // 缺省只展开第一段：一张卡十来个字段，三段同屏会把对话框拉成一条读不完的长队。
+          // 收起的分段仍然说得清自己有没有被动过（分段头的 caption 带已声明 / 未声明 /
+          // 有未保存改动），所以看不见字段也不会看不见状态。一两张卡时全部展开。
+          names.forEach(function (model, index) { mcExpanded.value[model] = index === 0 || names.length <= 2 })
+          mcOpen.value = true
+        }
+
+        function sectionDirty (section) {
+          return snapshotOf(section.form) !== section.base
+        }
+
+        function mcSectionCaption (section) {
+          const declared = (modelCards.value || []).some(row => row && row.model === section.model)
+          const parts = [section.origin === 'virtual' ? t.value.mcFromVirtual : t.value.mcFromPool,
+            declared ? t.value.mcSectionDeclared : t.value.mcSectionNone]
+          if (sectionDirty(section)) parts.push(t.value.mcDirtyMark)
+          return parts.join(' · ')
+        }
+
+        const mcCopyText = computed(() => window.lmrI18n.translate(locale.value, 'workers', 'mcCopy', {
+          url: (mcRow.value && mcRow.value.url) || ''
+        }))
+        const mcSummary = computed(() => {
+          const total = mcSections.value.length
+          if (!total) return ''
+          const pending = mcSections.value.filter(sectionDirty).length
+          return window.lmrI18n.translate(locale.value, 'workers', 'mcPending', { pending, total })
+        })
+
+        // 校验与 models.html 同口径：留空合法（= 不声明），填了必须是正整数。
+        // 错误文案带上模型名：多个分段同屏时报「必须是大于 0 的整数」没人知道是哪张卡。
+        function positiveIntRule (value) {
+          if (value === '' || value === null || value === undefined) return true
+          return /^\d+$/.test(String(value)) && Number(value) >= 1 ? true : mt('ctxRule')
+        }
+        function ruleWithModel (model, value) {
+          const verdict = positiveIntRule(value)
+          return verdict === true ? true : window.lmrI18n.translate(locale.value, 'workers', 'mcFieldRule', { model, message: verdict })
+        }
+        function ctxRuleOf (model, value) { return ruleWithModel(model, value) }
+        function maxOutputTokensRuleOf (model, value) { return ruleWithModel(model, value) }
+        function mcFormsValid () {
+          return mcSections.value.every(section => {
+            const form = section.form
+            return positiveIntRule(form.ctx) === true && positiveIntRule(form.max_output_tokens) === true
+          })
+        }
+
+        async function saveModelCards () {
+          if (!mcSections.value.length) return
+          if (!mcConfigFresh.value) { notify(t.value.mcStaleRefuse, 'negative'); return }
+          if (!mcFormsValid()) {
+            // 把第一个违规的字段连模型名一起念出来：多张卡同屏时只报一句「必须是大于 0 的整数」等于什么都没说
+            const bad = mcSections.value.find(section => positiveIntRule(section.form.ctx) !== true || positiveIntRule(section.form.max_output_tokens) !== true)
+            const verdict = positiveIntRule(bad.form.ctx) !== true ? positiveIntRule(bad.form.ctx) : positiveIntRule(bad.form.max_output_tokens)
+            notify(window.lmrI18n.translate(locale.value, 'workers', 'mcFieldRule', { model: bad.model, message: verdict }), 'negative')
+            return
+          }
+          const dirty = mcSections.value.filter(sectionDirty)
+          if (!dirty.length) { notify(t.value.mcNoDirty, 'info'); return }
+          mcSaving.value = true
+          try {
+            // 逐个模型一次 POST /config/model（服务端 merge 语义：发了的字段才改）。
+            // 三态字段一律显式带键：填了发布尔、留头发 null = 清回「不知道」，与 models.html
+            // saveCard 同一份补丁形状；hidden / disabled 同族（后端 null = 清除）。
+            for (const section of dirty) {
+              const form = section.form
+              const tri = value => (value === true || value === false ? value : null)
+              await window.lmrApi.configModel({
+                model: section.model,
+                ctx: form.ctx === '' ? null : Number(form.ctx),
+                max_output_tokens: form.max_output_tokens === '' ? null : Number(form.max_output_tokens),
+                default_effort: form.default_effort || null,
+                effort_map: (form.effort_map || []).filter(one => one.from && one.to).map(one => ({ from: one.from, to: one.to })),
+                supports_tool_use: tri(form.supports_tool_use),
+                supports_streaming: tri(form.supports_streaming),
+                supports_reasoning: tri(form.supports_reasoning),
+                supports_vision: tri(form.supports_vision),
+                supports_reasoning_effort: tri(form.supports_reasoning_effort),
+                hidden: tri(form.hidden),
+                disabled: tri(form.disabled)
+              })
+              section.base = snapshotOf(form)
+            }
+            notify(window.lmrI18n.translate(locale.value, 'workers', 'mcSavedAll', { n: dirty.length }))
+            mcConfigFresh.value = await loadDeclsQuiet()
+            // 存完就收起（与本页其它对话框一致：成功后关闭，操作员要再看就从行上重开，
+            // 那时读到的是刚落盘的卡片）。保存中途失败会停在 catch，弹窗保持打开，
+            // 已经存过的段其基准已更新，重试只补没存成的那几张。
+            mcOpen.value = false
+          } catch (error) {
+            notify(error.message, 'negative')
+          } finally {
+            mcSaving.value = false
+          }
+        }
+
         // ── JSON 权威面：upstreams 段的原文往返 ──
         // 服务端回显的是脱敏行（api_key 恒 null + has_api_key 存在位）。这里只把
         // 「操作员看得懂的字段」放进视图，但视图→保存这条路必须无损：任何表单没画的
@@ -1623,7 +1970,11 @@
           saveJson, selected, submitting, submitAdd, submitDecl, submitEdit, t, waitingNotice, unsupported, urlRule,
           capConfigText, capMeasuredText, capNumber, capRangeText,
           loadStateColor, loadStateLabel, loadStateTextColor, loadStateTooltip, gpuBadge,
-          capRules, addCapsOk, declCapsOk, editCapsOk
+          capRules, addCapsOk, declCapsOk, editCapsOk,
+          // 实例级「模型配置」对话框
+          mcOpen, mcSaving, mcSections, mcExpanded, mcCopyText, mcSummary, mt, effortOptions,
+          triStateOptions, yesNoOptions, openModelCards, saveModelCards, mcSectionCaption,
+          ctxRuleOf, maxOutputTokensRuleOf, canConfigureModels
         }
       }
     })

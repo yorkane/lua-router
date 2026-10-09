@@ -93,7 +93,39 @@
         editFieldsHint: '只提交需要改动的字段，留空表示保持不变',
         emptyPool: '服务池为空', emptyFilter: '没有匹配条件的实例',
         openWorker: '打开该服务', probeNow: '立即刷新列表',
-        watcherHint: '标签含 managed-by 的实例由 watcher 维护，在前端摘除后可能被重新发现'
+        watcherHint: '标签含 managed-by 的实例由 watcher 维护，在前端摘除后可能被重新发现',
+        // ── 实例行的「模型配置」对话框（用户诉求 2026-10-09）──
+        // 卡片按**模型名**配（不是按实例名）：一行服务几个模型就几张卡片，字段形状与写入
+        // 路径都和「模型管理」页的模型卡片一致（同一个 POST /config/model）。
+        // ctx / 最大输出 / 默认档位 / 档位改写 / tool use 那一族的 label 复用 models 块的键
+        // （页面里 mt() 取），这里只放服务池页新增的说法。
+        mcButton: '配置模型',
+        mcTitle: '模型配置',
+        mcCopy: '{url}：这一行服务的每个模型各一张卡片，按模型名落盘。卡片是对外的声明（进 /v1/models 与 /props），网关不改写任何输出预算字段；留空 = 未声明（清回引擎自报），false 是结论，两者绝不互相冒充。',
+        mcNoModels: '这一行还没有可配的模型名：等探针读到它的 /v1/models，或在「编辑声明条目」里填写模型与覆盖模型。',
+        mcStaleRefuse: '配置文档读取失败：卡片此刻是空的或过期的，保存会把没读到的声明当成没人声明过。请重试，或关闭自动刷新后手动刷新一次。',
+        mcVirtualNote: '清单还并入虚拟入口按地址或实例 id 绑定归进这一行的实际模型成员：改的就是同一份 model_configs，与「模型管理」页的卡片同源。',
+        mcFromPool: '实例注册', mcFromVirtual: '入口归并',
+        mcSectionDeclared: '已声明', mcSectionNone: '未声明', mcDirtyMark: '有未保存改动',
+        mcSaveAll: '保存卡片', mcSavedAll: '已保存 {n} 张模型卡片', mcNoDirty: '没有需要保存的卡片改动',
+        mcFieldRule: '{model}：{message}',
+        mcStreamingField: '流式输出（streaming）',
+        mcStreamingHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明 supports_streaming。留空 = 不知道，退回引擎自报，两边都没读数时整个键省略。只影响对外声明，不影响转发。',
+        mcReasoningField: '推理（reasoning）',
+        mcReasoningHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明 supports_reasoning。留空 = 不知道，退回引擎自报，两边都没读数时整个键省略。只影响对外声明，不影响转发。',
+        mcVisionField: '视觉（vision）',
+        mcVisionHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明 supports_vision。留空 = 不知道，退回引擎自报（其次由卡片模态推断）。只影响对外声明，不影响转发：配了不支持，带图的请求照样转出去。',
+        mcEffortSupportField: '档位支持（reasoning effort）',
+        mcEffortSupportHint: '填了就以本卡片为准，压过入口与引擎自报；对外声明顶层 supports_reasoning_effort。留空 = 不知道，退回原有派生（有任一份档位读数才是 true）。只影响对外声明，不改任何档位改写。',
+        mcHiddenField: '隐藏（不对外广告）',
+        mcHiddenHint: '选「是」= 这个名字从 /v1/models 里消失，但照常服务：仍进候选池、仍被 watcher 保留、仍能被虚拟入口选作落点。留空 = 没说，照旧广告。',
+        mcDisabledField: '禁用（不广告也不服务）',
+        mcDisabledHint: '选「是」= 不广告、不进候选、watcher 摘除，是熔断级别的下线。留空 = 没说。被禁的名字被虚拟入口选中时该落点会被排除，慎用。',
+        // 三态下拉的「支持 / 不支持」沿用 models 块那一族文案（toolUseYes / toolUseNo），这里不造第二份；
+        // hidden / disabled 用的是「是 / 否」这一组。
+        mcYes: '是', mcNo: '否',
+        mcMapAdd: '添加改写',
+        mcPending: '未保存 {pending} / 共 {total} 张卡片'
       },
       pool: {
         title: '服务池',
@@ -215,6 +247,14 @@
         cardToolUseField: '工具调用（tool use）',
         cardToolUseHint: '填了就以本卡片为准，压过入口与全局；留空 = 不知道，对外声明退回引擎自己报的 supports_tool_use，两边都给不出读数时整个省略这个键',
         colToolUse: '工具调用', toolUseUnknown: '未知', toolUseYes: '支持', toolUseNo: '不支持',
+        // ──「隐藏」与「禁用」（用户裁定 2026-10-09）：卡片层与入口层各一份，三态下拉共用一套词 ──
+        // 两位都不是能力位：hidden 只关 /v1/models 广告面（照常服务与调度），disabled 是全套排除。
+        // 留空 = 删键 = 没说，false 是结论，两者在解析/落盘/往返里绝不合并，所以控件用三态下拉。
+        cardSwitchUnknown: '未声明',
+        cardHiddenField: '隐藏（不对外广告但继续服务）',
+        cardHiddenHint: '只从 /v1/models 里抹掉，仍可被虚拟服务使用和调度。留空 = 没说（照旧广告）；选「不支持」= 明确声明不隐藏，压过入口层的同名声明',
+        cardDisabledField: '禁用（不被发现/服务/调度）',
+        cardDisabledHint: '全套排除：不出现在 /v1/models、watcher 摘除、路由候选排除。留空 = 没说（照常服务）；被禁的名字按它发的请求会失败',
         declarationDisclosure: '能力位只影响对外声明，不影响转发：配了「不支持工具调用」，带 tools 的请求照样转给引擎，由它自己接受或 400；能力位不含 image，发图的请求也照样转。网关判不准「是否真需要视觉」，误杀代价大于漏放，所以一律放行（与 2026-10-04「网关不改写调用方意图」同向），由客户端按 /v1/models 的 capabilities 自己决定要不要发。',
         cardSaved: '已保存模型卡片 {model}', cardRemove: '清除该模型的全部覆盖', cardRemoveTitle: '清除模型覆盖',
         cardRemoveConfirm: '会同时删除模型卡片与旧的 ctx / 强制档位条目。', clearedNotice: '已清除 {model} 的覆盖配置',
@@ -266,6 +306,12 @@
         // ── 虚拟模型「条目列表 + 编辑对话框」（refactor-arch 5.1，w_ui_models 2026-10-05）──
         virtualEntriesEmpty: '还没有虚拟模型入口：点击右上角「添加服务入口」新建一条',
         virtualEditTitle: '编辑服务入口', virtualNewTitle: '新增服务入口',
+        // 入口层的两位与卡片层各自独立，判定按「或」汇合（任一说了 true 即命中）：入口可以只藏自己
+        // 而组内模型照旧广告，也可以只禁这个入口而不动组内模型的其它落点。
+        entryHiddenField: '隐藏（不对外广告但继续服务）',
+        entryHiddenHint: '只把这个入口名从 /v1/models 里抹掉：按这个名字发的请求照样能转，组内模型仍进候选池、仍被 watcher 保留。留空 = 没说；卡片层勾了「隐藏」也算命中（两条判据是「或」）',
+        entryDisabledField: '禁用（不被发现/服务/调度）',
+        entryDisabledHint: '全套排除：这个入口名不出现在 /v1/models、按它发的请求没有候选（落回既有的「无候选」拒绝）、组内成员在候选装配里逐个按 disabled 收窄。留空 = 没说；这是熔断式开关，与只关广告面的「隐藏」分家',
         virtualEditCopy: '一条入口 = 一个对外名字 + 一组实际模型。没编辑过的字段保持磁盘原样；留空的声明位一律写成删键（让位卡片与引擎自报），false 是结论、留空是沉默，两者绝不合并。',
         virtualEntrySave: '保存条目',
         virtualSaveChainNote: '保存 = 先重取服务器整表、只替换这一条，其余条目原样带回（整表提交）',
@@ -419,7 +465,40 @@
         editFieldsHint: 'Only changed fields are sent; empty means keep as is',
         emptyPool: 'The pool is empty', emptyFilter: 'No worker matches the filter',
         openWorker: 'Open this service', probeNow: 'Refresh now',
-        watcherHint: 'Workers labelled managed-by belong to the watcher and may be re-discovered after removal'
+        watcherHint: 'Workers labelled managed-by belong to the watcher and may be re-discovered after removal',
+        // ── Per-worker "Model config" dialog (user request 2026-10-09) ──
+        // Cards are keyed by *model name*, not by worker: a row that serves several models
+        // gets one card each. Field shape and write path match the model cards on the
+        // Model-manager page (same POST /config/model). The ctx / max-output / default-effort
+        // / effort-rewrite / tool-use labels are reused from the models block via mt();
+        // only the service-pool specific wording lives here.
+        mcButton: 'Model config',
+        mcTitle: 'Model configuration',
+        mcCopy: '{url}: each model this row serves has its own card, stored by model name. A card is an outward advertisement (it lands in /v1/models and /props) and the gateway never rewrites an output budget field; blank means undeclared (clear back to the engine report) while false is a verdict, and the two never stand in for each other.',
+        mcNoModels: 'This row has no model name to configure yet: wait for the probe to read its /v1/models, or fill in the model and served models under "Edit declaration".',
+        mcStaleRefuse: 'The config document could not be read: the cards are empty or stale right now, so saving would treat declarations we never read as undeclared. Retry, or turn auto-refresh off and refresh manually once.',
+        mcVirtualNote: 'The list also merges the real model members that a virtual entry binds into this row by URL or worker id: it is the same model_configs store, shared with the Model-manager cards.',
+        mcFromPool: 'worker report', mcFromVirtual: 'entry merge',
+        mcSectionDeclared: 'declared', mcSectionNone: 'not declared', mcDirtyMark: 'unsaved changes',
+        mcSaveAll: 'Save cards', mcSavedAll: 'Saved {n} model cards', mcNoDirty: 'No card changes to save',
+        mcFieldRule: '{model}: {message}',
+        mcStreamingField: 'Streaming',
+        mcStreamingHint: 'When set, this card wins over the entry and the engine report and advertises supports_streaming. Blank = unknown, so it falls back to the engine and the key is dropped when neither has a reading. Changes the advertisement only, never forwarding.',
+        mcReasoningField: 'Reasoning',
+        mcReasoningHint: 'When set, this card wins over the entry and the engine report and advertises supports_reasoning. Blank = unknown, so it falls back to the engine and the key is dropped when neither has a reading. Changes the advertisement only, never forwarding.',
+        mcVisionField: 'Vision',
+        mcVisionHint: 'When set, this card wins over the entry and the engine report and advertises supports_vision. Blank = unknown, so it falls back to the engine report and then to the card modalities. Changes the advertisement only: an image request still goes out when this says unsupported.',
+        mcEffortSupportField: 'Effort support (reasoning effort)',
+        mcEffortSupportHint: 'When set, this card wins over the entry and the engine report and advertises the top-level supports_reasoning_effort. Blank = unknown, so the existing derivation stays (true when any effort reading exists). Changes the advertisement only and rewrites no effort mapping.',
+        mcHiddenField: 'Hide (stop advertising)',
+        mcHiddenHint: '"Yes" removes the name from /v1/models while it keeps serving: it stays in the candidate pool, stays registered with the watcher and can still be picked by a virtual entry. Blank = never said, so it keeps being advertised.',
+        mcDisabledField: 'Disable (no ads, no serving)',
+        mcDisabledHint: '"Yes" means not advertised, excluded from candidates and removed by the watcher: this is an outage-level take-down. Blank = never said. A disabled name is skipped as a virtual-entry landing point, so use with care.',
+        // The tri-state dropdown reuses toolUseYes / toolUseNo from the models block instead of a
+        // second copy here; hidden / disabled use the yes/no pair.
+        mcYes: 'yes', mcNo: 'no',
+        mcMapAdd: 'Add rewrite',
+        mcPending: '{pending} of {total} cards unsaved'
       },
       pool: {
         title: 'Service pool',
@@ -545,6 +624,16 @@
         cardToolUseField: 'Tool use',
         cardToolUseHint: 'When set, this card wins over the entry and the global policy; blank = unknown, so the advertised value falls back to what the engine reports as supports_tool_use, and the key is dropped entirely when neither side has a reading',
         colToolUse: 'Tool use', toolUseUnknown: 'unknown', toolUseYes: 'supported', toolUseNo: 'unsupported',
+        // ── "Hidden" and "disabled" (root ruling 2026-10-09): card layer plus entry layer, one
+        // shared tri-state wording. Neither is a capability flag: hidden only drops the name from
+        // the /v1/models advertisement while it keeps serving, disabled is the full exclusion.
+        // Blank = key deleted = the operator never spoke; false is a conclusion. Never merged, so
+        // the control is a tri-state select rather than a checkbox.
+        cardSwitchUnknown: 'not declared',
+        cardHiddenField: 'Hidden (not advertised, still serving)',
+        cardHiddenHint: 'Removes the name from /v1/models only: virtual entries can still use and schedule it. Blank = never spoken (advertised as before); "unsupported" = an explicit "do not hide", which outranks the entry-level claim of the same name',
+        cardDisabledField: 'Disabled (not discoverable, not served, not scheduled)',
+        cardDisabledHint: 'Full exclusion: absent from /v1/models, unregistered by the watcher, and removed from the routing candidates. Blank = never spoken (served as before); requests naming a disabled model will fail',
         declarationDisclosure: 'Capability flags only change what is advertised, never what is forwarded: a request with tools still goes to the engine even when tool use is set to unsupported, and an image request still goes when image is not ticked. The gateway cannot tell whether vision is really needed, and a false refusal costs more than a missed one, so everything is passed through (same direction as the 2026-10-04 ruling that the gateway does not rewrite caller intent); the client decides from capabilities in /v1/models.',
         cardSaved: 'Model card saved for {model}', cardRemove: 'Clear all overrides',
         cardRemoveTitle: 'Clear model overrides',
@@ -622,6 +711,13 @@
         // ── Virtual model entry list + edit dialog (refactor-arch 5.1, w_ui_models 2026-10-05) ──
         virtualEntriesEmpty: 'No service entries yet: use "Add service entry" at the top right',
         virtualEditTitle: 'Edit service entry', virtualNewTitle: 'New service entry',
+        // Entry layer of the two switches: each layer is independent and the verdicts OR together
+        // (either side saying true wins), so an entry can hide itself while its group models stay
+        // advertised, or disable just this entry without touching other landing points.
+        entryHiddenField: 'Hidden (not advertised, still serving)',
+        entryHiddenHint: 'Removes this entry name from /v1/models only: requests by that name still forward, the group models still enter the candidate pool and stay registered with the watcher. Blank = never spoken; a card that claims hidden also wins (the two verdicts are an "or")',
+        entryDisabledField: 'Disabled (not discoverable, not served, not scheduled)',
+        entryDisabledHint: 'Full exclusion: the entry name disappears from /v1/models, requests by that name get no candidates (the existing "no candidates" refusal), and group members are filtered per member by disabled. Blank = never spoken; this is a circuit-breaker switch, kept apart from hidden, which only closes the advertisement',
         virtualEditCopy: 'One entry = one public name plus a group of real models. Fields you never touch stay byte-identical on disk; a blank declaration field is written as a deleted key (the card and the engine get to speak), and false is a conclusion while blank is silence — never merged.',
         virtualEntrySave: 'Save entry',
         virtualSaveChainNote: 'Save = re-fetch the whole table from the server, replace only this entry, and carry every other entry through unchanged',

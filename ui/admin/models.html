@@ -147,7 +147,7 @@
                实际模型组）保持行内直改——它们本身就是条目式，不再套一层弹窗。控件密度：
                身份 2 列，缺省档位 + 五个三态位 + 四个能力位 3 列；三态位保持 clearable 下拉
                而不是 radio（塌缩成 2 项就画不出「不知道」那一档，见本页三态纪律注释）。 -->
-          <q-dialog v-model="virtualOpen" persistent>
+          <q-dialog v-model="virtualOpen">
             <q-card class="dialog-card virtual-dialog">
               <q-card-section>
                 <div class="dialog-title">{{ virtualDialogTitle }}</div>
@@ -181,6 +181,17 @@
                               @update:model-value="touchRow(virtualForm)"></q-select>
                     <q-select v-model="virtualForm.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
                               :label="cjText('virtualEffortSupportField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualEffortSupportHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                  </div>
+                  <!-- 「隐藏」与「禁用」的入口层（用户裁定 2026-10-09）：与卡片层的两位各自独立，
+                       判定按「或」汇合（卡片或入口任一说了 true 即命中）。三态下拉而不是勾选框，
+                       理由与卡片对话框那两位同一条：留空 = 删键 = 没说，false 是结论。 -->
+                  <div class="form-grid-2">
+                    <q-select v-model="virtualForm.hidden" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="tv('entryHiddenField')" :placeholder="tv('cardSwitchUnknown')" :hint="tv('entryHiddenHint')"
+                              @update:model-value="touchRow(virtualForm)"></q-select>
+                    <q-select v-model="virtualForm.disabled" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="tv('entryDisabledField')" :placeholder="tv('cardSwitchUnknown')" :hint="tv('entryDisabledHint')"
                               @update:model-value="touchRow(virtualForm)"></q-select>
                   </div>
                   <div>
@@ -430,6 +441,16 @@
                               :label="cjText('cardVisionField')" :placeholder="t.toolUseUnknown" :hint="cjText('cardVisionHint')"></q-select>
                     <q-select v-model="cardForm.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
                               :label="cjText('cardEffortSupportField')" :placeholder="t.toolUseUnknown" :hint="cjText('cardEffortSupportHint')"></q-select>
+                  </div>
+                  <!-- 「隐藏」与「禁用」（用户裁定 2026-10-09）：两位刻意摆在能力位那一组**外面**
+                       —— 它们不是对外能力读数（后端 snapshot/profiles 也没把它们并进那五位），
+                       hidden 管广告面、disabled 连服务一起停。控件仍是三态下拉而不是勾选框：
+                       勾选框的 false 与未填同值，画不出「没说」那一档，而后端 nil 与 false 分家一路到底。 -->
+                  <div class="form-grid-2">
+                    <q-select v-model="cardForm.hidden" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="t.cardHiddenField" :placeholder="t.cardSwitchUnknown" :hint="t.cardHiddenHint"></q-select>
+                    <q-select v-model="cardForm.disabled" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
+                              :label="t.cardDisabledField" :placeholder="t.cardSwitchUnknown" :hint="t.cardDisabledHint"></q-select>
                   </div>
                   <div>
                     <div class="rows-head q-mb-xs">{{ t.cardEffortMapTitle }}</div>
@@ -752,6 +773,9 @@
           model: '', targets: [], context_window: '', default_effort: null, effort_map: [], modalities: [],
           supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
           supports_vision: null, supports_reasoning_effort: null,
+          // 「隐藏」/「禁用」（用户裁定 2026-10-09）：与那五位同为三态，null = 操作员没说
+          // （后端缺席与 null 都读作「不知道」），false 是结论，两者在往返里绝不合并。
+          hidden: null, disabled: null,
           raw: null, dirty: false
         })
         // 池成员的实时形状（url / model_id / models / models_verified）：给候选下拉用，
@@ -764,6 +788,10 @@
           model: '', ctx: '', max_output_tokens: '', default_effort: null, effort_map: [], modalities: [],
           supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
           supports_vision: null, supports_reasoning_effort: null,
+          // 「隐藏」/「禁用」（用户裁定 2026-10-09）：三态布尔，null = 没说（后端缺席即沉默，
+          // 磁盘上不会无中生有一个没人声明过的键），true/false 是结论。刻意不并进上面那五位
+          // —— 它们不是对外能力读数：hidden 只关 /v1/models 广告，disabled 连服务与候选一起停。
+          hidden: null, disabled: null,
           // 档位勾选（用户诉求 2026-10-08）。三态刻意用**两个**字段而不是一个数组：
           //   reasoning_efforts_auto = true  → 这张卡从没勾过（键不在 / null），对外跟随引擎
           //   reasoning_efforts_auto = false → 操作员的结论，数组就是勾选集合（可为空数组，
@@ -821,6 +849,10 @@
         // 勾选框 —— 勾选框的 false 与未填是同一个值，表达不出「不知道」，而那正是让位给
         // 引擎自报的那一档。选项与 tool use 共用一份（同一族 label 真布尔）。
         const CAP_FIELDS = ['supports_streaming', 'supports_reasoning', 'supports_vision', 'supports_reasoning_effort']
+        // 「隐藏」/「禁用」（用户裁定 2026-10-09）：与那五位同一条三态纪律，但**不并进**那个数组
+        // —— 它们不是对外能力读数（后端 profiles / snapshot 也刻意把两位写在循环之外）：
+        // hidden 只关 /v1/models 广告面，disabled 连候选与 watcher 一起停。
+        const OPERATOR_SWITCH_FIELDS = ['hidden', 'disabled']
         const CAP_LABELS = {
           supports_streaming: () => cjText('capStreaming'),
           supports_reasoning: () => cjText('capReasoning'),
@@ -965,7 +997,10 @@
         function entryDeclarations (entry) {
           const out = { default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
             supports_streaming: null, supports_reasoning: null,
-            supports_vision: null, supports_reasoning_effort: null }
+            supports_vision: null, supports_reasoning_effort: null,
+            // 「隐藏」/「禁用」（用户裁定 2026-10-09）：同一条三态读侧 —— 只有真布尔算声明，
+            // null / 缺键 / 脏值一律读成「没说」（后端 nil 与 false 分家，UI 合一次就白分）
+            hidden: null, disabled: null }
           if (!entry || typeof entry !== 'object') return out
           out.default_effort = normalizeEffort(entry.default_effort)
           const map = entry.effort_map
@@ -991,6 +1026,10 @@
           // 四个新位同一条纪律：只有真布尔算声明，脏值（字符串 / 数字 / null）一律读成
           // 「没说」而不是 false —— 后端把 nil 与 false 分家，UI 这边合一次就白分
           CAP_FIELDS.forEach(field => {
+            if (typeof entry[field] === 'boolean') out[field] = entry[field]
+          })
+          // 「隐藏」/「禁用」同一条读侧：只有真布尔算声明，脏值读成「没说」而不是 false
+          OPERATOR_SWITCH_FIELDS.forEach(field => {
             if (typeof entry[field] === 'boolean') out[field] = entry[field]
           })
           return out
@@ -1357,6 +1396,9 @@
             supports_reasoning: declared.supports_reasoning,
             supports_vision: declared.supports_vision,
             supports_reasoning_effort: declared.supports_reasoning_effort,
+            // 「隐藏」/「禁用」与那五位同一条读侧：读进编辑面，提交与否仍由 dirty 决定
+            hidden: declared.hidden,
+            disabled: declared.disabled,
             raw: { ...entry },
             // 只有真被编辑过的行才允许改写 targets/candidates/context_window 与四个声明位
             dirty: false
@@ -1373,6 +1415,7 @@
             default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
             supports_streaming: null, supports_reasoning: null,
             supports_vision: null, supports_reasoning_effort: null,
+            hidden: null, disabled: null,
             raw: null, dirty: true
           })
           virtualOpen.value = true
@@ -1396,6 +1439,9 @@
             supports_vision: typeof row.supports_vision === 'boolean' ? row.supports_vision : null,
             supports_reasoning_effort: typeof row.supports_reasoning_effort === 'boolean'
               ? row.supports_reasoning_effort : null,
+            // 「隐藏」/「禁用」同一条回显纪律：只有真布尔回填，其余落「没说」
+            hidden: typeof row.hidden === 'boolean' ? row.hidden : null,
+            disabled: typeof row.disabled === 'boolean' ? row.disabled : null,
             raw: row.raw ? JSON.parse(JSON.stringify(row.raw)) : null,
             // 打开即「未编辑」：没碰过任何字段的条目提交时逐字节回传 raw（dirty 决定改写面）
             dirty: false
@@ -1598,6 +1644,13 @@
             if (row[field] === true || row[field] === false) entry[field] = row[field]
             else delete entry[field]
           })
+          // 「隐藏」/「禁用」与那五位同一条提交纪律：dirty 才改写，留空 = 删键（不是 null、
+          // 更不是 false）。两位都只在磁盘配置层说得出口（后端刻意不给它们 env 层），
+          // 所以这里写出去的就是操作员的那句话本身（用户裁定 2026-10-09）
+          OPERATOR_SWITCH_FIELDS.forEach(field => {
+            if (row[field] === true || row[field] === false) entry[field] = row[field]
+            else delete entry[field]
+          })
           return entry
         }
 
@@ -1722,6 +1775,16 @@
           })
           return out
         }
+        // 「隐藏」/「禁用」的卡片层读数源：打开对话框拿到的行有两份来源 —— registered 行来自
+        // models_document（那份文档刻意不带这两位，它们不是对外能力读数），config-only 行来自
+        // document.model_configs（snapshot_of 在操作员真说过时才带上键）。两处都问一遍，
+        // 缺席一律「没说」：这两个键在磁盘上只在操作员真说过时才存在，UI 不许无中生有。
+        function operatorSwitchValue (row, field) {
+          if (row && typeof row[field] === 'boolean') return row[field]
+          const cfg = doc.value || {}
+          const card = (cfg.model_configs || []).find(one => one && one.model === (row && row.model))
+          return card && typeof card[field] === 'boolean' ? card[field] : null
+        }
         function openCard (row) {
           // 声明的输出预算与表格列同一个来源（卡片优先、平铺层兜底）：registered 行来自
           // models_document，那里有没有带出该字段不该影响对话框回显——查卡比查行稳
@@ -1743,6 +1806,10 @@
             supports_vision: typeof row.supports_vision === 'boolean' ? row.supports_vision : null,
             supports_reasoning_effort: typeof row.supports_reasoning_effort === 'boolean'
               ? row.supports_reasoning_effort : null,
+            // 「隐藏」/「禁用」同一条回显纪律：只有真布尔回填，null / 缺键 / 脏值一律落「没说」，
+            // 所以打开一张从没勾过的卡片再保存不会替操作员造出一句「不隐藏 / 不禁用」
+            hidden: operatorSwitchValue(row, 'hidden'),
+            disabled: operatorSwitchValue(row, 'disabled'),
             // 档位勾选的回显：这张卡没勾过 → 自动态，勾选框里铺的是**引擎原话**（基线，
             // 显示为已勾）——操作员于是能直接在探测结果上做加减；勾消任意一个就转成手动态。
             // 卡片勾过 → 手动态，画的就是操作员保存的那一份（包括他手动加的引擎没报的档）。
@@ -1875,6 +1942,13 @@
               ? cardForm.supports_vision : null,
             supports_reasoning_effort: (cardForm.supports_reasoning_effort === true || cardForm.supports_reasoning_effort === false)
               ? cardForm.supports_reasoning_effort : null,
+            // 「隐藏」/「禁用」三态：true/false 是结论，null 是「没说」（后端 merge_model_patch
+            // 认 null = 清回沉默，磁盘上整个键不出现）。绝不能把留空写成 false —— 那会把
+            // 「不隐藏/不禁用」当成操作员说过的话落盘（用户裁定 2026-10-09）
+            hidden: (cardForm.hidden === true || cardForm.hidden === false)
+              ? cardForm.hidden : null,
+            disabled: (cardForm.disabled === true || cardForm.disabled === false)
+              ? cardForm.disabled : null,
             // 档位勾选（用户诉求 2026-10-08）。null = 「清除回自动」：键删掉，对外读数退回
             // 引擎自报；数组 = 操作员的结论，逐档带 default 标记（后端 normalize_effort_ladder
             // 认对象数组，至多保留一个 default=true）。
