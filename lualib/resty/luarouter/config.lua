@@ -261,7 +261,7 @@ function _M.load()
 
         -- ==================== GPU utilization channel ====================
         -- doc/caps-redesign-2026-10-06.md §5：gu: 键（逐卡 GPU 利用率 0..1，TTL'd）的唯一
-        -- 写者通道，registry 的 max_gpu_util 上限判定读它。与负载/功率两路共用同一个定时器
+        -- 写者通道，registry 的 max_gpu_util 上限判定读它。与负载那一路共用同一个定时器
         -- 与同一份抓取（metrics 路同一正文多扫一遍；prom 路最多再多一条 PromQL），所以
         -- SMG_LOAD_SOURCE 仍是总开关：它是 none 时这里设了也不会有任何读数（registry 侧
         -- 「读数未知 -> 不排除」，红线 §0 第 2 条）。
@@ -278,7 +278,7 @@ function _M.load()
         --  * SMG_LOAD_UTIL_KEYS 覆盖 metrics 路的利用率 gauge 名册；空 = 内置名册
         --    （DEFAULT_UTIL_METRIC_KEYS：dcgm_fi_dev_gpu_util 真名 + nvidia/dcgm 两个同量纲
         --    写法，刻意不含 KV-cache 用量名——准入判据只认 GPU 利用率）。
-        -- 这三个名字与功率那三个不同，走的是 config.lua 装配（fork 前解析，天然进
+        -- 这三个名字走的是 config.lua 装配（fork 前解析，天然进
         -- /probe/config）；三份 conf 的 env 声明只是为了让 util_config 的 os.getenv 兜底
         -- 分支在「手搓 cfg」的调用面里也能读到，两条路都通。
         load_util_enabled = bool("SMG_LOAD_UTIL_ENABLED", true),

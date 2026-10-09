@@ -61,7 +61,6 @@ local K_JOB = keys.K_JOB
 local K_LOAD = keys.K_LOAD
 local K_MPROBE = keys.K_MPROBE
 local K_MPROBE_OK = keys.K_MPROBE_OK
-local K_POWER = keys.K_POWER
 local K_SLOAD = keys.K_SLOAD
 local K_TEMP_DISABLE = keys.K_TEMP_DISABLE
 local K_URL2ID = keys.K_URL2ID
@@ -417,9 +416,8 @@ function M.add(req, cfg)
             -- "all three absent" before it touches a dict. Every registration entry
             -- point (POST /workers, the watcher, the config declaration layer, the
             -- bootstrap seed, DP ranks) gets them from here rather than its own
-            -- call site, which is what keeps the four paths identical. The watt
-            -- ceiling is gone: `pw:` stayed a pure observation, and the scheduler's
-            -- busy-side knob is now the utilisation percent (`max_gpu_util`, whose
+            -- call site, which is what keeps the four paths identical. The scheduler's
+            -- busy-side knob is the utilisation percent (`max_gpu_util`, whose
             -- meaningful zero is why it normalizes through util_limit, not cap_limit).
             -- `min_concurrency` is the lower rung of the three-way verdict and is
             -- absent-equivalent-to-1, so it is stored the same way rather than defaulted.
@@ -478,11 +476,10 @@ function M.add(req, cfg)
         d:set(K_LOAD .. id, 0)
         d:set(K_ACTIVE .. id, 0)  -- 从未活跃过，让第一次巡检会探它
         -- A re-registration is a new engine behind the url: whatever the previous
-        -- owner's GPU was doing has no right to describe this one, so both
-        -- external channels start empty (the load source refills them on its tick).
+        -- owner's GPU was doing has no right to describe this one, so the external
+        -- channels start empty (the load source refills them on its tick).
         d:delete(K_XLOAD .. id)
         d:delete(K_SLOAD .. id)
-        d:delete(K_POWER .. id)
         local ids = read_ids(d)
         local seen = false
         for i = 1, #ids do
@@ -540,7 +537,7 @@ function M.remove(worker_id)
         dd:delete(K_IDURL .. id)
         for _, prefix in ipairs({ K_HEALTH, K_HFAIL, K_HSUCC, K_CBSTATE,
                                  K_CBF, K_CBS, K_CBO, K_LOAD, K_XLOAD, K_SLOAD,
-                                K_POWER, K_TEMP_DISABLE,
+                                K_TEMP_DISABLE,
                                 K_DISC, K_DPROBE, K_MPROBE, K_MPROBE_OK, K_HSEL }) do
             dd:delete(prefix .. id)
         end
@@ -629,9 +626,9 @@ function M.info(record, d)
         -- the one rung where 0 *is* a limit (max_gpu_util, folded by util_limit).
         -- inflight_requests is the pure request count (what the concurrency ceiling
         -- compares against), which is deliberately not `load` -- that field is the
-        -- ranking number and mixes in the GPU sample. gpu_util and power_w stay nil
-        -- while no fresh sample exists: "unknown, not zero" is what keeps both channels
-        -- safe to leave switched on, and power_w only survives as an observation.
+        -- ranking number and mixes in the GPU sample. gpu_util stays nil while no
+        -- fresh sample exists: "unknown, not zero" is what keeps the utilisation
+        -- ceiling safe to leave switched on.
         max_concurrency = R.cap_limit(record.max_concurrency),
         min_concurrency = R.cap_limit(record.min_concurrency),
         max_gpu_util = R.util_limit(record.max_gpu_util),
@@ -643,13 +640,8 @@ function M.info(record, d)
         -- like a state the gateway refused to name.
         load_state = R.capacity_state(record, d),
         inflight_requests = d:get(K_LOAD .. id) or 0,
-        power_w = (function()
-            local milli = d:get(K_POWER .. id)
-            return milli and (milli / 1000) or nil
-        end)(),
         -- The live reading the utilisation ceiling compares against, in the 0..1 shape
-        -- the exporter publishes it in (power_w just above stays for the dashboards:
-        -- the watt channel is pure observation now). Nil = no fresh sample = unknown.
+        -- the exporter publishes it in. Nil = no fresh sample = unknown.
         gpu_util = (function()
             local milli = d:get(K_GPU_UTIL .. id)
             return milli and (milli / 1000) or nil

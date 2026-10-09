@@ -523,7 +523,7 @@ local function candidates_for(model, profile, counted)
     end
     -- Registry-side cap predicate (doc/gap-worker-caps.md). Read-only from here:
     -- the two numbers it compares are this gateway's own in-flight counter and
-    -- gpu_load's watt samples, both maintained elsewhere. Absent (a stripped unit
+    -- gpu_load's GPU-utilisation samples, both maintained elsewhere. Absent (a stripped unit
     -- probe, an older build) means no gate at all, which is the fail-open direction
     -- the rule itself demands -- a missing reading must never cost capacity.
     local cap_check = registry.capacity_exclusion

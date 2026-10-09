@@ -203,7 +203,7 @@ _M.note_config_skip = note_config_skip
 --   * reconcile 对 protected 行只做 model-map rename（本文件 protected_seen 那一圈），
 --     从不认领发现层的元数据。
 -- 三条链合起来的结果就是 labels 恒空：/_ui 的卡号徽章不亮，gpu_load 的逐卡 util 归属
--- 也只有 ledger 的 g|<url> 提示可依（逐卡功率读台账、逐卡 util 读记录 labels.gpu）。
+-- 也只有 ledger 的 g|<url> 提示可依（逐卡归属先读台账提示、再读记录 labels.gpu）。
 --
 -- 为什么补 label 不违反守卫 3（「不改操作员/环境已经声明过的东西」）：守卫 3 保护的是
 -- **路由身份与调度判定** —— URL、model_id、健康位、熔断、优先级、权重、DP 展开、并发与

@@ -1033,8 +1033,6 @@ local HELP = {
     -- family as a single undifferentiated failure mode. Missing this entry is not
     -- cosmetic: the exporter prints the TYPE line with no HELP above it and the
     -- scraper is left with a blank description.
-    -- (doc/caps-redesign-2026-10-06.md section 6: reason=power retired with the watt
-    -- ceiling; the readings are now max_concurrency and max_gpu_util.)
     smg_worker_capacity_excluded_total = "Candidates removed from selection by their configured concurrency limit or GPU-utilisation limit by reason",
     -- Sibling of the family above, and deliberately *not* part of it: the green-light
     -- preference (doc/caps-redesign-2026-10-06.md section 3) hands the policy only the
@@ -1130,29 +1128,6 @@ local HELP = {
     lr_config_store_backend = "Config snapshot backend this process writes to (1=active) by backend (sqlite/postgres/file)",
     lr_config_store_degradations_total = "Config store resolutions that degraded to a weaker backend by reason",
     lr_config_store_saves_total = "Config snapshot save attempts by result (ok/conflict/unavailable/mirror_failed)",
-    -- Power channel of the GPU load source (the per-worker max_power_w cap). Separate
-    -- families from lr_gpu_load* on purpose: those are a 0..1 score, these are
-    -- absolute watts, and one dashboard axis cannot carry both. They only appear
-    -- when SMG_LOAD_POWER / SMG_LOAD_POWER_QUERY is on, so a box that never opted
-    -- in exports exactly what it exported before.
-    --   samples      = watt readings that reached the registry's `pw:` key
-    --   parse_failures = the reading that should have been there and was not: no
-    --                    power gauge in the body, the query failed, or the answer
-    --                    was not a legal PromQL vector
-    --   rejected     = a reading that reached registry.set_power_w and was refused
-    --                    there as unusable. Near-zero by construction: this module
-    --                    screens with power_watt() before calling, so a non-zero
-    --                    count here means an exporter that answers with numbers
-    --                    this gateway cannot trust (negative/NaN/inf) rather than
-    --                    an exporter that is merely silent -- the latter shows up
-    --                    as parse_failures, not here.
-    --   unmatched    = series naming a host no pooled worker is behind
-    lr_gpu_load_power_samples_total = "GPU watt samples stored by the load source",
-    lr_gpu_load_power_parse_failures_total = "GPU watt readings the load source could not obtain or parse",
-    lr_gpu_load_power_rejected_total = "GPU watt readings refused by the registry as unusable",
-    lr_gpu_load_power_unmatched_total = "GPU watt series naming a host with no pooled worker",
-    lr_gpu_load_power_workers = "Workers with a fresh GPU watt sample",
-    lr_gpu_load_power_watts = "Hottest GPU power draw per worker in watts (absolute, not a 0..1 score)",
 }
 
 ---Pool membership labels for one worker record, in the spelling Rust uses.

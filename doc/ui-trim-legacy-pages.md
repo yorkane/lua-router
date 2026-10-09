@@ -54,7 +54,7 @@ admin 版还多出 SSE 开关、GPU 与 route_type 列、tokens/cached/reasoning
 重叠（表单面，admin 全覆盖且更强）：全局 default_effort 与强度映射、每模型卡
 （ctx / 默认档位 / 模型级映射 / 能力启用）、虚拟模型入口（targets / workers 白名单 /
 context_window / candidates 逐候选绑定）、服务接入池 upstreams（含 max_concurrency /
-max_power_w / api_key 三态）、模型名映射（转发 watcher）。路由策略已由
+api_key 三态）、模型名映射（转发 watcher）。路由策略已由
 admin/routing.html 承担（`/_ui/config/policy`）。
 
 旧页独有 → 已移植进 `ui/admin/models.html` 的「配置 JSON」对话框：

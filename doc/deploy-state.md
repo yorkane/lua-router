@@ -43,19 +43,12 @@ curl -s http://127.0.0.1:<port>/metrics | grep lr_config_store_backend
 实测表现为 8801 的 `lr_gpu_load_workers` 为 8、8802 为 0。**两台在同一天被改成不一致，是漂移不是设计。**
 要对齐的话把 8802 改成和 8801 一样。
 
-## 3. 功率通道：两台的查询串都缺 `gpu`
+## 3. （作废）功率通道记录
 
-两个实例的 `SMG_LOAD_POWER_QUERY` 都是：
-
-```
-max by (Hostname,instance) (DCGM_FI_DEV_POWER_USAGE)     # ← 缺 gpu，这就是 8 台同值的根因
-```
-
-实测 `lr_gpu_load_power_per_card_workers 0`、`lr_gpu_load_power_watts{worker=...} 8 台完全同值`。
-**改成 `max by (Hostname, instance, gpu) (DCGM_FI_DEV_POWER_USAGE)`** 才会有逐卡区分。
-代码侧已经支持（`store_sqlite` 那次之外的 per-card 分支已落地），**缺的只是 compose 里的这个串**。
-
-`doc/deploy-fleet.md` 里的示例也还是旧的 `max by (Hostname,instance)`，**照抄会复刻 342.371 故障**。
+功率通道已于 2026-10-09 整体移除（用户裁定；21.k 实测八实例瓦特读数恒同值、零区分度），
+原「两台的 `SMG_LOAD_POWER_QUERY` 查询串都缺 `gpu`」的漂移记录随之失效，原文见 git 历史。
+现役负载口径只有 GPU 利用率（`DCGM_FI_DEV_GPU_UTIL` 逐卡，查询串必须带 `gpu` 与 `instance`）
+与在途数两个。
 
 ## 4. 需要清理的残留（实测发现）
 
@@ -83,7 +76,6 @@ max by (Hostname,instance) (DCGM_FI_DEV_POWER_USAGE)     # ← 缺 gpu，这就�
 * `legacy_snapshot_is_empty` **这个函数不存在**，只活在一条注释里（`migrate_once` 实际用 `snapshot_is_hollow`）。
 * CAS marker `revision conflict` 在 `store_dispatcher.lua` 里有**两份独立字面量**，没走 `config_store` 的
   共享常量，且 `find` 都没加 plain 标志。
-* `lr_gpu_load_power_per_card_workers` 有写入但 `observability.lua` 的 HELP 表里漏了它。
 
 ## 7. 行号锚点大面积漂移
 

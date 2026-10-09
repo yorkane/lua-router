@@ -11,7 +11,7 @@
 --   ids                        registry/keys (write_ids; a failed set raises)
 --   w: url: u: isel:           registry/records
 --   hl: cbs: cbf: cbu: cbo:    registry/health      (hf:/hs: are written by hb.lua directly)
---   lo: act: xl: sl: pw: gu:   registry/loads       (xl:/pw:/gu: each has one
+--   lo: act: xl: sl: gu:       registry/loads       (xl:/gu: each has one
 --   xany                                           production writer: gpu_load.lua)
 --   job: disc: dpr: mp: mpok:  registry/discovery
 --   td:                        registry/loads       (watcher 临时禁用位；写者=watcher
@@ -73,16 +73,6 @@ local K_HSEL = "isel:"
 --       是为了让「谁说了算」这件事在数据模型里就写清楚，而不是靠调用顺序。
 local K_XLOAD = "xl:"  -- external GPU sample, milli of a 0..1 load, TTL'd
 local K_SLOAD = "sl:"  -- engine self-report, same shape, lower priority
--- Raw measured power (doc/gap-worker-caps.md): the third external channel, and
--- deliberately *not* a load. `xl:` answers "how busy is this card" for the ranking
--- policies; `pw:` answers "how many watts is it drawing" for the per-worker power
--- cap, which is a hard admission gate and not a score. Folding watts into
--- _M.load() would let an idle-but-thirsty co-tenant's GPU make a worker look
--- overloaded to power_of_two, so the two numbers never share a field.
---   value = integer milli-watts (watts x 1000), TTL'd like the load samples: an
---   expired key means "no reading", and _M.capacity_exclusion reads that as
---   *unknown*, which never excludes a worker.
-local K_POWER = "pw:"   -- raw power sample, milli-watts, TTL'd
 -- Per-worker GPU **utilisation** ceiling (doc/caps-redesign-2026-10-06.md section 2): the
 -- pure busy-fraction of the card this worker is pinned to, stored the same way as the
 -- other external readings - integer milli of a 0..1 fraction (percent x 10), TTL'd, so an
@@ -95,11 +85,6 @@ local K_POWER = "pw:"   -- raw power sample, milli-watts, TTL'd
 -- _M.inflight_requests), and a utilisation ceiling has to compare a utilisation, so it
 -- needs a reading that never passed through load_scale. Reusing `xl:` would let an
 -- operator moving a scoring knob (SMG_LOAD_SCALE) silently move an admission gate.
---
--- Why `pw:` is kept: what the 2026-10-06 ruling retires from capacity decisions is the
--- *watt* comparison, not the collection. The power channel stays a pure observation
--- (_M.power_samples and the lr_gpu_load_power_* family keep their readers); only
--- _M.capacity_exclusion stops reading it.
 local K_GPU_UTIL = "gu:" -- pure GPU utilisation sample, milli of a 0..1 fraction, TTL'd
 -- watcher 临时禁用位：探针「其他情况」(非服务下线、非 /v1/models 连不上) 判定的实例
 -- 保留 registry 行、只在候选装配时排除，探针恢复轮删键即自动回归。带 TTL 作泄漏兜底,
@@ -345,7 +330,6 @@ M.K_JOB = K_JOB
 M.K_LOAD = K_LOAD
 M.K_MPROBE = K_MPROBE
 M.K_MPROBE_OK = K_MPROBE_OK
-M.K_POWER = K_POWER
 M.K_SLOAD = K_SLOAD
 M.K_URL2ID = K_URL2ID
 M.K_WORKER = K_WORKER

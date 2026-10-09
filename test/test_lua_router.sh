@@ -2390,7 +2390,7 @@ if section caps; then
 
     # GET /workers 的容量形状（§2）：声明的上限逐字段回显（util 是整数百分比）；
     # 声明了上限的行带 load_state，**没声明任何上限的行是键缺席而不是 null**（null
-    # 会让无门行冒充一个网关拒绝命名的态）；退役的 max_power_w 哪里都不再出现。
+    # 会让无门行冒充一个网关拒绝命名的态）。
     request "$CAP_BASE" GET /workers
     assert_json "caps: declared util ceiling echoes as an integer percent" \
         '.workers[] | select(.id=="'"$CAP_ID_A"'") | .max_gpu_util' "60"
@@ -2400,20 +2400,16 @@ if section caps; then
         '.workers[] | select(.id=="'"$CAP_ID_C"'") | has("load_state") | tostring' "false"
     assert_json "caps: an ungated row carries none of the three cap keys" \
         '.workers[] | select(.id=="'"$CAP_ID_C"'") | (has("max_concurrency") or has("min_concurrency") or has("max_gpu_util")) | tostring' "false"
-    assert_json "caps: the retired max_power_w is not echoed anywhere" \
-        '[.workers[] | select(has("max_power_w"))] | length' "0"
 
     # PUT 运行时面接受三个新字段（与 priority/cost 同一条 UPDATE_NUMBER_FIELDS 的
-    # 202 路径；范围校验住在声明层，记录面按读时归一）。max_power_w 已从白名单退役：
-    # PUT 它像任何未知键一样被忽略——既不落记录，也不炸成 400。
+    # 202 路径；范围校验住在声明层，记录面按读时归一）。
     request "$CAP_BASE" PUT "/workers/$CAP_ID_B" -H 'Content-Type: application/json' \
-        --data '{"min_concurrency":2,"max_concurrency":8,"max_gpu_util":40,"max_power_w":123}'
+        --data '{"min_concurrency":2,"max_concurrency":8,"max_gpu_util":40}'
     assert_eq "caps: PUT accepts the three capacity fields (202)" "$STATUS" "202"
     request "$CAP_BASE" GET "/workers/$CAP_ID_B"
     assert_json "caps: PUT applied min_concurrency" '.min_concurrency' "2"
     assert_json "caps: PUT applied max_concurrency" '.max_concurrency' "8"
     assert_json "caps: PUT applied max_gpu_util" '.max_gpu_util' "40"
-    assert_json "caps: PUT ignored the retired max_power_w" 'has("max_power_w") | tostring' "false"
     # 还原成「全场只剩并发上限 1」的形状：util 档用**负数**清除（0 在那一档是结论不是
     # 清除，这是 cap_limit 与 util_limit 的分岔，运行时面也必须照这个口径收）。
     request "$CAP_BASE" PUT "/workers/$CAP_ID_B" -H 'Content-Type: application/json' \

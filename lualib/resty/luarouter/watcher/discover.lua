@@ -572,7 +572,7 @@ end
 ---不是「这个 url 由哪一路扫到」。21.k 的形状正是 bridge 容器 + 发布端口——同一个容器
 ---同时贡献 docker（127.0.0.1:public）与 docker-net（172.x:container）两条候选，旧写法
 ---择优后把败者整条丢弃，于是存活那条不带 gpu，make_register 的 labels.gpu 恒 nil，
----逐卡功率就永远接不上。字段只在胜者自己缺失时才补，绝不会覆盖一条本来就写了卡号的候选。
+---逐卡 util 就永远接不上。字段只在胜者自己缺失时才补，绝不会覆盖一条本来就写了卡号的候选。
 ---@param lists table[]
 ---@return table[]
 function _M.unique_candidates(lists)

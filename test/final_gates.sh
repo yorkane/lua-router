@@ -65,11 +65,10 @@
 #                  a whitelist that matches nothing must empty the candidate set to
 #                  503 without leaking to a bound instance);
 #                  S2 per-worker max_concurrency really excludes the saturated
-#                  instance from the candidate array; S3 max_power_w excludes on the
-#                  gpu_load watt reading (machine-hottest-card semantics) while a
-#                  *missing* reading stays unknown = never excluded; the /metrics
-#                  lr_gpu_load_power* family; S6 default-off exports zero power
-#                  series; S4 cache_aware affinity cannot carry a capped instance;
+#                  instance from the candidate array; S3 max_gpu_util excludes on the
+#                  gpu_load per-card utilisation reading while a *missing* reading
+#                  stays unknown = never excluded; the /metrics lr_gpu_load_util*
+#                  family; S4 cache_aware affinity cannot carry a capped instance;
 #                  S5 pool-full 503 keeps code no_available_workers with the cap
 #                  count in the message; S7 a renamed config row stops routing the
 #                  old name under IGW; S5c default-off pool behaviour unchanged)
@@ -561,7 +560,7 @@ run_unit_resty() {
 
 gate_unit() {
     local rc=0 t
-    # test_caps_routing：并发/功率上限与 candidates 交集的纯 luajit 单测（无端口，
+    # test_caps_routing：并发/利用率上限与 candidates 交集的纯 luajit 单测（无端口，
     # 与其余 luajit 组同档）；它钉的判定在 router.lua/registry.lua 里，HTTP 面只有
     # e2e_caps 一份门禁，二者缺一就会漏掉"上限写成排序项"这类回归。
     # test_models_shape：/v1/models 对外形状的纯 luajit 单测（切真源码配桩，无端口）。

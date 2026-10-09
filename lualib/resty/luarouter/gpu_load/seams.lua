@@ -2,13 +2,13 @@ local _M = require "resty.luarouter.gpu_load"
 local M = {}   -- cross-module helper surface (not part of _M)
 
 -- gpu_load/seams.lua -- the live seams: the lazy hb/registry module
--- resolvers, the nine default_* injection points (workers / get / post /
--- write / write_power / gpu_hints / now ...), the bearer header helper,
+-- resolvers, the eight default_* injection points (workers / get / post /
+-- write / write_util / gpu_hints / now ...), the bearer header helper,
 -- the effective-load priority rule and the hour-window WARN dedup.
 -- default_gpu_hints pcalls resty.luarouter.watcher lazily on purpose: a
 -- load-time require here would close the watcher -> ... -> gpu_load
--- cycle, and it is why the per-card channel can be entirely absent
--- without costing the power cap its honesty.  Moved verbatim.
+-- cycle, and it is why the per-card channel can be entirely absent without
+-- costing the utilisation ceiling its honesty.  Moved verbatim.
 
 ---Whether this file is running inside nginx *right now*.
 ---
@@ -132,7 +132,7 @@ local function default_workers()
     return out
 end
 
----Per-card power reads the worker->gpu hint table off the watcher's ledger.
+---Per-card attribution reads the worker->gpu hint table off the watcher's ledger.
 ---
 ---Lazy pcall(require) like registry_mod()/hb_mod(): gpu_load must not require the
 ---watcher at load time (a require cycle watcher -> ... -> gpu_load would deadlock
@@ -141,7 +141,8 @@ end
 ---snapshot is empty and the per-card channel simply falls back to labels.gpu and
 ---then to the whole-machine max -- i.e. exactly the pre-feature behaviour. That is
 ---why this is a *hint* channel and not the source of truth: it can be entirely
----missing and the power cap stays as honest as it was before per-card attribution.
+---missing and the utilisation ceiling stays as honest as it was before per-card
+---attribution.
 ---@return table @ url -> gpu id
 local function default_gpu_hints()
     local ok, watcher = pcall(require, "resty.luarouter.watcher")
@@ -193,83 +194,23 @@ local function default_write(id, value, timestamp, ttl_secs, url)
     return written
 end
 
----Store one **watt** sample on the registry's independent `pw:` key.
----
----Why two return values rather than a boolean: the caller must distinguish "there
----was no reading to store" (nothing is written, the old sample simply TTLs out and
----the cap reads *unknown*) from "a reading registry refused" (a genuinely broken
----exporter, worth a counter), and both from a stored sample. This layer never
----writes 0 and never repeats the previous value — that is exactly what makes the
----power cap safe to leave switched on. registry.set_power_w() already rejects
----negatives/NaN/±inf; what is added here is the seam symmetry with
----default_write() and the per-worker gauge.
----@param id string
----@param watts number|nil @ absolute watts
----@param timestamp number @ ms clock (accepted for seam symmetry, unused here)
----@param ttl_secs number
----@param url string|nil @ only for the gauge label
----@return boolean stored, string reason
-local function default_write_power_inner(id, watts, ttl_secs, url)
-    local registry = registry_mod()
-    if not registry or type(registry.set_power_w) ~= "function" then
-        return false, "no-registry"
-    end
-    local stored = registry.set_power_w(id, watts, ttl_secs)
-    if not stored then
-        return false, "rejected"
-    end
-    if url then
-        _M.publish_worker_power_gauge(url, watts)
-    end
-    return true, "stored"
-end
-
----Store one watt sample, telling the two kinds of "not stored" apart.
----
----registry.set_power_w() answers false both when it refuses an unusable number
----(negative / NaN / ±inf) and when the shared dict simply had no room — the first
----means the exporter is lying, the second means this gateway is out of memory, and
----an operator reading one counter must not be sent looking at the wrong one. So
----the value is re-screened here with the same predicate the parsers use: if it is
----valid, a false from registry can only be the dict, which is counted as an error
----of *this* module rather than a rejection. (The "rejected" branch is therefore
----rare by construction — everything reaching here already passed power_watt().)
----@param id string
----@param watts number|nil @ absolute watts
----@param timestamp number @ ms clock (accepted for seam symmetry, unused here)
----@param ttl_secs number
----@param url string|nil @ only for the gauge label
----@return boolean stored, string reason
-local function default_write_power(id, watts, timestamp, ttl_secs, url)
-    if _M.power_watt(watts) == nil then
-        return false, "rejected"
-    end
-    local stored, why = default_write_power_inner(id, watts, ttl_secs, url)
-    if (not stored) and why == "rejected" then
-        -- The number is usable, so registry's only remaining reason to refuse is
-        -- the shared dict. It already logged the shdict error itself.
-        return false, "store-failed"
-    end
-    return stored, why
-end
-
 ---Store one **utilization** sample on the registry's independent gu: key.
 ---
----Structure is default_write_power()'s, and so is the reason for two return values:
----the caller must tell "there was no reading" (nothing written, the old sample TTLs
----out, the cap reads *unknown*) from "registry refused a number" (a lying exporter,
----worth a counter) and from "the store itself failed" (this gateway out of shared
----dict memory). Both are counted separately in runpass and exported as separate
----families, because an operator reading one number must not be sent looking at the
----wrong machine.
+---Structure is the removed default_write_power()'s, and so is the reason for two
+---return values: the caller must tell "there was no reading" (nothing written,
+---the old sample TTLs out, the cap reads *unknown*) from "registry refused a
+---number" (a lying exporter, worth a counter) and from "the store itself failed"
+---(this gateway out of shared dict memory). Both are counted separately in runpass
+---and exported as separate families, because an operator reading one number must
+---not be sent looking at the wrong machine.
 ---
 ---Who screens what: the **authority** on what counts as a usable utilization reading
 ---is registry.set_gpu_util() (it refuses negatives/NaN/±inf/>1 and never writes a
 ---gu: key for them, so a refused sample leaves the key to expire back to nil =
 ---unknown = do not exclude). gpu_load's half of the bargain is collection and
 ---normalisation only: parse.collects, cards attributes, this seam stores. The
----pre-screen below exists for the same reason power's does -- it is what lets a false
----from registry be attributed to the dict rather than to the number.
+---pre-screen below is what lets a false from registry be attributed to the dict
+---rather than to the number.
 ---
 ---It deliberately does **not** reuse util_fraction(), and the reason is a bug class
 ---specific to this channel: util_fraction() carries the percent heuristic (anything
@@ -377,7 +318,7 @@ M.live_ngx, M.now_ms = live_ngx, now_ms
 M.hb_mod, M.registry_mod = hb_mod, registry_mod
 M.default_workers, M.default_gpu_hints = default_workers, default_gpu_hints
 M.default_get, M.default_post = default_get, default_post
-M.default_write, M.default_write_power = default_write, default_write_power
+M.default_write = default_write
 M.default_write_util = default_write_util
 M.worker_headers = worker_headers
 

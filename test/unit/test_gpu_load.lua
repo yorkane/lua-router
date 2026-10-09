@@ -1110,7 +1110,7 @@ near(out_l.a1, 0.82, "legacy source: machine max for a1")
 near(out_l.a2, 0.82, "and for a2")
 eq(pc_l, 0, "no per-card claims without per-card series")
 eq(fb_l, 3, "all three are fallbacks, honestly counted")
--- 卡认得出但 vector 没有该卡 series -> 回退整机 max（利用率侧与功率侧的刻意差别）
+-- 卡认得出但 vector 没有该卡 series -> 回退整机 max（利用率侧的保守方向）
 local out_g, unm_g, pc_g, fb_g = gpu_load.assign_util(
     { { id = "c1", url = "http://gpu-c:8800" } },
     { ["gpu-c"] = 0.5 }, { ["gpu-c" .. SEP .. "7"] = 0.5 }, true,

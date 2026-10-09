@@ -85,26 +85,29 @@ ssh 21.k 'cd /data1/app/lua-router-8801 && docker compose down'   # 完全移除
 ssh 21.k 'cd /data1/app/lua-router-8801 && sed -i "s#8801-20261001-2#8801-20261001-1#" docker-compose.yml && docker compose up -d'
 `
 
-compose 追加了功率通道（DCGM exporter 在本机 9400，Prometheus 在 9092）：
+compose 追加了 GPU 负载通道（DCGM exporter 在本机 9400，Prometheus 在 9092；当时的
+`SMG_LOAD_POWER_QUERY` 行已随功率通道于 2026-10-09 移除，不再需要配）：
 
 ```
 SMG_LOAD_SOURCE: "prom"
 SMG_LOAD_PROM_URL: "http://127.0.0.1:9092"
 SMG_LOAD_PROM_QUERY: "max by (Hostname) (DCGM_FI_DEV_GPU_UTIL)"
-SMG_LOAD_POWER_QUERY: "max by (Hostname,instance,gpu) (DCGM_FI_DEV_POWER_USAGE)"
 SMG_LOAD_INTERVAL_SECS: "10"
 SMG_LOAD_STALE_SECS: "30"
 ```
 
-**功率查询必须带 instance**：只写 by (Hostname) 时采样侧拿到的是机器名
+**负载与利用率查询必须带 instance**：只写 by (Hostname) 时采样侧拿到的是机器名
 gpu-pro6000-1，而 21.k 的 worker 全部注册为 127.0.0.1:8012 这类 IP，两侧命名对不上，
-lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。加 instance
-之后两者被判定为同一台机器并折叠，读数才落得到池成员上。
+lr_gpu_load_util_unmatched_total 会稳定增长而 lr_gpu_load_util_workers 恒为 0。加 instance
+之后两者被判定为同一台机器并折叠，读数才落得到池成员上；`SMG_LOAD_UTIL_QUERY` 还必须
+保留 `gpu` 标签（`max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)`），聚合掉它八台就共用一个数。
 
 ### 真机验证结论
 
-- 功率通道：8/8 worker 采到真实瓦数（lr_gpu_load_power_watts = 96.46，与 DCGM 原始值
-  一致），unmatched 归零。八个 worker 读数相同——功率是**整机最热卡**口径，共享是预期行为。
+- 功率通道（**历史记录，功率通道已 2026-10-09 移除**）：8/8 worker 采到真实瓦数
+  （lr_gpu_load_power_watts = 96.46，与 DCGM 原始值
+  一致），unmatched 归零。八个 worker 读数相同——功率是**整机最热卡**口径，共享是预期行为
+  （正是它零区分度、后来被逐卡利用率取代的原因）。
 - 虚拟模型多绑定：mixed-route 绑 8025/Q38-Flash-Next 与
   8021/qwen38-flashnext-orca-nvfp4 两个**不同上游的不同模型**，请求按绑定名转发并返回
   对应模型；only-orca 单候选同样正确。两条都是 apply 后**要等一拍**再发第一个请求，
@@ -115,8 +118,8 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
 - 功率上限（**⚠️ 旧口径历史记录，已被 2026-10-06 的 `max_gpu_util`（GPU 利用率上限）取代**）：
   给 8025 配 max_power_w=50（实测 96W）后
   smg_worker_capacity_excluded_total{reason="power"} 增长，该 worker 被跳过、请求仍成功。
-  判定现在读的是**逐卡利用率**，功率整条链只保留为纯观测；本条与下面两段功率段落保留为当时
-  （2026-10-01）记录的事实，现行口径见文末〈2026-10-06 容量新口径部署提示〉与
+  判定现在读的是**逐卡利用率**，功率整条链已于 2026-10-09 整体移除（用户裁定）；本条与下面两段
+  功率段落保留为当时（2026-10-01）记录的事实，现行口径见文末〈2026-10-06 容量新口径部署提示〉与
   [gap-worker-caps.md](gap-worker-caps.md)。
 - 验证完已把两个 worker 的上限与全部虚拟模型配置清回（workers with caps: 0 / 8，
   health OK，推理 200）。
@@ -154,7 +157,7 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
 ### 功率上限的真机形态（2026-10-01 23:1x）
 
 > ⚠️ 旧口径历史记录：功率上限（`max_power_w`）已于 2026-10-06 被 `max_gpu_util`（GPU 利用率上限）取代——
-> 判定改读逐卡利用率，功率整条链只保留为**纯观测**。以下保留为当时（2026-10-01）记录的事实，
+> 判定改读逐卡利用率，功率通道已于 2026-10-09 整体移除（用户裁定）。以下保留为当时（2026-10-01）记录的事实，
 > 现行口径见文末〈2026-10-06 容量新口径部署提示〉与 [gap-worker-caps.md](gap-worker-caps.md)。
 
 **这台机器上功率是整机共享读数**（8/8 worker 的 lr_gpu_load_power_watts 完全相同，95.982W），
@@ -176,7 +179,7 @@ lr_gpu_load_power_unmatched_total 会稳定增长而 power_workers 恒为 0。�
 ### 清限的一个操作坑
 
 > ⚠️ 旧口径历史记录：功率上限（`max_power_w`）已于 2026-10-06 被 `max_gpu_util`（GPU 利用率上限）取代——
-> 判定改读逐卡利用率，功率整条链只保留为**纯观测**。以下保留为当时（2026-10-01）记录的事实，
+> 判定改读逐卡利用率，功率通道已于 2026-10-09 整体移除（用户裁定）。以下保留为当时（2026-10-01）记录的事实，
 > 现行口径见文末〈2026-10-06 容量新口径部署提示〉与 [gap-worker-caps.md](gap-worker-caps.md)。
 
 > 本段「PUT 写 0 = 清回不限」是**当时的清除拼法**，已随功率上限退役；现行清除哨兵见文末：
@@ -192,8 +195,8 @@ PUT 时，后两条可能不生效**（update 走后台队列，间隔太近会�
 把 21.k 上验证过的同一版能力推到 235.t 生产实例。compose 在 /data/app/lua-router/，
 部署前镜像为 8800-20261001-7，回滚就是把它改回去再 compose up -d。
 
-compose 本轮**只换镜像**，没有新增任何 env——功率通道在 235.t 未启用（上游是远程的
-217.t 那几个，功率口径要重新评估，不在这次部署范围内）。
+compose 本轮**只换镜像**，没有新增任何 env——功率通道（历史记录，已 2026-10-09 移除）当时未
+在 235.t 启用（上游是远程的 217.t 那几个，不在这次部署范围内）。
 
 ### 部署效果：第 10 条守卫当场治好了僵尸池
 
@@ -228,7 +231,7 @@ hinted 之类，端口是高位随机数，进程早已不存在（ps 查 mock_l
 ## 生产 235.t :8800 部署 lua-router:8800-20261002-9（2026-10-02）
 
 虚拟模型语义反转（服务入口 1 对多）+ 服务池页合并上线。compose 只换镜像，**没有新增任何
-env**（功率通道仍未在 235.t 启用）。回滚：把 compose 镜像改回
+env**（功率通道当时未启用；该通道已于 2026-10-09 移除）。回滚：把 compose 镜像改回
 `lua-router:8800-20261002-8`（或更早的 `8800-20261001-8`）再 compose up -d。
 
 ### 真机验证：1 对多与 context_window 统一口径
@@ -315,9 +318,10 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
   `min_concurrency < max_concurrency`，写反了 400。
 - `max_power_w` 已退役：声明层里还写着它的行，解析时 **warn 一次并丢弃该键**；`PUT` 带它和带任何
   未知字段一样被忽略；`GET /workers` 不再回显。老配置不用手改，它会自己变干净，但别指望改回来还生效。
-- 功率**采集**链没删，只是降级为纯观测：`SMG_LOAD_POWER` / `SMG_LOAD_POWER_KEYS` /
-  `SMG_LOAD_POWER_QUERY` 照旧（`pw:` 键、`lr_gpu_load_power_*` 六族、`/workers` 的 `power_w` 字段），
-  用来看谁热，不再参与任何容量判定。
+- 功率链的后续（历史）：**2026-10-09 用户裁定把剩余的观测链一并移除**——`pw:` 键、
+  `lr_gpu_load_power_*` 六族、`/workers` 的 `power_w` 字段、`SMG_LOAD_POWER` /
+  `SMG_LOAD_POWER_KEYS` / `SMG_LOAD_POWER_QUERY` 三个 env 全部下线；当时的 compose 里的
+  `SMG_LOAD_POWER_QUERY` 行现在可以直接删掉。负载只剩利用率（逐卡）与在途数两个口径。
 
 ### 读数未知 = 不排除
 
@@ -331,7 +335,7 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 （空 = `max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)`）。**prom 路的 `gpu` 标签必须留在 `by` 里**：
 聚合掉它，同机 8 台就共用一个数，逐卡归属当场作废（2026-10-04 的 342.371 事故就是这个形状）。判断自己
 是逐卡还是整机口径，看 `lr_gpu_load_util_per_card_workers` 与 `lr_gpu_load_util_fallback_total` 的差——
-回退是**计数**的，不静默。四个通道（负载 / 功率 / 利用率）全部搭载在 `SMG_LOAD_SOURCE` 上，它设成
+回退是**计数**的，不静默。两个通道（负载 / 利用率）全部搭载在 `SMG_LOAD_SOURCE` 上，它设成
 `none` 时定时器根本不启动，其他开关设了也不会有读数。
 
 ### 选路行为，部署后该怎么验
@@ -371,6 +375,6 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 最后一条纪律：这些改动只在 **21.k:8802（测试）** 上验，8801 是生产，未经用户明确要求不得更新。
 
 > 另记一条已知残留：`observability` 的 gauge 没有 TTL 也没有删除原语，worker 被删掉之后它的
-> `lr_gpu_load_util_gpu{worker=...}` 与 `lr_gpu_load_power_watts{worker=...}` 会永久留在 `/metrics`
-> （本轮在 8802 实测到已删 mock 18301–18303 的序列仍在）。功率 gauge 一直如此，本轮利用率 gauge
-> 继承了同一特性。登记与后续修法见 [gap-worker-caps.md](gap-worker-caps.md) §11 第 10 条。
+> `lr_gpu_load_util_gpu{worker=...}` 会永久留在 `/metrics`
+> （本轮在 8802 实测到已删 mock 18301–18303 的序列仍在）。登记与后续修法见
+> [gap-worker-caps.md](gap-worker-caps.md) §11 第 10 条。

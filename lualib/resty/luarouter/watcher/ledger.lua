@@ -27,7 +27,7 @@ local GPU_HINT_PREFIX = "g|"
 ---   q|<url>   pending add   {queued_at, worker_id}
 ---   f|<url>   add back-off  {n, until}
 ---   map       the whole rename map as one JSON object
----   g|<url>   卡号提示：这个 url 背后的容器是哪张卡（gpu_load 的逐卡功率用它接地址）
+---   g|<url>   卡号提示：这个 url 背后的容器是哪张卡（gpu_load 的逐卡 util 用它接地址）
 ---@param d table ngx.shared.Dict (or a test double with get/set/delete/get_keys)
 local function new_ledger(d)
     local self = { dict = d }
@@ -111,9 +111,9 @@ local function new_ledger(d)
     ---记录**，所以「让 watcher 再 add 一次把 labels 补上」这条链在盘上不成立。21.k 生产
     ---正是这种形状：八个 worker 由 SMG_WORKER_URLS 播种（bootstrap → registry.add({url=…})，
     ---不带 labels），watcher 首轮又把池里已有的行整排 protect 掉（guard 3），register 对
-    ---它们永远不会被调用，于是 labels 恒为 null、逐卡功率永远接不上。
+    ---它们永远不会被调用，于是 labels 恒为 null、逐卡 util 永远接不上。
     ---卡号是 watcher 从容器名解析出来的知识，就存在 watcher 自己的 lr_watch 里；gpu_load
-    ---在写某个 worker 的功率读数时读一次，接不上就回落整机 max。全程不需要 registry.lua 配合。
+    ---在写某个 worker 的 util 读数时读一次，接不上就回落整机 max。全程不需要 registry.lua 配合。
     ---@param url string
     ---@param gpu string|nil @ nil / "" = 这一轮不再认得它（容器改名），删键
     ---@return boolean stored
@@ -135,7 +135,7 @@ local function new_ledger(d)
         return d:set(key, wanted, 0) and true or false
     end
 
-    ---台账里现存的卡号提示，一次读全（功率 pass 每 tick 读一次，不在 worker 循环里摸 shdict）。
+    ---台账里现存的卡号提示，一次读全（util pass 每 tick 读一次，不在 worker 循环里摸 shdict）。
     ---@return table @ url -> gpu id
     function self.gpu_hints()
         local out = {}

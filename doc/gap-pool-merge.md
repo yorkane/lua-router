@@ -47,7 +47,7 @@
 
 ## 4. 上限的事实来源
 
-`max_concurrency` / `max_power_w` **以声明层为准**。原因：`upstream_drifts` 把
+`max_concurrency` **以声明层为准**。原因：`upstream_drifts` 把
 `max_*` 连同 priority / cost / labels / disable_health_check 一并比较，所以运行态
 `PUT /workers/{id}` 改的值会在 30 秒自愈里被声明值写回——**只锁上限字段是不够的**，
 改 priority 照样被抹。

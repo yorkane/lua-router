@@ -66,7 +66,7 @@ env SMG_WATCHER_MODEL_MAP;
 #   SMG_WATCHER_PROBE_FANOUT        每轮探测的协程池宽度（缺省 8，1..32）
 #   LR_MODEL_LABEL_CAP              lr_stats 里 distinct model 标签值的上限
 #                                   （缺省 300，越过之后新名字并入 other=；0 关闭）
-#   LR_METRICS_SCAN_LIMIT           /metrics 与功率读数一次共享字典扫描的行数上限
+#   LR_METRICS_SCAN_LIMIT           /metrics 与 GPU 利用率读数一次共享字典扫描的行数上限
 #                                   （缺省 20000；截断会发 smg_dict_scan_truncated=1）
 env SMG_MAX_TREE_NODES;
 env SMG_EVICT_BUDGET;
@@ -77,34 +77,25 @@ env SMG_WATCHER_PROBE_FANOUT;
 env LR_MODEL_LABEL_CAP;
 env LR_METRICS_SCAN_LIMIT;
 
-# GPU 功率通道（每 worker 的功率上限，registry.capacity_exclusion）：其余 SMG_LOAD_* 由
-# resty.luarouter.config 在 init_by_lua 里解析（fork 之前，不受白名单影响），而这三个由
-# gpu_load.lua 在 worker 定时器里用 os.getenv 现读，所以必须在这里声明——nginx 按 env
-# 白名单重建 worker 环境，漏声明的名字读回来是 nil，功能是静默失效的。生效方式是重启
-# 容器（worker 环境 fork 后不再变化），改 compose 里的值即可。
-#   SMG_LOAD_POWER       =1 时 metrics 路顺带扫功率 gauge（缺省 off）
-#   SMG_LOAD_POWER_KEYS  覆盖功率 gauge 名单，逗号/空格分隔
-#   SMG_LOAD_POWER_QUERY prom 路的第二条 PromQL，留空 = 不采功率
-# 注意：功率是**搭载**在负载源上的，SMG_LOAD_SOURCE 仍是总开关——它是 none 时定时器
-# 根本不启动，这里设了 SMG_LOAD_POWER 也不会有任何读数（不是 bug，是为了不给一个
-# 关掉的子系统留第二条独立抓取路径）。prom 路的合法组合是「SMG_LOAD_PROM_URL +
-# SMG_LOAD_PROM_QUERY（负载）+ 可选 SMG_LOAD_POWER_QUERY（功率）」，两条查询各自独立。
-env SMG_LOAD_POWER;
-env SMG_LOAD_POWER_KEYS;
-env SMG_LOAD_POWER_QUERY;
 #
 # GPU 利用率通道（doc/caps-redesign-2026-10-06.md §5，registry 的 gu: 键 / 每 worker 的
-# max_gpu_util 上限的数据源）。这三个名字与上面三个的区别：它们由 resty.luarouter.config
-# 在 init_by_lua 里装配（fork 之前，不受白名单影响，天然进 /probe/config），这里的 env
-# 声明是为了让 gpu_load/cards.util_config() 的 os.getenv 兜底分支也能读到——两条路都通。
+# max_gpu_util 上限的数据源）。这三个名字由 resty.luarouter.config 在 init_by_lua 里
+# 装配（fork 之前，不受白名单影响，天然进 /probe/config），这里的 env 声明是为了让
+# gpu_load/cards.util_config() 的 os.getenv 兜底分支也能读到——两条路都通；漏了这一
+# 份，「手搓 cfg 表」的调用面仍能读到，正常部署不受影响。生效方式是重启容器（worker
+# 环境 fork 后不再变化），改 compose 里的值即可。缺省值：ENABLED 开、QUERY 用
+# parse.lua 的缺省串（带 gpu 标签才有逐卡）、KEYS 用内置名册（dcgm_fi_dev_gpu_util 真名）。
 #   SMG_LOAD_UTIL_ENABLED  缺省 1（采集开；判定只在记录显式配了 max_gpu_util 时发生，
 #                          所以缺省开 = 现有部署零选路行为变化）；0/false/no/off 关
 #   SMG_LOAD_UTIL_KEYS     覆盖 metrics 路的利用率 gauge 名册，逗号/空格分隔
-#   SMG_LOAD_UTIL_QUERY    prom 路的第三条 PromQL；空 = 缺省串
+#   SMG_LOAD_UTIL_QUERY    prom 路的第二条 PromQL；空 = 缺省串
 #                          max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)
 #                          （gpu 必须留在 by 里：聚合掉它 = 八台 worker 共用一个数）
-# 利用率与功率一样**搭载**在负载源上：SMG_LOAD_SOURCE=none 时定时器不启动，设了也没有
-# 读数（registry 侧「未知 -> 不排除」）。test/conf/nginx-lua-router.conf 必须同步。
+# 注意：利用率是**搭载**在负载源上的，SMG_LOAD_SOURCE 仍是总开关——它是 none 时定时器
+# 根本不启动，这里设了什么都不会有读数（registry 侧「未知 -> 不排除」，不是 bug，是为了
+# 不给一个关掉的子系统留第二条独立抓取路径）。prom 路的合法组合是「SMG_LOAD_PROM_URL +
+# SMG_LOAD_PROM_QUERY（负载）+ 可选 SMG_LOAD_UTIL_QUERY（利用率）」，两条查询各自独立。
+# 集成测试用的 test/conf/nginx-lua-router.conf 必须同步这三个名字。
 env SMG_LOAD_UTIL_ENABLED;
 env SMG_LOAD_UTIL_KEYS;
 env SMG_LOAD_UTIL_QUERY;

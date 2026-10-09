@@ -6,43 +6,30 @@ local seams = require "resty.luarouter.gpu_load.seams"
 local MAX_BODY_BYTES = 4 * 1024 * 1024
 
 -- gpu_load/runpass.lua -- one pass over the configured source.  The two
--- per-query closures (one / one_power) are module-level functions here
+-- per-query closures (one / one_util) are module-level functions here
 -- with an explicit ctx, so the stats口径 stays single-point (new_stats)
--- and the power_per_card distinction cannot be split or misread.  The
--- three source branches, the 采集不到 -> 什么都不写 branches and the
+-- and the per-card / fallback distinction cannot be split or misread.
+-- The three source branches, the 采集不到 -> 什么都不写 branches and the
 -- skip / failed / unmatched accounting moved verbatim.
 
 ---The pass stats table, defined in exactly one place so every field
----keeps its 口径 here (doc/gap-gpu-load.md 6/9).  power_per_card is
----deliberately its own counter: without it, all-per-card and all-
----machine-max grow the same shape on /metrics, which is how 21.k
----342.371 stayed unnoticed.
+---keeps its 口径 here (doc/gap-gpu-load.md 6/9).  util_per_card and
+---util_fallback are deliberately their own counters: without them,
+---all-per-card and all-machine-max grow the same shape on /metrics, which
+---is how 21.k 342.371 stayed unnoticed.
 local function new_stats(cfg)
     return {
         source = cfg.load_source or "none", probed = 0, matched = 0,
         failed = 0, unmatched = 0, skipped = 0, errors = 0,
-        -- 功率通道的独立计数（每 worker 功率上限的采集侧）。全部从 0 起，未启用时保持
-        -- 全 0 且不导出，缺省关闭的实例上 /metrics 与改动前逐字节一致。口径：
-        -- probed = metrics 路是「被拨通过且正文可用」的 worker 数，prom 路是「成功
-        -- 执行的功率查询」数；matched = 真正写进 pw: 的读数数；failed = 拨通了却取不
-        -- 到可用瓦数；errors = 连查询都没做成/响应不可解析；rejected = registry 拒收。
-        power_enabled = false, power_probed = 0, power_matched = 0,
-        power_failed = 0, power_rejected = 0, power_errors = 0,
-        power_unmatched = 0, power_skipped = 0,
-        -- 本 pass 里**真正按自己那张卡**拿到瓦特的 worker 数（逐卡归属命中数）。它和
-        -- power_matched 的差就是「悄悄退回整机 max」的台数；只有 matched 一个数的话，
-        -- 「八张卡各归各」与「八张卡共用一个数」在 /metrics 上完全同形，而后者正是
-        -- 21.k 的 342.371 能长期无人察觉的原因。
-        power_per_card = 0,
         -- GPU 利用率通道（doc/caps-redesign-2026-10-06.md §5，registry 的 gu: 键）的独立
-        -- 计数，形状照功率那族：probed = metrics 路「正文可用并被扫过」的 worker 数 /
+        -- 计数：probed = metrics 路「正文可用并被扫过」的 worker 数 /
         -- prom 路「成功执行的利用率查询」数；matched = 真正写进 gu: 的读数数；failed =
         -- 扫过却取不到可用读数；errors = 查询没做成 / 响应不可解析 / 存储失败；rejected =
         -- registry 拒收；skipped = worker url 解析不出 host、压根没法问。
-        -- util_per_card 与 util_fallback 是这一族的存在理由（口径同 power_per_card）：只
+        -- util_per_card 与 util_fallback 是这一族的存在理由：只
         -- 有 matched 一个数的话，「八台各归各卡」与「八台共用一个整机 max」在 /metrics 上
         -- 完全同形——区分「全逐卡命中」与「全回退整机 max」正是 342.371 那一课的处方。
-        -- 利用率与功率不同的一点：认不出卡时利用率**回退**整机 max（保守方向，见 cards.lua
+        -- 认不出卡时利用率**回退**整机 max（保守方向，见 cards.lua
         -- assign_util 上方）而不是留空，所以回退必须有一个不被静默吞掉的计数，
         -- util_fallback 就是那一声。
         util_enabled = false, util_probed = 0, util_matched = 0,
@@ -82,63 +69,15 @@ local function one(ctx, query, target)
             ctx.stats.probed = ctx.stats.probed + 1
         end
 
-local function one_power(ctx, query, target)
-            local ok_call, status, body, err = pcall(ctx.post, ctx.endpoint, ctx.timeout_ms,
-                ctx.headers, _M.query_body(query))
-            if not ok_call then
-                ctx.stats.power_errors = ctx.stats.power_errors + 1
-                _M.warn_dedup("power-prom-raise", target, tostring(status), ctx.stamp())
-                return false
-            end
-            local code = tonumber(status) or 0
-            if code < 200 or code >= 300 or type(body) ~= "string" then
-                ctx.stats.power_errors = ctx.stats.power_errors + 1
-                _M.warn_dedup("power-prom", target,
-                    err or ("status " .. tostring(status)), ctx.stamp())
-                return false
-            end
-            local rows, perr = _M.parse_prom_response(body)
-            if not rows then
-                -- 正文不是合法 PromQL 响应（404 页面、query 语法错被代理成 200）：
-                -- 这是「解析失败」，单独计数，供 lr_gpu_load_power_parse_failures_total
-                -- 观测。
-                ctx.stats.power_errors = ctx.stats.power_errors + 1
-                _M.warn_dedup("power-prom", target, perr, ctx.stamp())
-                return false
-            end
-            -- 逐卡展开（= host_powers 的展开版；expose_cards=false 时两者逐字节同值，
-            -- 所以只有 prom 路受益，且缺 gpu 标签时不会比今天少一个读数）。
-            local folded, cards, card_hosts_of_query = _M.host_card_powers(rows)
-            for host, watts in pairs(folded) do
-                if ctx.by_power[host] == nil or watts > ctx.by_power[host] then
-                    ctx.by_power[host] = watts
-                end
-            end
-            for key, watts in pairs(cards) do
-                -- {host} 模板会发多条查询，同一个 host+gpu 键取最大：与 host 键同
-                -- 做法，也保证结果与查询到达顺序无关（同一份输入跑两遍必须逐字节相同）。
-                if ctx.by_card_power[key] == nil or watts > ctx.by_card_power[key] then
-                    ctx.by_card_power[key] = watts
-                end
-            end
-            for host in pairs(card_hosts_of_query) do
-                ctx.card_hosts[host] = true
-            end
-            ctx.stats.power_probed = ctx.stats.power_probed + 1
-            return true
-        end
-
-
 ---One prom-path utilization query (the third PromQL).
 ---
----结构照 one_power()，差别只有一处且是纪律要求的：数值走 util_fraction()（经由
----host_card_utils），而不是负载那一路的 normalize()、也不是功率那一路的 power_watt()。
----三个读数、三把筛子、一次抓取预算——而利用率这条 vector 喂的是准入门，不能被
+---数值走 util_fraction()（经由 host_card_utils），而不是负载那一路的 normalize()。
+---这是纪律要求的差别，不是笔误：利用率这条 vector 喂的是准入门，不能被
 ---normalize() 的「>1 就当百分数、越界一律夹到 1」的打分启发式折一遍
 ---（doc/caps-redesign-2026-10-06.md §5 点名的缺口正是这一条）。
 ---
----与功率查询一样，它有自己独立的 vector、自己的逐卡表与自己的 card_hosts 集合：利用率
----查询是与负载查询**分开的**第三条 PromQL，两者永不合并（gauge 家族与聚合口径常常不同，
+---它有自己独立的 vector、自己的逐卡表与自己的 card_hosts 集合：利用率
+---查询是与负载查询**分开的**第二条 PromQL，两者永不合并（gauge 家族与聚合口径常常不同，
 ---一条写坏时不能把另一路一起拖走）。
 local function one_util(ctx, query, target)
     local ok_call, status, body, err = pcall(ctx.post, ctx.endpoint, ctx.timeout_ms,
@@ -163,7 +102,7 @@ local function one_util(ctx, query, target)
         _M.warn_dedup("util-prom", target, perr, ctx.stamp())
         return false
     end
-    -- 逐卡展开（机器/卡的身份规则与功率同源，见 cards.lua 的 util_fold 上方）。
+    -- 逐卡展开（机器/卡的身份规则见 cards.lua 的 util_fold 上方）。
     local folded, cards, card_hosts_of_query = _M.host_card_utils(rows)
     for host, util in pairs(folded) do
         if ctx.by_util[host] == nil or util > ctx.by_util[host] then
@@ -186,17 +125,17 @@ end
 
 ---Metrics-path utilization scan for one worker's /metrics body.
 ---
----由 pass 用 pcall 包住调用，所以这里的任何意外都吃不到同一 tick 的负载/功率读数
----（三通道互不影响）。它只碰传进来的正文与自己名下的那几个计数。
+---由 pass 用 pcall 包住调用，所以这里的任何意外都吃不到同一 tick 的负载读数
+---（两通道互不影响）。它只碰传进来的正文与自己名下的那几个计数。
 ---@param ctx table @ {record, body, stats, names, hints, stamp, ttl_secs, write_util}
 local function scan_util_metrics(ctx)
     local stats = ctx.stats
     local record, body = ctx.record, ctx.body
     stats.util_probed = stats.util_probed + 1
-    -- 一次正文扫出「整机最热」与「逐卡」两张表（功率那次扫描旁边的第三遍，同一个正文、
-    -- 同一次拨号）。取哪张由这个 worker 认不认得自己的卡决定；认不出时回退整机 max **并
-    -- 计入 fallback**（口径见 assign_util 上方：利用率侧的整机 max 是保守方向，代价是少用
-    -- 一台机器而不是让满载的卡继续接活，所以可以回退，但绝不静默降级）。
+    -- 一次正文扫出「整机最热」与「逐卡」两张表（同一个正文、同一次拨号）。取哪张由这个
+    -- worker 认不认得自己的卡决定；认不出时回退整机 max **并计入 fallback**（口径见
+    -- assign_util 上方：利用率侧的整机 max 是保守方向，代价是少用一台机器而不是让满载的
+    -- 卡继续接活，所以可以回退，但绝不静默降级）。
     local whole, by_card, have_cards = _M.util_by_card(body, ctx.names)
     if whole == nil then
         -- 采不到：什么都不写。旧的 gu: 键会在自己的 TTL 后消失，registry 侧读成「未知 ->
@@ -219,7 +158,7 @@ local function scan_util_metrics(ctx)
     end
     if util == nil then
         -- 认不出卡 / 该卡无 series / 源根本没有逐卡标签：用整机最热卡的利用率，并计一次
-        -- 回退。三种情形不在日志里分开（那是功率那一路的形状），利用率侧的归因由
+        -- 回退。三种情形不在日志里分开，利用率侧的归因由
         -- lr_gpu_load_util_fallback_total 与 per_card 的差承担——那才是运维要看的数。
         util = whole
         stats.util_fallback = stats.util_fallback + 1
@@ -243,7 +182,7 @@ end
 
 ---Prom-path utilization channel: query (deduped), fold, assign, write.
 ---
----与负载/功率两路在构造上互不牵连：自己的 ctx 表、自己的计数，且整个函数在调用点被
+---与负载那一路在构造上互不牵连：自己的 ctx 表、自己的计数，且整个函数在调用点被
 ---pcall 包住，这一路炸了也不会带走另一路的这一 tick。
 ---@param ctx table @ prom context (by_util / by_card_util / util_card_hosts / util ...)
 local function run_util_prom(ctx)
@@ -259,7 +198,7 @@ local function run_util_prom(ctx)
                     one_util(ctx, uq, record.url)
                 end
             else
-                -- 这条 worker 的 url 解析不出 host，模板没法展开：与负载/功率那一路的
+                -- 这条 worker 的 url 解析不出 host，模板没法展开：与负载那一路的
                 -- skipped 同义（是「这个 worker 没法问」而不是「监控系统没给出读数」），
                 -- 混进 failed 会让 lr_gpu_load_util_parse_failures_total 随坏 url 的个数
                 -- 放大，指错排障方向。
@@ -275,8 +214,8 @@ local function run_util_prom(ctx)
         url_for_util[ctx.workers[i].id] = ctx.workers[i].url
     end
     -- 按 worker 各自的卡分发（四路口径见 cards.lua 的 assign_util 上方注释）。逐卡命中数
-    -- 与回退数由 assign_util 一并给出，不在这里二次推断：功率那一路的 card_hits 复算是
-    -- 历史形状，利用率不必复刻一个「同一件事在两处算」的口径。
+    -- 与回退数由 assign_util 一并给出，不在这里二次推断——同一件事在两处算只会
+    -- 长出口径分歧。
     local u_assigned, u_unmatched, u_per_card, u_fallback = _M.assign_util(
         ctx.workers, ctx.by_util, ctx.by_card_util, ctx.util_card_hosts, ctx.gpu_hints)
     stats.util_unmatched = u_unmatched
@@ -332,21 +271,11 @@ function _M.run_pass(cfg, opts)
     local stats = new_stats(cfg)
     if stats.source == "none" then
         stats.skipped = 1
-        -- 唯一需要在「负载源关着」时说的话：功率是**搭载**在负载源上的（同一个
-        -- 定时器、同一次抓取），source=none 时那个定时器根本不启动，于是设了
-        -- SMG_LOAD_POWER / SMG_LOAD_POWER_QUERY 也不会有任何读数，而 max_power_w
-        -- 会安静地一直按「未知 → 不排除」放行——正是最容易以为自己在生效、其实没有的
-        -- 那种配置。留一条去重 WARN，比静默强。
-        local want_power = _M.power_config(cfg)
-        if want_power.on or want_power.query then
-            -- 这里不能用手边的 stamp()：它在下面才赋值，此刻还是个 nil 全局。
-            _M.warn_dedup("power-source-none", "none",
-                "power requested but SMG_LOAD_SOURCE=none: no timer runs, set it to metrics or prom")
-        end
-        -- 利用率同样**搭载**在负载源上（同一个定时器）。缺省串人人都有，不足以说明操作员
+        -- 唯一需要在「负载源关着」时说的话：利用率是**搭载**在负载源上的（同一个
+        -- 定时器），source=none 时它根本不启动。缺省串人人都有，不足以说明操作员
         -- 想用这一路，所以只有他**显式**写过 SMG_LOAD_UTIL_QUERY 才值得留话——那时
-        -- max_gpu_util 会安静地一直按「未知 -> 不排除」放行，正是最容易以为在生效、其实没
-        -- 有的那种配置。
+        -- max_gpu_util 会安静地一直按「未知 -> 不排除」放行，正是最容易以为在生效、
+        -- 其实没有的那种配置。
         local want_util = _M.util_config(cfg)
         if want_util.on and want_util.explicit_query then
             _M.warn_dedup("util-source-none", "none",
@@ -360,7 +289,6 @@ function _M.run_pass(cfg, opts)
     local post = opts.post or seams.default_post
     local list_workers = opts.workers or seams.default_workers
     local write = opts.write or seams.default_write
-    local write_power = opts.write_power or seams.default_write_power
     local write_util = opts.write_util or seams.default_write_util
     local stamp = opts.now or seams.now_ms
     local timeout_ms = math.max(250, (tonumber(cfg.load_timeout_secs) or 4) * 1000)
@@ -385,47 +313,30 @@ function _M.run_pass(cfg, opts)
     local workers = list_workers() or {}
     stats.workers = #workers
 
-    -- 功率通道（缺省关闭）。放在两路分支之前统一算一次，metrics 路用它决定「同一个
-    -- 正文要不要顺手扫功率」，prom 路用它决定「要不要多发一条查询」；两处都不启用时
-    -- 下面两个分支的执行路径与改动前完全一致。
-    local power = _M.power_config(cfg)
     -- 利用率通道（缺省启用，doc/caps-redesign-2026-10-06.md §5）。它的判定开关不在这里：
     -- 采集只把读数写进 registry 的 gu: 键，只有 worker 记录上显式配了 max_gpu_util 才会有
     -- 人读它，所以缺省开不改变任何现有部署的选路行为（「读数未知 -> 不排除」）。prom 路是
     -- 否**多发**这条查询见下面 util_enabled 的口径。
     local util = _M.util_config(cfg)
-    -- 「这一路真的被启用了」而不是「操作员配过某个功率开关」：metrics 路只认 on，prom
-    -- 路只认 query。否则会出现一种误导性的导出——source=metrics 却只设了
-    -- SMG_LOAD_POWER_QUERY（那条查询在这条路上永远不执行，只有 WARN），power_enabled
-    -- 为真于是导出 power_workers=0 / samples_total=0，看板读起来像「功率在生效但一台
-    -- 都没采到」，而真相是这条根本不该有读数。
-    -- prom 路的利用率查询只在「这一轮本来就会跑」或「操作员显式写了 SMG_LOAD_UTIL_QUERY」
-    -- 时才多发。缺省查询串人人都有（util.query 恒非空），不作区分的话一个只配了负载查询的
-    -- 部署会凭空多一条 POST，而「负载与功率两条查询都没配 = 配置缺口、整轮 skip」的老语义
-    -- 也会被一个没人要求的缺省值推翻。metrics 路没有额外拨号（同一份正文多扫一遍），缺省开
-    -- 就是纯赚，所以只认 util.on。power_enabled 的「这一路真的在跑」口径原样沿用。
-    -- prom 路的第三条 POST 只认**操作员的显式意图**（写了 SMG_LOAD_UTIL_QUERY）：缺省串
-    -- 人人都有（util.query 恒非空），拿它当意图的话，每个只配了负载查询的部署都会凭空多出
-    -- 一条没人要求的 POST——那是「缺省零行为变化」这条红线（caps-redesign §0 第 3 条）直接
-    -- 否掉的形状，单测里「一条 PromQL = 一个 tick 一个 POST」的钉也一起塌掉。metrics 路不受
-    -- 这条约束：它不新增拨号，只是在同一份正文上多扫一遍，缺省开是纯赚，所以那里只认
-    -- util.on。与功率那一路「query 非空才算这一路在跑」的 power_enabled 口径同构（差别只在
-    -- 功率的缺省是空、利用率的缺省是一个能用的串，所以意图要单独问）。
+    -- 「这一路真的在跑」的口径。metrics 路只认 util.on：同一份正文多扫一遍，不新增
+    -- 拨号，缺省开是纯赚。prom 路只认**操作员的显式意图**（写了 SMG_LOAD_UTIL_QUERY）：
+    -- 缺省串人人都有（util.query 恒非空），拿它当意图的话，每个只配了负载查询的部署
+    -- 都会凭空多出一条没人要求的 POST——那是「缺省零行为变化」这条红线
+    -- （caps-redesign §0 第 3 条）直接否掉的形状，单测里「一条 PromQL = 一个 tick
+    -- 一个 POST」的钉也一起塌掉。它同时挡住一种误导性的导出：util_enabled 为真却
+    -- 导出 util_workers=0 / samples_total=0，看板读起来像「利用率在生效但一台都没
+    -- 采到」，而真相是这条根本不该有读数。
     local util_runs_prom = util.on and util.query ~= nil and util.explicit_query
     if stats.source == "metrics" then
-        stats.power_enabled = power.on
         stats.util_enabled = util.on
     elseif stats.source == "prom" then
-        stats.power_enabled = power.query ~= nil
         stats.util_enabled = util_runs_prom
     else
-        stats.power_enabled = false
         stats.util_enabled = false
     end
 
     if stats.source == "metrics" then
         local names = _M.metric_key_list(cfg.load_metrics_keys)
-        local power_names = _M.metric_key_list(power.keys)
         local util_names = _M.metric_key_list(util.keys)
         -- 逐卡归属用的卡号快照（watcher 台账 g| 键，见 default_gpu_hints）。一次 pass
         -- 读一次，不在 worker 循环里摸共享字典。opts.gpu_hints 是测试注入面。
@@ -435,14 +346,6 @@ function _M.run_pass(cfg, opts)
         end
         -- 编成查找索引一次（exact + host:port 两级），worker 循环里只查不编。
         hints = _M.hint_index(hints)
-        if power.query then
-            -- 配了功率 PromQL 却把负载源设成 metrics：这条查询永远不会被执行。
-            -- metrics 路没有 Prometheus 可问，只能扫 worker 自己的 /metrics。与其
-            -- 静默失效（operator 会一直以为功率上限在生效），留一条去重 WARN。
-            _M.warn_dedup("power-query-ignored", "metrics",
-                "SMG_LOAD_POWER_QUERY set but SMG_LOAD_SOURCE=metrics; use source=prom",
-                stamp())
-        end
         for i = 1, #workers do
             local record = workers[i]
             stats.probed = stats.probed + 1
@@ -479,21 +382,14 @@ function _M.run_pass(cfg, opts)
                         write(record.id, load, stamp(), ttl_secs, record.url)
                         stats.matched = stats.matched + 1
                     end
-                    -- 功率用**同一次 GET 的正文**再扫一遍：一次抓取两个读数，不额外
-                    -- 增加拨号次数（引擎的 /metrics 常有几十 KB，多打一轮是纯浪费）。
-                    -- 位置很关键：它排在上面「负载 gauge 有没有采到」的 if/else **之后**
-                    -- 而不是它的 else 分支里——一个正文里没有负载 gauge 却带功率 gauge
-                    -- 的 exporter（dcgm-exporter 本体就是这种，只有 DCGM_* 没有
-                    -- nvidia_gpu_utilization）仍然要交出功率读数，两个读数是独立的。
-                    -- 反过来取不到功率也不影响负载那一路：stats.failed 与
-                    -- power_failed 各自记账，抓取失败（非 2xx / 超正文上限）只算进
-                    -- 负载的 failed，功率这边连 probed 都不加——没有正文就没什么可扫的，
-                    -- 再记一次 failure 会把同一个故障数成两遍。
-                    -- 利用率用**同一次 GET 的正文**再扫一遍（第三个读数，第三遍扫描）：
-                    -- 与功率那条同样的位置纪律——排在负载那一路的 if/else 之后、独立记账，
-                    -- 取不到利用率不影响负载与功率；抓取失败（非 2xx / 超正文上限）只算进
-                    -- 负载的 failed，这里连 probed 都不加（没有正文就没什么可扫的）。整个
-                    -- 扫描包在 pcall 里：一条通道出我们没预料的错，代价只能是它自己的读数。
+                    -- 利用率用**同一次 GET 的正文**再扫一遍（第二个读数，第二遍扫描）：
+                    -- 位置纪律很关键——排在负载那一路的 if/else 之后、独立记账，所以
+                    -- 一个正文里没有负载 gauge 却带 gpu-util gauge 的 exporter
+                    -- （dcgm-exporter 本体就是这种）仍然要交出利用率读数；反过来取不到
+                    -- 利用率也不影响负载那一路。抓取失败（非 2xx / 超正文上限）只算进
+                    -- 负载的 failed，这里连 probed 都不加（没有正文就没什么可扫的），
+                    -- 再记一次 failure 会把同一个故障数成两遍。整个扫描包在 pcall 里：
+                    -- 一条通道出我们没预料的错，代价只能是它自己的读数。
                     if util.on then
                         local ok_util, err_util = pcall(scan_util_metrics, {
                             record = record, body = body, stats = stats,
@@ -506,107 +402,22 @@ function _M.run_pass(cfg, opts)
                                 tostring(err_util), stamp())
                         end
                     end
-                    if power.on then
-                        stats.power_probed = stats.power_probed + 1
-                        -- 一次正文扫出「整机最热」与「逐卡」两张表；取哪张由这个 worker
-                        -- 认不认得自己的卡决定（四路口径见 assign_power 上方注释）。
-                        -- power_watts_by_card 的 whole 与 max_power_watts 逐字节同值
-                        -- （同一套 power_watt 筛、同样对全部可用 series 取 max），所以
-                        -- 认不出卡的老数据源不会因为这次改动少一个读数。
-                        local whole, by_card, have_cards = _M.power_watts_by_card(
-                            body, power_names)
-                        -- 四路口径与 prom 路完全一致（见 assign_power 上方注释）：
-                        -- 源没有逐卡标签 → 整机 max（老数据源一个读数不少）；源是逐卡
-                        -- 的 → 只认这个 worker 自己那张卡，认不出卡或该卡没有 series
-                        -- 都**不写键**，绝不拿整机 max 冒充——那时整机 max 是邻居卡的
-                        -- 瓦特，用它会让一张空闲 worker 因为邻居发热而被排除。
-                        local watts, miss_kind = whole, nil
-                        if whole ~= nil and have_cards then
-                            local gpu = _M.worker_card(record, hints)
-                            if gpu == nil then
-                                watts = nil
-                                miss_kind = "identity"
-                            else
-                                watts = by_card[gpu]
-                                if watts == nil then
-                                    miss_kind = "series"
-                                else
-                                    stats.power_per_card = (stats.power_per_card or 0) + 1
-                                end
-                            end
-                        end
-                        if watts == nil then
-                            -- 采不到：什么都不写。旧的 pw: 键会在自己的 TTL 后消失，
-                            -- registry.power_w() 回到 nil，router 侧按「未知 → 不排除」
-                            -- 处理。写 0 或沿用上一次的旧值都会让坏 exporter 把这台
-                            -- worker 永久顶在功率上限之外。
-                            stats.power_failed = stats.power_failed + 1
-                            -- 三种「采不到」在排障上是三个不同的地方，必须分开说：
-                            -- 整份正文没有功率 gauge（exporter 没起 / gauge 名单写错）、
-                            -- 有 gauge 但这个 worker 认不出自己的卡（容器名不带 gpuN，
-                            -- 台账没有 g| 提示）、卡认得出却没有对应 series（卡被直通给
-                            -- 别的容器 / 改名后的残留卡号）。全都报 "no power gauge" 的
-                            -- 话，运维会被送去查 exporter，而真相在容器命名上。
-                            if whole == nil then
-                                _M.warn_dedup("power-nogauge", record.url,
-                                    "no power gauge in " .. #body .. "B", stamp())
-                            elseif miss_kind == "identity" then
-                                _M.warn_dedup("power-noident", record.url,
-                                    "per-card power available but this worker names no card;"
-                                    .. " left uncapped (machine max "
-                                    .. string.format("%.1f", whole)
-                                    .. " W is another card's reading)", stamp())
-                            else
-                                _M.warn_dedup("power-nocard", record.url,
-                                    "per-card power available but no series for this worker's"
-                                    .. " card; left uncapped (machine max "
-                                    .. string.format("%.1f", whole)
-                                    .. " W not used as a substitute)", stamp())
-                            end
-                        else
-                            local stored, why = write_power(record.id, watts, stamp(),
-                                ttl_secs, record.url)
-                            if stored then
-                                stats.power_matched = stats.power_matched + 1
-                            elseif why == "rejected" then
-                                stats.power_rejected = stats.power_rejected + 1
-                            else
-                                stats.power_errors = stats.power_errors + 1
-                            end
-                        end
-                    end
                 end
             end
         end
     elseif stats.source == "prom" then
         local endpoint = _M.query_endpoint(cfg.load_prom_url)
         local template = cfg.load_prom_query
-        if power.on and not power.query then
-            -- 反过来：metrics 路的功率开关对 prom 路没有意义（那里没有 /metrics
-            -- 正文可扫），功率要靠第二条查询。同样只是提示，不改变行为。
-            _M.warn_dedup("power-flag-ignored", "prom",
-                "SMG_LOAD_POWER is the metrics-path switch; prom needs SMG_LOAD_POWER_QUERY",
-                stamp())
-        end
         if not endpoint or type(template) ~= "string" or template == "" then
-            -- 只配功率查询、没配负载查询：以前这里整轮 skip，于是「只想从 Prometheus
-            -- 拿功率」这种完全合理的部署永远采不到读数，max_power_w 一直按「未知 →
-            -- 不排除」放行，操作员却以为上限在生效。现在负载那一路自己 skip，功率
-            -- 那一路照常执行；两条查询共用同一个 SMG_LOAD_PROM_URL，所以 endpoint
-            -- 缺失仍然是整轮 skip。
-            if endpoint and (power.query
-                or (util.on and util.explicit_query)) then
-                -- 显式配了利用率查询 = 操作员明确要这一路（与功率同等待遇）。注意只有
-                -- **缺省串**不构成意图：否则每个漏配负载查询的部署都会悄悄多打一条 POST，
-                -- 「配置缺口」也被一个没人要求过的缺省值吞掉。消息按**真正会跑的**通道列，
-                -- 两路都配了时报 "power + utilization"，不留「其实另一路也在跑」的假话。
+            -- 没配负载查询：以前这里整轮 skip，于是「只想从 Prometheus 要利用率读数」
+            -- 这种完全合理的部署永远采不到读数，max_gpu_util 一直按「未知 -> 不排除」
+            -- 放行，操作员却以为上限在生效。现在负载那一路自己 skip，利用率那一路照常
+            -- 执行；两条查询共用同一个 SMG_LOAD_PROM_URL，所以 endpoint 缺失仍然是整轮
+            -- skip。**缺省串**不构成意图：否则每个漏配负载查询的部署都会悄悄多打一条
+            -- POST，「配置缺口」也被一个没人要求过的缺省值吞掉。
+            if endpoint and (util.on and util.explicit_query) then
                 local running = {}
-                if power.query then
-                    running[#running + 1] = "power"
-                end
-                if util.on and util.explicit_query then
-                    running[#running + 1] = "utilization"
-                end
+                running[#running + 1] = "utilization"
                 _M.warn_dedup("prom-config", tostring(cfg.load_prom_url),
                     "SMG_LOAD_PROM_QUERY empty: running the "
                     .. table.concat(running, " + ") .. " query only", stamp())
@@ -622,135 +433,18 @@ function _M.run_pass(cfg, opts)
         local prom_ctx = {
             post = post, endpoint = endpoint, timeout_ms = timeout_ms,
             headers = headers, stats = stats,
-            by_host = {}, by_power = {}, by_card_power = {}, card_hosts = {},
-            -- 利用率通道的独立表（第三条查询自己的 vector / 逐卡表 / 逐卡源标记），
-            -- 以及它需要的 worker 名册、卡号提示快照与写 seam。三通道共用一次 pass 的
+            by_host = {},
+            -- 利用率通道的独立表（第二条查询自己的 vector / 逐卡表 / 逐卡源标记），
+            -- 以及它需要的 worker 名册、卡号提示快照与写 seam。两通道共用一次 pass 的
             -- ctx 容器但各用各的字段，一个通道的表读写不到另一个通道的账上。
             by_util = {}, by_card_util = {}, util_card_hosts = {},
             stamp = stamp,
             workers = workers, util = util, write_util = write_util,
         }
 
-        -- 功率那一路复用同一个 endpoint、同一条 POST helper、同一套
-        -- parse_prom_response / host 折叠，只是换成第二条 PromQL（独立配置项
-        -- SMG_LOAD_POWER_QUERY，留空即不采），并把值交给 host_powers() 而不是
-        -- host_values()——差的正是 normalize() 那一步。
-        --
---- 为什么不与负载查询合并成一条 PromQL：两者的 gauge 家族、聚合口径常常不同
---- （负载 avg by (instance) (DCGM_FI_DEV_GPU_UTIL)，功率
---- max by (Hostname, instance) (DCGM_FI_DEV_POWER_USAGE)），拼成 or/vector(0)
---- 之类的花活会让一条写坏时两路一起失效，也没法分别归因。两次查询的代价是一个 tick
---- 多一个 POST，本 fleet 的 Prometheus 完全吃得住。
----
---- 写这条 PromQL 时请**保留 instance 标签**（by (Hostname, instance) 或直接裸查
---- DCGM_FI_DEV_POWER_USAGE）：本 fleet 的 worker 全部注册成 http://127.0.0.1:80xx，
---- 而机器名标签（Hostname）与 IP 之间没有任何映射可用，只有 exporter 的抓取地址
---- 127.0.0.1:9400 能把读数交回本机 worker。聚合时把 Hostname 一起 by 上，是为了让
---- host_card_powers() 在「同一台 Prometheus 抓了多台机器的本机 exporter」时仍能识破归属
---- 冲突、宁可整台不采纳，也不会把 A 机最热的卡挂到 B 机头上。
----
---- 而且必须把 gpu 留在 by 里（缺省查询串：
----     max by (Hostname, instance, gpu) (DCGM_FI_DEV_POWER_USAGE)
---- ）：245/246 那份 compose 写的 max by (Hostname,instance) 正是 21.k:8801 八个
---- worker 全部读到 342.371 的直接原因——聚合发生在 Prometheus 侧，逐卡标签根本没
---- 能到达网关，网关再怎么改也只是在一条已折平的 series 上做文章。逐卡读数在
---- exporter 上一直齐全（/data/tmp/dcgm-metrics-9400.txt 有 gpu="0"…"7" 八条），
---- 所以口径是「查询别聚合掉 gpu，网关按 worker 自己的卡分发」。
-        -- 逐卡表，与「这一台机器的数据源到底是不是逐卡的」。后者取自 power_fold 自己
-        -- 给出的 card_hosts（按 host 记），刻意**不是**一个全局布尔：prom 路一轮可以跨
-        -- 多台机器，而一个 fleet 里「A 机跑 dcgm-exporter、B 机只有 node_exporter」是
-        -- 常态。用全局标志的话，A 机有逐卡 series 会把 B 机一起拖进逐卡口径，于是 B 机
-        -- 那些「本来就认不出卡」的 worker 一个读数都拿不到 —— 一台机器的监控形状把
-        -- 另一台机器的功率通道关掉。
-        -- 功率这一路：先把自己的 vector 拉回来（查询是否按 host 展开由**它自己的**
-        -- 模板决定，与负载查询互不牵连），再交给 assign() 按 host 落到 worker 上。
-        -- assign() 只按 split_host 取值、不碰数值语义，所以负载那一路的同一套映射
-        -- 规则原样可用：同机多个 worker（DP rank、一机两引擎）自动共享同一个读数，
-        -- series 找不到归属的记成 power_unmatched 而不是硬塞给谁。
-        if power.query then
-            if _M.query_needs_host(power.query) then
-                local queried = {}
-                for i = 1, #workers do
-                    local record = workers[i]
-                    local pq = _M.render_query(power.query, record)
-                    if pq then
-                        if not queried[pq] then
-                            queried[pq] = true
-                            one_power(prom_ctx, pq, record.url)
-                        end
-                    else
-                        -- 这条 worker 的 url 解析不出 host，模板没法展开：与负载
-                        -- 那一路的 skipped 同义——它不是「监控系统没给出读数」，而是
-                        -- 「这个 worker 没法问」，混进 failed 会让 lr_gpu_load_power_
-                        -- parse_failures_total 随坏 url 的个数放大，指错排障方向。
-                        stats.power_skipped = stats.power_skipped + 1
-                    end
-                end
-            else
-                one_power(prom_ctx, power.query, endpoint)
-            end
-
-            local url_for_power = {}
-            for i = 1, #workers do
-                url_for_power[workers[i].id] = workers[i].url
-            end
-            local hints = opts.gpu_hints
-            if hints == nil then
-                hints = seams.default_gpu_hints()
-            end
-            hints = _M.hint_index(hints)
-            -- 按 worker 各自的卡分发（四路口径见 assign_power 上方注释：源无逐卡标签
-            -- → 整机 max；认得出且有该卡 series → 本卡瓦特；认不出卡 / 该卡无 series
-            -- → 什么都不写，绝不拿邻居卡的整机 max 冒充）。
-            local p_assigned, p_unmatched = _M.assign_power(workers, prom_ctx.by_power,
-                prom_ctx.by_card_power, prom_ctx.card_hosts, hints)
-            stats.power_unmatched = p_unmatched
-            -- 「本 pass 里有多少 worker 真的按自己那张卡拿到读数」。没有这个计数，
-            -- 「全部逐卡成功」与「全部悄悄退回整机 max」在 /metrics 上长得一模一样，
-            -- 而后者正是 342.371 故障能一直活着的原因。
-            local card_hits = 0
-            for i = 1, #workers do
-                local w = workers[i]
-                local host = w and _M.split_host(w.url)
-                if w and host and prom_ctx.card_hosts[host] and p_assigned[w.id] ~= nil
-                    and _M.worker_card(w, hints) ~= nil then
-                    card_hits = card_hits + 1
-                end
-            end
-            stats.power_per_card = card_hits
-            -- 查询本身成功却一个可用读数都没有（gauge 名写错、那批机器没起 dcgm、
-            -- 整表都是 NaN）：与 metrics 路的 no-gauge 同义，记一次 failed 并留一条
-            -- 去重 WARN。放在这里而不是 one_power 内，是因为按 host 展开时会有多次
-            -- 查询，只有折叠完才知道「整个 vector 到底有没有可用读数」。
-            if next(prom_ctx.by_power) == nil and (stats.power_errors or 0) == 0 then
-                stats.power_failed = stats.power_failed + 1
-                _M.warn_dedup("power-prom-nogauge", tostring(power.query),
-                    "power query returned no usable watt series", stamp())
-            elseif next(p_assigned) == nil and next(prom_ctx.by_power) ~= nil then
-                -- 查得到读数、一个 worker 都没配上：几乎只会是标签口径对不上（比如
-                -- by(Hostname) 折叠出的机器名与注册成 IP:port 的 worker url 永不在同
-                -- 一把键上相遇）。这是「功率上限看着在生效、其实一台都没进」最隐蔽的
-                -- 一种，只靠 power_unmatched 计数太容易漏看，所以补一条去重 WARN。
-                _M.warn_dedup("power-prom-unassigned", tostring(power.query),
-                    "power series matched no pooled worker (" ..
-                    tostring(stats.power_unmatched) .. " hosts unmatched)", stamp())
-            end
-            for id, watts in pairs(p_assigned) do
-                local stored, why = write_power(id, watts, stamp(), ttl_secs,
-                    url_for_power[id])
-                if stored then
-                    stats.power_matched = stats.power_matched + 1
-                elseif why == "rejected" then
-                    stats.power_rejected = stats.power_rejected + 1
-                else
-                    stats.power_errors = stats.power_errors + 1
-                end
-            end
-        end
-
-        -- 利用率这一路（第三条查询）。整段包在 pcall 里：一个 tick 里三通道互不影响，
-        -- util 采集出任何我们没预料的错，代价只能是 util 自己的读数，不能拖垮已经跑完的
-        -- 功率 vector 与接下来的负载 vector。
+        -- 利用率这一路（第二条查询）。整段包在 pcall 里：一个 tick 里两通道互不影响，
+        -- util 采集出任何我们没预料的错，代价只能是 util 自己的读数，不能拖垮已经
+        -- 跑完的负载 vector。
         if stats.util_enabled and util.query then
             local u_hints = opts.gpu_hints
             if u_hints == nil then

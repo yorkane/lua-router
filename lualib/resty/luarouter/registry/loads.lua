@@ -13,7 +13,7 @@
 --     three-way verdict (idle/busy/full) is computed - the /workers echo and the
 --     router's green-light narrowing both read *that*, so no second caller can derive
 --     the traffic-light from a different mix of readings (doc/caps-redesign-2026-10-06.md
---     section 2). xl:, pw: and gu: never share a field with each other or with the
+--     section 2). xl:, sl: and gu: never share a field with each other or with the
 --     in-flight counter, because a score and an admission number are different kinds.
 
 local M = {}
@@ -25,7 +25,6 @@ local K_ACTIVE = keys.K_ACTIVE
 local K_GPU_UTIL = keys.K_GPU_UTIL
 local K_TEMP_DISABLE = keys.K_TEMP_DISABLE
 local K_LOAD = keys.K_LOAD
-local K_POWER = keys.K_POWER
 local K_SLOAD = keys.K_SLOAD
 local K_XANY = keys.K_XANY
 local K_XLOAD = keys.K_XLOAD
@@ -168,10 +167,11 @@ end
 ------------------------------------------------------------------ capacity caps
 --
 -- Per-worker ceilings on the two things that actually run a serving instance out
--- of headroom: requests in flight and watts the GPU is drawing (the latter is the
--- fleet's own reason for the feature -- a card pinned at its power limit decodes
--- noticeably slower than one at half load, and neither the request count nor the
--- utilization gauge shows it). doc/gap-worker-caps.md.
+-- of headroom: requests in flight (this gateway's own counter) and how busy the
+-- GPU is (the external gu: sample). Utilisation is the only busy-side reading
+-- there is: the third gauge that originally sat beside those two is gone, so
+-- nothing on this path reports an absolute busy-side magnitude any more.
+-- doc/gap-worker-caps.md, reshaped by doc/caps-redesign-2026-10-06.md sections 1-2.
 
 ---Normalize one declared cap. Absent, blank, non-numeric, NaN, +/-inf or a value
 ---<= 0 all mean "no limit" and collapse to nil, so the selection path can test
@@ -256,7 +256,7 @@ end
 --   busy  everything else
 --   nil   no ceiling of any kind declared: no gate at all, i.e. today's behaviour
 --
--- Three rules decide every shape below, and they are the reason a caller must not
+-- These rules decide every shape below, and they are the reason a caller must not
 -- recompute this at home:
 --   * the readings are different in kind. `lo:` is this gateway's counter and is
 --     always known (a missing key is 0 in-flight, never "unknown"); `gu:` is an
@@ -267,9 +267,9 @@ end
 --     is scaled by load_scale into in-flight-request units, so comparing a
 --     utilisation ceiling against it would make a scoring knob move an admission
 --     gate. See the header comment of registry/keys.lua.
---   * the watt ceiling left the verdict on 2026-10-06. `pw:` and its exporter
---     family stay (pure observation), but no capacity decision reads them any
---     more, and the reason strings "concurrency"/"power" are retired.
+--   * there are exactly two ceilings. The concurrency rung compares lo: and the
+--     busy rung compares gu:; nothing else feeds the verdict, and the only reason
+--     strings are concurrency_max and gpu_util.
 
 ---The verdict behind both public faces: the traffic-light plus the numbers that
 ---decided it. Private so that `capacity_state` stays exactly the one-value
@@ -365,100 +365,18 @@ function M.capacity_exclusion(record, d)
     return verdict
 end
 
----Store one raw watt sample for a worker (gpu_load's power pass is the only
----writer; unit tests may call it directly). Watts go in as milli-watts so gauge
----noise below one watt does not widen the key's type, and a negative or unusable
----reading is refused rather than clamped: "0 W" is a claim about the hardware
----that no exporter in this fleet can honestly make, and a stored 0 would read
----"far below any cap" for a worker whose exporter is misbehaving.
----@param id string
----@param watts number|nil
----@param ttl_secs number|nil
----@return boolean written
-function M.set_power_w(id, watts, ttl_secs)
-    local number = tonumber(watts)
-    if number == nil or number ~= number
-        or number == math.huge or number == -math.huge or number < 0 then
-        return false
-    end
-    local seconds = R.stale_ttl(ttl_secs)
-    local ok, err = shdict():set(K_POWER .. id,
-        math.floor(number * 1000 + 0.5), seconds)
-    if not ok then
-        -- No-capacity-on-the-dict is the only way this fails and it is worth one
-        -- line: the cap silently stops being enforceable for this worker until the
-        -- sample TTLs out or the exporter refills it.
-        if ngx and ngx.log then
-            ngx.log(ngx.WARN, "luarouter: power sample for ", tostring(id),
-                " not stored: ", tostring(err))
-        end
-        return false
-    end
-    return true
-end
-
----The fresh watt sample for one worker: nil when there is none (an absent sample
----is *unknown*, and never collapses to 0 -- that distinction is what makes the
----power cap safe to leave switched on).
----@param id string
----@return number|nil watts
-function M.power_w(id)
-    local milli = shdict():get(K_POWER .. id)
-    if milli == nil then
-        return nil
-    end
-    return milli / 1000
-end
-
----Every fresh watt sample, keyed by worker id. The exporter and the UI pool
----table both want the whole table (N single lookups over a shared dict is the
----shape this module has already paid for in _M.records).
----@return table @ worker id -> watts
-function M.power_samples()
-    local out = {}
-    local d = shdict()
-    if type(d.get_keys) ~= "function" then
-        return out
-    end
-    -- Bounded: this is a render-time read (the /metrics power section and the UI pool
-    -- table), and get_keys(0) walks the whole lr_workers dict inside the single
-    -- forwarding worker on every scrape. Rows only leave lr_workers when a worker is
-    -- deleted, so the scan length tracks the pool's history rather than its size.
-    -- 4096 is ~500x the largest pool we run; a dict that big is the case where a
-    -- cheaper scrape is the point. Power rows are also the only key family here that
-    -- a *worker* writes every pass, so truncation shows up as missing watts, never as
-    -- a mis-routed request.
-    for _, key in ipairs(d:get_keys(4096)) do
-        if type(key) == "string" and #key > #K_POWER
-            and string.sub(key, 1, #K_POWER) == K_POWER then
-            local value = d:get(key)
-            if value ~= nil then
-                out[string.sub(key, #K_POWER + 1)] = value / 1000
-            end
-        end
-    end
-    return out
-end
-
----Drop the power sample (an operator override, a re-registration, or a test;
----TTL expiry is the ordinary life cycle).
----@param id string
-function M.clear_power_w(id)
-    shdict():delete(K_POWER .. id)
-end
-
 ---Store one raw GPU-utilisation sample for a worker.
 --
 --gpu_load's util pass is the only production writer (unit tests may call it
---directly), which is the same one-writer-per-key discipline `xl:` and `pw:` follow. The
+--directly), which is the same one-writer-per-key discipline `xl:` and `sl:` follow. The
 --fraction goes in as integer milli (percent x 10) so gauge noise below 0.1 % cannot
---widen the key's type, exactly as the watt channel rounds to milli-watts.
+--widen the key's type.
 --
 --Unlike `to_milli` - the *scoring* normalizer, which clamps whatever it is handed into
 --0..1 so a nonsense sample still ranks the worker - this gate feeds an admission
---decision, and a stored number there is a claim about hardware. A negative or unusable
---reading is therefore refused rather than clamped: `set_power_w` already refuses a
---negative watt for the same reason, and "0 % busy" is precisely the reading a broken
+--decision, and a stored number there is a claim about hardware. A negative or
+--unusable reading is therefore refused rather than clamped: this reader refuses a
+--negative fraction for the same reason, and "0 % busy" is the reading a broken
 --exporter would produce for a saturated card, which would silently disarm the ceiling.
 --Only out-of-range *above* clamps (a DCGM gauge that momentarily answers 105 %).
 ---@param id string

@@ -407,10 +407,8 @@ local function snapshot_of(cfg)
         --
         -- Per-tier normalizer, and the util tier cannot borrow the concurrency one:
         -- cap_limit folds <= 0 to nil, which would erase max_gpu_util = 0 -- the
-        -- strictest legal gate -- into silence. An old snapshot that still carries the
-        -- retired max_power_w key re-emits nothing here (the parse layer warns once and
-        -- drops it, so the key leaves the document for good on the next save); no new
-        -- phantom key appears either, which is what the lossless round-trip pins.
+        -- strictest legal gate -- into silence. No new phantom key is emitted either,
+        -- which is what the lossless round-trip pins.
         for _, field in ipairs(CS_UPSTREAMS.CAP_FIELDS) do
             local cap
             if field == "max_gpu_util" then

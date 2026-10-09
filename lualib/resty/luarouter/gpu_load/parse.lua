@@ -4,9 +4,8 @@ local _M = require "resty.luarouter.gpu_load"
 
 -- gpu_load/parse.lua -- metric names and numbers, the host identity keys
 -- and the exposition parsers: the split_sample character scan, the
--- max-gauge reductions, the 0..1 normalisation, and the absolute-watt
--- channel.  power_watt screens NaN / <=0 / >= MAX_PLAUSIBLE_WATTS and a
--- missing or implausible reading answers nil -- never a guessed number.
+-- max-gauge reductions, the 0..1 normalisation, and the GPU-utilisation
+-- channel.  util_fraction screens NaN / negative / implausible readings and a
 -- This is where the missing-reading discipline starts: no usable reading
 -- writes no key, the TTL expires the old one back to nil, and the router
 -- reads nil as unknown -> do not exclude.  Moved verbatim.
@@ -44,46 +43,13 @@ _M.DEFAULT_UTIL_METRIC_KEYS = DEFAULT_UTIL_METRIC_KEYS
 
 -- prom 路利用率查询的缺省 PromQL（SMG_LOAD_UTIL_QUERY 缺省值）。它是**唯一权威**的一份
 -- 字面量：config.lua 装配 + cards.util_config() 的回落都指向这里，两处不再各抄一遍。
--- gpu 必须留在 by 里，理由与功率那条一模一样（lr-map-gpuload-2026.md §2.2）：把它聚合掉
--- 就是 21.k 八台 worker 共用一个数（342.371）的复刻，逐卡归属当天就退化回整机 max。
--- Hostname 与 instance 也都留在 by 里：util_fold（复用 power_fold 的机器身份规则）靠这两
--- 个标签在「一台 Prometheus 抓了多台机器的本机 exporter」时识破归属冲突，而本机 worker 全
+-- gpu 必须留在 by 里（lr-map-gpuload-2026.md §2.2）：把它聚合掉 = 21.k 八台 worker
+-- 共用一个数（342.371）的复刻，逐卡归属当天就退化回整机 max。
+-- Hostname 与 instance 也都留在 by 里：cards.lua 的 util_fold 靠这两个标签在「一台
+-- Prometheus 抓了多台机器的本机 exporter」时识破归属冲突，而本机 worker 全
 -- 注册成 http://127.0.0.1:80xx，只有 exporter 的抓取地址能把读数交回本机。
 local DEFAULT_UTIL_QUERY = "max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)"
 _M.DEFAULT_UTIL_QUERY = DEFAULT_UTIL_QUERY
-
--- 功率 gauge 的候选名（SMG_LOAD_POWER_KEYS 为空时用）。列在这里的名字都是在
--- 21.k（8x RTX PRO 6000 Blackwell SE）上真实抓到的写法：
---   * DCGM_FI_DEV_POWER_USAGE        dcgm-exporter :9400 的每卡瓦特，
---       '# HELP DCGM_FI_DEV_POWER_USAGE Power draw (in W).'，样本
---       DCGM_FI_DEV_POWER_USAGE{gpu="0",Hostname="gpu-pro6000-1",...} 89.780000
---       （抓取：ssh 21.k 'curl -s 127.0.0.1:9400/metrics'，样本
---        /data/tmp/dcgm-metrics-9400.txt）。Prometheus :9092 里同名，标签
---       多出 instance="127.0.0.1:9400" / job="dcgm"。
---   * node_hwmon_power_average_watt  node_exporter 的 hwmon 功率，只有整机口径，
---       **故意不进缺省名单**。折叠规则是「取最大」，而 node_hwmon 给的是整机/电源
---       口径（一台 8 卡机能读到 700 W+），把它和每卡读数混在一起会让最热的卡被高估，
---       配上 max_power_w 就是「这台机器上的所有 worker 永久高于上限」——监控系统的一
---       个口径错误吃掉整台机器的容量，比没有读数糟得多。确实只有 node_exporter 的
---       机器请显式写进 SMG_LOAD_POWER_KEYS（那时取最大就是 operator 自己的选择）。
--- 推理引擎自己的 /metrics 一律**没有**功率：21.k 上的 sglang 8026 全文 87 KB 里
--- grep -iE 'power|watt' 命中 0 行（样本 /data/tmp/sglang-metrics-8026.txt），vLLM
--- 同样只有 gpu_cache_usage_perc 一类。所以 metrics 路只对「引擎与 dcgm-exporter
--- 同机、且 operator 把 SMG_LOAD_METRICS_PATH 指到 exporter」的情形有意义，
--- 跨机采集请用 prom 路。
-local DEFAULT_POWER_METRIC_KEYS = {
-    "dcgm_fi_dev_power_usage",
-}
-_M.DEFAULT_POWER_METRIC_KEYS = DEFAULT_POWER_METRIC_KEYS
-
--- 一个还能被当成「单卡功率」的读数上限。dcgm 的 DCGM_FI_DEV_POWER_USAGE 是每卡
--- 瞬时瓦特，本 fleet 里最大的卡（Blackwell SE / H200 级）功率墙也在 600-1000 W，
--- 取 5000 留五倍余量。超出的几乎只会是被误配进来的**能量计数器**（焦耳，例如
--- DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION 会爬到千万）、整机功耗或 UPS 读数——那种
--- 数字喂给功率上限判定，会让这一路 worker 永久高于上限而被整个摘出候选集，
--- 也就是一个配错的 gauge 名单独干掉一个实例。宁可回「未知」。
-local MAX_PLAUSIBLE_WATTS = 5000
-_M.MAX_PLAUSIBLE_WATTS = MAX_PLAUSIBLE_WATTS
 
 -- Identity labels a Prometheus series can carry the machine in. `instance` is what
 -- the exporters get scraped with (host:port), the rest cover the SD-produced label
@@ -335,9 +301,9 @@ local function split_sample(line)
     local rest = string.sub(line, split_at + 1)
     local value = string.match(rest, "^%s*([^%s]+)")
     -- Third return: the identity *with* its label section, which is what the
-    -- per-card power channel needs (split_sample()'s first return drops the
-    -- braces, and the max-gauge readers never wanted them). Existing callers
-    -- take two values, so this is additive.
+    -- per-card utilisation channel reads gpu="6" from (the first return drops
+    -- the braces, and the max-gauge readers never wanted them). Existing
+    -- callers take two values, so this is additive.
     return identity, value, string.sub(line, 1, split_at - 1)
 end
 _M.split_sample = split_sample
@@ -417,29 +383,6 @@ function _M.normalize(value)
     return load
 end
 
---------------------------------------------------------------- power (absolute W)
-
----Usable single-GPU watt reading, or nil.
----
----三道筛子，每一道都对应一种「会把功率上限判定带偏」的真实读数：
----  * 非数 / NaN / ±inf：同 parse_number() 的口径。
----  * <= 0：本 fleet 的卡（RTX PRO 6000 SE）空载也有 80-90 W，读到 0 只可能是
----    exporter 把「没有这个字段」渲染成了 0。registry 允许存 0，而 0 会被判成
----    「远低于任何上限」，等于一个坏 exporter 给这台 worker 发了免检牌。
----  * >= MAX_PLAUSIBLE_WATTS：几乎只会是被误配进 SMG_LOAD_POWER_KEYS 的能量计数器
----    （DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION 是焦耳，会爬到 1e7 以上）或整机/UPS
----    功率。这种数字进池子会让该 worker 永久高于上限、整个从候选集消失。
----宁可回 nil（未知 → 不排除），也不猜。
----@param value number|string|nil
----@return number|nil watts
-function _M.power_watt(value)
-    local number = _M.parse_number(value)
-    if number == nil or number <= 0 or number >= MAX_PLAUSIBLE_WATTS then
-        return nil
-    end
-    return number
-end
-
 ------------------------------------------------------------- util (0..1 busy)
 
 -- 一个还能被当成「单卡 GPU 利用率」的原始读数上限（百分数量纲）。DCGM 的
@@ -447,7 +390,7 @@ end
 -- 驱动舍入到 105 仍算满载；而 1000 以上的读数几乎只会是被误配进名册的**计数器**
 -- （运行时长、能量焦耳、token 累计……），那种数字喂给利用率上限判定，会让这一路
 -- worker 永久高于任何 0..100 的上限而整个从候选集消失——一个配错的 gauge 名单独
--- 干掉一个实例，与 MAX_PLAUSIBLE_WATTS 防的是同一类事故。宁可回「未知」。
+-- 干掉一个实例，与负载那一路的名册筛的是同一类事故。宁可回「未知」。
 local MAX_PLAUSIBLE_UTIL_PERCENT = 1000
 _M.MAX_PLAUSIBLE_UTIL_PERCENT = MAX_PLAUSIBLE_UTIL_PERCENT
 
@@ -460,8 +403,8 @@ _M.MAX_PLAUSIBLE_UTIL_PERCENT = MAX_PLAUSIBLE_UTIL_PERCENT
 ---  * 非数 / NaN / ±inf：同 parse_number() 的口径，nil。
 ---  * **负数 -> nil**（绝不夹到 0）：0 % 是合法读数（21.k 的 dcgm 空载就报
 ---    DCGM_FI_DEV_GPU_UTIL{gpu="0"} 0），而负数是坏 exporter；夹成 0 等于给一台
----    撒谎的 exporter 发免检牌——它永远「远低于任何上限」，这正是功率侧拒收 0 W
----    的同一类事故，只是方向反过来。
+---    撒谎的 exporter 发免检牌——它永远「远低于任何上限」。坏读数一律当未知，
+---    绝不夹成一个看起来安全的数。
 ---  * 0..1（含端点）：按分数收。恰好 1 = 满载（与 normalize() 对负载的口径一致，
 ---    xl: 与 gu: 两把键对「1」必须同义，否则同一个 exporter 在打分与准入两路读出
 ---    两种世界）。百分数量纲里 1 % 的真读数被当满载是**过判**——过判只会少用一台
@@ -490,12 +433,12 @@ function _M.util_fraction(value)
 end
 
 ---Per-card **utilization** readings for one /metrics exposition (the metrics
----path's util scan; the counterpart of power_watts_by_card()).
+---path's util scan).
 ---
----与功率版同一次正文扫描、同样的两路归约（whole = 整机最热卡，by_card[gpu] = 该卡），
----差的只有两点：筛子换成 util_fraction()（功率的 power_watt() 会把合法的 0 拒掉，
----利用率不能），以及名册默认 DEFAULT_UTIL_METRIC_KEYS（不含 KV-cache 用量名）。
----gpu 标签只认纯数字（"0".."7"），口径与功率逐卡归属完全一致。
+---一次正文扫出两路归约（whole = 整机最热卡，by_card[gpu] = 该卡）。筛子是
+---util_fraction()：合法的 0 必须保留（DCGM 空载就报 0 %，那是「远低于任何上限」
+---的诚实读数，不能当成缺数拒掉），名册默认 DEFAULT_UTIL_METRIC_KEYS（不含
+---KV-cache 用量名）。gpu 标签只认纯数字（"0".."7"）。
 ---@param text string|nil @ the exposition body
 ---@param names table[]|string|nil @ gauge names to keep (default DEFAULT_UTIL_METRIC_KEYS)
 ---@return number|nil whole @ hottest card on the machine, 0..1
@@ -546,111 +489,10 @@ function _M.util_by_card(text, names)
     return whole, by_card, have_cards
 end
 
----Max **usable** watt reading over every power gauge in one exposition.
----
----Same shape as max_gauge() (any label set of any wanted name participates) but
----not the same reduction rule: values go through power_watt() first, so a body
----that carries one honest 96 W series and one mis-fed 1.2e7 energy counter still
----answers 96 W instead of poisoning the cap. max_gauge() cannot do this because
----it reduces over raw values before normalize() ever sees them.
----@param text string|nil @ the exposition body
----@param names table[]|string|nil @ gauge names to keep (default DEFAULT_POWER_METRIC_KEYS)
----@return number|nil watts
-function _M.max_power_watts(text, names)
-    if type(text) ~= "string" or text == "" then
-        return nil
-    end
-    local wanted = {}
-    local list = _M.metric_key_list(names)
-    if #list == 0 then
-        list = _M.metric_key_list(DEFAULT_POWER_METRIC_KEYS)
-    end
-    for i = 1, #list do
-        wanted[list[i]] = true
-    end
-    local best
-    for line in string.gmatch(text, "[^\r\n]+") do
-        if string.byte(line, 1) ~= 35 then
-            local identity, value_text = split_sample(line)
-            local name = canon(identity)
-            if name and wanted[name] then
-                local watts = _M.power_watt(value_text)
-                if watts and (best == nil or watts > best) then
-                    best = watts
-                end
-            end
-        end
-    end
-    return best
-end
-
----Per-card watt readings for one /metrics exposition (the metrics path's power scan).
----
----The metrics path dials a worker's *own* /metrics, so every series in the body
----belongs to that machine: no host matching is involved (that is the prom path's
----problem, and host_powers() owns it). Two reductions come out of one pass:
----  * whole -> the max over every usable series: byte-for-byte what
----    max_power_watts() answers today, and the fallback whenever the card cannot be
----    named (a worker whose record carries no labels.gpu, or an exporter that
----    exposes no gpu label at all — node_exporter, a machine-level gauge).
----  * by_card[gpu] -> max over the series naming that card, only for series whose
----    gpu label is a pure digit.
----Both go through power_watt(), so a mis-fed energy counter is screened out before
----either reduction, exactly as in max_power_watts().
----@param text string|nil @ the exposition body
----@param names table[]|string|nil @ gauge names to keep (default DEFAULT_POWER_METRIC_KEYS)
----@return number|nil whole @ hottest card on the machine
----@return table @ by_card @ gpu id -> watts
----@return boolean @ have_cards @ any usable series named a card
-function _M.power_watts_by_card(text, names)
-    local whole, by_card, have_cards = nil, {}, false
-    if type(text) ~= "string" or text == "" then
-        return whole, by_card, have_cards
-    end
-    local wanted = {}
-    local list = _M.metric_key_list(names)
-    if #list == 0 then
-        list = _M.metric_key_list(DEFAULT_POWER_METRIC_KEYS)
-    end
-    for i = 1, #list do
-        wanted[list[i]] = true
-    end
-    for line in string.gmatch(text, "[^\r\n]+") do
-        if string.byte(line, 1) ~= 35 then
-            local identity, value_text, labelled = split_sample(line)
-            local name = canon(identity)
-            if name and wanted[name] then
-                local watts = _M.power_watt(value_text)
-                if watts then
-                    if whole == nil or watts > whole then
-                        whole = watts
-                    end
-                    local labels = _M.parse_labels(labelled)
-                    local raw = labels and labels.gpu
-                    local gpu = nil
-                    if type(raw) == "string" or type(raw) == "number" then
-                        local t = string.match(tostring(raw), "^%s*(.-)%s*$")
-                        if t and string.match(t, "^%d+$") then
-                            gpu = t
-                        end
-                    end
-                    if gpu then
-                        have_cards = true
-                        if by_card[gpu] == nil or watts > by_card[gpu] then
-                            by_card[gpu] = watts
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return whole, by_card, have_cards
-end
-
 ---Split the label portion out of one sample identity ("name{k=\"v\"}").
 ---
 ---split_sample() drops the braces (max_gauge only needs the metric name), but the
----per-card power channel needs gpu="6", so the name is returned together with the
+---per-card utilisation channel needs gpu="6", so the name is returned together with the
 ---label set parsed here. A malformed label section answers nil, which makes the row
 ---behave exactly like an unlabelled one (→ whole-machine reduction), never a guess.
 ---@param identity string @ text before the value, braces included

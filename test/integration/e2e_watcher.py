@@ -37,6 +37,12 @@ Scenarios, in order:
      pass, with no remove grace and no keep-last exemption, then re-registers through
      the ordinary add gates once /v1/models answers again. Scenario 7 is the same
      shape with a 500 instead of an id-less 200.
+     Both run with SMG_WATCHER_PROBE_TEMP_DISABLE=0, which is what keeps them on the
+     physical-delete branch after commit 9bf3c07 made the reject verdicts keep the row.
+  8  the shipped default of that switch (用户裁定 2026-10-09), same id-less 200 fault:
+     the row survives, the removal counter does not move, the candidate exclusion shows
+     up on smg_worker_temp_disabled_total, traffic is refused, and clearing the fault
+     brings traffic back through the very same row (no delete, no re-add).
 """
 import json
 import os
@@ -616,13 +622,20 @@ def scenario_probe_failure_eviction(tag, mode):
     3/4. Only the strict probe's answer changes, flipped inside the same mock
     process on the same url -- a restart or a new port would be a different
     discovery situation, not the same row going bad and coming back.
+
+    SMG_WATCHER_PROBE_TEMP_DISABLE=0 pins the *physical delete* branch: since
+    commit 9bf3c07 the reject verdicts (no_ids among them) keep the row and stamp
+    a temporary-disable marker instead, so this scenario has to opt out of that to
+    keep asserting what guard 10 was written to assert. The keep-the-row semantic
+    is scenario 8's job.
     """
     t = "[%s]" % tag
     name = "lr-watch-%s-%s" % (tag, RUN)
     mock_port = free_port()
     mock = start_mock(mock_port, "flaky-model")
     url = "http://127.0.0.1:%d" % mock_port
-    port = start_watcher({"SMG_WATCHER_TARGETS": url}, name)
+    port = start_watcher({"SMG_WATCHER_TARGETS": url,
+                          "SMG_WATCHER_PROBE_TEMP_DISABLE": "0"}, name)
     if not check(t + " the worker registers from a real /v1/models",
                  wait_workers(port, 1, timeout=30), logs(name)):
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
@@ -692,6 +705,123 @@ def scenario_probe_failure_eviction(tag, mode):
           st == 200 and echo.get("model") == "flaky-model", "%s %s" % (st, body[:200]))
     check(t + " and nothing else was removed on the way back",
           watch_counter(port, "lr_watch_removes_total") == before + 1,
+          watch_metrics(metrics(port)))
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    stop_mock(mock)
+
+
+# --------------------------------------------------------------------------
+def scenario_probe_temp_disable(tag):
+    """Guard 10's other half (用户裁定 2026-10-09): the reject verdict keeps the row.
+
+    Same shape as scenario 6 -- a static TARGET whose only bad behaviour is what
+    /v1/models answers, while /health and /metrics keep answering 200 -- but on the
+    *shipped* default SMG_WATCHER_PROBE_TEMP_DISABLE. Since 9bf3c07 a probe that
+    answers without data[].id no longer costs the row: the watcher stamps a td:
+    marker and the candidate assembly excludes it, so the observation surface is the
+    exclusion counter rather than a deletion. This pins the four things the ruling
+    promises and that scenario 6 (which opts out of the switch to keep testing the
+    physical delete) cannot see: the row survives, the removal counter does not move,
+    traffic is refused because the only candidate is excluded, and clearing the fault
+    brings traffic back through the same row -- no delete and no re-add in between.
+    """
+    t = "[%s]" % tag
+    name = "lr-watch-%s-%s" % (tag, RUN)
+    mock_port = free_port()
+    mock = start_mock(mock_port, "flaky-model")
+    url = "http://127.0.0.1:%d" % mock_port
+    port = start_watcher({"SMG_WATCHER_TARGETS": url}, name)
+    if not check(t + " the worker registers from a real /v1/models",
+                 wait_workers(port, 1, timeout=30), logs(name)):
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        stop_mock(mock)
+        return
+    row = by_url(port).get(url, {})
+    check(t + " the row is watcher-owned",
+          row.get("metadata", {}).get("managed-by") == "router-watch"
+          and wait_metric(port, "lr_watch_owned_workers", 1),
+          json.dumps(row.get("metadata")) + "\n" + watch_metrics(metrics(port)))
+    check(t + " and healthy while it can still name its model",
+          wait_healthy(port, url), logs(name))
+    # Same reason as scenario 6: let reap_pending confirm the queued add, so the
+    # pass below acts on a settled ledger row rather than a pending one.
+    time.sleep(3)
+    before = watch_counter(port, "lr_watch_removes_total") or 0
+    excluded_before = watch_counter(port, "smg_worker_temp_disabled_total") or 0
+
+    st, body, _ = http("POST", url + "/fault", {"models_mode": "no_ids"})
+    check(t + " the mock accepts the /v1/models fault 'no_ids'",
+          st == 200 and json.loads(body).get("models_mode") == "no_ids",
+          "%s %s" % (st, body[:160]))
+    # Two passes at the 2 s interval is enough for the verdict to be reached and the
+    # marker stamped (the marker is re-written every failing pass, so the wait is
+    # about seeing at least one, not about catching a race).
+    time.sleep(6)
+    lg = logs(name)
+    check(t + " the reject verdict names the temporary disable",
+          "temporarily disabled, keeping the row" in lg, lg[-600:])
+    check(t + " and the row is still in the pool (kept, not deleted)",
+          url in by_url(port), json.dumps(sorted(by_url(port))))
+    check(t + " nothing was counted as a removal (the ledger keeps owning it)",
+          watch_counter(port, "lr_watch_removes_total") == before
+          and watch_counter(port, "lr_watch_owned_workers") == 1,
+          watch_metrics(metrics(port)))
+    check(t + " it is not the physical-eviction branch",
+          "probe failed (no /v1/models)" not in lg
+          and "(undiscovered, gone" not in lg, lg[-600:])
+
+    # The exclusion is a *selection-time* fact, so it is the request that makes it
+    # visible: candidates_for counts a candidate it drops on the td: marker only on
+    # the counted pass (forward), and this worker is the only candidate for its model.
+    refused = None
+    for _ in range(6):
+        st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                           {"model": "flaky-model",
+                            "messages": [{"role": "user", "content": "x"}]})
+        refused = st
+        if st in (404, 503):
+            break
+        time.sleep(1)
+    check(t + " a request naming it is refused, not routed", refused in (404, 503),
+          "%s %s" % (refused, (body or "")[:160]))
+    check(t + " and the refusal says there are no available workers",
+          "no_available_workers" in (body or ""), (body or "")[:200])
+    check(t + " the candidate-assembly exclusion is counted",
+          (watch_counter(port, "smg_worker_temp_disabled_total") or 0) > excluded_before,
+          "before=%s\n%s" % (excluded_before,
+                              "\n".join(l for l in metrics(port).splitlines()
+                                         if l.startswith("smg_worker_temp_disabled"))))
+    st, body, _ = http("GET", "http://127.0.0.1:%d/v1/models" % port)
+    check(t + " the advertised model list still offers it (row kept)",
+          st == 200 and "flaky-model" in body, "%s %s" % (st, body[:160]))
+    st, body, _ = http("GET", url + "/health")
+    check(t + " the health surface never stopped answering", st == 200,
+          "%s %s" % (st, body[:80]))
+
+    # Recovery half: no re-add, only the marker going away on the pass that reads a
+    # real /v1/models again.
+    st, body, _ = http("POST", url + "/fault", {"models_mode": "normal"})
+    check(t + " the fault is cleared", st == 200, "%s %s" % (st, body[:120]))
+    check(t + " the row is the same one throughout (never dropped, so never re-added)",
+          wait_until(lambda: url in by_url(port)
+                     and by_url(port)[url].get("model_id") == "flaky-model", timeout=30),
+          logs(name))
+    served = False
+    echo = {}
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                           {"model": "flaky-model",
+                            "messages": [{"role": "user", "content": "y"}]})
+        if st == 200:
+            served = True
+            echo = json.loads(body).get("echo_body", {})
+            break
+        time.sleep(0.5)
+    check(t + " traffic flows again once the probe answers",
+          served and echo.get("model") == "flaky-model", "%s %s" % (st, (body or "")[:200]))
+    check(t + " and still nothing was removed on the way back",
+          watch_counter(port, "lr_watch_removes_total") == before,
           watch_metrics(metrics(port)))
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     stop_mock(mock)
@@ -804,6 +934,7 @@ def main():
     scenario_grace_and_keep_last()
     scenario_probe_failure_eviction("6", "no_ids")
     scenario_probe_failure_eviction("7", "error500")
+    scenario_probe_temp_disable("8")
     scenario_docker_and_restart()
     failed = [r for r in RESULTS if not r[0]]
     print("\n=== %d checks, %d failed ===" % (len(RESULTS), len(failed)))

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""e2e：虚拟模型多绑定（需求 A）+ 每服务并发/功率上限（需求 B）。
+"""e2e：虚拟模型多绑定（需求 A）+ 每服务并发/利用率上限（需求 B）。
 
 跑法（门禁纪律：本文件全部是 lr- 前缀容器 + host 侧 mock，跑前必须确认没有别的门禁在
 跑，严禁并发）：
     python3 test/integration/e2e_caps.py
 
 为什么这份文件用 CONF_TEST(_lib.probe_container) 而不是 _lib.start_router：
-  1. 本轮同时给 test/conf/nginx-lua-router.conf 补三条 SMG_LOAD_POWER* 的 env 声明。
-     nginx 按 env 白名单重建 worker 环境，gpu_load 的功率开关又是在 worker 定时器里
+  1. 本轮同时给 test/conf/nginx-lua-router.conf 补三条 SMG_LOAD_UTIL* 的 env 声明。
+     nginx 按 env 白名单重建 worker 环境，gpu_load 的利用率开关又是在 worker 定时器里
      os.getenv 现读，所以声明漏了就静默失效——断言必须跑在**被改的那份 conf** 上才有
      意义，只有 CONF_TEST 容器能把这个失效照出来（与上次补 SMG_WATCHER_PROBE_FAILURES
      同一性质）。
@@ -24,11 +24,9 @@
   S2        max_concurrency=1（三态断言）：长响应压出真并发，后续请求一条都不许多进
             那台；/workers 的 load_state 跟着判定变色（idle 在场、到顶 full、无门行
             **键缺席**而不是 null）；解除后可选。排除计数按 reason=concurrency_max，
-            旧的 "concurrency"/"power" 两个 reason 拼写不再出现。
+            旧的 "concurrency" reason 拼写不再出现。
   S3        max_gpu_util：GPU 利用率读数超上限→迁走（连显式 pin 都带不走它）；读数
-            缺失（两族 gauge 一起撤走=未知）→不排除。瓦特通道保留为纯观测：本场同时
-            让无上限的 B 做全场最热瓦特台（300 W），实现若还按 pw: 做容量判定，B 被
-            摘走 → 当场红。排除计数按 reason=gpu_util。
+            缺失（两族 gauge 一起撤走=未知）→不排除。排除计数按 reason=gpu_util。
   S3b       同机逐卡归属（生产 342.371 的回归门，利用率口径）：同一份三卡正文
             （gpu 0/1/2 = 12/82/37 %）下三台 worker 各自 labels.gpu 指一张、各挂
             max_gpu_util=50，gpu_util 必须**精确**等于自己那张卡的读数
@@ -49,8 +47,8 @@
             Requests、message 精确等于 "No available workers (N at their concurrency
             or GPU-util limit)"；对照"非上限造成的 503"（熔断/不健康）文案保持原样。
   S5d       声明层三字段自动化（2026-10-06 §1 的 POST 面）：min>=max 拒、util=0 保留、
-            util=101 拒、旧 max_power_w 被 warn 丢弃且不落盘——四条都必须过真 HTTP 的
-            POST /config/upstreams（探针 lr_caps_store_probe.lua 的边界组上闸）。
+            util=101 拒——三条都必须过真 HTTP 的 POST /config/upstreams（探针
+            lr_caps_store_probe.lua 的边界组上闸）。
   S5c       缺省配置（不设上限、不设 candidates）老行为零变化：spread 照旧、排除计数
             与绿灯优先让位计数都为 0。
   S1 交集    candidates 与旧 workers 同时存在时取交集（candidates_for 的 2026-10-01
@@ -59,9 +57,6 @@
   S7        IGW 模型门四条款里最尖锐的一条：config 声明行**改名**后，旧名必须
             非 200（patch_record 把 models_verified 清零 + refresh_models 的 300 s
             mp: 冷却让折叠残留不足以翻案）、新名必须 200。
-  S6        功率通道开关可见性：启用后 lr_gpu_load_power_watts{worker=} 是绝对瓦特（>1）、
-            lr_gpu_load_power_samples_total 随 tick 增长；缺省关闭时 lr_gpu_load_power*
-            一个 series 都不出现，而负载族 lr_gpu_load 仍在（负断言的假绿对照）。
 """
 import json
 import os
@@ -274,7 +269,7 @@ def metric_value(port, name, needle=None):
 def wait_metric_grows(port, name, timeout=12, needle=None):
     """等某个计数器在定时器驱动下真的增长，返回 (之前值, 之后值)。
 
-    为什么必须等：功率计数器是按 tick 涨的（interval=1 s），抓一次快读就可能读到
+    为什么必须等：负载计数器是按 tick 涨的（interval=1 s），抓一次快读就可能读到
     「还没到下一个 tick」的同一个值，写成一次性对比就是一条天生会红的断言；而定时器
     根本没跑（本场景真正要排除的失败模式）会一直不涨，poll 到超时恰好把它照出来。"""
     start = metric_value(port, name, needle)
@@ -297,22 +292,20 @@ def err_parts(st, raw, hdrs):
     return st, code, message
 
 
-# ------------------------------------------------------------------ 会报功率的 worker
+# ------------------------------------------------------------------ 会报 GPU 利用率的 worker
 #
 # 共享 mock 的 /metrics 是固定正文（只有 mock_uptime/mock_requests/sglang 两族），没有
-# 任何功率 gauge，也没有"运行时可改瓦数"的口子。功率场景要求瓦数能被测试随时抬高/清空
-# （清空 = 采不到 = 未知，正是安全红线那一条），而 mock 不在我的文件所有权里，所以在
-# 这里自带一个 worker。
-# 正文形状是 dcgm 的**逐卡**形状（用户裁定 2026-10-04 之后的口径，见 gpu_load.assign_power
-# 上方注释）：一台机器的每个 engine 端口都看得见整机所有卡，所以同一份正文会被该机上
-# 每个 worker 各抓一次，而每个 worker 只该取走**自己那张卡**的瓦数。生产 342.371 那次
-# 故障就是这一步做成了"整机最热"——8 个 worker 拿到同一个数，于是恒真的
-# 100 <= power_w <= 500 检不出来。fixture 因此必须同机报**三个互不相同**的瓦数。
+# "运行时可改利用率"的口子。利用率场景要求读数能被测试随时抬高/清空（清空 = 采不到 =
+# 未知，正是安全红线那一条），而 mock 不在我的文件所有权里，所以在这里自带一个 worker。
+# 正文形状是 dcgm 的**逐卡**形状：一台机器的每个 engine 端口都看得见整机所有卡，所以
+# 同一份正文会被该机上每个 worker 各抓一次，而每个 worker 只该取走**自己那张卡**的读数。
+# 生产 342.371 那次故障就是这一步做成了"整机最热"——8 个 worker 拿到同一个数，于是恒真
+# 的区间断言检不出来。fixture 因此必须同机报**三个互不相同**的利用率。
 
-class PowerWorker(object):
-    """A worker whose /metrics carries a DCGM-style per-card watt gauge."""
+class UtilWorker(object):
+    """A worker whose /metrics carries a DCGM-style per-card utilisation gauge."""
 
-    def __init__(self, port, model, watts=88.0, cards=None, utils=None):
+    def __init__(self, port, model, utils=None):
         self.port, self.model = port, model
         self.chats = 0
         self.last_model = None
@@ -327,15 +320,6 @@ class PowerWorker(object):
         self.util_mode = "dcgm" if utils is not None else "plain"
         if utils is not None:
             self.utils = [(str(g), float(u)) for (g, u) in utils]
-        # self.cards 是 [(gpu_id, watts), ...]；None = 正文里根本没有功率 gauge
-        # （= exporter 掉线 = 采不到，另一条降级分支）。缺省沿用老的两卡形状，
-        # 热的那张在 gpu="1"，所以 S3/S6 的既有断言口径不变。
-        if cards is not None:
-            self.cards = [(str(g), float(w)) for (g, w) in cards]
-        elif watts is None:
-            self.cards = None
-        else:
-            self.cards = [("0", 12.0), ("1", float(watts))]
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -362,7 +346,6 @@ class PowerWorker(object):
                 if path == "/metrics":
                     with outer.lock:
                         chats = outer.chats
-                        cards = list(outer.cards) if outer.cards else None
                     lines = ["# HELP mock_requests_total received requests",
                              "# TYPE mock_requests_total counter",
                              "mock_requests_total %d" % chats]
@@ -380,21 +363,11 @@ class PowerWorker(object):
                             lines.append(
                                 'DCGM_FI_DEV_GPU_UTIL{gpu="%s",Hostname="caps-e2e"} %s'
                                 % (gpu, "%.1f" % pct))
-                    if cards:
-                        # dcgm 的真实写法就是全大写 + Hostname 标签，这里照抄形状。
-                        # 每台 worker 都报**同一份**三卡正文：同机共享 exporter，
-                        # 谁都不该看见邻居那张卡的瓦数被算到自己头上。
-                        lines += ["# TYPE DCGM_FI_DEV_POWER_USAGE gauge"]
-                        for gpu, watts in cards:
-                            lines.append(
-                                'DCGM_FI_DEV_POWER_USAGE{gpu="%s",Hostname="caps-e2e"} %s'
-                                % (gpu, "%.1f" % watts))
                     return self._send(200, "\n".join(lines) + "\n",
                                        ctype="text/plain; charset=utf-8")
                 if path == "/state":
                     with outer.lock:
                         return self._send(200, {"model": outer.model, "chats": outer.chats,
-                                                "cards": outer.cards,
                                                 "utils": outer.utils,
                                                 "util_mode": outer.util_mode,
                                                 "last_model": outer.last_model})
@@ -425,11 +398,6 @@ class PowerWorker(object):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
-    def set_watts(self, watts):
-        """整机热卡读数改写（None = 正文里的功率 gauge 全部撤走 = 采不到）。"""
-        with self.lock:
-            self.cards = None if watts is None else [("0", 12.0), ("1", float(watts))]
-
     def set_utils(self, utils):
         """Rewrite the per-card utilisation vector ("off" = both gauge families gone)."""
         with self.lock:
@@ -459,17 +427,6 @@ class PowerWorker(object):
         with self.lock:
             self.util_mode = "off"
             self.utils = None
-
-    def drop_card(self, gpu):
-        """把某张卡从正文里摘掉：该卡 series 消失 = 这台机器再也答不出它的瓦数。
-
-        这是「worker 认得自己的卡、但数据源没有那张卡的 series」那一支的注入手法
-        （另一支"worker 认不出卡"用不带 labels.gpu 的注册行覆盖），两条都必须
-        落到"不写键 → 未知 → 不排除"，绝不能拿邻居那张卡的瓦数顶替。
-        """
-        with self.lock:
-            if self.cards:
-                self.cards = [(g, w) for (g, w) in self.cards if g != str(gpu)]
 
     def hits(self):
         with self.lock:
@@ -865,11 +822,10 @@ def scenario_concurrency():
           and "max_concurrency" not in rows[url_b]
           and "min_concurrency" not in rows[url_b]
           and "max_gpu_util" not in rows[url_b]
-          and "max_power_w" not in rows[url_b]
           and "load_state" not in rows[url_b],
           json.dumps({k: rows[url_b].get(k) for k in
                       ("min_concurrency", "max_concurrency", "max_gpu_util",
-                       "max_power_w", "load_state", "inflight_requests")}))
+                       "load_state", "inflight_requests")}))
     # Three-state echo (doc/caps-redesign-2026-10-06.md section 2): X declares only
     # max_concurrency=1 (min absent = 1), so at rest it is the green light, and the
     # *absence* of a gate on Y means the **key is missing**, not null: an explicit
@@ -913,12 +869,12 @@ def scenario_concurrency():
                          'reason="concurrency_max"') or 0
     check("[%s] exclusion counted by reason=concurrency_max" % tag, after > before,
           "%s -> %s" % (before, after))
-    # The retired spellings must never appear: an implementation that reintroduces
-    # reason="concurrency" (or the watt-era "power") grows a *different* series and
-    # leaves the pinned one at the pre-burst value above -- both halves together pin
-    # the naming, which either check alone cannot.
+    # The retired spelling must never appear: an implementation that reintroduces
+    # reason="concurrency" grows a *different* series and leaves the pinned one at
+    # the pre-burst value above -- both halves together pin the naming, which either
+    # check alone cannot.
     retired = [line for line in metric_lines(port, "smg_worker_capacity_excluded_total")
-               if 'reason="concurrency"' in line or 'reason="power"' in line]
+               if 'reason="concurrency"' in line]
     check("[%s] the retired exclusion reasons never appear" % tag, not retired,
           json.dumps(retired)[:200])
     freed = wait_inflight_zero(port, url_a, timeout=40)
@@ -931,50 +887,42 @@ def scenario_concurrency():
     stop_router(name)
 
 
-# ============================================================ S3/S6 功率上限与功率通道
+# ================================================ S3 GPU 利用率上限（含观测面）
 
-def scenario_power():
+def scenario_util_cap():
     """GPU 利用率读数超上限→迁走；读数缺失（未知）→不得排除。外加观测面断言。
 
-    2026-10-06 容量语义重设计（doc/caps-redesign-2026-10-06.md §1/§2/§5）把准入判据从
-    **绝对瓦特**换成 **GPU 利用率百分比**：判定读的是 registry 的 gu: 键（0..1，逐卡归属，
-    TTL'd），reason 是 "gpu_util"；瓦特通道（pw: 与 lr_gpu_load_power_*）刻意**原样保留**
-    为纯观测——它仍有读者（看板、/workers 的 power_w 字段），只是不再参与任何容量判定。
-    所以这一场同时钉两件事：利用率在管准入（写错的实现当场红），瓦特还在被采集但**不再
-    咬人**（还按瓦特排除的实现当场红）。
+    2026-10-06 容量语义重设计（doc/caps-redesign-2026-10-06.md §1/§2/§5）把准入判据定为
+    **GPU 利用率百分比**：判定读的是 registry 的 gu: 键（0..1，逐卡归属，TTL'd），
+    reason 是 "gpu_util"。
 
-    读数口径沿用 2026-10-04 之后的逐卡形状：gpu_load 写进 registry 的是**该 worker 自己
-    那张卡**的读数，卡号来自记录上的 labels.gpu。不带卡号在数据源已是逐卡形状时不写键
-    （功率侧）/回退整机 max 并计 fallback（利用率侧，保守方向，见 cards.lua assign_util），
-    两种都不是"取整机最热冒充每台"。因此读数断言一律**精确等值**，不用区间——区间对
-    "整机最热"与"每卡各自取"同样成立，正是 342.371 长期无人察觉的原因。
+    读数口径沿用逐卡形状：gpu_load 写进 registry 的是**该 worker 自己那张卡**的读数，
+    卡号来自记录上的 labels.gpu。不带卡号在数据源已是逐卡形状时回退整机 max 并计
+    fallback（保守方向，见 cards.lua assign_util），不是"取整机最热冒充每台"。因此读数
+    断言一律**精确等值**，不用区间——区间对"整机最热"与"每卡各自取"同样成立，正是
+    342.371 长期无人察觉的原因。
 
     判别性：
       * A 声明 max_gpu_util=60、正文里自己那张卡 65%：GET /workers 的 gpu_util **精确
         = 0.65**，load_state == "full"；未 pin 的 6 条全进 B（B 卡 8%、无上限、转发名
         beta）；连显式 pin A 都带不走 A。
-      * **瓦特不再咬人**：B 同时是全场最热的瓦特台（300 W）且**没有**任何上限，它必须
-        照常接满 6 条；实现若还留着 pw: 判定，B 会被摘走 → 红。
       * 利用率读数清空（两族 gauge 一起撤走）→ TTL 过期 → gpu_util 字段缺席 → A 必须
         恢复可选（pin A 200 且 A 计数涨）。这条是安全性红线：实现写成"取不到就按 0/沿用
         旧值"都会红。
-      * 排除计数按 reason="gpu_util" 增长（"power"/"concurrency" 两个旧拼写不再出现）。
+      * 排除计数按 reason="gpu_util" 增长（旧的 "concurrency" 拼写不再出现）。
       * lr_gpu_load_util_gpu{worker=} 出现且值在 0..1（准入读数不是打分开的那个混算数）；
-        lr_gpu_load_util_samples_total 随 tick 增长；瓦特族仍在（纯观测的存活证明）。
+        lr_gpu_load_util_samples_total 随 tick 增长。
     """
     tag = "S3-util"
     wa, wb = free_port(), free_port()
-    # A: own card hot in both units (65 % util / 280 W). B: hottest in watts (300 W, the
-    # retired knob would have excluded it at cap 100) but cool in utilisation (8 %),
-    # and it declares **no** ceiling at all.
-    a = PowerWorker(wa, "alpha", watts=280.0, utils=[("0", 12.0), ("1", 65.0)])
-    b = PowerWorker(wb, "beta", watts=300.0, utils=[("0", 12.0), ("1", 8.0)])
-    # 利用率与功率都**搭载**在负载源上：SMG_LOAD_SOURCE=none 时定时器根本不启动。metrics
+    # A: own card hot in utilisation (65 %). B: cool in utilisation (8 %) and it
+    # declares **no** ceiling at all.
+    a = UtilWorker(wa, "alpha", utils=[("0", 12.0), ("1", 65.0)])
+    b = UtilWorker(wb, "beta", utils=[("0", 12.0), ("1", 8.0)])
+    # 利用率**搭载**在负载源上：SMG_LOAD_SOURCE=none 时定时器根本不启动。metrics
     # 路复用 worker 自己的 /metrics，是 e2e 里最省的一条注入（自带 worker 就能改读数）。
-    # SMG_LOAD_POWER=1 留着：瓦特通道作为纯观测必须仍然被采集（下面的 power_w 断言）。
     port, name, gw = start_conf_container({"SMG_POLICY": "round_robin",
                                            "SMG_LOAD_SOURCE": "metrics",
-                                           "SMG_LOAD_POWER": "1",
                                            "SMG_LOAD_INTERVAL_SECS": "1",
                                            "SMG_LOAD_TIMEOUT_SECS": "1",
                                            "SMG_LOAD_STALE_SECS": "3"}, tag)
@@ -995,10 +943,10 @@ def scenario_power():
           reg_meta.get("gpu") == "1", json.dumps(reg_meta)[:200])
     row0 = workers_by_url(port).get(url_a) or {}
     check("[%s] /workers echoes the declared util ceiling as an integer percent" % tag,
-          row0.get("max_gpu_util") == 60 and "max_power_w" not in row0
+          row0.get("max_gpu_util") == 60
           and row0.get("max_concurrency") is None,
           json.dumps({k: row0.get(k) for k in
-                      ("max_gpu_util", "max_power_w", "max_concurrency")}))
+                      ("max_gpu_util", "max_concurrency")}))
 
     def wait_field(url, key, timeout=25):
         end = time.time() + timeout
@@ -1011,7 +959,7 @@ def scenario_power():
         return seen
 
     # 精确等值而不是区间（342.371 的教训）：gpu_util 是 registry 的 gu: 键（0..1），
-    # power_w 是 pw: 键（绝对瓦特），两条通道各归各卡。
+    # 同机的每台 worker 各归各卡，读数互不借用。
     seen_util = wait_field(url_a, "gpu_util")
     check("[%s] gpu_load writes A's own card utilisation into the registry (exactly 0.65)" % tag,
           seen_util == 0.65, str(seen_util))
@@ -1025,13 +973,6 @@ def scenario_power():
           and (workers_by_url(port).get(url_b) or {}).get("load_state") is None,
           json.dumps([(workers_by_url(port).get(url_a) or {}).get("load_state"),
                       (workers_by_url(port).get(url_b) or {}).get("load_state")]))
-    # 瓦特通道作为纯观测仍然在跑（且**各归各卡**）：pw: 不再是判据，但它没被拆掉。
-    seen_power = wait_field(url_a, "power_w")
-    check("[%s] the watt channel still collects A's own card (exactly 280, observation only)" % tag,
-          seen_power == 280.0, str(seen_power))
-    gauge = metric_value(port, "lr_gpu_load_power_watts", 'worker="%s"' % url_a)
-    check("[%s] /metrics still exposes lr_gpu_load_power_watts{worker=}" % tag,
-          gauge == 280.0, str(gauge))
     util_gauge = metric_value(port, "lr_gpu_load_util_gpu", 'worker="%s"' % url_a)
     check("[%s] lr_gpu_load_util_gpu{worker=} is the 0..1 admission reading" % tag,
           util_gauge == 0.65, str(util_gauge))
@@ -1054,8 +995,8 @@ def scenario_power():
         ok = ok and st == 200 and echo.get("model") == "beta"             and echo.get("content", "").startswith("echo[beta]")
     check("[%s] over-ceiling batch served 200 by the uncapped instance, forwarded as beta" % tag,
           ok, str(ok))
-    # B 是全场最热的瓦特台（300 W）：还按 pw: 做容量判定的实现会在这里把它一起摘走 → 红。
-    check("[%s] the hottest-in-watts worker takes all 6 (watts no longer bite: a+= %d b+= %d)"
+    # B 无上限且利用率只有 8%：6 条必须全落在它身上（把无上限冷台一起摘走的实现当场红）。
+    check("[%s] the uncapped cool worker takes all 6 (a+= %d b+= %d)"
           % (tag, a.hits() - a0, b.hits() - b0),
           a.hits() - a0 == 0 and b.hits() - b0 == 6,
           "a+= %d b+= %d" % (a.hits() - a0, b.hits() - b0))
@@ -1068,10 +1009,6 @@ def scenario_power():
                          'reason="gpu_util"') or 0
     check("[%s] exclusion counted by reason=gpu_util" % tag, after > before,
           "%s -> %s" % (before, after))
-    retired = [line for line in metric_lines(port, "smg_worker_capacity_excluded_total")
-               if 'reason="power"' in line]
-    check("[%s] the retired reason=power series never grows" % tag, not retired,
-          json.dumps(retired)[:200])
     grown_start, grown = wait_metric_grows(port, "lr_gpu_load_util_samples_total")
     check("[%s] util samples keep counting across ticks" % tag,
           grown_start is not None and grown is not None and grown > grown_start,
@@ -1108,51 +1045,8 @@ def scenario_power():
     b.shutdown()
 
 
-def scenario_power_switch_off():
-    """缺省关闭（不设 SMG_LOAD_POWER）：功率族一个 series 都不出现，而负载族照常在。
-
-    这条负断言只有在"负载通道确实活着"时才有意义，否则"功率族缺席"可以是整个子系统没跑
-    造成的假绿。它与 scenario_power 的正断言成对：conf 里若漏了 env SMG_LOAD_POWER 声明，
-    正断言那侧就会全空，从而把静默失效照出来。
-    """
-    tag = "S6-power-off"
-    wa = free_port()
-    a = PowerWorker(wa, "alpha", watts=280.0)
-    port, name, gw = start_conf_container({"SMG_POLICY": "round_robin",
-                                           "SMG_LOAD_SOURCE": "metrics",
-                                           "SMG_LOAD_INTERVAL_SECS": "1",
-                                           "SMG_LOAD_STALE_SECS": "4"}, tag)
-    url_a = "http://%s:%d" % (gw, wa)
-    st, _ = post_json(port, "/workers", {"url": url_a, "model_id": "alpha"})
-    if not check("[%s] worker registered" % tag, st in (200, 202), str(st)):
-        a.shutdown(); stop_router(name); return
-    load_seen = None
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        lines = metric_lines(port, "lr_gpu_load")
-        if any('worker="%s"' % url_a in line for line in lines):
-            load_seen = lines
-            break
-        time.sleep(0.4)
-    check("[%s] load channel is alive (lr_gpu_load{worker=} present)" % tag,
-          load_seen is not None, json.dumps(metric_lines(port, "lr_gpu_load"))[:300])
-    time.sleep(2.0)
-    st, text, _ = http("GET", "http://127.0.0.1:%d/metrics" % port)
-    leaked = [line for line in text.splitlines()
-              if not line.startswith("#") and line.startswith("lr_gpu_load_power")]
-    check("[%s] default-off exports not a single lr_gpu_load_power* series" % tag,
-          not leaked, json.dumps(leaked)[:300])
-    check("[%s] no watt sample reaches the registry while the channel is off" % tag,
-          (workers_by_url(port).get(url_a) or {}).get("power_w") is None,
-          json.dumps(workers_by_url(port).get(url_a, {}))[:200])
-    check_no_abort(tag, name)
-    stop_router(name)
-    a.shutdown()
-
-
 # ============================================ S3b 同机逐卡归属（342.371 的回归门）
 
-CARD_WATTS = [("0", 12.0), ("1", 280.0), ("2", 99.0)]
 # 逐卡利用率（percent）。三张卡的读数刻意让**只有 gpu=1 那台**越过 50 的上限；
 # 实现若把整机最热冒充每台，三台会一起被排除 → spread/pin 断言当场红（342.371 的
 # 利用率复刻）。0.12/0.82/0.37 三个精确值互不相同，"取全机最大"会让三条精确断言
@@ -1160,12 +1054,11 @@ CARD_WATTS = [("0", 12.0), ("1", 280.0), ("2", 99.0)]
 CARD_UTILS = [("0", 12.0), ("1", 82.0), ("2", 37.0)]
 
 
-def scenario_power_per_card():
+def scenario_util_per_card():
     """同机三台 worker 各自 pin 一张卡：gpu_util 必须精确等于自己那张卡的读数。
 
-    这条是 342.371 故障的回归门，2026-10-06 之后按**利用率**口径钉（准入判据换到了
-    gu: 键；瓦特仍是纯观测，同场次一并钉住各归各卡）。生产上 8 个 worker 的读数全是
-    同一个 342.371，真实 GPU 是 94/84/284/208/89/94/431/95 W —— 根因是 PromQL 的
+    这条是 342.371 故障的回归门，按**利用率**口径钉（准入判据读 registry 的 gu: 键）。
+    生产上 8 个 worker 的读数全是同一个数 —— 根因是 PromQL 的
     max by (Hostname,instance) 把 8 张卡折成 1 条 series。恒真区间检不出这件事，
     所以这里换成**三台互不相同的精确值** + 只热一台的上限：取全机最大必三台全被排除。
 
@@ -1178,18 +1071,16 @@ def scenario_power_per_card():
         分不出「各归各卡」与「共用整机 max」，这正是 342.371 的观测面处方。
       * 反向断言：B 的两族 gpu-util series 全撤（drop_all_util）→ B 的 gpu_util 缺席
         （不是 0、不是整机 max、不是邻居那张卡的读数）→ B 必须恢复可选（pin 200 通
-        流量、计数涨）。这条钉「未知 → 不排除」；功率侧的"认不出卡不写键"由 pw: 的
-        精确断言继续覆盖（B 的卡还挂在瓦特正文里，两族的形状在这里分开）。
+        流量、计数涨）。这条钉「未知 → 不排除」。
       * 邻居读不到不许波及另外两台：A、C 仍各自 0.12 / 0.37。
     """
     tag = "S3b-percard"
     wa, wb, wc = free_port(), free_port(), free_port()
-    a = PowerWorker(wa, "alpha", cards=CARD_WATTS, utils=CARD_UTILS)
-    b = PowerWorker(wb, "beta", cards=CARD_WATTS, utils=CARD_UTILS)
-    c = PowerWorker(wc, "gamma", cards=CARD_WATTS, utils=CARD_UTILS)
+    a = UtilWorker(wa, "alpha", utils=CARD_UTILS)
+    b = UtilWorker(wb, "beta", utils=CARD_UTILS)
+    c = UtilWorker(wc, "gamma", utils=CARD_UTILS)
     port, name, gw = start_conf_container({"SMG_POLICY": "round_robin",
                                            "SMG_LOAD_SOURCE": "metrics",
-                                           "SMG_LOAD_POWER": "1",
                                            "SMG_LOAD_INTERVAL_SECS": "1",
                                            "SMG_LOAD_TIMEOUT_SECS": "1",
                                            "SMG_LOAD_STALE_SECS": "3"}, tag)
@@ -1469,14 +1360,13 @@ def scenario_caps_persistence():
                       for u in (url_a, url_b)})[:200])
     check("[%s] neither row carries a cap before the declaration" % tag,
           "max_concurrency" not in (rows.get(url_a) or {})
-          and "max_power_w" not in (rows.get(url_b) or {})
           and "max_gpu_util" not in (rows.get(url_b) or {})
           and "load_state" not in (rows.get(url_a) or {}),
           json.dumps([rows.get(url_a, {}), rows.get(url_b, {})])[:300])
 
     # 声明层整表替换：两行都是 protected。A 只写并发上限；B 写一个 GPU 利用率上限
     # （本场景没有负载源 -> 读数未知 -> 永不生效，只用来验字段下发）和一个冒充改名的
-    # model_id。2026-10-06 §1：max_power_w 退役，声明层的新字段是 max_gpu_util。
+    # model_id。2026-10-06 §1：声明层的容量字段是 max_concurrency / max_gpu_util。
     st, doc = post_json(port, "/config/upstreams", {"entries": [
         {"url": url_a, "model_id": "alpha", "max_concurrency": 1},
         {"url": url_b, "model_id": "renamed-by-declaration", "max_gpu_util": 60},
@@ -1709,9 +1599,9 @@ def scenario_all_capped_503():
       * 两台各 max_concurrency=1、各被一条 pin 的长响应挂住，第三条 → 429，
         X-SMG-Error-Code 仍是 no_available_workers，**error.type == "Too Many Requests"**
         （实现还答 503 的话这一族三条一起红），message **精确等于**
-        "No available workers (2 at their concurrency or GPU-util limit)"——旧文案里的
-        "configured concurrency/power cap" 字样必须消失（瓦特退役进了文案，实现漏改
-        字符串也会被精确匹配当场抓住）。实现若放松成"都到顶就照旧转发"，这里不是
+        "No available workers (2 at their concurrency or GPU-util limit)"——更早文案里的
+        "cap" 字样必须消失（实现漏改字符串也会被精确匹配当场抓住）。实现若放松成
+        "都到顶就照旧转发"，这里不是
         429 → 红。
       * 对照组（一个死端口、没有任何上限）：**503** 文案保持原样、code 同、不许带
         cap/util 字样——容量到顶与服务不可用的两条路径必须分得开。
@@ -1793,7 +1683,7 @@ def scenario_all_capped_503():
 def scenario_declaration_bounds():
     """声明层三字段的边界组（2026-10-06 §1）过真 HTTP POST /config/upstreams。
 
-    这四条此前只有 /data/tmp/lr_caps_store_probe.lua 那份一次性 luajit 探针覆盖，
+    这三条此前只有 /data/tmp/lr_caps_store_probe.lua 那份一次性 luajit 探针覆盖，
     探针不进门禁 = 没有自动化。全部走声明层的整表替换（POST /config/upstreams，
     与 JSON 编辑器同一条 apply_upstreams 写入口），因为设计书钉的校验就挂在这两条
     入口（apply_profiles / apply_document）上：
@@ -1803,13 +1693,10 @@ def scenario_declaration_bounds():
       * max_gpu_util = 0 → 200 且**逐字段回显 0**（cap_limit 的 <=0 折叠会把它抹成
         缺席；util_limit 必须保住这一档）；GET /config 的 upstreams 行同样回显 0，
         投影进池行也是整数 0；
-      * max_gpu_util = 101 → 400（它不可能是一个整数百分比）；
-      * 旧行携带 max_power_w → 200（可读入、不 400），但该键被**丢弃**：文档回显、
-        GET /config、GET /workers 都不许再有它，warn-once 日志点名 retired。
+      * max_gpu_util = 101 → 400（它不可能是一个整数百分比）。
 
     判别性：写成"util=0 折成不限"的实现红在第 2 条（回显缺席而非 0）；不做 min<max
-    校验的红在第 1 条（200 而非 400）；把 max_power_w 照旧接受/迁移的红在第 4 条
-    （键还在文档里或池行里）。
+    校验的红在第 1 条（200 而非 400）。
     """
     tag = "S5d-decl-bounds"
     pa = free_port()
@@ -1882,36 +1769,6 @@ def scenario_declaration_bounds():
     check("[%s] max_gpu_util=101 is refused 400" % tag, st == 400,
           "%s %s" % (st, json.dumps(doc)[:300]))
 
-    # 4) 旧 max_power_w：读入不 400，键被 warn 丢弃、不迁移、不出现在任何回显里
-    st, doc = decl([{"url": url_a, "model_id": "alpha",
-                     "max_power_w": 250, "max_gpu_util": 60}])
-    row4 = {}
-    if isinstance(doc, dict):
-        for u in (doc.get("upstreams") or []):
-            if u.get("url") == url_a:
-                row4 = u
-    check("[%s] a legacy max_power_w row is accepted, not 400" % tag,
-          st == 200, "%s %s" % (st, json.dumps(doc)[:250]))
-    check("[%s] the retired key is dropped, not migrated (no phantom util number)" % tag,
-          "max_power_w" not in row4 and row4.get("max_gpu_util") == 60,
-          json.dumps(row4)[:250])
-    st, cfgtext, _ = http("GET", "http://127.0.0.1:%d/config" % port)
-    check("[%s] GET /config returns no max_power_w anywhere" % tag,
-          st == 200 and "max_power_w" not in cfgtext,
-          "%s %s" % (st, cfgtext[:150]))
-    st, raw_w, _ = http("GET", "http://127.0.0.1:%d/workers" % port)
-    check("[%s] GET /workers stops echoing the retired cap" % tag,
-          st == 200 and "max_power_w" not in raw_w,
-          "%s %s" % (st, raw_w[:150]))
-    txt = docker_logs_full(name)
-    warned = "max_power_w" in txt and "retired" in txt
-    deadline = time.time() + 10
-    while not warned and time.time() < deadline:
-        txt = docker_logs_full(name)
-        warned = "max_power_w" in txt and "retired" in txt
-        time.sleep(0.5)
-    check("[%s] the retirement warns in the gateway log" % tag, warned, txt[-300:])
-
     check_no_abort(tag, name)
     stop_router(name)
 
@@ -1920,7 +1777,7 @@ def scenario_default_behaviour():
     """缺省配置（不设上限、不设 candidates）：老行为零变化。
 
     判别性：不设上限时三个容量字段（min_concurrency/max_concurrency/max_gpu_util）与
-    退役的 max_power_w、以及 load_state 全部必须**缺席**（0 会被读成"零个槽位"、
+    load_state 全部必须**缺席**（0 会被读成"零个槽位"、
     load_state 写成 null 会让无门行冒充一个网关拒绝命名的态）；round_robin 的 spread
     与改动前一致；smg_worker_capacity_excluded_total 与绿灯优先的
     smg_worker_capacity_preferred_idle_total 一个都不计（无门池里两条判据都不许花钱）。
@@ -1939,7 +1796,7 @@ def scenario_default_behaviour():
         return
     rows3 = workers_by_url(port3)
     _ABSENT = ("max_concurrency", "min_concurrency", "max_gpu_util",
-               "max_power_w", "load_state", "gpu_util")
+               "load_state", "gpu_util")
     check("[%s] no cap declared means the fields are absent, not zero/null" % tag,
           all(all(k not in r for k in _ABSENT) for r in rows3.values()),
           json.dumps([sorted(r.keys()) for r in rows3.values()])[:400])
@@ -1973,9 +1830,8 @@ def main():
     scenario_config_rename_model_gate(1)
     scenario_config_rename_model_gate(0)
     scenario_concurrency()
-    scenario_power()
-    scenario_power_switch_off()
-    scenario_power_per_card()
+    scenario_util_cap()
+    scenario_util_per_card()
     scenario_caps_persistence()
     scenario_affinity_vs_cap()
     scenario_all_capped_503()

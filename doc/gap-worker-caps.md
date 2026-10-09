@@ -16,10 +16,9 @@
 - [registry/loads.lua](../lualib/resty/luarouter/registry/loads.lua)：`cap_limit` 与 `util_limit`
   （两把归一尺子，为什么分开见 §2）、`inflight_requests`、私有的 `capacity_verdict`（唯一判定体）、
   公开导出的 `capacity_state`（红绿灯）与 `capacity_exclusion`（硬排除门）、
-  `set_gpu_util` / `gpu_util` / `clear_gpu_util`（`gu:` 键的读写）、以及**保留为纯观测**的
-  `set_power_w` / `power_w` / `power_samples` / `clear_power_w`
-- [registry/keys.lua](../lualib/resty/luarouter/registry/keys.lua)：`K_GPU_UTIL`（`gu:`）与 `K_POWER`（`pw:`）
-  的键格局注释——`gu:` 为什么**不能**复用 `xl:` 写在该注释里
+  `set_gpu_util` / `gpu_util` / `clear_gpu_util`（`gu:` 键的读写）
+- [registry/keys.lua](../lualib/resty/luarouter/registry/keys.lua)：`K_GPU_UTIL`（`gu:`）的键格局注释——
+  `gu:` 为什么**不能**复用 `xl:` 写在该注释里
 - [registry/records.lua](../lualib/resty/luarouter/registry/records.lua)：`add`（三字段只在真声明了才落）、
   `info`（`/workers` 的 `load_state` + 三个上限 + 两个实测读数）
 - [registry/discovery.lua](../lualib/resty/luarouter/registry/discovery.lua)：`UPDATE_NUMBER_FIELDS`
@@ -29,19 +28,19 @@
 - [router/forward.lua](../lualib/resty/luarouter/router/forward.lua)：`forward` 的 429 兜底与 503 原文案分支、
   显式 pin 读 `why.stepped_aside`
 - [config_store/upstreams.lua](../lualib/resty/luarouter/config_store/upstreams.lua)：`CAP_FIELDS` /
-  `cap_normalize` / `cap_clear_value` / `warn_retired_power_w` / protected 行的 caps-only 投影
+  `cap_normalize` / `cap_clear_value` / protected 行的 caps-only 投影
 - [gpu_load/](../lualib/resty/luarouter/gpu_load)：利用率通道的 `parse.util_by_card` /
   `cards.assign_util` / `cards.host_card_utils` / `cards.util_config` /
   `runpass.scan_util_metrics` / `runpass.run_util_prom` / `seams.default_write_util` /
   `export.publish_worker_util_gauge`
 - [observability.lua](../lualib/resty/luarouter/observability.lua)：HELP 名册里的
   `smg_worker_capacity_excluded_total` 与 `smg_worker_capacity_preferred_idle_total`
-- 设计关联：[gap-gpu-load.md](gap-gpu-load.md)（负载 / 功率 / 利用率三通道）、
+- 设计关联：[gap-gpu-load.md](gap-gpu-load.md)（负载 / 利用率两通道，功率通道 2026-10-09 已移除）、
   [gap-virtual-models.md](gap-virtual-models.md)（绑定与组门）
 
 测试：单测 [test_caps_routing.lua](../test/unit/test_caps_routing.lua)、
 [e2e_caps.py](../test/integration/e2e_caps.py)（S1–S8，含 S2 三态、S3/S3b 利用率与逐卡、
-S5 全池到顶 429、S5d 声明层边界、S6 功率开关可见性、S8 caps 跨重启存活）、契约 `caps` 段。
+S5 全池到顶 429、S5d 声明层边界、S8 caps 跨重启存活）、契约 `caps` 段。
 计数由一次全绿门禁日志统一刷新，本文不登记任何数字。
 
 ---
@@ -118,8 +117,7 @@ nil   ⟺  三门全未声明（一次 shdict 读都不发）
 ```
 
 整数算术：`gu:` 存的是「百分数 × 10」的毫整数，上限是百分数，所以 `milli >= max_u * 10` 就是同一次
-比较而不引入浮点除法——亚 0.1 % 的 gauge 噪声也因此不会改变键的数值类型，这与 `pw:` 存毫瓦是同一个
-理由。
+比较而不引入浮点除法——亚 0.1 % 的 gauge 噪声也因此不会改变键的数值类型。
 
 `lo:` 是**本网关自己的在飞计数**，由 router 的 hold/release 用 `shdict:incr` 维护，天然跨 nginx 进程，
 也是 `smg_worker_requests_active` 导出的同一个原始计数。`inflight_requests()` 只读 `lo:`，一个加数都不混。
@@ -150,9 +148,9 @@ last-value-wins 会把最后一次读数变成永久事实。
 `SMG_WORKER_URLS` 种子、watcher 注册、config 声明层（upstreams reconcile）；DP rank 继承基记录。
 热改走 `PUT /workers/{id}`，白名单 `UPDATE_NUMBER_FIELDS`（registry/discovery.lua）含这三个字段，
 **契约应答是 202 不是 200**——它与 priority/cost 走同一条队列化的更新路径，为它单独造一个状态码会把
-契约里 worker_service 那一整段断言拆散。**`max_power_w` 已从这张名单里删除**：PUT 里带它现在和任何
-未知字段一样被忽略（契约 caps 段钉「PUT ignored the retired max_power_w」与
-「the retired max_power_w is not echoed anywhere」两条）。
+契约里 worker_service 那一整段断言拆散。**`max_power_w` 已从这张名单里删除（功率通道 2026-10-09 整体移除）**：PUT 里带它现在和任何
+未知字段一样被忽略——契约不再单独为退役键留断言（原「PUT ignored the retired max_power_w」
+与「the retired max_power_w is not echoed anywhere」两条 caps 段断言已随通道移除）。
 
 config 声明层删除某项时把值写成该档的**清除哨兵**（并发档 0、利用率档 -1），配合上面的归一，
 「删掉这行声明」与「明确不限」在池侧收敛成同一个不限。刻意**只在存量行真带上限时**才发哨兵——
@@ -240,9 +238,9 @@ full 的 worker（e2e_caps S3 钉这条），hard gate 没有逃生口。
 **也不放宽**：既不排队等槽位，也不回退到超限 worker。回退会恰好复现这套上限要消除的行为，而且是在
 负载下复现——那正是它最疼的时候。
 
-## 6. 功率上限为什么退役、功率采集为什么保留
+## 6. 功率通道的退役与移除（历史）
 
-退役的是**判定**，不是**采集**。
+退役的是**判定**，随后整条通道一并移除。
 
 退役的理由（2026-10-06 实测，21.k 生产）：八个实例的 GPU 功率读数完全相同（约 271 W）。这是 `pw:` 的
 **整机最热卡口径**的必然结果——引擎进程看得见整机所有卡，折叠规则取最大，同机 worker 就共享同一
@@ -255,15 +253,14 @@ full 的 worker（e2e_caps S3 钉这条），hard gate 没有逃生口。
 换利用率而不是继续换阈值：DCGM 的 `DCGM_FI_DEV_GPU_UTIL` **带 `gpu="0".."7"` 标签**，能逐卡区分，于是
 「谁的卡忙」变成可判的问题。采集侧的口径与陷阱见 [gap-gpu-load.md](gap-gpu-load.md)。
 
-**为什么留采集**：`pw:` 键、`set_power_w` / `power_w` / `power_samples`、`lr_gpu_load_power_*` 六族指标与
-`/workers` 的 `power_w` 字段**全部原样保留**，仍然有读者（看板、逐卡归属的覆盖率对比），只是**再没有
-任何容量决策读它**。删采集要动六族指标 + e2e 断言，收益不抵风险；用户要换的是「上限这个判定指标」，
-不是「瓦特这个观测量」。
-
-**旧配置的处理**：声明层里还写着 `max_power_w` 的行，解析时 **warn 一次并丢弃该键**
-（`config_store/upstreams.lua` 的 `warn_retired_power_w`；warn-once memo 是必须的——`current()` 每请求
-重解析整份快照，逐条 warn 会把 error.log 写满），`/config` 的 GET 如实不返回它，容量判定不读它。
+**旧配置的处理**：声明层里还写着 `max_power_w` 的行，解析时**按未知字段直接丢弃**
+（功率通道 2026-10-09 移除后，退役期那套 warn-once 逻辑也一并删了；历史上它必须先 warn-once
+再丢，因为 `current()` 每请求重解析整份快照，逐条 warn 会把 error.log 写满），
+`/config` 的 GET 如实不返回它，容量判定不读它。
 **不做迁移**：新字段里没有与瓦特等价的东西，替操作员猜一个瓦特→利用率的换算等于替他决定一道门开多大。
+
+**2026-10-09 用户裁定**把剩余的观测链（`pw:` 键、`lr_gpu_load_power_*` 六族、`/workers` 的 `power_w`
+字段、`SMG_LOAD_POWER_*` 三个 env）一并移除；本节保留的是退役决策的推理记录。
 
 ## 7. 逐卡归属与「读数未知」在这里怎么落地
 
@@ -280,13 +277,12 @@ full 的 worker（e2e_caps S3 钉这条），hard gate 没有逃生口。
 - worker 认不出卡 → **回退整机 max**（`util_fallback++`）。
 - 卡认得出但 vector 没有该卡 series → **回退整机 max**（`util_fallback++`）。
 
-**利用率回退、功率不回退**，后两支的差别是刻意的（不是笔误，设计书 §5 钉死）：功率读绝对瓦特，整机
-max 会把邻居的热度算到一台空闲 worker 头上而把它摘出候选集——一个监控缺口吃掉容量，正是那一路最不肯
-犯的错；利用率读「这张卡忙不忙」，整机 max 在它的语义下是**保守方向**（本机有任何一张卡忙就把这台
-worker 当忙看，代价是少用一台机器，而不是让满载的卡继续接新请求）。所以**允许**回退——但绝不允许
-**静默**：每次回退都进 `lr_gpu_load_util_fallback_total`，与 `lr_gpu_load_util_per_card_workers` 并排读就是
-逐卡覆盖率。前者为 0 而后者非 0 = 逐卡归属一台都没接上（卡号没解析出来，或 `SMG_LOAD_UTIL_QUERY` 把
-`gpu` 聚合掉了），这正是 342.371 的处方。
+**认不出卡时回退整机 max 是刻意选择**（不是笔误，设计书 §5 钉死）：利用率读「这张卡忙不忙」，整机 max
+在它的语义下是**保守方向**（本机有任何一张卡忙就把这台 worker 当忙看，代价是少用一台机器，而不是让
+满载的卡继续接新请求）。所以**允许**回退——但绝不允许**静默**：每次回退都进
+`lr_gpu_load_util_fallback_total`，与 `lr_gpu_load_util_per_card_workers` 并排读就是逐卡覆盖率。前者为 0
+而后者非 0 = 逐卡归属一台都没接上（卡号没解析出来，或 `SMG_LOAD_UTIL_QUERY` 把 `gpu` 聚合掉了），
+这正是 342.371 的处方。
 
 worker 与卡的对应关系由 watcher 供给（`watcher/env.lua` 的 `gpu_from_name` / `gpu_from_cmdline` 与
 `watcher/discover.lua` 的 socket→pid→cmdline 标注，经 `watcher/reconcile.lua` 落到台账 `g|<url>` 与记录
@@ -327,10 +323,6 @@ pass 数。它**刻意不是**上面那族的一部分——「池子拒绝了�
 在飞请求单位），前者是准入判定的数据源（`gu:`）。今天两族读的是同一批 gauge，但口径与生命周期各自
 独立（`xl:` 的名册含 KV-cache 用量，`gu:` 刻意不含），画在同一个 series 名下会让人以为「打分与准入看的
 是同一个数」——那正是本轮要拆开的两件事。
-
-功率家族（`lr_gpu_load_power_*` 六族 + `lr_gpu_load_power_per_card_workers`）**原样保留**，定位为纯观测：
-缺省关闭时一个 series 都不导出（metrics 路只认 `SMG_LOAD_POWER=1`、prom 路只认给了 query），启用时导出
-绝对瓦特。它与利用率族不可互解：一个是瓦特、一个是忙分数，同一个坐标轴载不动两者。
 
 Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua 独有超集**，对齐 Rust 时不许把它「对齐掉」。
 
@@ -375,7 +367,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
   模型」；刷新零抖动（`:loading` 只在首屏空表时进、非首屏失败不清空 rows、cursor 无变化跳过整段替换、
   轮询定时器在 SSE 连上后降档）。
 - `/config` 的 JSON 视图无损读写三字段（含 protected 行的 caps-only 投影）；退役的 `max_power_w` 在
-  GET 里如实不返回。
+  GET 里如实不返回（该字段与整条功率通道已于 2026-10-09 移除）。
 
 ## 11. 已知限制与残余缺口
 
@@ -404,15 +396,13 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
    `GET /v1/models` 走 `models()`（Rust 对拍钉住的那一列，`router/models_api.lua` 的 `models_handler`）；
    管理台 `GET /u/v1/models` 走 `ui.lua` → `props.http_workers()`。两者都不吃上面那三个 reader。
 6. 全池到顶是 **429 而非排队**（§5）：没有「等一个槽位释放」的语义（与并发闸门的排队能力是两套东西）。
-7. `lr_workers` 2m 容量竞争：`gu:` / `pw:` 写失败只在 `set_gpu_util` / `set_power_w` 的 shdict 写分支各
+7. `lr_workers` 2m 容量竞争：`gu:` 写失败只在 `set_gpu_util` 的 shdict 写分支
    WARN 一行，后果是该 worker 在该采样 TTL 内退化成「无上限」。方向仍是「宁可少一层保护，也不因监控
    自身抖动丢容量」，但它意味着容量告警要同时看 `lr_workers` 的占用。
-8. **利用率三个 env 与功率三个 env 不是同等待遇**（全表见 [gap-gpu-load.md](gap-gpu-load.md)）：
-   `SMG_LOAD_UTIL_ENABLED` / `_QUERY` / `_KEYS` 走 `config.lua` 装配（fork 前解析，天然进 `/probe/config`），
-   三份 conf 的 env 声明只是给 `util_config` 的 `os.getenv` 兜底分支放行，两条路都通；功率那三个
-   （`SMG_LOAD_POWER` / `_KEYS` / `_QUERY`）**没进 `config.lua`**，由 gpu_load 现读 `os.getenv`，因此漏一份
-   conf 声明即静默失效、不可热改、进不了 `/config`。把功率三件套并进 config.lua / JSON / UI 仍是
-   收尾项（AGENTS.md 重点 3/4 的欠账）。
+8. **利用率三个 env 走 `config.lua` 装配**（全表见 [gap-gpu-load.md](gap-gpu-load.md)）：
+   `SMG_LOAD_UTIL_ENABLED` / `_QUERY` / `_KEYS` 在 fork 前解析，天然进 `/probe/config`，
+   三份 conf 的 env 声明只是给 `util_config` 的 `os.getenv` 兜底分支放行，两条路都通。
+   （功率那三个 env 随通道已于 2026-10-09 移除，当年的「没进 config.lua」欠账一并销账。）
 9. **利用率准入门是逐卡的，但「哪张卡归谁」目前只有 21.k 这一种已验证形状**（容器名带 `gpuN`，或命令行
    带 `--device-id` / `CUDA_VISIBLE_DEVICES`）。两者都不带的部署，逐卡归属只能靠 `lr_gpu_load_util_fallback_total`
    显形——覆盖率看 `lr_gpu_load_util_per_card_workers` 与它的差；覆盖率不是 100 % 时利用率上限仍生效，只是
@@ -422,14 +412,14 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
     `observability` 的 gauge 没有 TTL 也没有删除原语——`observability.gauge` 就是 `lr_stats` 上一次
     `set("g|<metric>|<label 串>", value)`（不带 TTL），导出口 `prometheus_text` 又按 `get_keys(0)` 全量枚举，于是
     worker 被 `DELETE /workers/{id}` 或 watcher 摘除之后，它名下的 `lr_gpu_load_util_gpu{worker=...}`
-    与 `lr_gpu_load_power_watts{worker=...}` 两条序列会**永久**留在 `/metrics` 上。本轮在 21.k:8802
+    序列会**永久**留在 `/metrics` 上。本轮在 21.k:8802
     实测到：已经删掉的 mock（端口 18301–18303）序列仍在导出，label 里的 worker 名也还在。
-    这不是本轮新引入的缺陷——功率 gauge 从一开始就是这个行为，util gauge 只是沿用了同一套导出机制。
+    这不是本轮新引入的缺陷——util gauge 沿用了 observability 从一开始就有的那套导出机制。
     **影响**：`/metrics` 面板会累积僵尸序列，按 worker 聚合或做 topk 的图会被陈旧 label 误导（一个
     已经不存在的实例仍然带最后一次的读数占位），长期跑下来序列数只增不减。转发面不受影响：判定读的是
     `gu:` / `lo:` shdict 键（有 TTL，会自己过期），不看 gauge。
     **建议（后续收，本轮不做）**：给 observability 加一个 `delete_gauge`／prune 原语（按 name + label
-    集移除注册项），或在 `registry.remove` / watcher 摘除路径上顺带清掉该 worker 的两条序列。二者取其一
+    集移除注册项），或在 `registry.remove` / watcher 摘除路径上顺带清掉该 worker 的 util 序列。二者取其一
     即可让面板与在册 worker 对齐（`g|` + metric + label 串的键格局本身可寻址，删除就是显式 delete 那一个键）；
     更彻底的做法是把这类 per-worker 序列改成导出时从 registry 实时派生——注册表不再存量保存，worker
     一消失序列自然消失（`smg_worker_health` 一族就是这么导出的）。那是独立一轮的活，本轮只登记。

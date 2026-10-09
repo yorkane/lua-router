@@ -558,7 +558,7 @@ end
 dict_reset()
 local REG_TABLE = {}
 local real_env = {
-    K_LOAD = "lo:", K_GPU_UTIL = "gu:", K_POWER = "pw:", K_ACTIVE = "act:",
+    K_LOAD = "lo:", K_GPU_UTIL = "gu:", K_ACTIVE = "act:",
     shdict = function()
         return { get = fake_get, set = fake_set, delete = fake_delete }
     end,

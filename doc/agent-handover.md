@@ -12,10 +12,10 @@
 
 lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能移植 + 裁剪 + 扩展）。当前形态：
 **多 GPU 服务的服务发现与请求调度器**——8 策略选路、健康/熔断/限流、DP 展开、mesh HA、进程内 watcher
-（原独立 llm-watcher 容器已合并退役）、GPU 负载双源 + 功率通道、路由策略热切换、token 核算、
+（原独立 llm-watcher 容器已合并退役）、GPU 负载双源 + 利用率准入、路由策略热切换、token 核算、
 虚拟模型＝**对下游暴露的服务主入口**、1 对多映射一组实际模型（`targets[]`，由调度策略在这一整组里选路；
 条目级**只允许 `context_window`** 一个覆盖字段，per-alias `policy`/`effort` 已停用）、持久化 upstreams、
-每服务并发/功率上限（候选集硬排除）、Quasar UMD 管理控制台（页面入口 **/**（站点根，2026-10-08 admin 迁根），原版 webui 入口 **/u/**（不变）；旧入口 /a 与 /a/ 各 302 到 /，**/_ui/* 全部取消**；
+每服务并发/利用率上限（候选集硬排除）、Quasar UMD 管理控制台（页面入口 **/**（站点根，2026-10-08 admin 迁根），原版 webui 入口 **/u/**（不变）；旧入口 /a 与 /a/ 各 302 到 /，**/_ui/* 全部取消**；
 管理台四页：**服务池**（运行态池 + 声明层同页，原「远程服务」页已并入）/ **模型管理** /
 **路由策略** / **日志**）。
 
@@ -97,8 +97,8 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
     registry/discovery.lua(803) 探针与覆盖度 probe_advertised_entries / refresh_models / model_caps /
         record_model_caps（models_verified 那枚印章）+ PUT update + 元数据发现 + DP 展开 + 作业队列 + 种子
     registry/caps.lua(647)      上游能力采集（自包含纯域：model_caps_from_listing / from_entry / merge）
-    registry/loads.lua(479)     负载折叠 + capacity_exclusion 每服务上限判定（lo:/pw: 两个读数；
-        读数未知→不排除，set_power_w 拒收负值/NaN/±inf）
+    registry/loads.lua(479)     负载折叠 + capacity_exclusion 每服务上限判定（lo:/gu: 两个读数；
+        读数未知→不排除，set_gpu_util 拒收负值/NaN/±inf）
     registry/keys.lua(336)      lr_workers 键格局 + shdict 懒解析 + resty.lock + worker id + 名单 + mesh 写钩子
     registry/health.lua(273)    健康位与熔断（open→half_open 唯一恢复 CAS 在此，charge 用 incr、flip 锁内重查）
     registry/url.lua(118)       url 规范化与拨号助手
@@ -114,11 +114,11 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
     watcher/ledger.lua(229)     台账 new_ledger
     watcher/probe.lua(176)      严格探针 classify/probe_verdict 三档判定（分档语义逐行原样）
   gpu_load.lua(80) facade
-    gpu_load/parse.lua(629)  exposition 解析族 · cards.lua(492) 卡归属与四路功率口径
+    gpu_load/parse.lua(629)  exposition 解析族 · cards.lua(492) 卡归属与利用率折叠
     gpu_load/runpass.lua(526) run_pass 主循环（stats 字段口径单点定义）· seams.lua(305) 九枚 live seams
     gpu_load/parse.lua(765) 利用率解析（util_fraction 0..100→0..1 / util_by_card 逐卡归约）
     gpu_load/cards.lua(848) 四路利用率口径 assign_util（认不出卡回退整机 max 并计 lr_gpu_load_util_fallback_total）
-    gpu_load/export.lua(304) 指标导出 + 定时器（三通道：负载 / 功率 pw: 纯观测 / 利用率 gu: 供 max_gpu_util）
+    gpu_load/export.lua(304) 指标导出 + 定时器（两通道：负载 xl: / 利用率 gu: 供 max_gpu_util）
     gpu_load/prom.lua(209)   Prom 客户端
   mesh.lua(59) facade
     mesh/crdt.lua(1368)  不拆：时钟/LWW/版本向量 + 成员表 + 分区检测 + observe_worker + 快照合并
@@ -245,8 +245,8 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
   `no_available_workers`、`error.type` 为 `Too Many Requests`、message 精确为
   「No available workers (N at their concurrency or GPU-util limit)」——容量到顶是「暂时不接单」不是
   「服务不可用」。熔断/不健康/组不服务仍 503 原句，两者处置相反（抬上限 vs 查实例）。
-  旧 `max_power_w` 已退役（读到 warn 一次并丢弃、`/workers` 不回显、判定不读），功率采集链 `pw:` 保留为
-  **纯观测**（21.k 实测 8 台读数同值——整机最热卡口径，无法区分实例，这也是改用逐卡利用率的原因）。
+  旧 `max_power_w` 已退役（读到 warn 一次并丢弃、`/workers` 不回显、判定不读），功率通道 2026-10-09 已
+  整体移除（用户裁定；21.k 实测 8 台读数同值——整机最热卡口径，无法区分实例，这也是改用逐卡利用率的原因）。
   完整口径见 [gap-worker-caps.md](gap-worker-caps.md)。
 - **GPU 归属标注是纯 label，不许借它改路由身份**（2026-10-06 新增）：watcher 从**容器名**
   （`q38fn-pennyroyal-gpu3` → gpu=3）或**进程启动参数**（`--device-id N` / `CUDA_VISIBLE_DEVICES=N`）
@@ -346,9 +346,7 @@ curl -s http://127.0.0.1:8800/config/policy                # 生效链 JSON（�
    `models`（只是备注，不构成否决依据）。另有一处前后端断点：`registry/records.lua` 的 `info()` 不输出
    `models_verified`，`GET /workers` 因此拿不到它，管理台的「引擎已验证」徽章与
    `ui/admin/models.html` 的已验证计数恒不生效（后端补一个字段即通）。
-8. **功率三个 env 没进 config.lua/JSON/UI**（`SMG_LOAD_POWER` / `_KEYS` / `_QUERY` 由 gpu_load
-   自己 `os.getenv`）：不可热改、进不了 `/config`，与 AGENTS.md 重点 3/4 的口径不符（收尾项）。
-9. **虚拟模型 1 对多的残余缺口**（2026-10-02 本轮登记，口径见 doc/gap-virtual-models.md §9 与
+8. **虚拟模型 1 对多的残余缺口**（2026-10-02 本轮登记，口径见 doc/gap-virtual-models.md §9 与
    doc/gap-pool-merge.md §6）：
    ① **组里某个模型没有任何已验证实例时，落到它的请求 503**——组门用的是 registry 的 fail-open
       谓词 `registry/records.lua` 的 `candidate_allows_model`，没被探过的行允许进候选；但一旦某行已盖章
@@ -379,9 +377,9 @@ curl -s http://127.0.0.1:8800/config/policy                # 生效链 JSON（�
 agent-handover.md（本文）、todo-deferred.md（TODO 口径）、gap-mesh.md、gap-mesh-final.md、
 gap-watcher-merge.md、gap-gpu-load.md、gap-routing-dyn.md、gap-token-accounting.md、
 gap-inflight-age.md、gap-metrics-final.md、gap-tls-chain.md、gap-virtual-models.md、
-gap-worker-caps.md（每服务并发/功率上限：候选集硬排除、最热卡口径、功率通道）、
+gap-worker-caps.md（每服务并发/利用率上限：候选集硬排除、逐卡利用率口径）、
 gap-config-store.md（配置持久化：sqlite/postgres/file 三态后端、CAS、镜像与采纳）、
-gap-session-2026-10-04.md（上下文窗口语义翻转、/v1/models 形状、effort 三层继承、per-GPU 功率、
+gap-session-2026-10-04.md（上下文窗口语义翻转、/v1/models 形状、effort 三层继承、per-GPU 利用率、
 以及这一轮踩过的坑——**接手前建议先读这一份**）、
 refactor-arch-2026-10-05.md（**本轮 facade + 子模块拆分 + UI 入口迁移的执行契约与落地结果**，
 含实测计数表与四条 backlog 登记）、

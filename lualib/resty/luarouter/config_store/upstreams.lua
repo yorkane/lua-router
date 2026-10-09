@@ -30,9 +30,7 @@ local MAX_GPU_UTIL_LIMIT = 100
 -- normalizer dispatch so a field's "unlimited" spelling is decided in exactly one place:
 -- the two concurrency tiers go through declared_cap (registry.cap_limit), the utilisation
 -- tier through declared_util (0 is a legal, strict reading there, which cap_limit would
--- erase). max_power_w is retired: an old row that still names it warns once per process
--- and the key is dropped -- no migration (a watts -> utilisation conversion would decide
--- for the operator, which the design rules out).
+-- erase).
 local CAP_FIELDS = { "min_concurrency", "max_concurrency", "max_gpu_util" }
 
 local function cap_normalize(field, value)
@@ -49,20 +47,6 @@ end
 local function cap_clear_value(field)
     if field == "max_gpu_util" then return -1 end
     return 0
-end
-
--- warn-once memo for the retired max_power_w: current() re-parses the whole snapshot on
--- every request (SNAPSHOT_TTL windows the disk read, not the parse), so a per-entry warn
--- would fill error.log from a legacy row that is on disk for a reason the operator has
--- already been told about once.
-local retired_power_warned = false
-
-local function warn_retired_power_w(canonical)
-    if retired_power_warned then return end
-    retired_power_warned = true
-    CS_LEXICON.ngx_log_warn("luarouter upstream ", tostring(canonical),
-        " declares retired max_power_w; ignored (capacity caps are now ",
-        "min_concurrency / max_concurrency / max_gpu_util -- see doc/caps-redesign-2026-10-06.md)")
 end
 
 --- Mask one upstreams row for a response body (contract 3.4): api_key is
@@ -301,13 +285,6 @@ local function upstream_from_entry(entry, index)
         return nil, string.format(
             "upstream %s min_concurrency (%d) must be less than max_concurrency (%d)",
             canonical, caps_said.min_concurrency, caps_said.max_concurrency)
-    end
-    -- Retired field: warn once and drop it. No migration -- the new fields carry no watts
-    -- equivalent, and inventing a watts -> utilisation conversion would set an operator's
-    -- gate for them (doc/caps-redesign-2026-10-06.md §1).
-    local legacy_power = rawget(entry, "max_power_w")
-    if legacy_power ~= nil and legacy_power ~= JSON_NULL then
-        warn_retired_power_w(canonical)
     end
     return out, nil
 end

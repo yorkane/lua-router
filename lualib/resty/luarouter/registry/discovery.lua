@@ -263,9 +263,7 @@ local UPDATE_NUMBER_FIELDS = {
     -- for the percent (its zero is the strictest rung, so a ceiling is cleared with a
     -- negative number or by the declaration dropping the key, never with 0). That is
     -- why no bespoke validator lives here; the contract's non-numeric-400 rule applies
-    -- unchanged. max_power_w left the list with the watt gate: a PUT naming it is now
-    -- ignored like any unknown field, and `pw:` itself stays collected as an
-    -- observation.
+    -- unchanged.
     "max_concurrency", "min_concurrency", "max_gpu_util",
     "health_check_timeout_secs", "health_check_interval_secs",
     "health_success_threshold", "health_failure_threshold",

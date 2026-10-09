@@ -40,8 +40,8 @@ _M.config = function()
     return captured_config
 end
 
----卡号提示的只读快照，给 gpu_load 的逐卡功率通道用。台账是共享字典上的闭包、不是单例，
----所以这里每次现造一个读；字典不在（nginx 外、或 conf 没声明 lr_watch）时回 {}，功率那
+---卡号提示的只读快照，给 gpu_load 的逐卡 util 通道用。台账是共享字典上的闭包、不是单例，
+---所以这里每次现造一个读；字典不在（nginx 外、或 conf 没声明 lr_watch）时回 {}，逐卡那
 ---一路就退回 labels.gpu 与整机 max —— 也就是逐卡归属落地之前的行为。
 ---@return table @ url -> gpu id
 function _M.gpu_hint_snapshot()

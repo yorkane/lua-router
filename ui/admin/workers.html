@@ -177,8 +177,9 @@
                     <!-- 三行读法：阈值（谁的口径）/ 实测（只读，绝不回写）/ 归属与漂移。
                          第一段是并发区间 min–max（min 缺席按 1，max 缺席 = 不限），第二段是 GPU 利用率
                          上限（0..100 整数百分比，缺席 = 不限）。颜色不在这张列里 —— 它是状态列的三态灯，
-                         判定只在后端。功率上限那段随 doc/caps-redesign-2026-10-06.md 整段删除：pw: 读数
-                         与它的指标族仍作为观测保留，但容量判定与 UI 都不再看瓦特。 -->
+                         判定只在后端。瓦特一族（pw: 读数、lr_gpu_load_power_* 指标族、power_w 字段）已于
+                         2026-10-09 整体移除（用户裁定；容量侧退役见 doc/caps-redesign-2026-10-06.md），
+                         UI 不再有它的任何形状。 -->
                     <div style="display:flex;flex-direction:column;gap:2px">
                       <div class="route-cell" style="gap:6px">
                         <!-- 图标名必须落在 vendor 打包的 MDI v7 名单里：原先用的那个名字不在名单内，
@@ -621,7 +622,7 @@
               priority: worker.priority, cost: worker.cost,
               // 两份上限分开留：pool_* 是池记录此刻真实的值，decl_* 是配置文档写的期望值。
               // 合并后的 min/max_gpu_util/max_* 只是「显示值」，归属见下面的 capOwnership。
-              // 瓦特那一档随 2026-10-06 退役，两侧都不再搬运 power_w / max_power_w。
+              // 瓦特那一档 2026-10-06 退役、2026-10-09 整条链移除；两侧都不再搬运 power_w / max_power_w。
               pool_min_concurrency: worker.min_concurrency, pool_max_concurrency: worker.max_concurrency,
               pool_max_gpu_util: worker.max_gpu_util,
               decl_min_concurrency: undefined, decl_max_concurrency: undefined, decl_max_gpu_util: undefined,
@@ -823,7 +824,7 @@
         // 一旦被当成配置回写，就等于让监控采样替操作员改了选路规则。
         // 读数缺席 = 未知（gpu_util 在没有新鲜采样时压根不出现），未知一律显示「未采集」而非 0，
         // 与后端「未知不排除」同口径（doc/caps-redesign-2026-10-06.md §0 第 2 条）。
-        // 瓦特读数（power_w）随 2026-10-06 的容量重设计退出判定，UI 也不再画它、不再发它的键。
+        // 瓦特读数（power_w）随 2026-10-06 的容量重设计退出判定，2026-10-09 整条观测链移除；UI 不画它、不发它的键。
         function capNumber (value) {
           const number = Number(value)
           if (!Number.isFinite(number) || number <= 0) return null
@@ -1033,8 +1034,8 @@
           return numberRule(form.priority) === true && numberRule(form.cost) === true
         }
         function appendCaps (target, form) {
-          // 三道门各自走 PUT 的三态；**绝不下发 max_power_w**：那个键已于 2026-10-06 退役，
-          // 后端解析时对它的存在 warn 一次并丢弃，UI 再发就等于每轮刷一条无意义的告警。
+          // 三道门各自走 PUT 的三态；**绝不下发 max_power_w**：那个键 2026-10-06 退役、2026-10-09 后端已
+          // 整体移除，它从此等同未知字段被解析层丢弃，UI 再发没有任何意义。
           const min = capFormValue(form.min_concurrency, true)
           if (min !== undefined) target.min_concurrency = min
           const concurrency = capFormValue(form.max_concurrency, true)
@@ -1129,8 +1130,8 @@
           delete entry.api_key_state
           delete entry.api_key_stored
           // 退役键的硬性抹除：base 可能是从 GET /_ui/config 克隆来的**旧**条目，里面还写着
-          // max_power_w。表单不再画它，但整表替换会把它原样带回、后端每轮 warn 一次并丢弃；
-          // UI 侧一并删掉，旧配置只要在管理台被编辑过一次就彻底不再携带这个键。
+          // max_power_w（后端已 2026-10-09 移除该键，按未知字段丢弃）。表单不再画它，
+          // 但整表替换会把它原样带回；UI 侧一并删掉，旧配置只要在管理台被编辑过一次就彻底不再携带。
           delete entry.max_power_w
           entry.url = normUrl(form.url)
           const model = String(form.model_id || '').trim()
@@ -1151,7 +1152,7 @@
           // 三道门各自独立往返：写了就落整数，留空就整键删除（= 未声明 = 不限）。
           // 全部取整数：与后端 config_store 的 1..31 / 1..32 / 0..100 判定同口径，
           // 免得 UI 显示 2.7 而池里落 2（自愈下一轮就显示成不一致）。
-          // max_power_w 绝不再写：那个键已退役，后端解析时对它的存在 warn 一次并丢弃。
+          // max_power_w 绝不再写：那个键已于 2026-10-09 随功率通道整体移除，后端按未知字段丢弃。
           writeCap(entry, form, 'min_concurrency', 1, CAP_MIN_LIMIT)
           writeCap(entry, form, 'max_concurrency', 1, CAP_MAX_LIMIT)
           writeCap(entry, form, 'max_gpu_util', 0, CAP_UTIL_LIMIT)

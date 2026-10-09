@@ -358,7 +358,7 @@ function _M.handle_config_virtual()
 end
 
 --- POST /_ui/config/upstreams  {entries:[{url,model_id?,api_key?,priority?,
----   cost?,labels?,disable_health_check?,max_concurrency?,max_power_w?}]}
+---   cost?,labels?,disable_health_check?,max_concurrency?,max_gpu_util?}]}
 --- Whole-list replace of the declared pool plus an immediate reconcile into
 --- lr_workers (contract 3.5). entries missing = empty list = reclaim every
 --- config row (root ruling 3: the UI always sends the full list and covers the
