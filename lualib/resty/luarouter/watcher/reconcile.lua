@@ -49,35 +49,40 @@ local function note_debug(log, message)
     end
 end
 
---- 「隐藏」判定的取用接缝（用户裁定 2026-10-08 的第二处联动；另两处：/v1/models 广告、
---- 路由候选）。**判定本身只有一份**，住在 config_store（readers.lua 的 model_is_hidden：
---- 卡片 hidden=true 或虚拟入口 hidden=true 即算隐藏），本函数只负责「取不取得到」。
+--- 「禁用」判定的取用接缝（用户裁定 2026-10-09：watcher 的注册与摘除从 hidden 改读
+--- disabled；另两处联动：/v1/models 广告读两条、路由候选只读 disabled）。**判定本身只有
+--- 一份**，住在 config_store（readers.lua 的 model_is_disabled：卡片 disabled=true 或
+--- 虚拟入口 disabled=true 即算禁用），本函数只负责「取不取得到」。
 ---
---- 返回 nil = 「无从知道」= 没有任何名字被藏起来，调用方据此整条隐藏逻辑短路成今天的
+--- hidden **不再**进来（2026-10-09 收窄）：操作员勾了「隐藏」的模型继续被注册、被保留、
+--- 被发现 —— 隐藏只关广告面，watcher 把它摘掉会让「不对外广告但继续服务」变成「停止服务」，
+--- 那是 disabled 那句话。
+---
+--- 返回 nil = 「无从知道」= 没有任何名字被禁用，调用方据此整条禁用逻辑短路成今天的
 --- 逐字节行为。三种情形都落到 nil：config_store 缺席（未装配的 build / 裸 luajit 探针 ——
 --- test_watcher 那份单测就是这么跑的）、reader 缺席（半程发布的旧 build）、整表判据
---- 答「没人说过隐藏」（生产上绝大多数 tick 走这一条，一次哈希读，不构造名册）。
+--- 答「没人说过禁用」（生产上绝大多数 tick 走这一条，一次哈希读，不构造名册）。
 ---
 --- 刻意**不是** `() -> boolean`：先取一次闭包、再在循环里问，比每个候选都 require + pcall
---- 便宜，而且把「取不到」与「取到了但没人隐藏」在形状上分开（nil vs 函数），日志和
+--- 便宜，而且把「取不到」与「取到了但没人禁用」在形状上分开（nil vs 函数），日志和
 --- 探针都分辨得出「配置没生效」与「配置说不用摘」。
 ---
 --- pcall 包住 require 而不是裸调：config_store 加载期会 require 一串重模块，一处抛错
 --- 不该让整轮 reconcile 少跑一步（AGENTS.md 硬规则 4 的同一姿态 —— 读数拿不到只是
 --- 没精度，绝不摘 worker）。
 ---@return fun(name: string): boolean|nil|nil
-function _M.hidden_reader()
+function _M.disabled_reader()
     local ok_store, store_mod = pcall(require, "resty.luarouter.config_store")
     if not ok_store or type(store_mod) ~= "table" then return nil end
-    if type(store_mod.any_hidden) ~= "function"
-        or type(store_mod.model_is_hidden) ~= "function" then
+    if type(store_mod.any_disabled) ~= "function"
+        or type(store_mod.model_is_disabled) ~= "function" then
         return nil
     end
-    local ok_any, flagged = pcall(store_mod.any_hidden)
+    local ok_any, flagged = pcall(store_mod.any_disabled)
     if not ok_any or flagged ~= true then return nil end
     return function(name)
         if type(name) ~= "string" or name == "" then return false end
-        local ok_ask, verdict = pcall(store_mod.model_is_hidden, name)
+        local ok_ask, verdict = pcall(store_mod.model_is_disabled, name)
         if not ok_ask then return false end
         return verdict == true
     end
@@ -428,54 +433,56 @@ function _M.reconcile(state)
 
     -- desired = discovered - protected (guard 3 again, from the other side).
     local desired, protected_seen = {}, {}
-    -- 「隐藏」（用户裁定 2026-10-08）的第二处联动（另两处：/v1/models 广告、路由候选），
-    -- 判据只有一份：config_store 的 model_is_hidden（卡片或入口任一说了 hidden=true）。
+    -- 「禁用」（用户裁定 2026-10-09）在 watcher 侧的联动（另两处：/v1/models 广告读两条、
+    -- 路由候选只读 disabled），判据只有一份：config_store 的 model_is_disabled（卡片或入口
+    -- 任一说了 disabled=true）。hidden **不**在这里问：被藏起来的模型继续注册、继续保留、
+    -- 继续被发现 —— 隐藏只是不对外广告，服务照旧。
     --
     -- 位置刻意排在守卫 3 的 protected/desired 分流**之后**、Adds / renames / Removals
-    -- **之前**，一次过滤改动三支：藏起来的 URL 不进 desired（于是 Adds 的注册侧跳过是
+    -- **之前**，一次过滤改动三支：被禁用的 URL 不进 desired（于是 Adds 的注册侧跳过是
     -- **结构性**的 —— 循环根本到不了它，Renames 也无从谈起），已注册的行由 Removals
-    -- 那一圈的专属分支摘掉。protected_seen 一并过滤是刻意的：藏起来的行如果继续被当
+    -- 那一圈的专属分支摘掉。protected_seen 一并过滤是刻意的：被禁用的行如果继续被当
     -- protected 喂给 rename 那一圈，会把一台操作员刚宣布不服务的实例又 adopt 一遍。
     --
-    -- 摘除走 _M.release 这**同一个**出口（见下面「隐藏即摘」那一支）：台账清理、
+    -- 摘除走 _M.release 这**同一个**出口（见下面「禁用即摘」那一支）：台账清理、
     -- drop_pending / drop_backoff、removes 计数、pass 日志全是现成的那一份，不新增
     -- 摘除判据；allow_remove 那一道保险照旧在前。刻意**不**借 undiscovered 那一支的
-    -- remove-grace 时钟与 keep-last 保险 —— 前者会让「勾了隐藏」要等几分钟才在 /workers
+    -- remove-grace 时钟与 keep-last 保险 —— 前者会让「勾了禁用」要等几分钟才在 /workers
     -- 上见效（操作员会以为没生效），后者会让「这个模型只剩这一台」把操作员的明确意图
     -- 顶回去。两者的理由都写在下面那一支里。
     --
-    -- 读数拿不到就**不隐藏**（store 缺席 / reader 缺席 / pcall 出错 → nil = 没有任何名字
-    -- 被藏起来），与硬规则 4 同一姿态：一次读不出的配置声明绝不该摘掉一台在服务的实例。
-    -- 每 tick 只问一次整表判据；没人说过隐藏时下面三个函数各自短路成今天的逐字节行为。
-    local hidden_asked = _M.hidden_reader()
+    -- 读数拿不到就**不禁用**（store 缺席 / reader 缺席 / pcall 出错 → nil = 没有任何名字
+    -- 被禁用），与硬规则 4 同一姿态：一次读不出的配置声明绝不该摘掉一台在服务的实例。
+    -- 每 tick 只问一次整表判据；没人说过禁用时下面三个函数各自短路成今天的逐字节行为。
+    local disabled_asked = _M.disabled_reader()
     --- 按**注册用的那个名字**问（= 操作员在 /_ui 与 /v1/models 上看到的名字）。
     --- 卡片的键是那个名字而不是引擎自报的原文，所以问之前必须过一遍与 Adds 循环
     --- 逐字相同的解析（_M.model_name(..., state.model_map, cfg.short_model_names)）：
-    --- 拿原文去问会让「配了 model_map / short_model_names 的部署」上隐藏静默不生效
-    --- —— 操作员勾了隐藏、名字却对不上，与他自己那句话相反。两处同源因此不可漂移。
-    local function hidden_name(name)
-        if hidden_asked == nil then return false end
+    --- 拿原文去问会让「配了 model_map / short_model_names 的部署」上禁用静默不生效
+    --- —— 操作员勾了禁用、名字却对不上，与他自己那句话相反。两处同源因此不可漂移。
+    local function disabled_name(name)
+        if disabled_asked == nil then return false end
         if type(name) ~= "string" or name == "" then return false end
         local model = _M.model_name(name, state.model_map, cfg.short_model_names)
-        return type(model) == "string" and model ~= "" and hidden_asked(model) == true
+        return type(model) == "string" and model ~= "" and disabled_asked(model) == true
     end
-    --- 本轮探到的候选：它对外服务的第一个名字（= 注册名）被藏起来了吗。
-    local function url_hidden(info)
-        return hidden_name(info and info.models and info.models[1])
+    --- 本轮探到的候选：它对外服务的第一个名字（= 注册名）被禁用了吗。
+    local function url_disabled(info)
+        return disabled_name(info and info.models and info.models[1])
     end
     --- 台账里已注册的行：entry.model_id **就是**当初注册用的那个名字，直接问，
     --- 绝不再跑一遍 _M.model_name —— 对已解析的名字二次解析会在「map 的键里恰好
     --- 有某个解析结果」时二次改写（链式别名），把摘除判定挂在一个不相干的名字上。
-    local function owned_hidden(entry)
-        if hidden_asked == nil then return false end
+    local function owned_disabled(entry)
+        if disabled_asked == nil then return false end
         local model = entry and entry.model_id
-        return type(model) == "string" and model ~= "" and hidden_asked(model) == true
+        return type(model) == "string" and model ~= "" and disabled_asked(model) == true
     end
     for i = 1, #discovered do
         local info = discovered[i]
-        if url_hidden(info) then
-            -- 藏起来的 URL 既不进 desired 也不进 protected_seen：它这一轮等同于不存在。
-            -- 已经在池里的行交给 Removals 的隐藏分支摘（不在池里的自然什么都不做）。
+        if url_disabled(info) then
+            -- 被禁用的 URL 既不进 desired 也不进 protected_seen：它这一轮等同于不存在。
+            -- 已经在池里的行交给 Removals 的禁用分支摘（不在池里的自然什么都不做）。
             -- 注册侧跳过因此是**结构性**的：desired 里没有它，Adds 的循环根本到不了它。
         elseif ledger.is_protected(info.url) then
             protected_seen[info.url] = info
@@ -731,26 +738,29 @@ function _M.reconcile(state)
                 ledger.drop_owned(url)
                 ledger.drop_pending(url)
                 ledger.drop_backoff(url)
-            elseif owned_hidden(entry) then
-                -- 「隐藏即摘」（用户裁定 2026-10-08 的 watcher 侧最小路径）：操作员勾了隐藏，
+            elseif owned_disabled(entry) then
+                -- 「禁用即摘」（用户裁定 2026-10-09 的 watcher 侧最小路径）：操作员勾了禁用，
                 -- 这条已注册的行就退出池子。走 _M.release 这**同一个**摘除出口（台账清理、
                 -- drop_pending / drop_backoff、removes 计数、pass 日志全复用），理由与
                 -- 「为什么 whole reconcile 不拆」那条纪律同一条 —— 「为什么那台 worker 走了」
                 -- 必须只有一个答点；新增一条并行摘除路径等于给出第二个答案。
                 --
                 -- 排在 is_config_member **之后**：声明层行归 config_store 所有，watcher 从不删它
-                -- （上面那一支的 stop-owning 口径），操作员隐藏一台 config 实例时由声明层与
+                -- （上面那一支的 stop-owning 口径），操作员禁用一台 config 实例时由声明层与
                 -- 候选门负责；这里只管 watcher 自己认领的行。protected 行同样不进这里（守卫 3
                 -- 永不删），两者都由候选门保证「不被服务」。
                 --
                 -- 也受 allow_remove 约束：SMG_WATCHER_ALLOW_REMOVE=0 是操作员「只许加不许删」的
                 -- 明确约定，配置动作不该绕过它（这与 strict probe 那次踩过的同一个坑对齐）。
-                -- 不删也不影响「不再被服务」—— 候选门按 hidden 排除它是独立的一道，摘除只是
+                -- 不删也不影响「不再被服务」—— 候选门按 disabled 排除它是独立的一道，摘除只是
                 -- 把池子打扫干净。warn 一次靠 entry.warned 静音，与 undiscovered 分支同形。
+                --
+                -- 隐藏（hidden）不走这一支：被藏的行留在池里继续服务（2026-10-09 收窄），
+                -- 它只是不出现在 /v1/models 的对外广告里。
                 if not cfg.allow_remove then
                     if not entry.warned then
                         warn(state.log, string.format(
-                            "watcher: model %q of %s is hidden but removal is disabled; keeping it (it stays out of every candidate pool)",
+                            "watcher: model %q of %s is disabled but removal is disabled; keeping it (it stays out of every candidate pool)",
                             tostring(entry.model_id), url))
                         entry.warned = true
                         ledger.set_owned(url, entry, state.entry_ttl)
@@ -758,11 +768,11 @@ function _M.reconcile(state)
                 else
                     -- keep-last 这一判刻意**不**套用（与 undiscovered 分支相反）：那一判存在的
                     -- 理由是「别让一次重启/掉线把某个模型的服务清空」，它防的是**意外**；
-                    -- 隐藏是操作员的明确意图，用「它是这个模型最后一台」去否决它，等于让
+                    -- 禁用是操作员的明确意图，用「它是这个模型最后一台」去否决它，等于让
                     -- 网关替操作员决定「这句话我不照做」。摘完之后该入口按既有的无候选路径答
                     -- 503，正是「不再被服务」的对外形状。
                     _M.release(state, url, entry, 0,
-                        string.format("model %q hidden by operator config",
+                        string.format("model %q disabled by operator config",
                             tostring(entry.model_id)))
                 end
             elseif probe_ignore[url] then

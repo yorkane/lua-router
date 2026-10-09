@@ -250,26 +250,44 @@ function _M.card_supports_tool_use(model)
     return nil
 end
 
--- ------------------------------------------------------------ 「隐藏」（用户裁定 2026-10-08）
+-- ------------------------------------------------------------ 「隐藏」与「禁用」（用户裁定 2026-10-09）
 --
--- 「这个模型名 / 入口名是不是被操作员藏起来了」的**唯一实现**。三处联动（/v1/models 的广告、
--- watcher 的注册与保留、路由候选）都必须经这里，各写一套必然漂移：一处还广告、另一处已不服务，
--- 就是 2026-10-07 那次「广告与路由互相矛盾」故障的翻版（见 inject_virtual_models 的遮蔽理由）。
+-- 「这个名字被操作员藏起来了吗」与「被操作员禁用了吗」的**唯一实现**：两个判定同住一份名册。
+-- 三处联动（/v1/models 的广告、watcher 的注册与保留、路由候选）都必须经这里，各写一套必然漂移：
+-- 一处还广告、另一处已不服务，就是 2026-10-07 那次「广告与路由互相矛盾」故障的翻版（见
+-- inject_virtual_models 的遮蔽理由）。
 --
--- 判定口径（用户裁定的原话）：卡片 hidden=true **或** 虚拟入口 hidden=true，即算隐藏。
+-- 为什么是两个开关而不是一个（用户裁定 2026-10-09 收窄了 2026-10-08 那一条）：
+--   * **hidden 只管对外广告**。被藏的名字仍进候选池、仍被 watcher 注册与保留、仍能被虚拟入口
+--     选作落点。它对应的运维场景是「我不想让它出现在 /v1/models 里被客户端点名，但它照常服务」
+--     —— 例如只由某个虚拟入口对外、真实名不外露的那批引擎。
+--   * **disabled 是全套排除**：不广告、不进候选、watcher 摘除（= 2026-10-08 那版 hidden 的语义）。
+--     这才是「这台实例别再被服务了」。
+-- 两者只在广告面上汇合成一条「或」：藏起来的与禁掉的一个都不广告；服务面只认 disabled。判据
+-- 因此是两份读面（model_is_hidden / model_is_disabled）而不是一份 —— 三处联动各自问得出自己
+-- 那一句：广告问两条，候选与 watcher 只问 disabled。
+--
+-- 判定口径（每个标记各自）：卡片上说了 true **或** 虚拟入口上说了 true，即算命中。
 -- 两条来源取**或**是刻意的：入口名与真实模型名可以同名遮蔽（root ruling 2026-10-07 方案 A），
--- 那时「卡片说藏」与「入口说藏」说的是同一个对外名字，任何一条成立就都得藏住。
+-- 那时「卡片说」与「入口说」说的是同一个对外名字，任何一条成立就都得算数。
 --
--- 三态纪律：只有**真布尔 true** 才算隐藏。nil（没说）与 false（说了不隐藏）在读取侧走同一条
+-- 三态纪律：只有**真布尔 true** 才算命中。nil（没说）与 false（说了不）在读取侧走同一条
 -- 「照旧」支路，两者在**磁盘上**仍然分家（见 snapshot_of / profiles 的写出侧）——读取侧合并它们
 -- 不损失任何信息，因为 false 与 nil 的行为本来就该一致。非布尔的垃圾值（脏手改出来的字符串、
 -- cjson 的 null 哨兵）一律按「没说」处理，绝不因一条坏字节把一台在跑的实例判成不存在。
 --
--- 便宜的「有没有人声明过隐藏」整表判据走一份按 revision 失效的记忆（与 policy_state 同一族：
+-- 便宜的「有没有人声明过」整表判据走一份按 revision 失效的记忆（与 policy_state 同一族：
 -- 有 shdict 时靠 revision token 跨进程失效，没有就靠 SNAPSHOT_TTL 界住陈旧度）。这一份存在的
--- 理由只有一个：**没声明隐藏的部署必须一个字节的额外开销都不付**（AGENTS.md「新开关缺省零行为
--- 变化」）。选路热路径每趟只问一次 `any`，答案是 false 就连那张隐藏名册都不构造。
-local hidden_view = { token = nil, at = 0, any = false, models = nil, aliases = nil }
+-- 理由只有一个：**两个开关都没声明的部署必须一个字节的额外开销都不付**（AGENTS.md「新开关
+-- 缺省零行为变化」）。选路热路径每趟只问一次整表判据，答案是 false 就连名册都不构造。
+-- 两个标记**共用同一次扫描**：四张表在同一次 current() 遍历里填完 —— 它们天然出自同一份快照，
+-- 分成两份缓存只会让配置多扫一遍。
+local hidden_view = {
+    token = nil, at = 0,
+    any_hidden = false, any_disabled = false,
+    models_hidden = nil, aliases_hidden = nil,
+    models_disabled = nil, aliases_disabled = nil,
+}
 
 local function hidden_state()
     local token = CS_FACADE.policy_revision()
@@ -290,49 +308,89 @@ local function hidden_state()
     end
     CS_FACADE._hidden_view_dirty = nil
     local cfg = CS_FACADE.current()
-    local models, aliases, any = {}, {}, false
+    local models_hidden, aliases_hidden = {}, {}
+    local models_disabled, aliases_disabled = {}, {}
+    local any_hidden, any_disabled = false, false
     for model, card in pairs(cfg.model_configs or {}) do
-        if type(card) == "table" and card.hidden == true then
-            models[model] = true
-            any = true
+        if type(card) == "table" then
+            if card.hidden == true then
+                models_hidden[model] = true
+                any_hidden = true
+            end
+            if card.disabled == true then
+                models_disabled[model] = true
+                any_disabled = true
+            end
         end
     end
     for alias, profile in pairs(cfg.virtual_profiles or {}) do
-        if type(profile) == "table" and profile.hidden == true then
-            aliases[alias] = true
-            any = true
+        if type(profile) == "table" then
+            if profile.hidden == true then
+                aliases_hidden[alias] = true
+                any_hidden = true
+            end
+            if profile.disabled == true then
+                aliases_disabled[alias] = true
+                any_disabled = true
+            end
         end
     end
     hidden_view.token = token
     hidden_view.at = now
-    hidden_view.any = any
-    hidden_view.models = models
-    hidden_view.aliases = aliases
+    hidden_view.any_hidden = any_hidden
+    hidden_view.any_disabled = any_disabled
+    hidden_view.models_hidden = models_hidden
+    hidden_view.aliases_hidden = aliases_hidden
+    hidden_view.models_disabled = models_disabled
+    hidden_view.aliases_disabled = aliases_disabled
     return hidden_view
 end
 
---- 整表便宜判据：有没有任何一个名字被声明过 hidden=true。false = 全场照旧，调用方可以
---- 据此一次跳过所有隐藏逻辑（热路径的零开销保证就靠它）。
+--- 整表便宜判据（hidden 那一族）：有没有任何一个名字被声明过 hidden=true。false = 全场照旧，
+--- 广告侧据此一次跳过所有隐藏逻辑（热路径的零开销保证就靠它）。
 ---@return boolean
 function _M.any_hidden()
-    return hidden_state().any == true
+    return hidden_state().any_hidden == true
 end
 
---- 对外的那个统一判定：卡片或入口任一说了 hidden=true 即算隐藏（名字两边都查）。
---- 这是**唯一**的对外判定，刻意不另开「只看卡片」/「只看入口」的分面读法：三处联动问的都
---- 是「这个名字还对外吗」，把判据拆成两半就会有人挑错那一半（组门问成员只问卡片、入口行问
---- 入口只问条目），而这两半必须同时生效才叫「藏住了」。名册内部仍分两张表存
---- （state.models / state.aliases），判定口径因此写在一条式子里，而不是两处各写一遍。
---- 同名遮蔽（root ruling 2026-10-07 方案 A）下这条「或」尤其要紧：入口 X 被藏时，真实模型
---- X 的路由也一并 blocked（入口名那一问），于是它的真实行也必须消失，否则就是「广告了却
---- 每个请求 503」。
+--- 整表便宜判据（disabled 那一族）：有没有任何一个名字被声明过 disabled=true。false = 没有
+--- 任何东西被禁用，候选门与 watcher 据此一次跳过。与 any_hidden 同一条零开销纪律，只是问的是
+--- 另一个开关 —— 一个只勾了隐藏的部署，候选侧问 any_disabled 仍然答 false，于是「藏起来但
+--- 继续服务」在热路径上一分钱不付。
+---@return boolean
+function _M.any_disabled()
+    return hidden_state().any_disabled == true
+end
+
+--- 对外的统一判定（hidden）：卡片或入口任一说了 hidden=true 即算隐藏（名字两边都查）。
+--- 这是**广告面**的判定，也是 hidden 唯一的对外读法，刻意不另开「只看卡片」/「只看入口」的
+--- 分面读法：入口名与真实模型名可以同名遮蔽（root ruling 2026-10-07 方案 A），那时入口 X 被
+--- 藏的同时真实模型 X 也在被路由，两边必须给同一个答案，否则就是「广告了却每个请求 503」。
+--- 判据拆成两半就会有人挑错那一半（组门问成员只问卡片、入口行问入口只问条目），所以名册内部
+--- 虽分两张表存（state.models_hidden / state.aliases_hidden），判定口径写在一条式子里。
+---
+--- 只管广告，不摘服务（用户裁定 2026-10-09）：被藏的名字仍进候选、仍被 watcher 注册与保留。
+--- 要「不再被服务」说的是 disabled（下一条判定）。
 ---@param name string|nil @ 真实模型名或入口名（同名遮蔽时两者是同一个对外名字）
 ---@return boolean
 function _M.model_is_hidden(name)
     if type(name) ~= "string" or name == "" then return false end
     local state = hidden_state()
-    if not state.any then return false end
-    return state.models[name] == true or state.aliases[name] == true
+    if not state.any_hidden then return false end
+    return state.models_hidden[name] == true or state.aliases_hidden[name] == true
+end
+
+--- 对外的统一判定（disabled）：卡片或入口任一说了 disabled=true 即算禁用。形状与
+--- model_is_hidden 逐字对称 —— 同一份名册、同一次 current() 扫描、同一套三态与垃圾值口径 ——
+--- 区别只在读的是哪一个开关。候选门与 watcher 问这一条：被禁用的名字既不进候选池，也不被注册；
+--- 只说了 hidden 的名字**不**命中这里，于是「不广告但继续服务」成立。
+---@param name string|nil @ 真实模型名或入口名（同名遮蔽时两者是同一个对外名字）
+---@return boolean
+function _M.model_is_disabled(name)
+    if type(name) ~= "string" or name == "" then return false end
+    local state = hidden_state()
+    if not state.any_disabled then return false end
+    return state.models_disabled[name] == true or state.aliases_disabled[name] == true
 end
 
 --- 虚拟模型条目的能力/档位声明（卡片级的读数由卡片自己出，这里只给条目这一层）。

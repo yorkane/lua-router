@@ -77,15 +77,22 @@ _M.snapshot_of = CS_SNAPSHOT.snapshot_of
 -- readers
 _M.card_supports_tool_use = CS_READERS.card_supports_tool_use
 _M.card_effort_ladder = CS_READERS.card_effort_ladder
--- 「隐藏」判定（用户裁定 2026-10-08）的对外读面：三处联动（/v1/models 广告、watcher 的
--- 注册与保留、路由候选）都经这里，实现只有一份（config_store/readers.lua 的 hidden_state）。
--- 只导两个，都是必需的：model_is_hidden 是**唯一**判定（卡片或入口任一说了 hidden 即藏），
--- any_hidden 是热路径的整表便宜判据（先问它，没人声明过隐藏就一次表查询都不付）。
--- 刻意**不**再导一个「只看卡片」或「只看入口」的分面读法：三处联动问的都是「这个名字还
--- 对外吗」，把判据拆成两半就会有人挑错那一半（组内成员问卡片、入口行问入口），而这两半
--- 恰恰必须同时生效才算「藏住了」。少一个导出面 = 少一种漂移方式。
+-- 「隐藏」与「禁用」判定（用户裁定 2026-10-08 / 2026-10-09）的对外读面：三处联动
+-- （/v1/models 广告、watcher 的注册与保留、路由候选）都经这里，实现只有一份
+-- （config_store/readers.lua 的 hidden_state，两个开关同住那一次扫描）。
+-- 每个开关导两个，都是必需的：model_is_hidden / model_is_disabled 是各自**唯一**判定
+-- （卡片或入口任一说了该开关即命中），any_hidden / any_disabled 是热路径的整表便宜判据
+-- （先问它，没人声明过就一次表查询都不付）。
+-- 两份读面而不是一个「任一被操作员抹过」的合并判定是刻意的（2026-10-09 收窄）：广告面问
+-- 两条（藏起来的与禁掉的一个都不广告），服务面只问 disabled（隐藏的东西照常进候选、照常
+-- 被注册）。合并成一条就没法表达「不对外广告但继续服务」这个真实运维形态。
+-- 刻意**不**再导「只看卡片」或「只看入口」的分面读法：同名遮蔽下入口名与真实模型名是同
+-- 一个对外名字，把判据拆成两半就会有人挑错那一半，而这两半恰恰必须同时生效才算数。
+-- 少一个导出面 = 少一种漂移方式。
 _M.any_hidden = CS_READERS.any_hidden
+_M.any_disabled = CS_READERS.any_disabled
 _M.model_is_hidden = CS_READERS.model_is_hidden
+_M.model_is_disabled = CS_READERS.model_is_disabled
 _M.ctx_cap = CS_READERS.ctx_cap
 _M.current = CS_READERS.current
 _M.entry_declaration = CS_READERS.entry_declaration

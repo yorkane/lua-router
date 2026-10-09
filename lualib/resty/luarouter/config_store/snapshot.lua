@@ -127,12 +127,21 @@ local function new_card()
              -- （{value,label?,default}），所以对外那份读数分不出数字来自哪一层——这正是
              -- 想要的：客户端不需要知道这个数字是谁说的。
              reasoning_efforts = nil,
-             -- 「隐藏」（用户裁定 2026-10-08）：三态，nil = 操作员没说 = 照旧可见且可服务，
-             -- true = 该模型既不对外广告也不被服务（/v1/models 不产出、watcher 不注册/保留、
-             -- 路由候选排除）。刻意**不是** false 缺省：false 与 nil 在读取侧走的是同一条
-             -- 「照旧」支路，但磁盘上必须分得开「说了不隐藏」与「没说」（与旁边五条能力位
-             -- 同一条三态纪律）。真正的判定只有一个实现，见 config_store/hidden.lua。
-             hidden = nil }
+             -- 「隐藏」（用户裁定 2026-10-08，2026-10-09 收窄）：三态，nil = 操作员没说，
+             -- true = 该模型**不再对外广告**（/v1/models 不产出它），但它照常服务：仍进候选池、
+             -- 仍被 watcher 注册与保留、仍能被虚拟入口选作落点。「不广告却继续服务」正是这个
+             -- 开关存在的理由（只由虚拟入口对外、真实名不外露的那批引擎）。
+             -- 刻意**不是** false 缺省：false 与 nil 在读取侧走的是同一条「照旧」支路，但磁盘上
+             -- 必须分得开「说了不隐藏」与「没说」（与旁边五条能力位同一条三态纪律）。
+             hidden = nil,
+             -- 「禁用」（用户裁定 2026-10-09 新增）：三态，nil = 没说，true = 该模型**既不对外
+             -- 广告也不被服务**（/v1/models 不产出、watcher 不注册/摘除、路由候选排除）—— 也就是
+             -- 2026-10-08 那版 hidden 的语义，收窄后搬到这个开关上。两个开关刻意分成两个字段而
+             -- 不是一个枚举：它们各自独立地「或」进判定（卡片或入口任一说了 true 即命中），且
+             -- 隐藏是审美、禁用是熔断，操作员改的经常是其中一个。
+             -- 同一份名册的判定实现见 config_store/readers.lua（model_is_hidden /
+             -- model_is_disabled，共用一次扫描与一套失效口径）。
+             disabled = nil }
 end
 
 local function cfg_from_env()
@@ -307,13 +316,14 @@ local function snapshot_of(cfg)
             supports_vision = CS_LEXICON.nul(card.supports_vision),
             supports_reasoning_effort = CS_LEXICON.nul(card.supports_reasoning_effort),
         }
-        -- 「隐藏」（用户裁定 2026-10-08）**不走**上面那一族 nul：那五位是对外读数，操作员
-        -- 「没说」时磁盘上写 null 是编辑器「留空 = 不动」的那一份字节；hidden 不参与任何对外
-        -- 形状，一条没人声明过的 hidden:null 只会让每份老配置的磁盘字节都长出一个键（违反
-        -- 「新开关缺省零行为变化」，也把 Rust 对拍的 model_configs 行字段表整页翻掉）。
-        -- 缺席 = 没说，与条目层那五位同一条「绝不无中生有一个没人声明过的字段」的约定；
+        -- 「隐藏」与「禁用」（用户裁定 2026-10-09）**不走**上面那一族 nul：那五位是对外读数，
+        -- 操作员「没说」时磁盘上写 null 是编辑器「留空 = 不动」的那一份字节；hidden / disabled
+        -- 不参与任何对外形状，一条没人声明过的 hidden:null 只会让每份老配置的磁盘字节都长出
+        -- 一个键（违反「新开关缺省零行为变化」，也把 Rust 对拍的 model_configs 行字段表整页翻
+        -- 掉）。缺席 = 没说，与条目层那五位同一条「绝不无中生有一个没人声明过的字段」的约定；
         -- false 是结论、必须写成 false，与条目层的 supports_* 同一条纪律。
         if card.hidden ~= nil then row.hidden = card.hidden end
+        if card.disabled ~= nil then row.disabled = card.disabled end
         model_configs[#model_configs + 1] = row
     end
     local virtual_models = {}
@@ -364,10 +374,11 @@ local function snapshot_of(cfg)
                                  "supports_reasoning_effort" }) do
             if profile[field] ~= nil then entry[field] = profile[field] end
         end
-        -- 「隐藏」与那五位同一条条目层纪律：false 是结论、写成 false，缺席是沉默、整个键不出现
-        -- （写 null 会让老 build 与 JSON 编辑器把「擦掉声明」与「说了不隐藏」读成同一件事）。
-        -- 同样刻意不进上面那个循环，理由见 profiles.lua 的 build_entry_declarations。
+        -- 「隐藏」与「禁用」与那五位同一条条目层纪律：false 是结论、必须写成 false，缺席是
+        -- 沉默、整个键不出现（写 null 会让老 build 与 JSON 编辑器把「擦掉声明」与「说了不隐藏」
+        -- 读成同一件事）。同样刻意不进上面那个循环，理由见 profiles.lua 的 build_entry_declarations。
         if profile.hidden ~= nil then entry.hidden = profile.hidden end
+        if profile.disabled ~= nil then entry.disabled = profile.disabled end
         if profile.context_window then entry.context_window = profile.context_window end
         virtual_models[#virtual_models + 1] = entry
     end
@@ -604,21 +615,23 @@ local function merge_model_patch(card, patch)
         end
     end
 
-    -- 「隐藏」（用户裁定 2026-10-08）：三态布尔，写入语义照抄旁边那一族 —— absent = 不动、
-    -- null = 清回「没说」、true/false = 写死。刻意**不并进上面那个循环**：那五位共享一条
-    -- 文案家族与一份被单测钉住的字段表，且 hidden 的语义根本不在「能力位」那一族里
-    -- （它不是对外读数，是把这台实例从对外面上抹掉）。它也不进 env 层：隐藏是有熔断后果的
-    -- 决定（藏掉的模型连候选都不进），只从**磁盘配置**说得出，一个误设的环境变量不该让
-    -- 一台实例凭空消失。
-    do
-        local raw = rawget(patch, "hidden")
+    -- 「隐藏」与「禁用」（用户裁定 2026-10-09）：两个三态布尔，写入语义逐字照抄旁边那一族
+    -- —— absent = 不动、null = 清回「没说」、true/false = 写死。刻意**不并进上面那个循环**：
+    -- 那五位共享一条文案家族与一份被单测钉住的字段表，而 hidden / disabled 的语义根本不在
+    -- 「能力位」那一族里（它们不是对外读数；hidden 管广告、disabled 连服务一起停）。两者都不进
+    -- env 层：禁用是有熔断后果的决定（被禁的模型连候选都不进），隐藏也是对外契约的收窄，都只
+    -- 从**磁盘配置**说得出，一个误设的环境变量不该让一台实例凭空消失。
+    -- 字段名与语义在 2026-10-09 一分为二（hidden 只保留广告面，服务面让给 disabled）；读这两
+    -- 个键的判定只有一份，见 config_store/readers.lua。
+    for _, field in ipairs({ "hidden", "disabled" }) do
+        local raw = rawget(patch, field)
         if raw ~= nil then
             if raw == JSON_NULL then
-                card.hidden = nil
+                card[field] = nil
             elseif type(raw) == "boolean" then
-                card.hidden = raw
+                card[field] = raw
             else
-                return nil, "hidden must be a boolean or null"
+                return nil, string.format("%s must be a boolean or null", field)
             end
         end
     end

@@ -386,7 +386,7 @@ local function build_entry_supports_flag(alias, field, raw)
     return raw
 end
 
---- 七个声明字段一起装配；任何一条非法都整条入口拒绝保存（与 context_window 同纪律）。
+--- 八个声明字段一起装配；任何一条非法都整条入口拒绝保存（与 context_window 同纪律）。
 ---@return table|nil fields, string|nil err
 local function build_entry_declarations(alias, entry)
     local out = {}
@@ -412,15 +412,20 @@ local function build_entry_declarations(alias, entry)
         if ferr then return nil, ferr end
         if value ~= nil then out[field] = value end
     end
-    -- 「隐藏」（用户裁定 2026-10-08）：**不并进上面那个循环**。那五位是能力位，对外读数会
-    -- 因为它们变化（capabilities.supports_*），而 hidden 不是对外读数 —— 它是「这个入口
-    -- 连被发现的资格都没有」，同一份字节形状却完全不同的一族语义。复用同一个循环会把
-    -- 「加一条能力位」变成「顺手加一条服务开关」的隐患；单独一句也让 UI 侧将来接这一位时
-    -- 在源码里看得见它的不同。解析口径照抄（build_entry_supports_flag 就是 absent/null→nil、
-    -- 真布尔→值、其它→400），文案家族因此也一致。
+    -- 「隐藏」与「禁用」（用户裁定 2026-10-09）：**不并进上面那个循环**。那五位是能力位，对外
+    -- 读数会因为它们变化（capabilities.supports_*），而这两条不是对外读数 —— hidden 说的是
+    -- 「这个名字别出现在 /v1/models 里」（照常服务），disabled 说的是「这台实例别再被服务了」
+    -- （连被发现的资格都没有）。同一份字节形状却是完全不同的一族语义，复用同一个循环会把
+    -- 「加一条能力位」变成「顺手加一条服务开关」的隐患；逐条写出来也让 UI 侧将来接这两位的
+    -- 时候在源码里看得见它们的不同。解析口径照抄（build_entry_supports_flag 就是
+    -- absent/null→nil、真布尔→值、其它→400），文案家族因此也一致。两条都必须装配：入口级
+    -- 「只藏不禁」与「只禁不藏」是两种真实配置，合并成一条就等于让操作员二选一。
     local hidden_val, herr = build_entry_supports_flag(alias, "hidden", rawget(entry, "hidden"))
     if herr then return nil, herr end
     if hidden_val ~= nil then out.hidden = hidden_val end
+    local disabled_val, disberr = build_entry_supports_flag(alias, "disabled", rawget(entry, "disabled"))
+    if disberr then return nil, disberr end
+    if disabled_val ~= nil then out.disabled = disabled_val end
     if next(out) == nil then return nil end
     return out
 end
@@ -736,9 +741,11 @@ local function profile_from_entry(alias, entry, shadow)
         profile.supports_reasoning = declarations.supports_reasoning
         profile.supports_vision = declarations.supports_vision
         profile.supports_reasoning_effort = declarations.supports_reasoning_effort
-        -- 「隐藏」走同一条往返链：它是入口级的声明位，装配 / 落盘 / 读回 / 展示四位一体，
-        -- 热路径上的读法只有 config_store 的那一份判定（readers.lua 的 model_is_hidden）。
+        -- 「隐藏」与「禁用」走同一条往返链：它们是入口级的声明位，装配 / 落盘 / 读回 / 展示
+        -- 四位一体，热路径上的读法只有 config_store 的那两份判定（readers.lua 的
+        -- model_is_hidden 管广告、model_is_disabled 管服务与候选）。
         profile.hidden = declarations.hidden
+        profile.disabled = declarations.disabled
     end
     return profile, nil
 end

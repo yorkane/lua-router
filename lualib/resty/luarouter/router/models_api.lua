@@ -70,10 +70,10 @@ local function boolean_or_nil(value)
     return nil
 end
 
---- 「这个名字被操作员藏起来了吗」（用户裁定 2026-10-08）——**判定只有一个实现**，
---- 住在 config_store（readers.lua 的 model_is_hidden：卡片 hidden=true 或入口 hidden=true）。
---- 本函数只做「有没有这个读面、答没答得出」的护栏，绝不在此复刻判据：广告与选路两处
---- 一旦各判各的，就是 2026-10-07 那次「一条目被广告却被路由拒服务」故障的翻版。
+--- 广告面的共用取用护栏：把一个 config_store 判定函数按名字问一次，问不出来一律答「可见」。
+--- **判定只有一个实现**，住在 config_store（readers.lua）；本函数只做「有没有这个读面、
+--- 答没答得出」的护栏，绝不在此复刻判据：广告与选路两处一旦各判各的，就是 2026-10-07 那次
+--- 「一条目被广告却被路由拒服务」故障的翻版。
 ---
 --- 形状纪律：本函数位于 test_models_shape.lua 的**切片区间**内（锚点从
 --- MODEL_CREATED_UNKNOWN 起到「The Rust gateway answers」止，那份单测把整段连同这里
@@ -86,15 +86,45 @@ end
 --- 硬规则 4 的「读数拿不到就不许摘 worker」是同一个姿态。
 ---@param store_mod table|nil
 ---@param name string|nil @ 真实模型名或虚拟入口名
+---@param reader_name string @ "model_is_hidden"（广告位）或 "model_is_disabled"（服务位）
 ---@return boolean
-local function name_hidden(store_mod, name)
+local function ask_hidden(store_mod, name, reader_name)
     if type(name) ~= "string" or name == "" then return false end
     if type(store_mod) ~= "table" then return false end
-    local reader = store_mod.model_is_hidden
+    local reader = store_mod[reader_name]
     if type(reader) ~= "function" then return false end
     local ok, verdict = pcall(reader, name)
     if not ok then return false end
     return verdict == true
+end
+
+--- 「这个名字被操作员藏起来了吗」（hidden 判定的取用护栏）。
+---@param store_mod table|nil
+---@param name string|nil @ 真实模型名或虚拟入口名
+---@return boolean
+local function name_hidden(store_mod, name)
+    return ask_hidden(store_mod, name, "model_is_hidden")
+end
+
+--- 「这个名字被操作员禁用了吗」（disabled 判定的取用护栏，同款 fail-open）。
+--- 广告面问两个开关（用户裁定 2026-10-09）：藏起来的与禁掉的一个都不广告 —— disabled 是
+--- hidden 的超集，「禁了却还在 /v1/models 上挂着」会让客户端点名打到一个恒 503 的名字。
+--- 服务面（候选、watcher）只问 disabled，不在此处。
+---@param store_mod table|nil
+---@param name string|nil @ 真实模型名或虚拟入口名
+---@return boolean
+local function name_disabled(store_mod, name)
+    return ask_hidden(store_mod, name, "model_is_disabled")
+end
+
+--- 广告门：hidden 或 disabled 任一为 true 就不对外产出这一行。两条必须走**同一份**
+--- config_store 判定（readers.lua 的 model_is_hidden / model_is_disabled），这里一个
+--- 判据都不复刻。
+---@param store_mod table|nil
+---@param name string|nil @ 真实模型名或虚拟入口名
+---@return boolean
+local function name_unadvertised(store_mod, name)
+    return name_hidden(store_mod, name) or name_disabled(store_mod, name)
 end
 
 local function list_contains(list, value)
@@ -984,20 +1014,25 @@ function models_advertise.only_data(store_mod, cfg, caps_by_model)
             local alias = row[1]
             if type(alias) == "string" and alias ~= "" and not seen[alias] then
                 seen[alias] = true
-                -- 「隐藏」（用户裁定 2026-10-08）：藏起来的入口不产出条目，**在装配之前**就跳过
-                -- 而不是产出一条再丢掉 —— 「不广告」与「不服务」必须是同一个决定的两面（这里、
-                -- 候选门、watcher 读的是 config_store 那同一份判定）。去重照旧先占位（seen[alias]）：
-                -- 一个被藏起来的名字同时也被从对外抹掉，不该再让同名的第二条入口顶上来冒充它。
-                -- 「开关开着而一条出入口」的既有退回全量 + WARN 分支不因此改变：全部入口都被藏
-                -- 时这里返回 nil，走的是老空配置那条路（WARN 说清「入口一条都没有」），而退回后
-                -- 那份全量广告里的真实行仍各自过 model_is_hidden（下面 models_handler 那一圈）。
+                -- 广告门（用户裁定 2026-10-09）：被藏起来**或**被禁用的入口都不产出条目，
+                -- **在装配之前**就跳过而不是产出一条再丢掉 —— 对外那一份列表里不该有一行是
+                -- 操作员亲手抹掉的。两条判据都来自 config_store 那同一份名册（readers.lua 的
+                -- model_is_hidden / model_is_disabled），这里一个判据都不复刻。注意这与候选门
+                -- 不再是同一句话：hidden 只关广告面，被藏的入口**仍**可被路由（2026-10-09 收窄），
+                -- 所以「不广告」在这里覆盖 hidden 与 disabled 两条，「不服务」只有 disabled 那一条。
+                -- 去重照旧先占位（seen[alias]）：一个被从对外抹掉的名字不该再让同名的第二条
+                -- 入口顶上来冒充它。「开关开着而一条出入口」的既有退回全量 + WARN 分支不因此
+                -- 改变：全部入口都被藏或都被禁时这里返回 nil，走的是老空配置那条路（WARN 说清
+                -- 「入口一条都没有」），而退回后那份全量广告里的真实行仍各自过广告门（下面
+                -- models_handler 那一圈）。
                 -- 本节的切片纪律（同 models_advertise.from_disk 对 json_decode / io 的处理）：
                 -- test_models_advertise 只把 models_advertise 这一块切出去配桩加载，那份受限
-                -- 环境表里没有 name_hidden 这个 local（它在锚点区间**之上**），于是这里先验
-                -- 可用、不可用就当「没人说隐藏」。真模块口径（生产 + test_models_shape 的
-                -- 整体切片）里它恒是函数，判定照常问；隐藏语义本身的对外覆盖由探针 A 钉。
-                local hide_alias = type(name_hidden) == "function"
-                    and name_hidden(store_mod, alias) or false
+                -- 环境表里没有 name_unadvertised 这个 local（它在锚点区间**之上**），于是这里
+                -- 先验可用、不可用就当「没人说隐藏也没人说禁用」。真模块口径（生产 +
+                -- test_models_shape 的整体切片）里它恒是函数，两条判定照常问；隐藏/禁用语义
+                -- 本身的对外覆盖由探针 A 钉。
+                local hide_alias = type(name_unadvertised) == "function"
+                    and name_unadvertised(store_mod, alias) or false
                 if not hide_alias then
                     local tail = {}
                     for j = 2, #row do
@@ -1092,12 +1127,14 @@ local function inject_virtual_models(data, sources)
         local tail = {}
         for j = 2, #aliases[i] do
             local name = tostring(aliases[i][j])
-            -- 「隐藏」的第三处联动（另两处：候选门 candidates_for、watcher 的注册与保留）：
-            -- 被藏起来的**组内成员**不进这一份名册。理由与遮蔽规则同一条 —— 这一行说的就是
-            -- 「这个入口替这几个实际模型服务」，而藏起来的模型在选路侧根本不成候选，留着它
-            -- 就是「对外说服务、每个请求都被拒」的自相矛盾广告（2026-10-07 那次故障的正是这句）。
-            -- 判据与候选门同一个：config_store 的 model_is_hidden（卡片或入口任一说了 hidden）。
-            if not name_hidden(store_mod, name) then
+            -- 广告门的组内成员过滤：被藏起来或被禁掉的**组内成员**不进这一份名册。理由与遮蔽
+            -- 规则同一条 —— 这一行说的就是「这个入口替这几个实际模型服务」，而 disabled 的模型
+            -- 在选路侧根本不成候选，留着它就是「对外说服务、每个请求都被拒」的自相矛盾广告
+            -- （2026-10-07 那次故障的正是那句）。hidden 的成员同样不出现在这份对外名册里（hidden
+            -- 只管广告面）；它不进的是这份**清单**，而候选门仍按 disabled 收成员 —— 被藏的模型
+            -- 依然可作为落点被服务，那是 2026-10-09 收窄后的口径。
+            -- 判据与候选门同源：config_store 的 model_is_hidden / model_is_disabled。
+            if not name_unadvertised(store_mod, name) then
                 tail[#tail + 1] = name
             end
         end
@@ -1105,7 +1142,7 @@ local function inject_virtual_models(data, sources)
         -- 同样不产出。与「一个入口一行、绝不静默少一条」不冲突：那条纪律护的是**没被操作员
         -- 藏过**的入口（少一条会让客户端以为服务消失），这里少的每一条正是操作员亲手要抹掉的
         -- 名字。原本就不带成员名的脏行（#row<=1）照旧产出，保持它今天的形状。
-        if not seen[alias] and not name_hidden(store_mod, alias)
+        if not seen[alias] and not name_unadvertised(store_mod, alias)
             and (#tail > 0 or #aliases[i] <= 1) then
             -- 入口赢：同名时上面已经把真实那一行摘掉，这里无条件补出入口那一行
             -- （少一条等于让客户端以为整个服务消失了，与 only_data 同一条纪律）。
@@ -1151,12 +1188,14 @@ local function models_handler()
     local caps_by_model = model_caps_table()
     local data = {}
     for i = 1, #models do
-        -- 「隐藏」（用户裁定 2026-10-08）第一处联动：藏起来的真实模型**不产出条目**（调用侧
-        -- 过滤，advertise_real_model 本身一字未改 —— 它的形状被 test_models_shape 与 e2e 钉着，
-        -- 且「不广告」是调用侧的策略而不是那一行的形状）。advertise_real_model 因此仍然可以
-        -- 被任何调用方（含单测）直接调用并拿到与今天相同的字节。
-        -- 与候选门读同一份判定：一处还广告、另一处已不服务，就是我们要避免的那件事。
-        if not name_hidden(store_mod, models[i]) then
+        -- 广告门第一处联动（用户裁定 2026-10-09）：藏起来的**或**禁掉的真实模型都不产出条目
+        -- （调用侧过滤，advertise_real_model 本身一字未改 —— 它的形状被 test_models_shape 与
+        -- e2e 钉着，且「不广告」是调用侧的策略而不是那一行的形状）。advertise_real_model 因此
+        -- 仍然可以被任何调用方（含单测）直接调用并拿到与今天相同的字节。
+        -- hidden 与 disabled 只在广告面上汇合成一条「或」：两条判据都来自 config_store 同一份
+        -- 名册，与候选门（只读 disabled）读的是同一份事实 —— 一处还广告、另一处已不服务，就是
+        -- 我们要避免的那件事。
+        if not name_unadvertised(store_mod, models[i]) then
             data[#data + 1] = advertise_real_model(store_mod, cfg, caps_by_model, models[i])
         end
     end
@@ -1219,6 +1258,8 @@ end
 -- router.lua facade 的导出区，那里的 _M 是 facade 表。
 _M.MODEL_CREATED_UNKNOWN = MODEL_CREATED_UNKNOWN
 _M.name_hidden = name_hidden
+_M.name_disabled = name_disabled
+_M.name_unadvertised = name_unadvertised
 _M.advertise_virtual_entry = advertise_virtual_entry
 _M.advertise_real_model = advertise_real_model
 _M.model_caps_table = model_caps_table
