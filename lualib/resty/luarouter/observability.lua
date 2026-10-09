@@ -1044,6 +1044,10 @@ local HELP = {
     -- preferred someone else" (this one); one counted sample per request pass that
     -- actually stepped a busy candidate aside.
     smg_worker_capacity_preferred_idle_total = "Selection passes where idle workers were preferred and busy workers yielded the choice",
+    -- watcher 临时禁用（用户裁定 2026-10-09）：探针「其他情况」保行、候选装配按 td:
+    -- 键排除时逐候选计一次。与 capacity 硬排除分开计,让操作员能从 /metrics 分辨
+    -- "这台被判不是合格 worker 暂时屏蔽" 与 "这台容量到顶被排除"。
+    smg_worker_temp_disabled_total = "Candidates excluded from selection by a watcher temporary-disable (td:) marker, distinct from the capacity ceiling",
     -- Lua-side superset: Rust has no tracing-self metrics and no in-flight gauge.
     smg_http_inflight_requests = "Requests currently being served by the router",
     -- Rust renders this family as non-cumulative gt/le gauges off a 30 s..86400 s

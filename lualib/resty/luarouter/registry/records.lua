@@ -63,6 +63,7 @@ local K_MPROBE = keys.K_MPROBE
 local K_MPROBE_OK = keys.K_MPROBE_OK
 local K_POWER = keys.K_POWER
 local K_SLOAD = keys.K_SLOAD
+local K_TEMP_DISABLE = keys.K_TEMP_DISABLE
 local K_URL2ID = keys.K_URL2ID
 local K_WORKER = keys.K_WORKER
 local K_XLOAD = keys.K_XLOAD
@@ -539,7 +540,7 @@ function M.remove(worker_id)
         dd:delete(K_IDURL .. id)
         for _, prefix in ipairs({ K_HEALTH, K_HFAIL, K_HSUCC, K_CBSTATE,
                                  K_CBF, K_CBS, K_CBO, K_LOAD, K_XLOAD, K_SLOAD,
-                                K_POWER,
+                                K_POWER, K_TEMP_DISABLE,
                                 K_DISC, K_DPROBE, K_MPROBE, K_MPROBE_OK, K_HSEL }) do
             dd:delete(prefix .. id)
         end

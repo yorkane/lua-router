@@ -604,6 +604,8 @@ local function harness(overrides)
         log = {},
         registered = {},
         unregistered = {},
+        disabled = {},      -- state.temp_disable 记 worker_id
+        temp_cleared = {},  -- state.clear_temp_disable 记 worker_id
         probed = {},
         -- 按 URL 指定「探针这一轮给出的失败理由」（classify 的第二返回值）。
         -- 分档测试全靠它：不写 reason 的老夹具等于「传输层未知」，要两轮才摘。
@@ -621,6 +623,11 @@ local function harness(overrides)
         allow_remove = true,
         short_model_names = false,
         exclude_patterns = {},
+        -- 2026-10-09 裁定把「reject 三档当轮删行」改成默认临时禁用保行。本套既有夹具
+        -- 全部是针对**删行路径**写的(那是保留下来的 opt-out 行为),因此缺省钉在
+        -- probe_temp_disable=false 让它们逐字节照旧跑；**新默认(临时禁用)另开 case 组**。
+        -- 覆盖新默认见 new_case("probe temp-disable keeps the row ...")。
+        probe_temp_disable = false,
         allow_ports = {},
         deny_ports = {},
     }
@@ -669,6 +676,15 @@ local function harness(overrides)
                 env.state.actual[url] = nil
             end
             return true
+        end,
+        -- 临时禁用接缝的桩（默认关→这两只被 reconcile 调到时记名,不碰真 shdict）。
+        -- reconcile 只在 verdict=temp_disable / accept 复位两支调它们,老路径(删)不走。
+        temp_disable = function(worker_id, reason, ttl)
+            env.disabled[#env.disabled + 1] = { id = worker_id, reason = reason, ttl = ttl }
+            return true
+        end,
+        clear_temp_disable = function(worker_id)
+            env.temp_cleared[#env.temp_cleared + 1] = worker_id
         end,
         stats = { reconciles = 0, adds = 0, add_fails = 0, removes = 0,
                   discovered = 0, adds_stuck_released = 0 },
@@ -2062,6 +2078,97 @@ do
     eq(watcher.probe_verdict(reason), "count", "and it still counts toward eviction")
 end
 
+
+--------------------------------------------------------------------------
+-- 15. 2026-10-09 用户裁定：探针「其他情况」默认**临时禁用保行**，非删行
+--------------------------------------------------------------------------
+local function reset_td(env)
+    env.disabled, env.temp_cleared = {}, {}
+end
+
+new_case("temp-disable: reject 三档保行、打 td: 位、不进 removes")
+do
+    local reasons = {
+        "/v1/models answers without data[].id",
+        "it is a router, not a worker",
+        "advertises 9 models (> max-models 8), looks like a proxy",
+    }
+    for i = 1, #reasons do
+        local url = "http://td" .. i .. ":8000"
+        local env = harness({ candidates = { candidate(url, "proc") } })
+        env.cfg.probe_temp_disable = true          -- 打开新默认
+        register_and_claim(env, url, "m")
+        fail_probe(env, url, reasons[i])
+        advance(env, 2000)
+        reset_td(env)
+        local stats = watcher.reconcile(env.state)
+        eq(#env.unregistered, 0, "reject 不删行: " .. reasons[i])
+        eq(#env.disabled, 1, "且打了 td: 位: " .. reasons[i])
+        eq(env.disabled[1].id, "id-" .. url, "td: 位按 worker_id 落")
+        check(env.disabled[1].ttl ~= nil and env.disabled[1].ttl > 0,
+            "td: 位带 TTL（interval_secs*3）")
+        check(owned_field(env, url, "temp_disabled") == true, "台账标 temp_disabled")
+        check(env.state.actual[url] ~= nil, "池行仍在（保行，非删）")
+        eq(stats.removes, 0, "removes 计数不为它 +1")
+        eq(owned_field(env, url, "probe_fails"), nil, "不进滞回计数")
+    end
+end
+
+new_case("temp-disable: 探针恢复轮清位、条目回到可选")
+do
+    local url = "http://tdback:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    env.cfg.probe_temp_disable = true
+    register_and_claim(env, url, "m")
+    fail_probe(env, url, "it is a router, not a worker")
+    advance(env, 2000)
+    reset_td(env)
+    watcher.reconcile(env.state)
+    eq(#env.disabled, 1, "先被打上 td: 位")
+    eq(#env.unregistered, 0, "行还在")
+    env.probed[url] = { models = { "m" } }
+    env.probe_reason[url] = nil
+    advance(env, 2015)
+    reset_td(env)
+    watcher.reconcile(env.state)
+    eq(#env.temp_cleared, 1, "恢复轮清了 td: 位")
+    eq(env.temp_cleared[1], "id-" .. url, "清的是那台的 id")
+    eq(owned_field(env, url, "temp_disabled"), nil, "台账标记清掉")
+    check(env.state.actual[url] ~= nil, "全程行未被删，恢复后可选")
+end
+
+new_case("temp-disable: 连不上(无法访问)与 undiscovered 不受开关影响，仍按累计/宽限删")
+do
+    local url = "http://tdconn:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    env.cfg.probe_temp_disable = true
+    register_and_claim(env, url, "m")
+    fail_probe(env, url, "no /v1/models answer")   -- 连不上=无法访问=可摘
+    advance(env, 2000)
+    reset_td(env)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 0, "连不上第 1 轮仍不删（累计滞回）")
+    eq(#env.disabled, 0, "连不上不占临时禁用")
+    eq(owned_field(env, url, "probe_fails"), 1, "而是进 probe_fails 滞回")
+    advance(env, 2015)
+    reset_td(env)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "连不上攒够阈值照样删（与开关无关）")
+end
+
+new_case("temp-disable: opt-out probe_temp_disable=false 退回旧当轮删行")
+do
+    local url = "http://tdoff:8000"
+    local env = harness({ candidates = { candidate(url, "proc") } })
+    env.cfg.probe_temp_disable = false
+    register_and_claim(env, url, "m")
+    fail_probe(env, url, "/v1/models answers without data[].id")
+    advance(env, 2000)
+    reset_td(env)
+    watcher.reconcile(env.state)
+    eq(#env.unregistered, 1, "关掉开关=退回 reject 当轮删")
+    eq(#env.disabled, 0, "不打 td: 位")
+end
 
 io.write(string.format("\n=== %d checks, %d failed ===\n", passed, failed))
 for i = 1, #failures do

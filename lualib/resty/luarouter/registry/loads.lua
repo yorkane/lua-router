@@ -23,6 +23,7 @@ local keys = require "resty.luarouter.registry.keys"
 
 local K_ACTIVE = keys.K_ACTIVE
 local K_GPU_UTIL = keys.K_GPU_UTIL
+local K_TEMP_DISABLE = keys.K_TEMP_DISABLE
 local K_LOAD = keys.K_LOAD
 local K_POWER = keys.K_POWER
 local K_SLOAD = keys.K_SLOAD
@@ -636,6 +637,35 @@ function M.change_load(id, delta)
         return 0
     end
     return value
+end
+
+---Watch 临时禁用位（watcher「其他情况」处置的落点，与 capacity 硬排除同范式）。
+---探针判定实例「能应答但不是合格 worker」时不删行，改写这把 TTL 键：候选装配
+---(router/candidates.lua) 读到它就把这台从候选里排除；探针恢复轮 clear 掉即自动回归。
+---读不到 = 可用（fail-open：字典缺失、键过期都算「没被禁用」，绝不误伤容量）。
+---@param id string
+---@param reason string|nil @ 探针文案，存进值只为排查,判定只看键在不在
+---@param ttl_secs number|nil @ 兜底过期（watcher 每轮续,正常不靠它掉）
+---@return boolean written
+function M.set_temp_disable(id, reason, ttl_secs)
+    local seconds = tonumber(ttl_secs)
+    if not seconds or seconds <= 0 then
+        seconds = 45
+    end
+    return shdict():set(K_TEMP_DISABLE .. id, tostring(reason or "disabled"), seconds) and true or false
+end
+
+---清掉某 worker 的临时禁用位（探针恢复轮调用）。delete 幂等,键不存在也返回。
+---@param id string
+function M.clear_temp_disable(id)
+    shdict():delete(K_TEMP_DISABLE .. id)
+end
+
+---这台是否处于临时禁用。纯读,读不到一律 false（fail-open,与 capacity 门同一姿态）。
+---@param id string
+---@return boolean
+function M.is_temp_disabled(id)
+    return shdict():get(K_TEMP_DISABLE .. id) ~= nil
 end
 
 -- Late-bind the facade: registry.lua pre-registers package.loaded before it

@@ -445,6 +445,11 @@ function _M.new_config(getenv, self_ports, metrics_port)
         -- 探针摘除的滞回与保险丝，见 reconcile 的 removal 段与 probe_verdict。
         -- 阈值写 0 或负数 = 退回"首次传输层失败即摘"（测试与显式要求立即摘除）。
         probe_failures = num_from(getenv, "SMG_WATCHER_PROBE_FAILURES", 2),
+        -- 2026-10-09 用户裁定：探针「其他情况」(能应答但判它不是合格 worker：无
+        -- data[].id / router 自指纹 / 超 max_models) 默认**临时禁用保行**而非删行。
+        -- 置 0 退回旧行为（这三档当轮删行）。传输层未知(连不上)与 undiscovered 两档
+        -- 不受此开关影响,恒按累计/宽限走摘除。见 reconcile 的 reject 分流。
+        probe_temp_disable = bool_from(getenv, "SMG_WATCHER_PROBE_TEMP_DISABLE", true),
         probe_fuse = bool_from(getenv, "SMG_WATCHER_PROBE_FUSE", true),
         max_models = num_from(getenv, "SMG_WATCHER_MAX_MODELS", 8),
         require_health = bool_from(getenv, "SMG_WATCHER_REQUIRE_HEALTH", false),

@@ -553,11 +553,31 @@ local function candidates_for(model, profile, counted)
     --     upvalue in registry.keys.shdict, so omitting the `d` argument costs no lookup
     --     per candidate either.
     local price = counted and registry.capacity_state or nil
+    -- watcher 临时禁用门（2026-10-09 用户裁定）：探针「其他情况」(能应答但判它不是
+    -- 合格 worker：无 data[].id / router 自指纹 / 超 max_models) 不再删行,改打这把
+    -- shdict 位,这里逐候选排除。与 capacity 硬排除同范式:运行态读、装配时判定、
+    -- 不改 config;句柄缺失(单元探针桩、老 build)一律 fail-open 不排除,红线 4。
+    local td_check = registry.is_temp_disabled
+    if type(td_check) ~= "function" then
+        td_check = nil
+    end
     local capped = 0
     local refused = 0
+    local disabled = 0
     for i = 1, #records do
         local record = records[i]
         local keep = registry.is_available(record.id)
+        if keep and td_check then
+            local ok, off = pcall(td_check, record.id)
+            if ok and off == true then
+                keep = false
+                disabled = disabled + 1
+                if counted then
+                    observability.counter("smg_worker_temp_disabled_total", {})
+                    observability.log_debug("watcher temp-disable excluded ", record.url)
+                end
+            end
+        end
         local binding
         if keep and allow then
             local hit, index = record_in_allow_list(record, allow)
@@ -807,6 +827,7 @@ local function candidates_for(model, profile, counted)
     -- 有、让了几台」在 /metrics 之外还能按请求查。group 旗标保持缺席式缺省——那一个才真的
     -- 只服务 503 文案。
     return out, { capped = capped, refused = refused, idle = yielded,
+                  disabled = disabled,
                   stepped_aside = stepped_aside,
                   group = group ~= nil and true or nil }
 end

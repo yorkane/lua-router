@@ -14,6 +14,8 @@
 --   lo: act: xl: sl: pw: gu:   registry/loads       (xl:/pw:/gu: each has one
 --   xany                                           production writer: gpu_load.lua)
 --   job: disc: dpr: mp: mpok:  registry/discovery
+--   td:                        registry/loads       (watcher 临时禁用位；写者=watcher
+--                                                reconcile，读者=candidates 装配；带 TTL)
 -- Bypass writers that deliberately do not go through this module - do not "tidy" them:
 --   hb.lua:201/215        incr/set hf: and hs: (cross-process-safe counting)
 --   init.lua:184-200      reads and writes upstreams:applied_rev (APPLIED_REV_KEY here);
@@ -99,6 +101,10 @@ local K_POWER = "pw:"   -- raw power sample, milli-watts, TTL'd
 -- (_M.power_samples and the lr_gpu_load_power_* family keep their readers); only
 -- _M.capacity_exclusion stops reading it.
 local K_GPU_UTIL = "gu:" -- pure GPU utilisation sample, milli of a 0..1 fraction, TTL'd
+-- watcher 临时禁用位：探针「其他情况」(非服务下线、非 /v1/models 连不上) 判定的实例
+-- 保留 registry 行、只在候选装配时排除，探针恢复轮删键即自动回归。带 TTL 作泄漏兜底,
+-- 值存探针给出的 reason 文案。与 capacity 硬排除同范式:运行态 shdict、装配时判定、不落 config。
+local K_TEMP_DISABLE = "td:" -- present = 该 worker 被 watcher 临时禁用; 读不到 = 可用
 -- One shared "any sample exists anywhere" flag plus its per-process memo.
 --
 -- The writer is the load timer, which runs in worker 0 only; the readers are the
@@ -329,6 +335,7 @@ M.K_CBSTATE = K_CBSTATE
 M.K_DISC = K_DISC
 M.K_DPROBE = K_DPROBE
 M.K_GPU_UTIL = K_GPU_UTIL
+M.K_TEMP_DISABLE = K_TEMP_DISABLE
 M.K_HEALTH = K_HEALTH
 M.K_HFAIL = K_HFAIL
 M.K_HSEL = K_HSEL

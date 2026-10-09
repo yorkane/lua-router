@@ -243,6 +243,32 @@ local function make_unregister()
     end
 end
 
+---临时禁用接缝（用户裁定 2026-10-09）：写/清 registry 的 td: 键。与 make_unregister
+---同一注入形状——reconcile 从不自己 require registry（单元桩在 _G.ngx=nil 下跑,
+---真 registry 在裸 luajit 摸不到 shdict），一切跨域写都从 state.* 进来。
+local function make_temp_disable()
+    local registry = require "resty.luarouter.registry"
+    return function(worker_id, reason, ttl_secs)
+        local id = tostring(worker_id or "")
+        if id == "" then
+            return false
+        end
+        local ok, result = pcall(registry.set_temp_disable, id, reason, ttl_secs)
+        return ok and result and true or false
+    end
+end
+
+local function make_clear_temp_disable()
+    local registry = require "resty.luarouter.registry"
+    return function(worker_id)
+        local id = tostring(worker_id or "")
+        if id == "" then
+            return
+        end
+        pcall(registry.clear_temp_disable, id)
+    end
+end
+
 ---Current pool as url -> {id, model_id, is_healthy} (the daemon's GET /workers).
 ---@return table
 local function actual_pool()
@@ -510,6 +536,11 @@ function _M.run_pass(cfg, opts)
         end,
         register = make_register(conf),
         unregister = make_unregister(),
+        -- 临时禁用接缝（2026-10-09 用户裁定：探针「其他情况」保行排除，非删行）。
+        -- 与 register/unregister 同一注入形状：reconcile 不自己 require registry，
+        -- 桩环境（_G.ngx=nil）把这两只塞进 state 即可，真环境走 registry 的 td: 键。
+        temp_disable = make_temp_disable(),
+        clear_temp_disable = make_clear_temp_disable(),
         -- GPU 归属补给的唯一写入接缝（reconcile 的 annotate_gpu_labels 用）。
         patch_gpu_label = make_patch_labels(),
         stats = {

@@ -594,6 +594,25 @@ function _M.reconcile(state)
         fail_threshold = 1
     end
     local probe_verdict_of, probe_evicting = {}, 0
+    -- 2026-10-09 用户裁定：物理摘除只留两个信号——服务下线(undiscovered,走下面
+    -- 宽限分支)与 /v1/models 无法访问(count 档「no /v1/models answer」,含连不上/
+    -- 超时,保持累计摘除)。探针「能应答却判它不是合格 worker」的 reject 三档
+    -- (无 data[].id / router 自指纹 / 超 max_models)属「其他情况」,改走临时禁用
+    -- 保行:registry 行不动、只打 td: 键让候选装配排除它,探针恢复轮 clear 即回归。
+    -- 不进 probe_evicting 计数(它永远不删,喂进保险丝分母就是虚报战果)。
+    -- SMG_WATCHER_PROBE_TEMP_DISABLE=0 退回旧行为(这三档当轮删行)。
+    local function temp_disable_reason(reason)
+        if reason == "/v1/models answers without data[].id"
+            or reason == "it is a router, not a worker" then
+            return true
+        end
+        if type(reason) == "string"
+            and string.find(reason, "advertises ", 1, true) == 1 then
+            return true
+        end
+        return false
+    end
+    local temp_disable_on = cfg.probe_temp_disable ~= false
     for _, url in ipairs(env_mod.sorted_keys(owned)) do
         local entry = owned[url]
         local failed = entry and not desired[url] and state.actual[url]
@@ -604,8 +623,13 @@ function _M.reconcile(state)
         -- get blamed for the delete that could not remove it.
         if failed and not _M.is_config_member(state, url) then
             if failed.verdict == "reject" then
-                probe_verdict_of[url] = { verdict = "release", reason = failed.reason }
-                probe_evicting = probe_evicting + 1
+                if temp_disable_on and temp_disable_reason(failed.reason) then
+                    probe_verdict_of[url] = { verdict = "temp_disable",
+                        reason = failed.reason }
+                else
+                    probe_verdict_of[url] = { verdict = "release", reason = failed.reason }
+                    probe_evicting = probe_evicting + 1
+                end
             else
                 local fails = (tonumber(entry.probe_fails) or 0) + 1
                 if fails >= fail_threshold then
@@ -666,7 +690,27 @@ function _M.reconcile(state)
             stats.probe_failures = (stats.probe_failures or 0) + 1
             entry.probe_fails = decided.fails
         end
-        if decided.verdict == "bump" then
+        if decided.verdict == "temp_disable" then
+            -- 保行、打位、每轮 warn（靠 entry.warned 静音,与 keep-it 分支同形）。
+            -- 不受 fuse 与 allow_remove 约束:这条分支从不删行,保险丝与「只许加
+            -- 不许删」约定管的都是删除,与临时禁用正交。
+            -- 走 state.temp_disable 接缝（live.lua 注入的闭包）,reconcile 不碰 registry。
+            if type(state.temp_disable) == "function" then
+                local worker_id = tostring(entry.worker_id or "")
+                if worker_id ~= "" then
+                    local ttl = (tonumber(cfg.interval_secs) or 15) * 3
+                    state.temp_disable(worker_id, decided.reason, ttl)
+                end
+            end
+            if not entry.warned then
+                warn(state.log, string.format(
+                    "watcher: %s fails the strict /v1/models probe (%s); temporarily disabled, keeping the row",
+                    url, tostring(decided.reason or "unknown")))
+                entry.warned = true
+            end
+            entry.temp_disabled = true
+            ledger.set_owned(url, entry, state.entry_ttl)
+        elseif decided.verdict == "bump" then
             ledger.set_owned(url, entry, state.entry_ttl)
             -- Unlike the other keep-it branches this one may log every round: the
             -- wait is bounded by the threshold, and an engine that starts timing out
@@ -717,6 +761,16 @@ function _M.reconcile(state)
                 -- never reach if each flap started from zero.
                 entry.probe_fails = nil
                 ledger.set_owned(url, entry, state.entry_ttl)
+                -- 探针恢复轮：清掉临时禁用位,该 worker 立刻回到候选池（TTL 键本就
+                -- 会自愈,显式清一次让回归即时、不靠过期兜底）。pcall 兜住桩环境里
+                -- registry 被换掉缺这个方法的极端情况,失败=键靠 TTL 掉,不影响判定。
+                if entry.temp_disabled then
+                    entry.temp_disabled = nil
+                    if type(state.clear_temp_disable) == "function" then
+                        state.clear_temp_disable(tostring(entry.worker_id or ""))
+                    end
+                    ledger.set_owned(url, entry, state.entry_ttl)
+                end
                 -- Guard 8: a router restart/reload re-creates workers with fresh
                 -- ids, so keep the recorded id in step with the pool.
                 local live = state.actual[url]
