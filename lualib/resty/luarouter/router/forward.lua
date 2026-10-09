@@ -782,8 +782,10 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
 
             elseif is_stream then
                 -- Commit status and headers, then copy bytes. The breaker outcome
-                -- is recorded when the stream ends, never from the status line, so
-                -- a "200 then broken pipe" worker still counts as a failure.
+                -- is recorded when the stream ends, never from the status line
+                -- alone, so a "200 then broken pipe" worker still counts as a
+                -- failure; the status only carries the non-stream 4xx exemption
+                -- (see hb.record_stream_outcome).
                 ngx.status = status
                 apply_response_headers(response.headers)
                 if status < 400 and not ttft_recorded then
@@ -801,7 +803,7 @@ local function forward(route, body, raw_body, model, text, incoming, profile, al
                     stream_response(response.sock, response.headers,
                         response.kind, worker.url, conf, inject_usage)
                 release_load(worker)
-                hb.record_outcome(worker.id, stream_ok and status < 400)
+                hb.record_stream_outcome(worker.id, status, stream_ok)
                 if not stream_ok then
                     observability.record_worker_error(worker.url, "backend_error")
                 end

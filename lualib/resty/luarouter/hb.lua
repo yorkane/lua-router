@@ -414,4 +414,18 @@ function _M.record_status(id, status)
     _M.record_outcome(id, not _M.breaker_failed(status))
 end
 
+---Charge a *streaming* outcome to the breaker, with the same 4xx exemption rule
+---as record_status. A stream that carries a client error (a malformed image gets
+---a 400 from sglang) proves the worker answered, so it must not open the circuit;
+---408/429 still do, and so does a stream that died mid-flight (stream_ok=false)
+---regardless of the status line -- that is the transport failure the breaker is
+---for. With stream_ok=true this is exactly record_status, which is the invariant
+---the two forward.lua branches must keep.
+---@param id string
+---@param status number
+---@param stream_ok boolean @ false when the stream broke before its end
+function _M.record_stream_outcome(id, status, stream_ok)
+    _M.record_outcome(id, stream_ok and not _M.breaker_failed(status))
+end
+
 return _M
