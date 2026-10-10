@@ -123,6 +123,15 @@ def start_two(policy, tag, worker_processes=None, config_file=""):
         env["NGINX_WORKER_PROCESSES"] = str(worker_processes)
     if config_file:
         env["LMR_CONFIG_FILE"] = config_file
+    else:
+        # 2026-10-09 起 entrypoint 给「什么存储 env 都不给」的裸容器注入默认
+        # LMR_CONFIG_FILE 走 sqlite（单实例缺省）。本文件的 E 靠 docker restart 钉
+        # 「不落盘 = 重启即丢」这条边界，D 还要在 NGINX_WORKER_PROCESSES=4 下验多进程
+        # 一致性（sqlite 有已知的 fork 降级到 file 的行为，见 doc/gap-config-store.md §6）,
+        # 两者都必须跑在「无落盘的纯内存态」上才等于改动前的逐字节行为。显式
+        # LMR_CONFIG_STORE_BACKEND=file 就是绕开新默认、拿回老内存态的开关（entrypoint
+        # 见此值不注入任何路径）。config_file 非空的调用方（本文件目前没有）仍走 sqlite。
+        env["LMR_CONFIG_STORE_BACKEND"] = "file"
     name = "lr-rdyn-%s-%s" % (tag[:24], RUN)
     port = start_router(env, name)
     check("[%s] both workers healthy" % tag, wait_ready(port), logs(name))

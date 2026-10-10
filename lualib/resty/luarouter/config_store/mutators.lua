@@ -16,6 +16,11 @@ local CS_SNAPSHOT = require "resty.luarouter.config_store.snapshot"
 
 local _M = {}
 
+-- The three capacity ceilings, in the one spelling the whole store uses (the
+-- roster lives in upstreams.lua so parse / drift / patch / snapshot / the two
+-- mutators below cannot drift apart from it).
+local CAP_FIELDS = CS_UPSTREAMS.CAP_FIELDS
+
 --- Persist-then-echo for every mutator below: the durable layers have to answer
 --- before a caller can honestly show a document. On a refused compare-and-set the
 --- mutator returns (nil, error) like any other validation failure, so no handler ever
@@ -343,6 +348,149 @@ function _M.apply_upstreams(entries)
     -- 「隐藏 / 禁用」名册（readers.lua 的 hidden_state）的本进程缓存必须一并作废。
     CS_FACADE._hidden_view_dirty = true
     return summary, nil
+end
+
+--- Does this declared row still say a limit on any of the three tiers? Used by
+--- the mirror mutator to decide when a row has been cleared back to nothing.
+local function row_declares_caps(row)
+    for _, field in ipairs(CAP_FIELDS) do
+        if CS_UPSTREAMS.cap_normalize(field, row[field]) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+--- Find the declared row whose url normalizes to `canonical` (nil when the
+--- section does not carry that endpoint). Compared on the normalized spelling
+--- because pool rows can arrive as `http://H:P/` from the probe while the
+--- operator typed `http://h:p`.
+local function upstream_row_for(cfg, canonical)
+    for i, item in ipairs(cfg.upstreams or {}) do
+        if type(item) == "table"
+            and (CS_PROFILES.norm_pool_url(item.url) or item.url) == canonical then
+            return item, i
+        end
+    end
+    return nil, nil
+end
+
+--- Mirror the three capacity ceilings of one worker into the declaration layer
+--- (user ruling 2026-10-09, doc/gap-worker-caps.md §4).
+---
+--- Why this exists at all: the worker record lives only in the lr_workers
+--- shdict, so anything the control plane PUT was gone on `docker restart` --
+--- SMG_WORKER_URLS re-seeds a bare row and the ceiling the operator believes is
+--- closed reopens. The declaration section is the only layer that survives a
+--- restart, and reconcile's protected-row branch already projects caps back onto
+--- a row it does not own, so mirroring here is enough to make the ceiling
+--- outlive the container without teaching the pool layer to write to disk.
+---
+--- Row-level upsert, not the whole-list replace that apply_upstreams does: the
+--- control plane knows one worker, and replacing the section from a single
+--- worker's view would silently reclaim every *other* declared config row
+--- (reconcile's removal loop treats a missing row as "the operator deleted
+--- it"). Identity fields are never written here -- a row that only ever came
+--- from this mutator carries url plus caps, which is exactly what
+--- CS_UPSTREAMS.caps_only_row recognizes and what lets DELETE /workers clean
+--- the memory up again.
+---
+---@param url string @ the worker's url (any spelling; normalized here)
+---@param caps table @ field -> raw value, for the tiers the body *named*;
+---   a named tier whose value normalizes to "unlimited" (concurrency <= 0,
+---   util negative / non-numeric) clears that tier rather than storing it.
+---@return table|nil summary @ reconcile counters, or nil on failure
+---@return string|nil err
+function _M.apply_upstream_caps(url, caps)
+    local canonical = type(url) == "string" and CS_PROFILES.norm_pool_url(url) or nil
+    if not canonical then return nil, "worker url is required" end
+    if type(caps) ~= "table" then return nil, "caps must be an object" end
+
+    -- Normalize through the *same* readers the pool side uses (declared_cap /
+    -- declared_util dispatch on the tier, and the util tier cannot borrow the
+    -- concurrency one -- 0 is its strictest gate, not an absence). Nothing is
+    -- validated by a private second rulebook here: the shape decisions live in
+    -- upstream_from_entry, which the create branch below reuses verbatim.
+    local said = {}
+    for _, field in ipairs(CAP_FIELDS) do
+        local value = rawget(caps, field)
+        if value ~= nil and value ~= JSON_NULL then
+            said[field] = value
+        end
+    end
+    if next(said) == nil then return {}, nil end
+
+    local cfg = CS_FACADE.current()
+    local row, index = upstream_row_for(cfg, canonical)
+    if not row then
+        -- Minimal row: url + the ceilings only, built by the section's own
+        -- validator so an out-of-range value (max_concurrency > 32, a
+        -- fractional min tier, a util that is not a whole percentage) is the
+        -- same 400-shaped error the console gets from POST /config/upstreams.
+        local entry = { url = canonical }
+        for field, value in pairs(said) do entry[field] = value end
+        local built, err = CS_UPSTREAMS.upstream_from_entry(entry, #(cfg.upstreams or {}) + 1)
+        if not built then return nil, err end
+        if not (cfg.upstreams and next(cfg.upstreams) ~= nil) then
+            cfg.upstreams = {}
+        end
+        cfg.upstreams[#cfg.upstreams + 1] = built
+    else
+        for field, value in pairs(said) do
+            local normalized = CS_UPSTREAMS.cap_normalize(field, value)
+            if normalized == nil then
+                row[field] = nil
+            else
+                row[field] = normalized
+            end
+        end
+        -- Every tier back to "unlimited" and the row remembers nothing: drop it,
+        -- but only while it is still a pure mirror. A row the operator declared
+        -- with identity / key / priority is theirs to keep -- clearing a ceiling
+        -- from the console must not delete their declaration.
+        if not row_declares_caps(row) and CS_UPSTREAMS.mirror_shaped_row(row) then
+            table.remove(cfg.upstreams, index)
+        end
+    end
+
+    local saved, serr, scur = CS_PERSISTENCE.write_snapshot(CS_SNAPSHOT.snapshot_of(cfg))
+    if not saved then return nil, CS_PERSISTENCE.store_conflict_message(serr, scur) end
+    local summary = CS_FACADE.reconcile_upstreams()
+    CS_FACADE._hidden_view_dirty = true
+    return summary, nil
+end
+
+--- Forget the mirrored caps of one worker when the worker itself is deleted
+--- (user ruling 2026-10-09, doc/gap-worker-caps.md §4).
+---
+--- The resurrection this closes: a pool row can disappear without going through
+--- DELETE /workers -- the probe reaps a non-protected row by calling
+--- registry.remove directly (watcher/live.lua make_unregister). If the caps
+--- mirror were left behind, the next reconcile would find a declared row with no
+--- pool record and take its add branch, which materializes the worker as
+--- discovery="config": the deleted worker comes back *and* changes ownership.
+--- (reconcile's add branch now refuses pure mirrors, so this cleanup is belt;
+--- that guard is braces.) Removing the memory here is what keeps the document
+--- honest rather than merely inert.
+---
+---@param url string
+---@return boolean removed @ true when a pure mirror row was deleted
+---@return string|nil err
+function _M.drop_upstream_caps(url)
+    local canonical = type(url) == "string" and CS_PROFILES.norm_pool_url(url) or nil
+    if not canonical then return false, "worker url is required" end
+    local cfg = CS_FACADE.current()
+    local row, index = upstream_row_for(cfg, canonical)
+    if not row then return false, nil end
+    -- Anything the declaration layer genuinely owns stays put: deleting a live
+    -- worker is a pool operation, not a licence to erase the operator's row.
+    if not CS_UPSTREAMS.caps_only_row(row) then return false, nil end
+    table.remove(cfg.upstreams, index)
+    local saved, serr, scur = CS_PERSISTENCE.write_snapshot(CS_SNAPSHOT.snapshot_of(cfg))
+    if not saved then return false, CS_PERSISTENCE.store_conflict_message(serr, scur) end
+    CS_FACADE.reconcile_upstreams()
+    CS_FACADE._hidden_view_dirty = true
+    return true, nil
 end
 
 --- Routing-policy patch. Body accepts three independent sections, all optional

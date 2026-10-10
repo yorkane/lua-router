@@ -20,10 +20,10 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261008-080618.log`（tier=full、`KEEP_GOING=1`、
-`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `71ac5d4`）。代码基线：
-`lualib/` **75 个 Lua 文件 / 36 110 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
-单测 16 文件、契约 **691 项 / 24 段**、文档 30 份。
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261010-043633.log`（tier=full、`KEEP_GOING=1`、
+`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `c829642`）。代码基线：
+`lualib/` **75 个 Lua 文件 / 36 407 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
+单测 18 文件、契约 **687 项 / 24 段**、文档 36 份。
 
 > 锚点取在 2026-10-05 的重构树上：facade + 子模块拆分（router / config_store / registry /
 > watcher / gpu_load / mesh / observability）+ 公共传输库 `httpc.lua` + UI 入口迁移
@@ -36,13 +36,15 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 > 当前锚点（2026-10-06）在重构树之上再叠一轮**容量语义重设计**（用户裁定）：并发上下限三态 +
 > GPU 利用率上限取代功率上限 + 绿灯优先选路 + 全池到顶 429，契约新增 `caps` 段（23 项；退役键不再单独钉）。执行契约见
 > [doc/caps-redesign-2026-10-06.md](doc/caps-redesign-2026-10-06.md)，实现口径见
-> [doc/gap-worker-caps.md](doc/gap-worker-caps.md)。
+> [doc/gap-worker-caps.md](doc/gap-worker-caps.md)。控制面设的容量上限（`PUT/POST /workers` 的
+> `max_concurrency` / `min_concurrency` / `max_gpu_util`）现经声明层 `upstreams` 段持久化，活过容器
+> 重建；`DELETE /workers` 连带清除其镜像行。口径见 doc/gap-worker-caps.md §4（用户裁定 2026-10-09）。
 
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
-| unit | luajit 15 + resty 4 口径 | luajit 侧 tree 67 / tree_bounds 44 / state_bounds 51 / observability 35 / policies 118 / hash 795 / mesh 391 / watcher 425 / gpu_load 402 / routing_dyn 122 / profiles 907 / caps_routing 157 / models_shape 124 / models_advertise 74 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
-| contract | **691 / 0 failed / 2 notes** | 24 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
+| unit | luajit 16 + resty 4 口径 | luajit 侧 tree 67 / tree_bounds 44 / state_bounds 51 / observability 35 / policies 118 / hash 795 / mesh 391 / watcher 461 / gpu_load 489 / routing_dyn 122 / profiles 907 / caps_persist 70 / caps_routing 157 / models_shape 130 / models_advertise 74 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
+| contract | **687 / 0 failed / 2 notes** | 24 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 26 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写、卡片档位 env 层穿透 worker |
 | e2e_stateful | 101 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
 | e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入 |
@@ -57,13 +59,13 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | e2e_token_accounting | 62 / 0 | 流式 include_usage 透明注入+剥帧、四类 token 指标、400 兜底 sticky |
 | e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry（mock 的 /metrics 带 `gpu` 标签，利用率通道走同一条路；逐卡归属与容量判定的断言在 e2e_caps S3/S3b） |
 | e2e_routing_dyn | 51 / 0 | 路由动态变更：全局与 per-model 策略热切换免重启、非法名 400 不生效 |
-| e2e_caps | 162 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务容量三态（S2 三态与 `load_state`、S3/S3b GPU 利用率上限与**逐卡归属**、S4 亲和被打断、S5 全池到顶 **429**、S5b 对照 503、S5c 缺省零变化、S5d 声明层三字段边界、S8 caps 跨重启存活；读数缺失不排除、上限不摘健康） |
+| e2e_caps | 199 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务容量三态（S2 三态与 `load_state`、S3/S3b GPU 利用率上限与**逐卡归属**、S4 亲和被打断、S5 全池到顶 **429**、S5b 对照 503、S5c 缺省零变化、S5d 声明层三字段边界、S8 声明层 caps 跨重启存活、**S9 控制面 PUT/POST /workers 的上限镜像进声明层并活过两次 docker restart（含删 worker 清镜像、孤儿不复活、config 行不走镜像）**；读数缺失不排除、上限不摘健康） |
 | e2e_models_advertisement | 210 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 + S12 卡片档位勾选（探测基线 / 勾选接管 / 判定面只跟引擎说过的） |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
-契约 691 的 24 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
-not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 69、tls_upstream 11、
-cb_race 6、igw 7、caps 25、discovery 5、prometheus 14、probes 29、cors 37、virtual_models 15、
+契约 687 的 24 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
+not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 64、tls_upstream 11、
+cb_race 6、igw 7、caps 23、discovery 5、prometheus 17、probes 29、cors 37、virtual_models 15、
 ratelimit 14、inflight_age 32、tls_server 19、profiles_upstreams 64。
 
 ## 目录
@@ -79,7 +81,7 @@ ratelimit 14、inflight_age 32、tls_server 19、profiles_upstreams 64。
 | `ui/` | 原版 llama.cpp webui（规范入口 `/u/`）+ `ui/admin/`（Quasar UMD 管理台四页，规范入口 `/`（站点根，由模板的 `location /` 提供）：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（href 指 `/`；旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`）。控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField 渲染，`:hint` 不生成 `.q-field__bottom`，说明文字只能并进 `:label` |
 | `test/final_gates.sh` | 22 门硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING` / `GATE_JOBS` / `GATE_DRY_RUN`） |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），24 段 |
-| `test/unit/` | 纯 Lua 单测 16 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑） |
+| `test/unit/` | 纯 Lua 单测 18 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑）；`test_caps_persist` 钉控制面 caps 的持久化镜像判定层（用户裁定 2026-10-09，见 doc/gap-worker-caps.md §4） |
 | `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps / models_advertisement（`models_advertisement` 钉 `/v1/models` 的对外形状，2026-10-04 随第 22 门加入 GATE_ORDER） |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
 | `doc/` | 现状文档 30 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |
@@ -395,7 +397,8 @@ watcher 的覆盖探针和客户端的模型选择全按 id 建，动了会连�
 | `LMR_MODEL_EFFORT_LEVELS` | 每模型**对外声明的允许档位**＝卡片 `model_configs[].reasoning_efforts` 的平铺 env 写法，形状照 `LMR_MODEL_MODALITIES`：`model:low+medium+high`（多模型逗号分隔；值侧统一按「非字母」切，逗号 / 分号 / 空白 / 竖线都可）。档位名一律过八档词表，拼错的那一档整件丢弃——env 层的垃圾值历来是忽略，不替操作员猜一个近似名；空 value（`model=`）= 整行没说，不建卡。作用与卡片完全同一条：决定 `/v1/models` 的 picker 内容与顺序，判定面只收窄不扩面（见〈档位阶梯：探测 + 手动勾选〉与 doc/gap-effort-ladder.md）。已在 `config_store.ENV_NAMES` 登记（漏登记 = nginx 把它从 worker 环境剥掉，配了也不响） |
 | `LMR_VIRTUAL_MODELS` | 虚拟服务入口的 env 形态 `alias:real`（逗号 / 分号 / 换行分隔多对），只能生成单 target 条目；1 对多的 `targets` 组、逐实例 `candidates` 绑定与条目级 `context_window` 只能经 `/config` 写。条目级 `context_window` 是**对外声明的上下文总窗口（输入+输出）**，作用只是让客户端更早触发压缩；它不是输出预算，也不参与 max_tokens 计算，网关与 UI 都不拿它跟卡片的 `max_output_tokens` 做比较（用户裁定 2026-10-08） |
 | `LMR_MODEL_MODALITIES` | `/props` 广告的能力位（`text,image`） |
-| `LMR_CONFIG_FILE` | RuntimeConfig 原子落盘路径，reload/重建后恢复；未设 = 内存态 |
+| `LMR_CONFIG_FILE` | RuntimeConfig 原子落盘路径，reload/重建后恢复。**未设时**裸容器由 `docker-entrypoint.sh` 缺省注入 `/data/lua-router/runtime.json` 走 sqlite 单实例持久化（该目录不挂 volume 则随 compose 重建丢，要跨重建耐久须挂 volume，同生产 compose）；只有**显式** `LMR_CONFIG_STORE_BACKEND=file` 才回到无落盘的纯内存态 |
+| `LMR_CONFIG_STORE_BACKEND` | 配置持久化后端：`sqlite`（缺省，单实例）/ `postgres`（多实例共享）/ `file`（显式回滚＝无落盘内存态）。sqlite 需要一个可派生的 db 路径（`LMR_CONFIG_STORE_PATH`，或由 `LMR_CONFIG_FILE` 派生 `.db`）；都没有时由 entrypoint 注入默认 `LMR_CONFIG_FILE`，显式 `file` 让裸容器保持 env-only 内存态 |
 | `LMR_UI_DIR` / `LMR_UI_ROUTER_MODE` | 静态 SPA 目录（默认 `/usr/local/share/llama-ui`）/ 路由模式开关。`SMG_UI_DIR` 由入口脚本映射到 `LMR_UI_DIR`（两者同时给出时 `LMR_` 优先），裸 conf 直跑只认 `LMR_UI_DIR` |
 | `LMR_REQUEST_LOG_CAPACITY` / `LMR_LOGS_BUFFER` | 请求日志环形缓冲容量，**`0` = 关闭，四个 `/logs*`、`/stats` 转 503** |
 | `LR_STATS_WINDOW_S` | `/stats` 的聚合窗口（缺省 10s）；空窗口的 `avg_*` 为 null |

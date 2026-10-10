@@ -502,6 +502,77 @@ local function upstream_caps_only_patch(item, record)
     end
     return patch
 end
+
+--- Shape half of the mirror-row verdict: does this declared row say nothing
+--- besides its url and (possibly) capacity caps? Kept separate from
+--- `caps_only_row` below because the clear path needs this half *without* the
+--- "at least one tier is live" requirement -- a mirror row whose tiers have all
+--- been cleared back to unlimited is still a mirror, and it is exactly the row
+--- that has to stop existing (an empty mirror is what reconcile would later
+--- mistake for a declaration, and what DELETE /workers can no longer clean up).
+---
+--- "Default value = not declared" is the load-bearing half of this judgment.
+--- snapshot_of materializes priority=50 / cost=1.0 / labels={} /
+--- disable_health_check=false / api_key_state="keep" onto *every* row and
+--- cfg_from_document reads them back, so after one disk round-trip a mirror row
+--- no longer looks like {url, caps} -- it is full of default-shaped keys.
+--- Comparing raw key presence would un-recognize mirror rows the first time
+--- they touch disk, and the cleanup would silently stop firing; the failure you
+--- then ship is a resurrected worker with flipped ownership.
+---@param item table @ declared row (cfg.upstreams shape)
+---@return boolean
+local function mirror_shaped_row(item)
+    if type(item) ~= "table" then return false end
+    if item.url == nil or item.url == JSON_NULL then return false end
+    -- An operator-declared identity (a real model_id, an advertised list) makes
+    -- the row theirs again, whatever caps it happens to carry.
+    if type(item.model_id) == "string" and CS_LEXICON.trim(item.model_id) ~= ""
+        and item.model_id ~= "unknown" then
+        return false
+    end
+    if item.models ~= nil and item.models ~= JSON_NULL and #item.models > 0 then
+        return false
+    end
+    local priority = tonumber(item.priority)
+    if priority ~= nil and priority ~= 50 then return false end
+    local cost = tonumber(item.cost)
+    if cost ~= nil and cost ~= 1.0 then return false end
+    if item.labels ~= nil and item.labels ~= JSON_NULL and next(item.labels) ~= nil then
+        return false
+    end
+    if item.disable_health_check == true then return false end
+    -- keep is the spelling every row carries; anything else said something
+    -- about the secret, and a secret lives in a declaration, not in a mirror.
+    if item.api_key_state ~= nil and item.api_key_state ~= JSON_NULL
+        and item.api_key_state ~= "keep" then
+        return false
+    end
+    if item.api_key_stored ~= nil and item.api_key_stored ~= JSON_NULL then
+        return false
+    end
+    return true
+end
+
+--- True when a declared row carries *nothing but* its url and capacity caps,
+--- i.e. it exists only to remember caps that the control plane set (the user
+--- ruling 2026-10-09 made PUT/POST /workers mirror the three ceilings into this
+--- section so they survive a restart -- doc/gap-worker-caps.md §4). Two
+--- consumers: reconcile's add branch refuses to materialize such a row as a
+--- worker (it would resurrect a deleted pool row *and* claim ownership for it),
+--- and mutators.drop_upstream_caps / the clear path of apply_upstream_caps use
+--- the same verdict to decide when a mirror may be deleted.
+---@param item table @ declared row (cfg.upstreams shape)
+---@return boolean
+local function caps_only_row(item)
+    if not mirror_shaped_row(item) then return false end
+    -- And it has to actually *be* a caps row: one tier at least says a limit.
+    for _, field in ipairs(CAP_FIELDS) do
+        if cap_normalize(field, item[field]) ~= nil then
+            return true
+        end
+    end
+    return false
+end
 --- 红线口径（doc/gap-worker-caps.md 第 312 行第 4 项）。原话「手填配置不能凭它判死一个健康
 --- 实例」被落地成了「protected 行整行不许声明层碰」，这个表述会误导下一个人继续绕开 caps
 --- （本函数存在的全部理由就是那次误解）。红线保护的对象是身份与健康判定：discovery、
@@ -556,6 +627,18 @@ function _M.reconcile_upstreams()
         local slot = by_endpoint[key]
         local record = slot and slot.chosen
         if not record then
+            -- A pure caps mirror is a memory, not a request to own the
+            -- endpoint. The pool row it describes is gone -- deleted through
+            -- DELETE /workers, or reaped by a path that never reaches the
+            -- control-plane handler (watcher/live.lua's make_unregister calls
+            -- registry.remove directly) -- so adding it back here would
+            -- resurrect the worker *and* hand it discovery="config". Stay
+            -- silent, count the skip: the row becomes live again -- as a caps
+            -- projection, ownership untouched -- the moment anything re-seeds
+            -- that url into the pool (bootstrap, watcher, POST /workers).
+            if caps_only_row(item) then
+                summary.skipped = summary.skipped + 1
+            else
             local res, aerr, kind = reg.add({
                 url = item.url,
                 -- Same pass-through as the patch path: registry.add seeds the record's
@@ -590,6 +673,7 @@ function _M.reconcile_upstreams()
                     CS_LEXICON.ngx_log_warn("luarouter upstream add failed for ", item.url, ": ", aerr)
                 end
                 summary.skipped = summary.skipped + 1
+            end
             end
         elseif record.discovery == "config" then
             if upstream_drifts(item, record) then
@@ -673,8 +757,11 @@ end
 -- 的落盘段与 reconcile 的三条写路径都从这同一份名单取值，字段不在两个文件里各写一遍。
 -- 不是导出面契约的一部分（老 _M 契约逐名不变），只是跨子模块共用。
 _M.CAP_FIELDS = CAP_FIELDS
+_M.cap_normalize = cap_normalize
+_M.mirror_shaped_row = mirror_shaped_row
 _M.build_upstreams = build_upstreams
 _M.previous_upstream_map = previous_upstream_map
+_M.caps_only_row = caps_only_row
 _M.sanitize_upstream_rows = sanitize_upstream_rows
 _M.upstream_from_entry = upstream_from_entry
 

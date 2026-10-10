@@ -213,6 +213,29 @@ NOFILE_LIMIT=$((WORKER_CONNECTIONS * 2))
 ulimit -n "$NOFILE_LIMIT" 2>/dev/null || true
 mkdir -p "$(dirname "$ERROR_LOG_PATH")" "$OPENRESTY_PREFIX/logs"
 
+# 单实例 sqlite 缺省（用户 2026-10-09）：裸容器（既不给 LMR_CONFIG_FILE 也不给
+# LMR_CONFIG_STORE_PATH）过去什么落盘都没有——store_sqlite.db_path() 拿不到路径就
+# available() 假，dispatcher 降级 file，file 也要 LMR_CONFIG_FILE，于是只剩 env 层，
+# 配置随容器销毁即丢。这里给一个默认落点，让「什么都不配」的部署开箱即上 sqlite
+# （后端缺省本就是 sqlite，见 store_dispatcher.DEFAULT_BACKEND；缺的只是「有没有可
+# 派生的 db 路径」这一步）。
+#   · 操作员显式 LMR_CONFIG_STORE_BACKEND=file = 明确要「无落盘的纯内存态」（老行为,
+#     也是 e2e_routing_dyn scenario E 靠 docker restart 钉「重启即丢」那条边界用的
+#     开关），此时什么都不注入，逐字节维持改动前行为。
+#   · 否则（BACKEND 未设 / sqlite / postgres / 未知值）且两个路径都没给 → 注入默认
+#     LMR_CONFIG_FILE，父目录建好（sqlite 打不开不存在的目录；建目录失败不弄挂启动）。
+#   · 操作员已显式给了 LMR_CONFIG_FILE 或 LMR_CONFIG_STORE_PATH 的一律尊重,绝不覆盖。
+# 提醒：不挂 volume 时 /data/lua-router 落在容器可写层，compose 重建即丢——要跨重建
+# 耐久必须像生产 compose 那样把该目录挂成 volume。
+_STORE_BACKEND="${LMR_CONFIG_STORE_BACKEND:-}"
+_STORE_BACKEND="$(printf '%s' "$_STORE_BACKEND" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+if [ "$_STORE_BACKEND" != "file" ] && [ -z "${LMR_CONFIG_FILE:-}" ] && [ -z "${LMR_CONFIG_STORE_PATH:-}" ]; then
+    LMR_CONFIG_FILE="/data/lua-router/runtime.json"
+    export LMR_CONFIG_FILE
+    mkdir -p /data/lua-router 2>/dev/null || true
+fi
+unset _STORE_BACKEND
+
 if [ ! -s "$TEMPLATE_FILE" ]; then
     echo "error: missing runtime template: $TEMPLATE_FILE" >&2
     exit 1

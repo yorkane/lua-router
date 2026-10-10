@@ -388,9 +388,41 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
    **允许**投影到 protected 行（`config_store/upstreams.lua` 的 caps-only 分支，2026-10-05 提交 `3728821`
    立的口径，本轮把字段名册换成三字段）。理由是 caps 从不判死、只在超限时把请求迁走，下发它们不触碰
    「不能凭配置判死健康实例」这件事；而在此之前 protected 行整行不许碰的落地口径，会让操作员**没有任何
-   能活过重启的上限配法**（上限只进内存 shdict，重启即蒸发；e2e_caps S8 钉「caps 跨声明层与跨重启存活」）。
-   注意 caps **只下发不清除**：从声明里删掉不会立刻摘掉存量上限（下次重启自然消失），要当场摘用
-   `PUT /workers/{id}` 写该档的清除哨兵（并发 0 / 利用率 -1）。
+   能活过重启的上限配法**（e2e_caps S8 钉「caps 跨声明层与跨重启存活」）。
+
+   **控制面设的上限现在也持久化（用户裁定 2026-10-09，推翻本节旧口径「上限只进内存 shdict，重启即
+   蒸发」）。** 旧口径不是 bug，是当时只做了声明层那一半：`PUT /workers/{id}` 与 `POST /workers`
+   只写 `lr_workers`（全仓零落盘路径），容器一重建就由 `SMG_WORKER_URLS` 重新播种成裸记录，操作员在
+   服务池页那个「编辑 worker」弹窗里填的并发/利用率上限当场蒸发。现行做法是**镜像**：控制面写成功
+   后，把 body 里显式出现的三档上限行级 upsert 进声明层的 `upstreams` 段（`config_store.apply_upstream_caps`），
+   重启后由 reconcile 的 protected 分支（`upstream_caps_only_patch`）原样贴回。要点四条：
+
+   * **只镜像、不认领**：镜像行只有 url 加三档上限，reconcile 因此走的是 caps-only 分支，protected 行的
+     `discovery` / 身份 / 探活结论一个字都不动。判据 `caps_only_row`（`config_store/upstreams.lua`）刻意把
+     **默认值视为没说**——`snapshot_of` 会给每一行物化出 `priority=50` / `cost=1.0` / `labels={}` /
+     `disable_health_check=false` / `api_key_state="keep"`，落盘一次之后镜像行看着像"什么都写了"，按原始键
+     是否存在来判就会当场认不出，清理链静默失效（`test/unit/test_caps_persist.lua` 第 3 节用真磁盘往返钉死）。
+   * **尽力而为的写，绝不让 202 变 500**：内存更新才是 202 契约钉住的那一半（Rust 版压根没有落盘层），
+     所以镜像失败（CAS 被拒、存储不可用、值被校验挡下）只写一条 WARN 让它显形，响应体保持
+     `{status,worker_id,message}` 逐字节不变，内存里已经生效的上限也不回滚。失败的后果是窄而诚实的：
+     这道门现在有效、但活不过重建。
+   * **删除即清除 + 孤儿不复活**：`DELETE /workers/{id}` 连带摘掉**纯镜像**行（带别的操作员字段的声明行
+     保留——删一个活 worker 是池操作，不是抹掉人家声明的许可证）。只靠删除钩子不够：探针摘行走
+     `watcher/live.lua` 的 `make_unregister`，它直接调 `registry.remove`、不经过控制面，留下的孤儿镜像会被
+     reconcile 的 add 分支当成"操作员新建的一条声明"建成 `discovery="config"` —— 既复活又翻归属。因此 add
+     分支现在对 caps-only 行**沉默**（计入 skipped），这条守卫是主、删除钩子是补（e2e_caps S9 把两条各自
+     钉一遍：孤儿镜像不复活，与删 worker 后 `GET /config` 里不留残行）。
+   * **归属反过来也成立**：`discovery=="config"` 的行**不走镜像**。控制面 PUT 改的是运行时读数，声明层
+     那个数保持操作员写下的值 —— 若让 PUT 顺手改了声明，`upstream_patch` 的清除哨兵会在下一次自愈时
+     反过来把闸门静默打开。这条拒绝同样只在日志里显形（`caps mirror skipped`），202 不变。
+
+   caps 那侧的旧纪律不变：**只下发不清除**（从声明里删掉一个上限不会立刻摘掉存量上限，下次重启自然
+   消失，要当场摘用 `PUT /workers/{id}` 写该档的清除哨兵：并发 0 / 利用率 -1）。镜像因此也不引入新的
+   清除语义——它写的就是控制面那次 PUT 的读时归一结果（并发档过 `declared_cap`、利用率档过
+   `declared_util`，两档不能共用一个归一器，理由见本文 §1）。身份红线一个字没动：caps 从不判死，
+   `registry.update` 里那道 `discovery == "config"` 的门仍替所有非 config 行挡掉身份字段。
+   验证：`test/unit/test_caps_persist.lua`（判定层，70 checks）+ e2e_caps S9（端到端，37 checks，
+   含真 `docker restart` 后「上限当场真的挡住流量」的流量判据）。
 5. `registry/records.lua` 的 `all_models()` / `worker_models()` / `record_models()` 目前**暂无消费者**。
    写了但没接线这件事要登记在这里，别让人以为已经有读者。两条模型列表链各自用的是：对外
    `GET /v1/models` 走 `models()`（Rust 对拍钉住的那一列，`router/models_api.lua` 的 `models_handler`）；

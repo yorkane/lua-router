@@ -26,6 +26,14 @@
 
 **file** 是**显式回滚路径**，必须能逐字节复现存储层引入之前的行为。
 
+entrypoint 层的缺省（用户 2026-10-09）：`docker-entrypoint.sh` 对「既不设 `LMR_CONFIG_FILE`
+也不设 `LMR_CONFIG_STORE_PATH`」的裸容器注入默认 `LMR_CONFIG_FILE=/data/lua-router/runtime.json`
+（并建父目录），使缺省 sqlite 真正开起来——后端缺省一直是 sqlite，缺的只是「有没有可派生的
+db 路径」这一步。操作员**显式** `LMR_CONFIG_STORE_BACKEND=file` 时不注入任何路径，保持老的
+「无落盘＝纯内存态」；这也是 e2e_routing_dyn scenario E（docker restart 钉「重启即丢」）走的
+口径。默认落点不挂 volume 仍在容器可写层，跨重建耐久须把 `/data/lua-router` 挂成 volume（生产
+compose 已如此）。
+
 选 sqlite 缺省不是顺手，是权衡：21.k 与 235.t 之间访问不到 `/nas2`，一个 `.db` 文件跨不了机，
 而 shdict 已经覆盖了同机多 worker。sqlite 换来的**跨重启耐久**与**原子提交**是真需求，多机共享不是。
 

@@ -587,7 +587,12 @@ gate_unit() {
     # model 标签基数与导出扫描上限 —— 回归时不会有任何 HTTP 面症状，只有这些断言会红。
     # test_tree_bounds 单列而不并进 test_tree：后者是对齐 Rust 的语义基线，新增维度是
     # Lua 侧的超集，分文件才看得清哪条断言属于哪一边。
-    for t in test_tree test_tree_bounds test_state_bounds test_observability test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_routing test_models_shape test_models_advertise test_effort_layers; do
+    # test_caps_persist：控制面（PUT/POST /workers）设的三档上限经声明层镜像持久化
+    # 的判定层单测（用户裁定 2026-10-09，doc/gap-worker-caps.md §4）。它钉的四件事在
+    # HTTP 面上都看不到症状 —— 镜像行的 建/改/清/删、「默认值=没说」这条能扛住
+    # snapshot 往返的认得判据、孤儿镜像不被 reconcile 建成 config 行、删 worker 连带
+    # 清除。e2e_caps S9 钉的是端到端那一半（真 docker restart 后上限真的挡流量）。
+    for t in test_tree test_tree_bounds test_state_bounds test_observability test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_persist test_caps_routing test_models_shape test_models_advertise test_effort_layers; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done

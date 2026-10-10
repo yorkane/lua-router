@@ -1476,6 +1476,285 @@ def scenario_caps_persistence():
 PFX = ("cache-aware sticky conversation prefix " * 12) + " with a long shared body "
 
 
+# ============================================ S9 控制面上限的持久化镜像（用户裁定 2026-10-09）
+
+
+def config_upstream_rows(port):
+    """GET /config 的 upstreams 段，按 url 索引（声明层那一面，不是 /workers）。"""
+    st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
+    if st != 200:
+        return {}
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return {}
+    return {r.get("url"): r for r in (doc.get("upstreams") or [])
+            if isinstance(r, dict)}
+
+
+def wait_row_field(port, url, field, want, timeout=25):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = workers_by_url(port).get(url)
+        if row is not None and row.get(field) == want:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def wait_config_row(port, url, timeout=25):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = config_upstream_rows(port).get(url)
+        if row is not None:
+            return row
+        time.sleep(0.3)
+    return config_upstream_rows(port).get(url)
+
+
+def scenario_control_caps_persistence():
+    """控制面（PUT/POST /workers）设的三档上限必须活过容器重建。
+
+    这是 2026-10-09 用户报的第二半：S8 钉的是**声明层**写 caps 能存活，而操作员实际
+    用的是服务池页那个"编辑 worker"弹窗（走 PUT /workers/{id}），那条路以前只进内存
+    shdict，重建容器就被 SMG_WORKER_URLS 重新播种成裸记录，上限当场蒸发。现在的口径
+    是控制面写成功后把三档上限**镜像**进声明层 upstreams 段（行级 upsert），reconcile
+    的 protected 分支在重启后把它贴回去。
+
+    判别性（每条都是旧实现会红的地方）：
+      * 两行都由 SMG_WORKER_URLS 播种成 protected（与 21.k 生产 8 台同形状）：PUT 设的
+        max_concurrency 当场生效。旧实现绿（内存本来就写得进去）—— 这是前提，不是结论。
+      * PUT 之后 GET /config 长出该 url 的镜像行，且**只带 caps**（模型名不许被网关
+        替它编一个）；镜像行里**没有明文 api_key**：把上限镜像进声明层，绝不能顺手
+        把密钥面也带过去（契约 3.4 的脱敏口径）。
+      * 该行的 /workers 回显 discovery 仍是 "dynamic"：镜像是"记忆"，不是"认领"。若
+        镜像把 protected 行翻成 config，操作员手填的数就变成了操作员声明，探针学到
+        的身份会被声明盖掉 —— 这是这条链最容易埋的雷。
+      * PUT 的 202 响应体形状**逐字节不变**（Rust UpdateWorkerResult::into_response 的
+        {status,worker_id,message}）：镜像失败只许进日志，不许改响应，也不许把 202 变 500。
+      * docker restart 后上限自己回来，并且**当场真的挡流量**（沿用 S8 的判定：被限的
+        那台一条都不许多进）。只看字段回显不够 —— 看得见却没人执行正是本 bug 的形状。
+      * 手工 POST 注册、又 PUT 过上限的 worker：DELETE 之后镜像行必须一并消失，且
+        重启后**不复活**（不复活是 add 分支的 caps-only 守卫挡的，镜像行消失是 drop
+        钩子做的，两条分开钉：只留 add 守卫会在 GET /config 里留下一条谁也看不懂的
+        孤儿声明，只留 drop 钩子则会被探针摘除那条绕过 handler 的路复活）。
+      * discovery=="config" 的行**不走镜像**：PUT 改的是运行时读数，声明层那个数必须
+        保持操作员写下的值（否则控制面一次 PUT 就悄悄改了声明，而声明的清除哨兵还会
+        反过来把上限静默打开）。
+    """
+    tag = "S9-control-caps-persist"
+    pa, pb, pc = free_port(), free_port(), free_port()
+    start_mock_env(pa, "alpha", LATENCY_MS=4000)     # A = 被并发上限钉住的那台
+    start_mock(pb, "alpha")                           # B = 对照
+    start_mock(pc, "alpha")                           # C = POST 注册后删掉的那台
+    pd = free_port()
+    start_mock(pd, "alpha")                           # D = 声明层自建的 config 行（不进播种名册）
+    gw0 = GATEWAY_FALLBACK
+    seed_urls = "http://%s:%d,http://%s:%d" % (gw0, pa, gw0, pb)
+    cfg_file = "/tmp/lr-caps-ctl-%s.json" % RUN
+    # 显式给 LMR_CONFIG_FILE：本场景验的就是"声明层落盘"这一层，绝不依赖 entrypoint 的
+    # 缺省注入（那条另有 e2e 钉，混在一起红了就分不清是谁）。
+    port, name, gw = start_conf_container({"SMG_POLICY": "round_robin",
+                                           "SMG_ENABLE_IGW": "0",
+                                           "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+                                           "SMG_WORKER_URLS": seed_urls,
+                                           "LMR_CONFIG_FILE": cfg_file}, tag)
+    url_a, url_b = "http://%s:%d" % (gw, pa), "http://%s:%d" % (gw, pb)
+    if not check("[%s] both rows seeded and healthy" % tag,
+                 wait_urls(port, [url_a, url_b]), logs(name)[:400]):
+        stop_router(name)
+        return
+    check("[%s] premise: the bridge gateway is the address seeded" % tag, gw == gw0,
+          "inspect=%s seeded=%s" % (gw, gw0))
+    rows = workers_by_url(port)
+    check("[%s] premise: both rows are protected bootstrap seeds without caps" % tag,
+          (rows.get(url_a) or {}).get("discovery") == "dynamic"
+          and "max_concurrency" not in (rows.get(url_a) or {}),
+          json.dumps(rows.get(url_a, {}))[:300])
+    check("[%s] premise: the declaration layer is empty before the console PUT" % tag,
+        config_upstream_rows(port).get(url_a) is None,
+        json.dumps(list(config_upstream_rows(port)))[:200])
+
+    id_a = (workers_by_url(port).get(url_a) or {}).get("id")
+    st, doc = put_json(port, "/workers/%s" % id_a, {"max_concurrency": 1})
+    check("[%s] PUT /workers with a ceiling answers 202" % tag, st == 202,
+          "%s %s" % (st, json.dumps(doc)[:200]))
+    check("[%s] the 202 body shape is unchanged by the mirror (Rust contract)" % tag,
+          isinstance(doc, dict) and set(doc.keys()) == {"status", "worker_id", "message"},
+          json.dumps(doc)[:200])
+    if not check("[%s] the ceiling is live immediately (GET /workers)" % tag,
+                 wait_row_field(port, url_a, "max_concurrency", 1),
+                 json.dumps(workers_by_url(port).get(url_a, {}))[:300]):
+        stop_router(name)
+        return
+
+    mirrored = wait_config_row(port, url_a)
+    check("[%s] the PUT mirrored the ceiling into the declaration layer" % tag,
+          isinstance(mirrored, dict) and mirrored.get("max_concurrency") == 1,
+          json.dumps(mirrored)[:300])
+    # 镜像行不许顺手带出密钥面（契约 3.4：api_key 只能是 null / 缺席，永不明文）
+    blob = json.dumps(mirrored)
+    check("[%s] the mirrored row carries no plaintext api_key" % tag,
+          mirrored.get("api_key") in (None,) and "sk-" not in blob,
+          blob[:250])
+    check("[%s] the mirrored row did not invent an identity for the worker" % tag,
+          mirrored.get("model_id") in (None, ""), blob[:250])
+    check("[%s] the pool row is still protected (mirror never claims ownership)" % tag,
+          (workers_by_url(port).get(url_a) or {}).get("discovery") == "dynamic",
+          json.dumps(workers_by_url(port).get(url_a, {}))[:200])
+
+    # ---- 重启前先把上限坐实成"能挡住流量"
+    base0 = {p: mock_lines(p, "/v1/chat/completions") for p in (pa, pb)}
+    t0, held0 = chat_async(port, "alpha", "pre-restart hold",
+                           headers={"x-smg-target-worker": id_a}, timeout=60)
+    wait_inflight(port, url_a, 1, timeout=25)
+    ok0 = True
+    for _ in range(3):
+        st_b, _, _ = chat_sync(port, "alpha", "pre-restart burst", timeout=60)
+        ok0 = ok0 and st_b == 200
+    t0.join(timeout=30)
+    a0 = mock_lines(pa, "/v1/chat/completions") - base0[pa]
+    check("[%s] pre-restart: the mirrored cap already gates traffic" % tag,
+          ok0 and a0 == 1, "a=%d" % a0)
+
+    # ---- 重建容器：shdict 全清，唯一能依赖的是落盘的声明层
+    subprocess.run(["docker", "restart", name], capture_output=True)
+    port = published_port(name, port)
+    up = False
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if http("GET", "http://127.0.0.1:%d/health" % port, timeout=2)[0] == 200:
+            up = True
+            break
+        time.sleep(0.5)
+    if not check("[%s] router back after the restart" % tag, up, logs(name)[-300:]):
+        stop_router(name)
+        return
+    if not check("[%s] both rows re-seeded after the restart" % tag,
+                 wait_urls(port, [url_a, url_b], timeout=60), logs(name)[:400]):
+        stop_router(name)
+        return
+    check("[%s] the control-plane ceiling survived docker restart" % tag,
+          wait_row_field(port, url_a, "max_concurrency", 1, timeout=40),
+          json.dumps(workers_by_url(port).get(url_a, {}))[:300])
+    check("[%s] the mirror row is still on disk after the restart" % tag,
+          (config_upstream_rows(port).get(url_a) or {}).get("max_concurrency") == 1,
+          json.dumps(config_upstream_rows(port).get(url_a, {}))[:250])
+    check("[%s] the re-seeded row is still protected, not reclaimed as config" % tag,
+          (workers_by_url(port).get(url_a) or {}).get("discovery") == "dynamic",
+          json.dumps(workers_by_url(port).get(url_a, {}))[:200])
+    id_a = (workers_by_url(port).get(url_a) or {}).get("id")
+    base = {p: mock_lines(p, "/v1/chat/completions") for p in (pa, pb)}
+    t1, held1 = chat_async(port, "alpha", "restart-held slot",
+                           headers={"x-smg-target-worker": id_a}, timeout=60)
+    busy = wait_inflight(port, url_a, 1, timeout=25)
+    ok_batch = True
+    for _ in range(5):
+        st_b, _, _ = chat_sync(port, "alpha", "burst after restart", timeout=60)
+        ok_batch = ok_batch and st_b == 200
+    t1.join(timeout=30)
+    hits_a = mock_lines(pa, "/v1/chat/completions") - base[pa]
+    hits_b = mock_lines(pb, "/v1/chat/completions") - base[pb]
+    check("[%s] the resurrected mirror gates traffic (A takes only the held one)" % tag,
+          busy and held1.status == 200 and ok_batch and hits_a == 1 and hits_b == 5,
+          "busy=%s held=%s a=%d b=%d" % (busy, held1.status, hits_a, hits_b))
+
+    # ---- 手工 POST + 上限 + DELETE：镜像行连带清除、且不复活
+    st, created = post_json(port, "/workers",
+                            {"url": "http://%s:%d" % (gw, pc), "model_id": "alpha",
+                             "max_concurrency": 2})
+    check("[%s] POST /workers with a ceiling answers 202" % tag, st == 202,
+          "%s %s" % (st, json.dumps(created)[:200]))
+    id_c = created.get("worker_id") if isinstance(created, dict) else None
+    url_c = "http://%s:%d" % (gw, pc)
+    check("[%s] the create path mirrored its ceilings too" % tag,
+          (wait_config_row(port, url_c) or {}).get("max_concurrency") == 2,
+          json.dumps(config_upstream_rows(port).get(url_c, {}))[:250])
+    st, _, _ = http("DELETE", "http://127.0.0.1:%d/workers/%s" % (port, id_c))
+    check("[%s] DELETE /workers answers 202" % tag, st == 202, "%s" % st)
+    deadline = time.time() + 20
+    while time.time() < deadline and url_c in workers_by_url(port):
+        time.sleep(0.3)
+    check("[%s] the worker left the pool" % tag, url_c not in workers_by_url(port),
+          json.dumps(list(workers_by_url(port)))[:200])
+    check("[%s] the deletion cleared its mirror row" % tag,
+          config_upstream_rows(port).get(url_c) is None,
+          json.dumps(config_upstream_rows(port).get(url_c, {}))[:250])
+
+    subprocess.run(["docker", "restart", name], capture_output=True)
+    port = published_port(name, port)
+    up = False
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if http("GET", "http://127.0.0.1:%d/health" % port, timeout=2)[0] == 200:
+            up = True
+            break
+        time.sleep(0.5)
+    if not check("[%s] router back after the second restart" % tag, up, logs(name)[-300:]):
+        stop_router(name)
+        return
+    wait_urls(port, [url_a, url_b], timeout=60)
+    check("[%s] the deleted worker was NOT resurrected by its old mirror" % tag,
+          url_c not in workers_by_url(port),
+          json.dumps(list(workers_by_url(port)))[:250])
+    check("[%s] nor did it come back as a config-declared member" % tag,
+          (workers_by_url(port).get(url_c) or {}).get("discovery") != "config"
+          and url_c not in workers_by_url(port),
+          json.dumps(workers_by_url(port).get(url_c, {}))[:200])
+    check("[%s] the surviving mirror keeps working after the second restart" % tag,
+          (workers_by_url(port).get(url_a) or {}).get("max_concurrency") == 1,
+          json.dumps(workers_by_url(port).get(url_a, {}))[:250])
+
+    st, doc = post_upstreams(port, [{"url": url_b, "model_id": "alpha",
+                                     "max_concurrency": 4}])
+    check("[%s] an operator declaration for the protected row is accepted (200)" % tag,
+          st == 200, "%s %s" % (st, json.dumps(doc)[:200]))
+    id_b = (workers_by_url(port).get(url_b) or {}).get("id")
+    st, doc = put_json(port, "/workers/%s" % id_b, {"max_concurrency": 8})
+    check("[%s] PUT on a declared-but-protected row answers 202" % tag, st == 202,
+          "%s %s" % (st, json.dumps(doc)[:200]))
+    wait_row_field(port, url_b, "max_concurrency", 8, timeout=15)
+    declared_b = config_upstream_rows(port).get(url_b) or {}
+    check("[%s] the operator's own row is updated in place, not forked" % tag,
+          declared_b.get("max_concurrency") == 8
+          and declared_b.get("model_id") == "alpha",
+          "declared=%s" % json.dumps(declared_b)[:250])
+    check("[%s] and that row still belongs to the pool, not to the declaration" % tag,
+          (workers_by_url(port).get(url_b) or {}).get("discovery") == "dynamic",
+          json.dumps(workers_by_url(port).get(url_b, {}))[:200])
+
+    # ---- discovery=="config" 的行**不走镜像**：PUT 改的是运行时读数，声明层那个数
+    #      必须保持操作员写下的值。否则一次控制台 PUT 就悄悄改了声明，而声明的清除
+    #      哨兵（upstream_patch）还会反过来把上限静默打开 —— 归属写错不是不好看，
+    #      是会自己把闸门拆掉。D 不在播种名册里，声明它才走 reconcile 的 add 分支。
+    url_d = "http://%s:%d" % (gw, pd)
+    st, doc = post_upstreams(port, [{"url": url_d, "model_id": "alpha",
+                                     "max_concurrency": 4}])
+    check("[%s] a declaration for an unseeded endpoint is accepted (200)" % tag,
+          st == 200, "%s %s" % (st, json.dumps(doc)[:200]))
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if (workers_by_url(port).get(url_d) or {}).get("discovery") == "config":
+            break
+        time.sleep(0.3)
+    check("[%s] premise: D is a config-owned row" % tag,
+          (workers_by_url(port).get(url_d) or {}).get("discovery") == "config",
+          json.dumps(workers_by_url(port).get(url_d, {}))[:300])
+    id_d = (workers_by_url(port).get(url_d) or {}).get("id")
+    st, doc = put_json(port, "/workers/%s" % id_d, {"max_concurrency": 8})
+    check("[%s] PUT on a config row still answers 202 (live-only)" % tag, st == 202,
+          "%s %s" % (st, json.dumps(doc)[:200]))
+    wait_row_field(port, url_d, "max_concurrency", 8, timeout=15)
+    check("[%s] the console PUT did not silently edit the operator's declaration" % tag,
+          (config_upstream_rows(port).get(url_d) or {}).get("max_concurrency") == 4,
+          "declared=%s" % json.dumps(config_upstream_rows(port).get(url_d, {}))[:250])
+    check("[%s] the refusal is loud in the log (no silent non-persistence)" % tag,
+          "caps mirror skipped" in docker_logs_full(name),
+          docker_logs_full(name)[-400:])
+    check_no_abort(tag, name)
+    stop_router(name)
+
+
 def scenario_affinity_vs_cap():
     """cache_aware 的亲和命中不许把达上限的实例带回来。
 
@@ -1833,6 +2112,7 @@ def main():
     scenario_util_cap()
     scenario_util_per_card()
     scenario_caps_persistence()
+    scenario_control_caps_persistence()
     scenario_affinity_vs_cap()
     scenario_all_capped_503()
     scenario_declaration_bounds()

@@ -32,6 +32,108 @@ local cors_apply = respond.cors_apply
 local cors_preflight = respond.cors_preflight
 local text_response = inference.text_response
 local policy_for = candidates.policy_for
+-- 控制面三档容量上限的持久化镜像（用户裁定 2026-10-09，doc/gap-worker-caps.md §4）。
+-- host.store 是既有的惰性取用（拿不到 config_store 的裁剪构建只是少一层持久化，
+-- 控制面照旧 202），所以这里不新增 require。
+local store = host.store
+
+-- The three capacity ceilings, spelled once. The pool side accepts them on
+-- POST/PUT /workers (registry/discovery.lua's UPDATE_NUMBER_FIELDS); only these
+-- three are mirrored into the declaration layer, because they are the ones the
+-- operator configures per worker and the ones that evaporate on a restart.
+local CAP_BODY_FIELDS = { "max_concurrency", "min_concurrency", "max_gpu_util" }
+
+--- Pull the capacity ceilings a request body named out of it, in the shape
+--- config_store.apply_upstream_caps wants. Absent / JSON_NULL means "the body
+--- said nothing about this tier", which is *not* the same as the tier being
+--- cleared -- clearing is a value the pool reader folds to unlimited (a
+--- non-positive concurrency, a negative utilisation) and still counts as said.
+---@param body table
+---@return table|nil caps @ nil when the body named none of the three
+local function caps_in_body(body)
+    if type(body) ~= "table" then return nil end
+    local caps
+    for i = 1, #CAP_BODY_FIELDS do
+        local field = CAP_BODY_FIELDS[i]
+        local value = rawget(body, field)
+        if value ~= nil and value ~= cjson.null then
+            caps = caps or {}
+            caps[field] = value
+        end
+    end
+    return caps
+end
+
+--- Best-effort mirror of a worker's ceilings into the declaration layer after the
+--- pool write already succeeded.
+---
+--- Deliberately never fatal: the in-memory update is the part the 202 contract
+--- pins (and the Rust gateway it matches has no durable layer at all), so a
+--- mirror that fails -- the CAS base went stale under us, the store refused, the
+--- value shape was refused by the validator -- must not turn a 202 into a 500 or
+--- roll back a ceiling the pool is already enforcing. The consequence of failure
+--- is narrow and honest: this ceiling works now and will not survive a restart,
+--- so it has to be loud in the log. Warn rather than ignore is the whole point --
+--- the failure mode this closes ("配了上限，重建容器就没了") is otherwise silent.
+---@param worker_url string|nil
+---@param caps table|nil
+---@param what string @ log context ("PUT /workers/<id>")
+local function mirror_worker_caps(worker_url, caps, what)
+    if not caps then return end
+    if type(worker_url) ~= "string" or worker_url == "" then
+        ngx.log(ngx.WARN, "luarouter caps mirror skipped (", what,
+            "): the worker record carries no url")
+        return
+    end
+    local mod = store()
+    if not mod or type(mod.apply_upstream_caps) ~= "function" then
+        ngx.log(ngx.WARN, "luarouter caps mirror skipped (", what,
+            "): config_store unavailable -- the ceiling will not survive a restart")
+        return
+    end
+    local ok_call, saved, err = pcall(mod.apply_upstream_caps, worker_url, caps)
+    if not ok_call or saved == nil then
+        ngx.log(ngx.WARN, "luarouter caps mirror FAILED (", what, "): ",
+            ok_call and tostring(err) or tostring(saved),
+            " -- the ceiling is live now but will not survive a restart")
+    end
+end
+
+--- Mirror the pool-side ceiling back onto a *declared* (discovery=="config")
+--- row, and report whether the caller may persist at all.
+---
+--- Why the ownership question belongs here: a config row's caps are owned by the
+--- declaration, and the 30s self-heal reconciles the pool from it (the clear
+--- sentinels live in upstream_patch). Writing the control plane's number into
+--- that row would make the console's PUT silently edit the operator's
+--- declaration, and a PUT whose value normalizes to "unlimited" would erase the
+--- declared tier outright -- after which the self-heal stops sending its clear
+--- sentinel and the ceiling silently reopens in the pool. That is a change of
+--- ownership dressed up as a convenience, so it is refused: the PUT stays exactly
+--- what it was before this feature (live-only on a config row), and the mirror
+--- serves only rows the declaration layer does not own.
+--- The refusal is logged because "I set a cap and it did not persist" otherwise
+--- has no symptom at all -- the answer is the JSON editor / 服务池 的声明条目.
+---@param worker_id string
+---@param body table
+---@param what string
+local function mirror_caps_if_protected(worker_id, body, what)
+    local caps = caps_in_body(body)
+    if not caps then return end
+    local record
+    local ok_get, info = pcall(registry.get, worker_id)
+    if ok_get and type(info) == "table" then record = info end
+    if not record then return end
+    if record.discovery == "config" then
+        ngx.log(ngx.WARN, "luarouter caps mirror skipped (", what,
+            "): ", tostring(record.url), " is a config-declared worker -- its",
+            " ceilings belong to the declaration layer (服务池的「编辑声明条目」",
+            " / POST /config/upstreams), so this PUT is live-only and will not",
+            " survive a restart")
+        return
+    end
+    mirror_worker_caps(record.url, caps, what)
+end
 -- Defined with the mesh handlers, called by the /workers control plane.
 local mesh_observe_worker
 local mesh_forget_worker
@@ -136,6 +238,13 @@ local function create_worker_handler(params, ctx, req)
         end
         return send_error(500, "INTERNAL_SERVER_ERROR", failure)
     end
+    -- Same best-effort mirror as the PUT path: registry.add already stored the
+    -- ceilings the body named, and they need the declaration layer to outlive
+    -- the container. The url is taken from the *record*, not the body, so a
+    -- registry-normalized spelling (http://H:P/ -> http://h:p) cannot fork a
+    -- second mirror row for one worker.
+    mirror_worker_caps(result.url, caps_in_body(body),
+        "POST /workers " .. tostring(result.id))
     -- Re-seed the stateful policies in every process: cache_aware / bucket / the
     -- hash rings derive their state from the worker set.
     policy_mod.bump_generation()
@@ -191,6 +300,22 @@ local function delete_worker_handler(params)
         end
         return send_error(404, "WORKER_NOT_FOUND",
             err or ("Worker " .. tostring(worker_id) .. " not found"))
+    end
+    -- Forget the mirrored ceilings of the worker that is gone (belt; reconcile's
+    -- add-branch guard against pure mirror rows is the braces). Only a pure
+    -- mirror is removed -- a row the declaration layer genuinely owns survives
+    -- the deletion of its worker, because deleting a live worker is a pool
+    -- operation and not a licence to erase an operator's declaration.
+    local mod = store()
+    if mod and type(mod.drop_upstream_caps) == "function" then
+        local ok_call, removed, derr = pcall(mod.drop_upstream_caps, result.url)
+        if not ok_call or removed ~= true then
+            local reason = ok_call and derr or removed
+            if reason ~= nil then
+                ngx.log(ngx.WARN, "luarouter caps mirror cleanup FAILED (",
+                    tostring(result.url), "): ", tostring(reason))
+            end
+        end
     end
     policy_for(nil):on_remove({ url = result.url })
     policy_mod.bump_generation()
@@ -259,6 +384,14 @@ local function update_worker_handler(params, ctx, req)
         end
         return send_error(500, "INTERNAL_SERVER_ERROR", err)
     end
+    -- Mirror the ceilings the body named onto the declaration layer so they
+    -- outlive a container restart. After this line the response shape is
+    -- pinned by the contract (test_lua_router.sh pins Rust's
+    -- UpdateWorkerResult::into_response to exactly {status,worker_id,message}),
+    -- which is why a mirror failure can only ever reach the log: the 202 body
+    -- must stay byte-identical whether or not the write took.
+    mirror_caps_if_protected(result.worker_id or worker_id, body,
+        "PUT /workers/" .. tostring(result.worker_id or worker_id))
     -- Scheduling attributes moved, so the stateful policies must re-seed.
     policy_mod.bump_generation()
     mesh_observe_worker(result.worker_id)
