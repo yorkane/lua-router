@@ -71,6 +71,169 @@ local function sanitize_upstream_rows(rows)
     return out
 end
 
+--- The capacity rulebook of the declaration layer, shared by **every** writer into
+--- the upstreams section.
+---
+--- Two ranges live in this file's neighbourhood and they are not the same number on
+--- purpose: the *pool* side (registry/discovery.lua's UPDATE_NUMBER_FIELDS) folds any
+--- whole number through cap_limit / util_limit, because PUT /workers reports a live
+--- reading and the operator may open a gate wider than the document would ever declare
+--- it. The *document* carries only what cfg_from_document can read back: the three
+--- limits above (doc/caps-redesign-2026-10-06.md §1). The gate therefore belongs to
+--- this doorway -- the crossing into the declaration layer -- and the pool side stays
+--- deliberately untouched.
+---
+--- Sharing the rulebook is load-bearing, not cosmetic: cfg_from_document validates the
+--- *whole* document, so a single out-of-range cap makes readers.current() throw away
+--- every other section it holds (model_configs / virtual_profiles / policy) and fall
+--- back to env defaults. One console PUT would then take the entire configuration with
+--- it, silently -- measured on 21.k:8802 with PUT /workers {"max_concurrency":77} onto
+--- an existing mirror row: the pool accepted 77, the mirror wrote it to the snapshot,
+--- and every following request logged "persisted config invalid (upstream ...
+--- max_concurrency must be at most 32); falling back to env defaults" until the row was
+--- removed by hand (an empty POST /config/upstreams could not clear it, because
+--- current() was already serving the env-default view).
+---
+--- So this is the rulebook upstream_from_entry has always applied, only reachable from
+--- the in-place writers too -- the per-tier posture below is decided here and nowhere
+--- else (AGENTS.md forbids a private second copy in mutators.lua). The *cross*-tier rule
+--- is factored out separately below, because a partial write has to check it against the
+--- tiers the batch did not name.
+---
+---@param canonical string @ the row url, for the error text
+---@param said table @ field -> *raw* value, for the tiers this batch named
+---@return table|nil caps_said @ field -> canonical number, for named tiers that landed
+---@return string|nil err
+local function cap_tiers_said(canonical, said)
+    local caps_said = {}
+    for _, field in ipairs(CAP_FIELDS) do
+        local value = rawget(said, field)
+        if value ~= nil and value ~= JSON_NULL then
+            if field == "max_gpu_util" then
+                local number = tonumber(value)
+                if number ~= nil and number == number
+                    and number ~= math.huge and number ~= -math.huge then
+                    if number < 0 then
+                        -- "said nothing": the reader folds it to unlimited either way.
+                        number = nil
+                    elseif number > MAX_GPU_UTIL_LIMIT or math.floor(number) ~= number then
+                        return nil, string.format(
+                            "upstream %s max_gpu_util must be a whole percentage between 0 and %d",
+                            canonical, MAX_GPU_UTIL_LIMIT)
+                    end
+                else
+                    number = nil
+                end
+                if number ~= nil then
+                    -- The registry reader stays the authority for the *stored* value (same
+                    -- posture as the concurrency tier): the range checks above decide what
+                    -- counts as said-vs-400, declared_util decides the canonical number
+                    -- that lands in the row.
+                    local cap = CS_PROFILES.declared_util(number)
+                    if cap ~= nil then
+                        caps_said[field] = cap
+                    end
+                end
+            elseif field == "max_concurrency" then
+                local cap = CS_PROFILES.declared_cap(value, true)
+                if cap ~= nil then
+                    if cap > MAX_CONCURRENCY_LIMIT then
+                        return nil, string.format(
+                            "upstream %s max_concurrency must be at most %d",
+                            canonical, MAX_CONCURRENCY_LIMIT)
+                    end
+                    caps_said[field] = cap
+                end
+            else
+                local cap = cap_normalize(field, value)
+                -- A floor that folds to "unlimited" (<= 0, NaN, ±inf, a non-number) says
+                -- nothing here, exactly like the other two tiers: clearing a floor is a
+                -- legitimate write for the in-place mirror, which is the only writer that
+                -- reaches a row already holding one. Whether *naming* the tier and having
+                -- it fold to nothing is instead a typo is a question about the row being
+                -- written, not about the number, so the create path decides it for itself
+                -- right after this call -- the mirror's "a named tier that normalizes to
+                -- unlimited clears that tier" contract stays as it was.
+                if cap ~= nil then
+                    -- Integrality is tested on the raw reading, not on the normalized one:
+                    -- cap_limit *floors* a fractional value (that is what makes 2.5 a legal
+                    -- max_concurrency), so by the time this branch sees it a typo like 1.5
+                    -- has already become a plausible 1. A floor is not a number the operator
+                    -- has to be protected from rounding -- it is the green threshold, so a
+                    -- fractional reading is a typo and says nothing about what was meant.
+                    local number = tonumber(value)
+                    if number == nil or cap ~= number
+                        or cap < 1 or cap > MIN_CONCURRENCY_LIMIT then
+                        return nil, string.format(
+                            "upstream %s min_concurrency must be an integer between 1 and %d",
+                            canonical, MIN_CONCURRENCY_LIMIT)
+                    end
+                    caps_said[field] = cap
+                end
+            end
+        end
+    end
+    return caps_said, nil
+end
+
+--- The cross-tier half of the rulebook: the green floor has to sit strictly below the
+--- red ceiling, otherwise "idle" and "full" overlap (or invert) and every state judgment
+--- in the pool becomes arbitrary. max_concurrency unlimited (nil) has no ceiling to
+--- violate. Split out of the per-tier pass because a *partial* write -- a console PUT
+--- that names one rung only -- must answer this about the whole row, not about the
+--- fragment it was handed.
+---@param canonical string @ the row url, for the error text
+---@param caps_said table @ field -> canonical number, for every rung the row will say
+---@return string|nil err
+local function cap_tiers_conflict(canonical, caps_said)
+    if caps_said.min_concurrency ~= nil and caps_said.max_concurrency ~= nil
+        and caps_said.min_concurrency >= caps_said.max_concurrency then
+        return string.format(
+            "upstream %s min_concurrency (%d) must be less than max_concurrency (%d)",
+            canonical, caps_said.min_concurrency, caps_said.max_concurrency)
+    end
+    return nil
+end
+
+--- Validate a *partial* caps write onto an already-declared row, then hand back the
+--- canonical numbers for the tiers the batch named. Same rulebook as the create path --
+--- per-tier ranges plus the cross-tier rule -- with one extra step the create path does
+--- not need: the rungs this batch left alone are read back out of the live row (through
+--- cap_normalize, i.e. exactly what the readers would store) so they join the cross-tier
+--- check -- *as the row will read after the write*, so a tier this batch clears counts as
+--- cleared rather than as its old number. Without that, a batch naming only
+--- max_concurrency could drop the ceiling to or below a floor the row already carried,
+--- and cfg_from_document's min<max rule -- the second poison shape, same blast radius as
+--- the first -- would take the whole document down on the next read.
+---
+--- All-or-nothing by construction: nothing is written here, and the caller only touches
+--- the row once this answers. A batch whose tiers do not all pass leaves the document
+--- byte-identical -- a half-applied ceiling set is the invisible-mines shape this whole
+--- path exists to avoid (doc/gap-worker-caps.md §11 item 4).
+---@param canonical string @ the row url, for the error text
+---@param row table @ the existing declared row; read only
+---@param said table @ field -> *raw* value, for the tiers this batch named
+---@return table|nil caps_said @ field -> canonical number, for named tiers that landed
+---@return string|nil err
+local function validate_cap_patch(canonical, row, said)
+    local caps_said, err = cap_tiers_said(canonical, said)
+    if not caps_said then return nil, err end
+    local whole = {}
+    for _, field in ipairs(CAP_FIELDS) do
+        if rawget(said, field) ~= nil and said[field] ~= JSON_NULL then
+            -- Named by this batch: the number it will store, or nil when the batch
+            -- cleared the tier (the "unlimited" spelling for that rung).
+            whole[field] = caps_said[field]
+        else
+            -- Left alone: whatever the readers would store off the existing row.
+            whole[field] = cap_normalize(field, row[field])
+        end
+    end
+    local conflict = cap_tiers_conflict(canonical, whole)
+    if conflict then return nil, conflict end
+    return caps_said, nil
+end
+
 --- Validate + normalize one upstreams entry. Returns (entry, nil) or (nil, err).
 --- The entry keeps the three-state api_key (absent / JSON_NULL = keep, "" =
 --- clear, non-empty = set) plus api_key_stored for persistence.
@@ -201,91 +364,39 @@ local function upstream_from_entry(entry, index)
     -- explicit null) exactly like the other optional fields, so a row that never mentions
     -- caps keeps its pre-feature byte-identical shape.
     --
-    -- How hard each tier pushes back on a value it cannot use is decided per tier, and the
-    -- asymmetry is deliberate:
-    --   * max_concurrency keeps today's normalization verbatim. The console has always sent
-    --     an explicit 0 for "unlimited" and 2.5 for "at most 2", and five readers (add /
-    --     update / info / capacity_exclusion / declared_cap) share that one folding, so the
-    --     declaration layer must not unilaterally turn a legacy spelling into a 400
-    --     (doc/gap-worker-caps.md §8 item 3). Anything cap_limit reads as unlimited is
-    --     stored as *absent*, and a whole number above 32 is the only refusal.
-    --   * min_concurrency is new, so it has no legacy spelling to honour: a value that is
-    --     not a whole 1..31 is a typo, and a floor the gateway quietly dropped is a gate
-    --     the operator believes is closed -- 400.
-    --   * max_gpu_util follows the design's split: a negative or non-numeric reading is
-    --     "not said" (nil, same unlimited the reader would fold it to), while a number that
-    --     cannot be a whole percentage -- 101, 55.5 -- is refused. Zero passes through: it
-    --     is the strictest legal gate, not an absence.
-    local caps_said = {}
+    -- How hard each tier pushes back on a value it cannot use -- and why that posture is
+    -- deliberately asymmetric between the tiers -- is written down once, in
+    -- cap_tiers_said above, together with the ranges themselves. The loop below only
+    -- decides *where* the canonical numbers land (out[field]; absent when the tier folds
+    -- to "unlimited"), and cap_tiers_conflict runs the cross-tier rule over the rungs
+    -- this entry said. No range question is answered privately here: the in-place mirror
+    -- writer (config_store/mutators.lua apply_upstream_caps) reads the very same
+    -- rulebook through validate_cap_patch, which is why an out-of-range ceiling from the
+    -- control plane cannot walk into the snapshot through one branch and be refused
+    -- through the other.
+    local said_caps = {}
     for _, field in ipairs(CAP_FIELDS) do
         local value = rawget(entry, field)
-        if value ~= nil and value ~= JSON_NULL then
-            if field == "max_gpu_util" then
-                local number = tonumber(value)
-                if number ~= nil and number == number
-                    and number ~= math.huge and number ~= -math.huge then
-                    if number < 0 then
-                        -- "said nothing": the reader folds it to unlimited either way.
-                        number = nil
-                    elseif number > MAX_GPU_UTIL_LIMIT or math.floor(number) ~= number then
-                        return nil, string.format(
-                            "upstream %s max_gpu_util must be a whole percentage between 0 and %d",
-                            canonical, MAX_GPU_UTIL_LIMIT)
-                    end
-                else
-                    number = nil
-                end
-                if number ~= nil then
-                    -- The registry reader stays the authority for the *stored* value (same
-                    -- posture as the concurrency tier): the range checks above decide what
-                    -- counts as said-vs-400, declared_util decides the canonical number
-                    -- that lands in the row.
-                    local cap = CS_PROFILES.declared_util(number)
-                    if cap ~= nil then
-                        out[field] = cap
-                        caps_said[field] = cap
-                    end
-                end
-            elseif field == "max_concurrency" then
-                local cap = CS_PROFILES.declared_cap(value, true)
-                if cap ~= nil then
-                    if cap > MAX_CONCURRENCY_LIMIT then
-                        return nil, string.format(
-                            "upstream %s max_concurrency must be at most %d",
-                            canonical, MAX_CONCURRENCY_LIMIT)
-                    end
-                    out[field] = cap
-                    caps_said[field] = cap
-                end
-            else
-                local cap = cap_normalize(field, value)
-                -- Integrality is tested on the raw reading, not on the normalized one:
-                -- cap_limit *floors* a fractional value (that is what makes 2.5 a legal
-                -- max_concurrency), so by the time this branch sees it a typo like 1.5 has
-                -- already become a plausible 1. A floor is not a number the operator has to
-                -- be protected from rounding -- it is the green threshold, so a fractional
-                -- reading is a typo and says nothing about what was meant.
-                local number = tonumber(value)
-                if cap == nil or number == nil or cap ~= number
-                    or cap < 1 or cap > MIN_CONCURRENCY_LIMIT then
-                    return nil, string.format(
-                        "upstream %s min_concurrency must be an integer between 1 and %d",
-                        canonical, MIN_CONCURRENCY_LIMIT)
-                end
-                out[field] = cap
-                caps_said[field] = cap
-            end
-        end
+        if value ~= nil and value ~= JSON_NULL then said_caps[field] = value end
     end
-    -- Both concurrency tiers declared: the green floor has to sit strictly below the red
-    -- ceiling, otherwise "idle" and "full" overlap (or invert) and every state judgment in
-    -- the pool becomes arbitrary. max_concurrency unlimited (nil) has no ceiling to violate.
-    if caps_said.min_concurrency ~= nil and caps_said.max_concurrency ~= nil
-        and caps_said.min_concurrency >= caps_said.max_concurrency then
+    local caps_said, caps_err = cap_tiers_said(canonical, said_caps)
+    if not caps_said then return nil, caps_err end
+    for field, cap in pairs(caps_said) do out[field] = cap end
+    -- One posture belongs to this path alone and is therefore decided here rather than
+    -- in the shared helper: a min tier that folds to "unlimited" (0, -5, "abc") is a
+    -- typo in a *fresh* declaration -- a new row has no floor to clear, and a floor the
+    -- gateway quietly dropped is a gate the operator believes is closed -- so it answers
+    -- 400 with the same wording as before. The mirror mutator reaches the same value
+    -- through validate_cap_patch, where naming that tier *is* the documented way to
+    -- clear it (its docstring: a named tier that normalizes to unlimited clears the
+    -- tier), so the shared rulebook decides ranges and this line decides declarations.
+    if rawget(said_caps, "min_concurrency") ~= nil and caps_said.min_concurrency == nil then
         return nil, string.format(
-            "upstream %s min_concurrency (%d) must be less than max_concurrency (%d)",
-            canonical, caps_said.min_concurrency, caps_said.max_concurrency)
+            "upstream %s min_concurrency must be an integer between 1 and %d",
+            canonical, MIN_CONCURRENCY_LIMIT)
     end
+    local conflict = cap_tiers_conflict(canonical, caps_said)
+    if conflict then return nil, conflict end
     return out, nil
 end
 
@@ -758,6 +869,8 @@ end
 -- 不是导出面契约的一部分（老 _M 契约逐名不变），只是跨子模块共用。
 _M.CAP_FIELDS = CAP_FIELDS
 _M.cap_normalize = cap_normalize
+-- 已存在行的逐档写入（控制面 caps 镜像）与新建路径共用同一份判据：范围与跨档规则不在 mutators 里再写第二份。同 CAP_FIELDS：跨子模块共用，不是 _M 导出面契约的一部分。
+_M.validate_cap_patch = validate_cap_patch
 _M.mirror_shaped_row = mirror_shaped_row
 _M.build_upstreams = build_upstreams
 _M.previous_upstream_map = previous_upstream_map

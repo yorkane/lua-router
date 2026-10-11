@@ -410,7 +410,10 @@ function _M.apply_upstream_caps(url, caps)
     -- declared_util dispatch on the tier, and the util tier cannot borrow the
     -- concurrency one -- 0 is its strictest gate, not an absence). Nothing is
     -- validated by a private second rulebook here: the shape decisions live in
-    -- upstream_from_entry, which the create branch below reuses verbatim.
+    -- upstream_from_entry / validate_cap_patch (config_store/upstreams.lua), which both
+    -- branches below reuse. That sharing is the whole point of the ordering: the pool
+    -- side accepts any whole number on PUT /workers, so a value that the *document*
+    -- cannot carry has to be refused here, at the doorway, or it poisons the snapshot.
     local said = {}
     for _, field in ipairs(CAP_FIELDS) do
         local value = rawget(caps, field)
@@ -436,6 +439,26 @@ function _M.apply_upstream_caps(url, caps)
         end
         cfg.upstreams[#cfg.upstreams + 1] = built
     else
+        -- The row already exists, which is exactly the case that used to skip the
+        -- section's rulebook: normalizing alone let a pool-side number (PUT /workers
+        -- accepts 77; the document holds at most 32) reach the snapshot, and
+        -- cfg_from_document validates the *whole* document -- one out-of-range cap made
+        -- readers.current() drop model_configs / virtual_models / policy along with it
+        -- and log "persisted config invalid ... falling back to env defaults" on every
+        -- request, with no way back except editing the file by hand (POST
+        -- /config/upstreams {"entries":[]} clears a section of a document that is no
+        -- longer being read). So: validate first, write only on a clean answer, and the
+        -- answer comes from the same helper the create path uses -- no second rulebook
+        -- lives here (the file comment above this branch is the rule it obeys).
+        --
+        -- All-or-nothing: validate_cap_patch either accepts every tier in this batch or
+        -- refuses the batch, so a half-applied ceiling set -- one rung out of range, the
+        -- others silently written -- cannot exist. It also checks the rungs this batch
+        -- left alone against the row's existing values, so a PUT of max_concurrency=4
+        -- onto a row that already declares min_concurrency=6 is refused here instead of
+        -- becoming the same document-wide failure through the min<max rule.
+        local caps_ok, cerr = CS_UPSTREAMS.validate_cap_patch(canonical, row, said)
+        if not caps_ok then return nil, cerr end
         for field, value in pairs(said) do
             local normalized = CS_UPSTREAMS.cap_normalize(field, value)
             if normalized == nil then

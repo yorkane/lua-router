@@ -413,6 +413,25 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
      所以镜像失败（CAS 被拒、存储不可用、值被校验挡下）只写一条 WARN 让它显形，响应体保持
      `{status,worker_id,message}` 逐字节不变，内存里已经生效的上限也不回滚。失败的后果是窄而诚实的：
      这道门现在有效、但活不过重建。
+   * **池侧范围 ≠ 声明层范围，跨界必须校验（2026-10-11 补，实测洞）**：三个上限的**取值范围**住在
+     声明层（`config_store/upstreams.lua` 的 31/32/100），池侧的 `PUT/POST /workers` 从来不受它约束
+     （`registry/discovery.lua` 的 UPDATE_NUMBER_FIELDS 只过读时归一器，77 照收——那是运行态读数）。
+     镜像因此是**跨进门**的那一步，必须在门口过声明层的判据：`cfg_from_document` 校验的是整份文档，
+     一个越界档就让 `readers.current()` 把 model_configs / virtual_models / policy 一起退回 env 缺省。
+     旧实现只在"行不存在"那一支过了 `upstream_from_entry`，"行已存在"那一支只归一化不校验，于是
+     21.k:8802 上一次 `PUT /workers/{id} {"max_concurrency":77}`（该 url 已有镜像行）把 77 写进快照，
+     此后每请求刷 `persisted config invalid (upstream ... max_concurrency must be at most 32); falling
+     back to env defaults`，且 `POST /config/upstreams {"entries":[]}` 清不掉（current() 已在读 env 那份，
+     毒行还在盘上）——正是本项目最忌讳的"配了但静默不生效"，而爆炸半径是一整份配置。修法是把已存在行
+     那一支也接回同一份规则：`upstreams.lua` 的 `cap_tiers_said`（逐档范围）+`cap_tiers_conflict`
+     （min<max）是新建与改写共用的唯一判据，mutators 里不写第二份私有规则（本文件 :409-413 注释立的规矩）；
+     已存在行走 `validate_cap_patch`，它额外把**这批没点名**的档按"写完之后这一行会读成什么"取回来一起过
+     min<max——否则一次只点名 `max_concurrency=4` 的 PUT 能撞上行内已有的 `min_concurrency=6`，同一个
+     爆炸半径换一条毒口进来。**要么整批接受、要么整批不落盘**（半套上限就是又一个隐形地雷）；被拒时仍是
+     上一条那句形状：`nil, err` 回到 `router/control.lua` 的 `mirror_worker_caps`，只多一条 WARN，202
+     逐字节不变、内存不回滚。池侧的宽松取值**刻意不加 32 上限**（越界由声明层在门口拒绝，运行态读数
+     归运行态）。回归门：`test/unit/test_caps_persist.lua` 第 6b 节钉"快照里不存在越界值 + 整份文档仍可被
+     current() 读到 + 混合批整批拒绝 + 范围内值（max=32）照常镜像 + 未点名档也进跨档判定"。
    * **删除即清除 + 孤儿不复活**：`DELETE /workers/{id}` 连带摘掉**纯镜像**行（带别的操作员字段的声明行
      保留——删一个活 worker 是池操作，不是抹掉人家声明的许可证）。只靠删除钩子不够：探针摘行走
      `watcher/live.lua` 的 `make_unregister`，它直接调 `registry.remove`、不经过控制面，留下的孤儿镜像会被

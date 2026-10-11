@@ -480,6 +480,128 @@ eq(#extra, 0, "(6) a declaration without caps grows no cap keys", table.concat(e
 eq(pool_row(B).max_concurrency, nil, "(6) and the pool row stays uncapped")
 
 --------------------------------------------------------------------------
+-- 6b. 已存在的镜像行 + 越界 caps（21.k:8802 实测：整份持久配置静默失效）
+--
+-- 复现的形状：该 url 已有一条镜像行（min=2/max=10），操作员在服务池弹窗里 PUT
+-- /workers/{id} {"max_concurrency":77} —— 池侧 registry 没有 32 的上限（那是运行态
+-- 读数，原样接受），于是镜像把 77 写进快照；cfg_from_document 校验的是**整份**文档，
+-- 一个越界档就让它把 model_configs / virtual_models / policy 一起退回 env 缺省，
+-- 每请求刷 "persisted config invalid ... falling back to env defaults"，而且
+-- POST /config/upstreams {"entries":[]} 清不掉（current() 已经在读 env 那份）。
+-- 判别性：旧实现在「快照里没有越界值」「整份文档仍可读」两条同时红。
+--------------------------------------------------------------------------
+reset_state()
+use_registry(make_registry_stub())
+pool_put({ id = "w-" .. A, url = A, model_id = "alpha", priority = 50, cost = 1.0,
+           labels = {}, disable_health_check = false })
+-- 一份"整份配置"：模型卡片 + 虚拟入口 + 全局策略。越界镜像的爆炸半径就是这三样。
+store.apply_model_config({ model = "alpha", ctx = 8192 })
+store.apply_profiles({ { model = "entry-a", target = "alpha" } })
+store.apply_policy({ policy = "round_robin" })
+
+--- 盘上字节 = 容器重启后唯一会被读回的那一层，直接按文本查越界值。
+local function disk_text()
+    local f = io.open(CONFIG_PATH, "r")
+    if not f then return "" end
+    local out = f:read("*a")
+    f:close()
+    return out
+end
+-- nil 安全取值：越界镜像在旧实现下的形状是"盘上出现 77 + current() 整体退回 env 缺省"
+-- （负证跑过：旧 mutators 会在这里取到 nil 而崩在半路）。崩了看不出是谁的错，所以这几处
+-- 走 nil 安全的读法，让那个形状如实报成 FAIL 清单。
+local function row_field(url, field)
+    local item = row_for(url)
+    return item and item[field]
+end
+
+local seeded, seed_err = store.apply_upstream_caps(A, {
+    min_concurrency = 2, max_concurrency = 10, max_gpu_util = 60,
+})
+eq(seed_err, nil, "(6b) premise: the in-range mirror row was accepted", tostring(seed_err))
+eq(type(seeded), "table", "(6b) premise: the mirror answered a reconcile summary")
+check(type(store.current().policy) == "string", "(6b) premise: the document carries a policy")
+
+-- 1) 越界档写进已存在行：拒（与新建分支同形状的错误），且**整批不落盘**
+local poison, poison_err = store.apply_upstream_caps(A, { max_concurrency = 77 })
+eq(poison, nil, "(6b) an out-of-range ceiling onto an existing row is refused")
+check(type(poison_err) == "string"
+    and poison_err:find("max_concurrency must be at most 32", 1, true) ~= nil,
+    "(6b) the refusal carries the shared validator wording", tostring(poison_err))
+check(disk_text():find('"max_concurrency":77') == nil,
+    "(6b) the poisoned value never reached the snapshot",
+    disk_text():match('"max_concurrency":[0-9]+') or "no ceiling on disk")
+eq(row_field(A, "max_concurrency"), 10, "(6b) the row keeps the ceiling it had")
+eq(row_field(A, "min_concurrency"), 2, "(6b) the tier the batch did not name is untouched")
+eq(row_field(A, "max_gpu_util"), 60, "(6b) nor is any other tier")
+
+-- 2) 主判别条：毒行不落盘之后，current() 仍读得到整份文档（不触发 env 兜底）
+local doc = roundtrip()
+eq(doc.policy, "round_robin", "(6b) the refused mirror did not take the global policy with it")
+check(next(doc.model_configs) ~= nil, "(6b) the model card is still readable")
+check(next(doc.virtual_profiles) ~= nil, "(6b) the virtual entry is still readable")
+check(disk_text():find("round_robin", 1, true) ~= nil,
+    "(6b) the policy is still on disk, not merely in this process")
+
+-- 3) 同一批混合合法档 + 越界档：整批拒绝，合法的也不许悄悄落盘
+local mixed, mixed_err = store.apply_upstream_caps(A, {
+    max_concurrency = 8, max_gpu_util = 101,
+})
+eq(mixed, nil, "(6b) a batch with one out-of-range tier is refused as a whole")
+check(type(mixed_err) == "string"
+    and mixed_err:find("max_gpu_util must be a whole percentage", 1, true) ~= nil,
+    "(6b) naming the tier that broke the batch", tostring(mixed_err))
+eq(row_field(A, "max_concurrency"), 10,
+    "(6b) the legal tier of a refused batch did not land either")
+check(disk_text():find('"max_concurrency":8') == nil,
+    "(6b) ... nor on disk", disk_text():match('"max_concurrency":[0-9]+') or "none")
+eq(row_field(A, "max_gpu_util"), 60, "(6b) the utilisation ceiling is untouched by the refused batch")
+
+-- 4) 正向：范围内值照常镜像（32 是文档能承载的上界）
+local raised, raised_err = store.apply_upstream_caps(A, { max_concurrency = 32 })
+eq(raised_err, nil, "(6b) an in-range ceiling onto an existing row still mirrors",
+    tostring(raised_err))
+eq(type(raised), "table", "(6b) the accepted mirror answers a reconcile summary")
+eq(row_field(A, "max_concurrency"), 32, "(6b) the ceiling was written")
+check(disk_text():find('"max_concurrency":32') ~= nil, "(6b) and it reached the snapshot")
+eq(pool_row(A).max_concurrency, 32, "(6b) reconcile projected it onto the pool row")
+local doc2 = roundtrip()
+eq(doc2.policy, "round_robin", "(6b) the accepted mirror kept the rest of the document intact")
+
+-- 5) 第二个同形状毒口：**只点名一档**的写与行内未点名的另一档组成 min>=max
+--    （旧实现同样绕过校验 → 整份文档失效），必须一起挡住。
+reset_state()
+use_registry(make_registry_stub())
+pool_put({ id = "w-" .. A, url = A, model_id = "alpha", priority = 50, cost = 1.0,
+           labels = {}, disable_health_check = false })
+store.apply_policy({ policy = "round_robin" })
+store.apply_upstream_caps(A, { min_concurrency = 6, max_concurrency = 10 })
+local inverted, invert_err = store.apply_upstream_caps(A, { max_concurrency = 4 })
+eq(inverted, nil, "(6b) a partial write that inverts the row's floor/ceiling is refused")
+check(type(invert_err) == "string" and invert_err:find("must be less than max_concurrency", 1, true) ~= nil,
+    "(6b) with the cross-tier wording", tostring(invert_err))
+eq(row_field(A, "max_concurrency"), 10, "(6b) the ceiling the refused batch wanted is not on the row")
+eq(row_field(A, "min_concurrency"), 6, "(6b) and the floor it never mentioned is untouched")
+eq(roundtrip().policy, "round_robin", "(6b) the document still reads back whole")
+
+-- 6) 反向护栏：这批**点名清除**的档按清除算，不许拿行内旧值来判冲突
+--    （min=0 + max=6 是合法的"摘掉绿档、留红档"，不是 min>=max）
+local cleared, clear_err = store.apply_upstream_caps(A, { min_concurrency = 0, max_concurrency = 6 })
+eq(clear_err, nil, "(6b) a batch that clears one tier is judged on what the row will say",
+    tostring(clear_err))
+eq(row_field(A, "min_concurrency"), nil, "(6b) the cleared floor is absent, not an explicit 0")
+eq(row_field(A, "max_concurrency"), 6, "(6b) the ceiling named by the same batch landed")
+
+-- 7) 上界成对出现仍受跨档规则管（31/31 拒，31/32 收）
+local pair, pair_err = store.apply_upstream_caps(A, { min_concurrency = 31, max_concurrency = 31 })
+eq(pair, nil, "(6b) min == max is refused on the mirror path too")
+check(type(pair_err) == "string", "(6b) with an error", tostring(pair_err))
+local pair2, pair2_err = store.apply_upstream_caps(A, { min_concurrency = 31, max_concurrency = 32 })
+eq(pair2_err, nil, "(6b) the highest legal pair mirrors", tostring(pair2_err))
+eq(row_field(A, "min_concurrency"), 31, "(6b) floor 31")
+eq(row_field(A, "max_concurrency"), 32, "(6b) ceiling 32")
+
+--------------------------------------------------------------------------
 -- 7. 收尾：未映射的 ngx.re 模式必须为空（否则上面的替身在骗人）
 --------------------------------------------------------------------------
 local seen = {}
