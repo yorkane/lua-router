@@ -201,6 +201,17 @@
                         outline :color="props.row.cap_drift[0] || props.row.cap_drift[1] ? 'amber-9' : 'teal-4'"
                         class="chip-soft" :label="props.row.cap_drift[0] || props.row.cap_drift[1] ? t.capDrift : t.capFromDecl"
                       ><q-tooltip>{{ t.capDriftHint }}</q-tooltip></q-badge>
+                      <!-- protected 行（来源不是 config）的三档上限走 caps-only 投影：声明写了话
+                            的档由自愈每 30 秒写回池记录、活得过重建，执行面按池记录上那个数选路，
+                            所以「一致 = 已生效」是青色的；「还有差」只是下一轮自愈收敛，是琥珀而不是
+                            红。红色只留给「声明对三档一个字都没写」那一档（cap_shadowed），那才是
+                            声明真的管不到这行。判定全在 mergeRows，这里只按布尔位上色。 -->
+                      <q-badge v-else-if="props.row.cap_projected" outline color="teal-4" class="chip-soft" :label="t.capProjected">
+                        <q-tooltip>{{ t.capProjectedHint }}</q-tooltip>
+                      </q-badge>
+                      <q-badge v-else-if="props.row.cap_projected_drift" outline color="amber-9" class="chip-soft" :label="t.capProjectedDrift">
+                        <q-tooltip>{{ t.capProjectedDriftHint }}</q-tooltip>
+                      </q-badge>
                       <q-badge v-else-if="props.row.cap_shadowed" outline color="red-4" class="chip-soft" :label="t.capShadowed">
                         <q-tooltip>{{ t.capShadowedHint }}</q-tooltip>
                       </q-badge>
@@ -683,12 +694,16 @@
             row.decl_has_key = Boolean(row.decl) && hasKey(row.decl)
             row.has_key = false
             row.key_inert = false
-            // 上限的事实来源（root 风险 6）：只有 config_store 的自愈会把声明值写进池记录，
-            // 而它只 patch discovery == "config" 的行（config_store.lua 的 reconcile：同地址被
-            // watcher/bootstrap/手工持有时整条 else 分支跳过）。所以：
-            //   declared —— 池行由声明层拥有：显示并编辑声明值，与池行的差异是「待自愈」；
-            //   runtime  —— 池行不归声明层管（未声明，或同地址被 watcher 抢先认领）：
-            //              显示并编辑池值；此时若还有声明，必须显式标出「声明覆盖不到这一行」。
+            // 上限的事实来源（root 风险 6）：只有 config_store 的自愈会把声明值写进池记录。
+            // 它对 discovery == "config" 的行整行投影；对 protected 行（同地址被
+            // watcher/bootstrap/手工持有）走 config_store/upstreams.lua 的
+            // upstream_caps_only_patch + reconcile 的 protected else 分支：每 30 秒把声明里
+            // 写了的三档上限（min/max_concurrency、max_gpu_util）单独投影进池记录并落盘生效，
+            // 身份与调度意图字段（model_id/models/priority/cost/labels）仍不碰。所以：
+            //   declared —— 池行由声明层整行拥有：显示并编辑声明值，与池行的差异是「待自愈」；
+            //   runtime  —— 池行不归声明层整行拥有（未声明，或同地址被 watcher 抢先认领）：
+            //              显示并编辑池值；此时若还有声明，按「声明对三档上限是否写了话」
+            //              分档打标（见下面的 cap_projected / cap_projected_drift / cap_shadowed）。
             const ownedByDecl = Boolean(row.decl_url) && (!row.inPool || row.discovery === 'config')
             row.cap_owner = ownedByDecl ? 'declared' : 'runtime'
             if (ownedByDecl) row.has_key = row.decl_has_key
@@ -709,7 +724,32 @@
               || capNumber(row.decl_max_concurrency) !== capNumber(row.pool_max_concurrency),
             utilNumber(row.decl_max_gpu_util) !== utilNumber(row.pool_max_gpu_util)
           ] : [false, false]
+            // protected 行不再一刀切判红（用户 2026-10-10 裁定，口径见 doc/gap-pool-merge.md §2/§4）：
+            // 2026-10-04（提交 3728821）起自愈会把声明里写了的三档上限 caps-only 投影进池记录，
+            // 执行面（registry/loads.lua 的 capacity_verdict、router/candidates.lua 的硬排除）读
+            // 的正是池记录 —— 上限那一半此刻是生效的。红色「声明管不到这行」只对身份与调度意图
+            // 字段成立，因此只在「声明对三档一个字都没写」时出场。
+            // 「是否写了上限」与后端 upstream_caps_only_patch 同一套归一化读法：并发档走
+            // capNumber（<=0 折成不限 = 没说），利用率走 utilNumber（0 是最严档、算主张）。
+            const protectedRow = Boolean(row.decl_url) && row.inPool && row.discovery !== 'config'
+            // 逐档读声明的主张：并发两档走 capNumber，利用率走 utilNumber（同一套归一化，
+            // 见上面 capNumber / utilNumber 的注释）。一致性只比「声明写了话」的那几档 ——
+            // 后端 upstream_caps_only_patch 对没写的档保持沉默（want == nil 就跳过，既不投影
+            // 也不清除，见 config_store/upstreams.lua 的补丁注释），未写的档永远不会被自愈
+            // 收敛；把它拉进比较会让琥珀徽章那句「30 秒内会跟上」长期说不算话。未写档的
+            // 存量上限来自 PUT /workers，事实来源仍是运行态。
+            const minCapWant = capNumber(row.decl_min_concurrency)
+            const maxCapWant = capNumber(row.decl_max_concurrency)
+            const utilWant = utilNumber(row.decl_max_gpu_util)
+            const declClaimsCap = minCapWant !== null || maxCapWant !== null || utilWant !== null
+            const declCapsMatchPool =
+              (minCapWant === null || minCapWant === capNumber(row.pool_min_concurrency))
+              && (maxCapWant === null || maxCapWant === capNumber(row.pool_max_concurrency))
+              && (utilWant === null || utilWant === utilNumber(row.pool_max_gpu_util))
+            row.cap_projected = protectedRow && declClaimsCap && declCapsMatchPool
+            row.cap_projected_drift = protectedRow && declClaimsCap && !declCapsMatchPool
             row.cap_shadowed = Boolean(row.decl_url) && !ownedByDecl
+              && !row.cap_projected && !row.cap_projected_drift
           })
           out.sort((a, b) => String(a.url).localeCompare(String(b.url)))
           return out

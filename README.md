@@ -81,7 +81,7 @@ ratelimit 14、inflight_age 32、tls_server 19、profiles_upstreams 64。
 | `ui/` | 原版 llama.cpp webui（规范入口 `/u/`）+ `ui/admin/`（Quasar UMD 管理台四页，规范入口 `/`（站点根，由模板的 `location /` 提供）：模型管理 / 服务池 / 路由策略 / 日志监控，中英双语；原「远程服务 / 服务接入」页已并入服务池）；`admin-inject.js` 向原版 webui 注入 Admin 入口（href 指 `/`；旧根目录工具页 logs/metrics/config 已移除，差异见 `doc/ui-trim-legacy-pages.md`）。控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField 渲染，`:hint` 不生成 `.q-field__bottom`，说明文字只能并进 `:label` |
 | `test/final_gates.sh` | 22 门硬门（`GATE_TIER` / `SKIP_ENV` / `GATE_ONLY` / `KEEP_GOING` / `GATE_JOBS` / `GATE_DRY_RUN`） |
 | `test/test_lua_router.sh` | 契约套件（严格模式，第一个 FAIL 即退出），24 段 |
-| `test/unit/` | 纯 Lua 单测 18 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑）；`test_caps_persist` 钉控制面 caps 的持久化镜像判定层（用户裁定 2026-10-09，见 doc/gap-worker-caps.md §4） |
+| `test/unit/` | 纯 Lua 单测 18 个文件，`luajit`(authz) 与 `resty`(apisix) 两个口径（tree/policies/hash 双跑）；`test_caps_persist` 钉控制面 caps 的持久化镜像判定层（用户裁定 2026-10-09，见 doc/gap-worker-caps.md §4）；另有宿主 node 口径 1 个（`test_ui_merge.mjs`，钉服务池页 `mergeRows` 的上限归属徽章三档判定，无端口无容器，宿主缺 node 时门禁如实记 NOT RUN） |
 | `test/integration/` | 真容器 e2e：stateful / policies / ui_bridge / errors / effort / probes / head_routes / mesh_http / mesh_two / policy_parity / tls_chain / watcher / token_accounting / gpu_load / routing_dyn / profiles / caps / models_advertisement（`models_advertisement` 钉 `/v1/models` 的对外形状，2026-10-04 随第 22 门加入 GATE_ORDER） |
 | `test/mock_llm_worker.py` | 纯标准库 mock worker，含 `echo_body` / `echo_headers` 取证 |
 | `doc/` | 现状文档 30 份（架构 / 交接 / 裁剪判定 / 各能力设计与对拍报告），索引见文末；裁剪前平面的历史留档已于 2026-10-01 清理，git 历史可查 |

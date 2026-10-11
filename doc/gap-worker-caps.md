@@ -361,7 +361,14 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
   须 > 下限）、GPU 利用率上限（0..100，可空 = 不限），并排两列省垂直空间。表单三态与后端归一严格对齐：
   **并发档**空串 = 省略、`0` = 清除、`>0` = 设定；**利用率档**空串 = 省略，`0` = 最严档而不是清除。
 - `cap_owner === 'declared'` 的行（声明层是上限的事实来源）隐藏运行态编辑入口，归属与漂移在 capacity
-  列以徽章显形，理由见 [gap-pool-merge.md](gap-pool-merge.md)。
+  列以徽章显形。protected 行（`discovery ~= config`）**不按整行判红**：三档上限由 reconcile 的
+  caps-only 分支投影进池记录、执行面按池记录上的数选路（§11 第 4 项），所以这一行的归属徽章跟着
+  **上限是否已跟上声明**分三档——池记录归一后与声明一致 → 青色「上限按声明 · 投影生效」；还有差 → 琥珀「等自愈 ·
+  上限未跟上」（下一轮自愈写回，不是「不生效」）；声明对三档一个都没写 → 红色「声明管不到这行」，
+  此时惰性的只是身份与调度意图那类字段——声明里的 `model_id` / `models` / `labels` 会被
+  `registry.update` 那道门丢掉，`priority` / `cost` 不进补丁（密钥走 `key_inert` 灰徽章）。
+  徽章与 tooltip 不许把上限写成「此刻没有生效」——那是 caps-only 投影落地之前的旧口径。完整徽章
+  表见 [gap-pool-merge.md](gap-pool-merge.md) §2。
 - `ui/admin/logs.html` 的日志页同期改造（2026-10-06）：inflight / 窗口请求·错误 / 缓冲三卡合并成一条
   紧凑统计条，腾出的整块给**输入/输出 tok/s（60s 均值）**大字卡；列序改为「时间 → 状态 → …… → CACHE →
   模型」；刷新零抖动（`:loading` 只在首屏空表时进、非首屏失败不清空 rows、cursor 无变化跳过整段替换、
@@ -385,7 +392,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
    不摘；严格探针的确定性否定对它们同样不生效——这是「手填配置不能凭它判死一个健康实例」这条红线的
    延伸。**但红线保护的对象是「身份与健康判定」**——discovery、`is_healthy`、探活结论、判死逻辑，以及
    `model_id` / `models` 这两份引擎读数，声明层一个字都改不动。**它不覆盖调度旋钮**：三个上限字段
-   **允许**投影到 protected 行（`config_store/upstreams.lua` 的 caps-only 分支，2026-10-05 提交 `3728821`
+   **允许**投影到 protected 行（`config_store/upstreams.lua` 的 caps-only 分支，2026-10-04 提交 `3728821`
    立的口径，本轮把字段名册换成三字段）。理由是 caps 从不判死、只在超限时把请求迁走，下发它们不触碰
    「不能凭配置判死健康实例」这件事；而在此之前 protected 行整行不许碰的落地口径，会让操作员**没有任何
    能活过重启的上限配法**（e2e_caps S8 钉「caps 跨声明层与跨重启存活」）。
@@ -423,6 +430,12 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
    `registry.update` 里那道 `discovery == "config"` 的门仍替所有非 config 行挡掉身份字段。
    验证：`test/unit/test_caps_persist.lua`（判定层，70 checks）+ e2e_caps S9（端到端，37 checks，
    含真 `docker restart` 后「上限当场真的挡住流量」的流量判据）。
+
+   UI 侧的归属徽章必须与这条 caps-only 投影一致，否则操作员会把生效的配置读成失效的：徽章按「上限是否
+   已跟上声明」分三档（青色「上限按声明 · 投影生效」/ 琥珀「等自愈 · 上限未跟上」/ 红色只留给「声明对三档一个都没
+   写」），完整表见 [gap-pool-merge.md](gap-pool-merge.md) §2。这条不一致自 2026-10-02（`80eaf3f`）起
+   存在——红色徽章连同 tooltip 宣布声明里的上限也没生效，与投影的实际行为相反（21.k:8800 上「配了 2/10
+   且已生效、徽章却写管不到」即由此而来），本轮登记为已修正的显示层缺陷。
 5. `registry/records.lua` 的 `all_models()` / `worker_models()` / `record_models()` 目前**暂无消费者**。
    写了但没接线这件事要登记在这里，别让人以为已经有读者。两条模型列表链各自用的是：对外
    `GET /v1/models` 走 `models()`（Rust 对拍钉住的那一列，`router/models_api.lua` 的 `models_handler`）；

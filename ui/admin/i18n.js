@@ -152,7 +152,15 @@
         reconcileNotice: '同步：新增 {added} · 更新 {updated} · 移除 {removed} · 跳过 {skipped}',
         capFromDecl: '按声明', capDrift: '等自愈 · 与声明不一致',
         capDriftHint: '上限的事实来源是声明层：自愈每 30 秒按声明值写回池记录，这个徽章表示池行还没跟上（或刚改完声明）。',
-        capShadowed: '声明管不到这行', capShadowedHint: '同地址的池行由 watcher/bootstrap 抢先持有，自愈不会覆盖它：声明里的上限与模型此刻没有生效，删掉同地址的动态实例后才会接管。',
+        // 徽章三档（用户裁定 2026-10-10，doc/gap-pool-merge.md §2/§4）：2026-10-04 起自愈对 protected
+        // 行做 caps-only 投影（config_store/upstreams.lua 的 upstream_caps_only_patch），声明写了的三档
+        // 上限会写进池记录并被执行面读到，所以「管不到」只关于 model_id/models/priority/cost/labels；
+        // 旧 tooltip 那句「上限与模型此刻没有生效」的上半句是错的，必须跟着分档走。
+        capProjected: '上限按声明 · 投影生效',
+        capProjectedHint: '这行由 watcher/bootstrap 持有，声明管不到它的模型与身份字段（model_id/models/priority/cost/labels 此刻惰性）；但三档上限是例外：自愈每 30 秒把声明里写的上限投影进池记录（caps-only），活过容器重建，选路按池记录上这个数硬排除，此刻与声明一致、正在生效。',
+        capProjectedDrift: '等自愈 · 上限未跟上',
+        capProjectedDriftHint: '上限由自愈每 30 秒从声明以 caps-only 方式投影进池记录，这个徽章表示池行还没跟上（30 秒内会收敛，或刚改完声明）；若长期不动，检查该池行是否被探针摘除。同条目里的模型与身份类字段对这种行仍然惰性。',
+        capShadowed: '声明管不到这行', capShadowedHint: '同地址的池行由 watcher/bootstrap 抢先持有，自愈不会覆盖它：声明里没写任何上限，模型与身份类字段（model_id/models/priority/cost/labels）此刻不生效，删掉同地址的动态实例后才会接管。上限若想生效，请写进声明的三档上限 —— 自愈会以 caps-only 方式投影进这一行。',
         capLockedHint: '该地址由声明层管理，上限请在「编辑声明条目」里改：在这里改会在 30 秒内被自愈按声明值覆盖。',
         labelsField: '标签', labelsHint: '逗号分隔的 k=v，例如 gpu=0,engine=sglang',
         labelsJsonPlaceholder: 'gpu=0,engine=sglang',
@@ -526,7 +534,15 @@
         reconcileNotice: 'Reconcile: +{added} · ~{updated} · -{removed} · skip {skipped}',
         capFromDecl: 'from declaration', capDrift: 'self-heal pending · differs',
         capDriftHint: 'The declaration owns the caps: the self-heal rewrites the pool row from it every 30s, so this badge only means the pool row has not caught up yet.',
-        capShadowed: 'Declaration cannot reach this row', capShadowedHint: 'The pool row for this URL is held by the watcher/bootstrap, which the self-heal never overwrites: the declared caps and model are inert until that dynamic row is gone.',
+        // Same three-tier badge as zh (user ruling 2026-10-10, doc/gap-pool-merge.md 2/4): since
+        // 2026-10-04 the self-heal projects the declared caps onto protected rows via
+        // upstream_caps_only_patch, so "cannot reach" is only about the identity fields; the old
+        // wording that also declared the caps inert was half wrong.
+        capProjected: 'caps as declared · projected',
+        capProjectedHint: 'This row is held by the watcher/bootstrap, so the declaration cannot reach its model and identity fields (model_id/models/priority/cost/labels are inert here). The capacity caps are the exception: the self-heal projects whatever the declaration states into the pool record (caps only), surviving a container restart, and routing hard-excludes on that number. It currently matches the declaration and is in effect.',
+        capProjectedDrift: 'self-heal pending · caps not caught up',
+        capProjectedDriftHint: 'The caps are projected from the declaration into the pool record by the self-heal every 30s; this badge means the pool row has not caught up yet (it converges within 30s, or the declaration was just edited). If it never moves, check whether this pool row was withdrawn by a probe. The model and identity fields in the same entry stay inert for a protected row.',
+        capShadowed: 'Declaration cannot reach this row', capShadowedHint: 'The pool row for this URL is held by the watcher/bootstrap, which the self-heal never overwrites: the declaration states no capacity cap at all, and the model/identity fields (model_id/models/priority/cost/labels) are inert until that dynamic row is gone. To make a cap take effect, write it into the three declared cap tiers -- the self-heal projects them onto this row caps-only.',
         capLockedHint: 'This URL is declaration-managed: set the caps under "Edit declaration". Anything sent here is overwritten by the self-heal within 30s.',
         labelsField: 'Labels', labelsHint: 'Comma separated k=v pairs, e.g. gpu=0,engine=sglang',
         labelsJsonPlaceholder: 'gpu=0,engine=sglang',

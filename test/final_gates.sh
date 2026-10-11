@@ -558,6 +558,19 @@ run_unit_resty() {
             dofile('/repo/test/unit/$t.lua')" )
 }
 
+# node口径 (host node, no container): 只跑 ui/admin 的纯函数单测 —— 无端口、无 shdict、
+# 不碰任何容器名册，与其余 unit 同档串行也不会踩到别的门。宿主没有 node 时如实打一行
+# NOT RUN 并返回 0：本仓门禁此前对宿主 node 零依赖，不该由一枚徽章测试把它升级成硬
+# 依赖；但「没跑」必须看得见，不许被读成绿。
+run_unit_node() {
+    local t=$1
+    if ! command -v node >/dev/null 2>&1; then
+        printf '!! host node missing: %s NOT RUN (recorded, not a green)\n' "$t" >&2
+        return 0
+    fi
+    ( cd "$REPO_ROOT" && timeout 120 node "test/unit/$t" )
+}
+
 gate_unit() {
     local rc=0 t
     # test_caps_routing：并发/利用率上限与 candidates 交集的纯 luajit 单测（无端口，
@@ -600,6 +613,11 @@ gate_unit() {
         printf '\n-- resty %s\n' "$t"
         run_unit_resty "$t" || rc=1
     done
+    # test_ui_merge：服务池页 mergeRows 的徽章归属判定（node、无端口、无容器）。合并逻辑
+    # 此前只有开发期自查脚本覆盖（doc/gap-pool-merge.md §6 第 3 条）；徽章判错的形状是安静的
+    # —— 把已经生效的上限读成失效配置，HTTP 面没有任何症状，只能钉纯函数。
+    printf '\n-- node test_ui_merge\n'
+    run_unit_node test_ui_merge.mjs || rc=1
     return "$rc"
 }
 
