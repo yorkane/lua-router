@@ -37,6 +37,13 @@ local text_response = inference.text_response
 -- 不一样。收在 capabilities 下面是物理隔离，官方 SDK 只读它认识的四个键；顶层那三个
 -- （supports_reasoning_effort / reasoning_effort / reasoning_efforts）沿用
 -- opencodex 已经在用的位置，让照它写死的客户端继续照旧读。
+--
+-- 那三个顶层位与「操作员给这一行配了 effort 配置」是**互斥**的两支（用户裁定 2026-10-11
+-- 选 A，实现见 effort_advertise 那节）：配了映射/缺省档的行，根路径改由四个推导字段说话
+-- （supports_reasoning / supported_reasoning_efforts / default_reasoning_effort /
+-- supports_reasoning_effort），旧的那三个位一并让位，避免「旧位说一套、映射推出一套」；
+-- 一行 effort 配置都没配时四个键整体省略，那三个位照旧来自引擎自报那条链 —— 于是现网那些
+-- 只靠上游 /v1/models 报档位的行逐字节不变。capabilities 里的判定面不参与这条替换。
 -- context_length 两份并存（用户裁定 2026-10-08）：根层一份给直接读顶层的客户端，
 -- capabilities.context_length 原样保留，同取一个读数来源，值必然一致。
 --
@@ -388,6 +395,182 @@ local function card_default_rung(ladder)
     return nil
 end
 
+-- ------------------------------------------------ effort 映射 -> 根路径四个字段
+--
+-- 用户裁定 2026-10-11（选 A）：虚拟服务上只保留**一张** effort 强度映射表（from==to 的
+-- 恒等映射 = 全档位原样透传），模型对象**根路径**下的四个字段全部由这张表推导：
+--   supports_reasoning            映射里出现过 none 以外的档位 -> true
+--   supported_reasoning_efforts   配置里实际出现过的档位，按词表 EFFORT_LEVELS 的顺序
+--   default_reasoning_effort      配置里声明的缺省档
+--   supports_reasoning_effort     与 supports_reasoning 同一条判据（opencodex 的拼写）
+-- 三层读数（卡片 -> 条目 -> 全局）与转发链**同源**：config_store/readers.lua 的
+-- effort_layers 就是这三层，逐 from 查表。对外说「支持哪几档」与实际「会改写哪几档」
+-- 必须出自同一份事实 —— 两处各判各的正是 2026-10-07 那次「一条目被广告却被路由拒服务」
+-- 的价钱（本文件 ask_hidden 那节同一条纪律）。
+--
+-- 判据是**操作员的配置**，不是引擎自报：一行没有任何 effort 配置时四个键整体省略
+-- （删键，不写 null、不写空数组），那一行继续沿用旧的三个顶层位 —— 纯引擎自报的形状
+-- 一字不改（AGENTS.md「新开关缺省零行为变化」+ 硬规则 9② 的「宁缺勿猜」在这一支完整生效）。
+--
+-- 档位清单一律按词表的规范顺序落地，**不**按配置里的字节顺序：查表形态用 pairs() 收集，
+-- 其顺序由 Lua 的散列决定，直接进输出就会打掉「同一配置两次调用逐字节相同」这条既有
+-- 纪律（test_models_shape G9 / e2e_models_advertisement 的字节稳定断言）。
+local effort_advertise = {
+    -- 规范顺序的兜底副本。唯一权威是 config_store/lexicon.lua 的 EFFORT_LEVELS；本文件
+    -- 被两份切片单测配桩加载（受限环境表），那里未必装配得动整条 config_store 依赖链，
+    -- 所以先问 store 一次、问不出来才用这份副本。两份内容不一致时切片单测里的 8 档断言会红。
+    order = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" },
+    levels = nil,   -- 装配好的规范顺序（进程级只读缓存；跨请求状态只走 shdict 的纪律管的
+                    -- 是参与判定的状态，这份**常量**只镜像词表，不参与任何判定）
+    levels_from = nil,  -- 上面那份缓存**是谁给的**（见 ordered_levels 的取用护栏）
+}
+
+--- 档位名的归一化：trim + lower，非字符串 / 空串 / 哨兵串 -> nil（= 这个读数不存在）。
+--- 刻意不复用 config_store 的 normalize_effort：切片单测那份受限环境里它可能取不到，而这里
+--- 要的只是「顺平大小写与空白 + 丢掉垃圾」；是否算一个**已知档位**交给规范顺序的成员判定
+--- （不在词表里的名字自然进不了清单，等于不猜）。
+function effort_advertise.name(value)
+    if type(value) ~= "string" then return nil end
+    local v = value:match("^%s*(.-)%s*$"):lower()
+    if v == "" or v == "null" or v == "default" then return nil end
+    return v
+end
+
+--- 规范顺序：优先问 config_store 的词表（唯一实现住在那里，facade 导出 effort_levels），
+--- 问不出来退回本表副本。取用护栏与本文件 ask_hidden / models_advertise.from_disk 同一条
+--- 纪律：store 缺席、reader 没落地、pcall 出错，一律退回副本而不是把判定打挂 —— 词表是
+--- 常量，两条来源给出的内容必须一致（不一致由单测的 8 档断言把红报出来）。
+---@return string[]
+function effort_advertise.ordered_levels(store_mod)
+    local cached = effort_advertise.levels
+    -- 缓存按**来源**判定，不按「有没有缓存」：切片单测每个用例换一份桩 store，一份粘住的
+    -- 缓存会让后一个用例悄悄读着前一个用例的词表（真生产里 store_mod 恒是同一个模块表，
+    -- 这条判据因此与缓存收益无关地一直命中）。
+    if type(cached) == "table" and #cached > 0 and effort_advertise.levels_from == store_mod then
+        return cached
+    end
+    local out
+    if type(store_mod) == "table" and type(store_mod.effort_levels) == "function" then
+        local ok_list, listed = pcall(store_mod.effort_levels)
+        if ok_list then out = clean_string_list(listed) end
+    end
+    if out == nil then out = clean_string_list(effort_advertise.order) end
+    effort_advertise.levels = out
+    effort_advertise.levels_from = store_mod
+    return out
+end
+
+--- 一层 effort_map 里出现过的 from 档位落进集合。两种拼法都收：磁盘/UI 的
+--- { {from,to}, ... } 数组与装配后的查表（与 config_store/readers.lua 的 effort_map_view
+--- 同一判据：数组形态看第一个元素有没有 from 键）。
+---
+--- 只取 from、不取 to：from 是**客户端能点名**的档位域（request_effort_for 拿它查改写），
+--- to 是转发给落点引擎的名字。把 to 列进对外清单等于告诉客户端「你可以直接点这个名」，
+--- 而那个名字是**被改写之后**的落点，未必是引擎认的那个 —— 报出去就是一条会让请求 400
+--- 的广告。
+function effort_advertise.collect_froms(set, map)
+    if type(map) ~= "table" then return end
+    if #map > 0 and type(map[1]) == "table" and rawget(map[1], "from") ~= nil then
+        for i = 1, #map do
+            local pair = map[i]
+            if type(pair) == "table" then
+                -- to 侧与查表分支同一条护栏：空 to 在 config_store 的装配里就是「没配这条」
+                -- （cfg_from_env / apply_model_patch 都把 to=="" 的条目丢掉），磁盘上手改进来的
+                -- 空 to 不该被算成「这个档位配过了」。
+                local to = rawget(pair, "to")
+                local from = effort_advertise.name(rawget(pair, "from"))
+                if from and type(to) == "string" and to ~= "" then set[from] = true end
+            end
+        end
+        return
+    end
+    for from, to in pairs(map) do
+        if type(to) == "string" and to ~= "" then
+            local name = effort_advertise.name(from)
+            if name then set[name] = true end
+        end
+    end
+end
+
+--- 一行 effort 配置读数：档位清单与缺省档。
+---
+--- 「这一行配没配 effort」的判据只来自**它自己那一层**的声明 —— 调用点决定传哪一层进来
+--- （真实模型那一行传卡片，虚拟入口那一行传条目）。刻意不把 config 的**全局/ env** 那一层
+--- （cfg.effort_map）算进这个判据：全局那张表是「给所有模型统一改写档位」的兜底，本身不是一份
+--- 「这台支持哪些档」的对外声明 —— 一条全局改写就把每一行点亮成支持推理，等于替操作员对所有
+--- 模型说了他没说过的话，也违反 AGENTS.md「新开关缺省零行为变化」（现网 runtime.json 的全局表
+--- 为空 = 一个字节都不变）。转发链照旧问那三层（readers.lua 的 effort_layers 一字未动）：
+--- **实际会改写哪些档**与**对外说支持哪些档**是两层陈述，前者由三层共同决定，后者只由这一行
+--- 自己的声明决定。
+---
+--- 档位清单的两个来源：本层 effort_map 的定义域（from 侧）与本层声明的 default_effort。后者也
+--- 算「配置里出现过的档位」—— 需求原文与最终裁定第 5 条把 default_effort 与 effort_map 并列成
+--- 「effort 配置」的两半（原文：「含 default_effort 与 effort_map 都为空」），判据是「出现过
+--- none 以外的档位」而不是「出现过映射条目」：一条只配了缺省档 low 的入口，对外说的就是
+--- 「low 可用、默认走它」，这句话操作员确实说了。
+---
+--- 缺省档的**取值**按转发链的层序逐层问（model_effort 强制行 > 卡片 > 条目 > 全局，第一个说了的
+--- 赢，与 readers.lua 的 effort_default_lookup 同一判据）——「客户端没点名时发哪一档」本来就是
+--- 那条链在回答的问题，对外说的与实际发的不许两套口径（本文件 ask_hidden 那节同一条纪律）。
+--- 低层只喂缺省档、不进清单，理由与全局那张表同一条。
+---
+---@return table|nil { levels = {string,...}, default = string|nil }
+--- nil = 「这一行自己没配过任何 none 以外的档位」，调用点据此把四个键整体省略。
+function effort_advertise.derive(store_mod, card, entry_declared, cfg, model)
+    local set = {}
+    local declared_default
+    --- 低层（model_effort 强制行 / 全局）：只喂缺省档，不进档位清单。
+    local function later_default(value)
+        if declared_default ~= nil then return end
+        declared_default = effort_advertise.name(value)
+    end
+    --- 本层（卡片 / 条目）：说的每一档既进清单也进缺省档。
+    local function own(value)
+        local name = effort_advertise.name(value)
+        if name == nil then return end
+        set[name] = true
+        if declared_default == nil then declared_default = name end
+    end
+    if type(cfg) == "table" and type(model) == "string" and model ~= "" then
+        local forced = cfg.model_effort
+        if type(forced) == "table" then later_default(forced[model]) end
+    end
+    if type(card) == "table" then
+        effort_advertise.collect_froms(set, rawget(card, "effort_map"))
+        own(rawget(card, "default_effort"))
+    end
+    if type(entry_declared) == "table" then
+        effort_advertise.collect_froms(set, rawget(entry_declared, "effort_map"))
+        own(rawget(entry_declared, "default_effort"))
+    end
+    if type(cfg) == "table" then
+        later_default(rawget(cfg, "default_effort"))
+    end
+    local levels = {}
+    local ordered = effort_advertise.ordered_levels(store_mod)
+    for i = 1, #ordered do
+        if set[ordered[i]] == true then levels[#levels + 1] = ordered[i] end
+    end
+    -- 一条判据两写（需求原文「只要有 effort 配置（除了 none 以外）就必须加上」）：清单为空、
+    -- 或清单里只剩 none，都算「没配」，四个键一起省略（裁定第 5 条）。none 之外的任何一档出现
+    -- 即算配了 —— 两个 support 位因此恒 true，不存在「配了表却报 false」那一支。
+    local any_beyond_none = false
+    for i = 1, #levels do
+        if levels[i] ~= "none" then any_beyond_none = true break end
+    end
+    if not any_beyond_none then return nil end
+    -- 缺省档只认**操作员配置**的那一份（上面那层序），引擎 picker 上的 default 一律不掺：那台
+    -- 引擎的预选不是这张表的说法，填进来就是替操作员编一句话（旁边 row.default_effort 那条链
+    -- 原样保留引擎/勾选表那份，两个来源各画各位、互不冒充）。配置没说就省略这一个键。
+    --
+    -- 刻意**不**要求缺省档落在清单里：清单说的是「客户端能点名哪些档、这张表覆盖哪些档」，
+    -- 缺省档说的是「客户端没点名时网关发哪一档」，两个量由配置的不同字段各自声明，拿一个去判
+    -- 另一个就是 2026-10-04 那次把三个量当一个数的翻版。操作员完全可以配一张只改写 high/max
+    -- 的表、同时让缺省档走 none（默认不思考）；反向组合同样合法。
+    if type(declared_default) ~= "string" then declared_default = nil end
+    return { levels = levels, default = declared_default }
+end
+
 --- 单个**实际模型**的一行能力读数：操作员声明与引擎自报按优先级合成后的样子。
 --- 每个维度独立取源，所以「操作员只声明了模态」不会连带把引擎报的上下文丢掉。
 ---@param entry_declared table|nil 虚拟条目那一层的声明（卡片没说的位由它接手）；真实模型那一行传 nil
@@ -419,6 +602,22 @@ local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
         input = clean_string_list(value)
         input_declared = input ~= nil
     end
+    -- 条目层那一份模态声明（虚拟入口的 profile.modalities）过去在这条链上**完全没有读者**：
+    -- modalities_for 只认卡片，于是操作员在入口上手填的 image/video 既不改对外模态、也不参与
+    -- supports_vision 的推断 —— 而 config_store 一路把它装配、落盘、往返、在 UI 上摆成一个
+    -- 可勾选项（profiles.lua 的 build_entry_modalities 与 mutators.lua 的 profile_for 拷贝），
+    -- 那份声明是**死的**。用户裁定 2026-10-11 第 3 条要求「视觉能力通过 image/video 判断，
+    -- 无论来自引擎自报还是操作员手填」，接不上这一格就等于继续让一个面板上的开关骗人。
+    --
+    -- 位置排在卡片**之后**、引擎之前：卡片离落点引擎最近（与旁边 effort 三层继承「卡片 → 条目」
+    -- 同一条纪律），条目那一份是入口对外的说法，只在卡片没说时接手。两边都是**穷尽**清单
+    -- （build_entry_modalities 与卡片那条写入路径都把 text 常开、空表也写成 { "text" }），
+    -- 所以它同样拿到 input_declared —— 允许反推负向。output 那一维不代填：条目层只有一份
+    -- 清单，没有「产出模态」的说法，凭空写个 { "text" } 就是替操作员编话。
+    if input == nil and type(entry_declared) == "table" then
+        input = clean_string_list(rawget(entry_declared, "modalities"))
+        input_declared = input ~= nil
+    end
     local modalities = type(caps) == "table" and caps.modalities or nil
     if type(modalities) == "table" then
         if input == nil then input = clean_string_list(modalities.input) end
@@ -448,6 +647,21 @@ local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
         local maybe = cfg.model_configs[model]
         if type(maybe) == "table" then card = maybe end
     end
+
+    -- 操作员在这张**卡**上配过 effort 映射或缺省档？这一维是本轮裁定的唯一开关：配了 -> 四个
+    -- 根路径字段由这张表推导；没配 -> 四个键整体省略，这一行的形状与改动前逐字节一致（旧的三个
+    -- 顶层位照旧来自「卡片声明 → 条目声明 → 引擎自报」那条链）。
+    --
+    -- 判据只取卡片那一层；cfg / model 只喂**缺省档的取值**（model_effort 强制行与全局 default
+    -- 那两层的读数，见 derive 的注释），不参与档位清单 —— 对外说的缺省档与转发链实际发的那一档
+    -- 不许两套口径，而全局那张 effort_map 本身不是一份「这台支持哪些档」的声明（derive 上方把
+    -- 这条界线连同「现网零行为变化」的理由一起写清了）。
+    -- 条目层也要参与（root 裁定 2026-10-11 的落地修正）：用户裁定原文是「直接在虚拟服务中
+    -- 配置强度映射」，本轮的主体就是**虚拟服务条目**上的那张表；只喂卡片会让「配在条目上」
+    -- 的那一档对外完全不说话——探针 PROBE1/4 就是这么红的。卡片与条目两层并联进 derive，
+    -- 档位取并集、缺省档按 derive 内既有的层序（卡片先说、条目接手）。真实模型行那边
+    -- entry_declared 本来就是 nil（:1047 不传 profile），所以纯引擎自报那一支仍逐字节不变。
+    local effort_declared = effort_advertise.derive(store_mod, card, entry_declared, cfg, model)
 
     --- 一个能力位在这台模型上的声明层读数：卡片先说，条目随后，都没说才 nil（=沉默）。
     --- 刻意不看 `card[field] == false` 之类的一元判定：false 是结论、nil 是沉默，
@@ -554,10 +768,32 @@ local function resolve_model_caps(store_mod, cfg, model, caps, entry_declared)
     else
         row.accepted = engine_face or ladder_values(ladder)
     end
-    -- 顶层 supports_reasoning_effort 的声明层读数（卡片 → 条目）。它是一位**独立**的
-    -- 对外说法，不是「有没有档位读数」那个派生的别名：派生只在两边都没说时才起作用
-    -- （见 fill_model_fields，那条派生链的行为逐字节不变，包括它什么时候省略这个键）。
-    row.declared_effort_support = declared("supports_reasoning_effort")
+    if effort_declared then
+        -- 这一行配了 effort 配置：四个根路径字段改由这张表推导（判据见 effort_advertise.derive
+        -- 上方的注释）。顶层那三个旧位此时一并让位（fill_model_fields 的 if 支），理由与
+        -- 「只保留一张映射表」那条裁定同一条：同一行上留两份档位枚举（引擎/勾选表的
+        -- reasoning_efforts 与推导出的 supported_reasoning_efforts）、两份缺省档说法
+        -- （reasoning_effort 与 default_reasoning_effort）、外加一位能被映射推翻的独立布尔，
+        -- 就是让客户端自己去仲裁谁说话。
+        -- capabilities 里那份**判定面**（out.reasoning_effort = row.accepted）不参与这条替换：
+        -- 它说的是「下游真正接受哪几档」，是引擎亲口给过的读数，被操作员的一张映射表抹掉就是
+        -- 销毁上游事实（硬规则 9② 在这一格完整生效）。row.ladder / row.default_effort 仍然照算
+        -- —— 引擎说过的事情留在 row 里，只是这一行不再为它对外画第二份清单。
+        -- 纯增量（root 裁定 2026-10-11）：四个根路径字段是**新增**读数，不顶掉旧三位。
+        -- 需求原文说的是「为输出的 /v1/models 增加描述字段」与「虚拟服务里配置强度映射」，
+        -- 去除的是**虚拟服务条目上的配置**（W1 拆的那五位布尔），不是对外已经存在的字段名。
+        -- 旧三位（reasoning_effort / reasoning_efforts / 顶层 supports_reasoning_effort）继续按
+        -- 「卡片声明 → 条目声明 → 引擎自报」那条既有链输出：卡片场景的对外缺省档（G5/G11 钉的就是
+        -- 它）是既有能力，不该被条目层的简化带走。两处数据同源时两个字段值一致、不冲突；
+        -- 纯引擎自报的那一支更是一行都没动（effort_advertise 为 nil，下面整段照旧）。
+        row.effort_advertise = effort_declared
+        row.declared_effort_support = declared("supports_reasoning_effort")
+    else
+        -- 顶层 supports_reasoning_effort 的声明层读数（卡片 → 条目）。它是一位**独立**的
+        -- 对外说法，不是「有没有档位读数」那个派生的别名：派生只在两边都没说时才起作用
+        -- （见 fill_model_fields，那条派生链的行为逐字节不变，包括它什么时候省略这个键）。
+        row.declared_effort_support = declared("supports_reasoning_effort")
+    end
     return row
 end
 
@@ -707,32 +943,85 @@ local function common_acceptance(rows, default_effort)
     return out
 end
 
---- 把一行能力读数摊到响应条目上：顶层三个 opencodex 键 + capabilities 命名空间，
---- 外加一个顶层 context_length。整行没有任何读数时什么都不加，条目回退成官方那四个
---- required 字段。
+--- 把一行能力读数摊到响应条目上：根路径的 effort 字段 + capabilities 命名空间，外加一个
+--- 顶层 context_length。整行没有任何读数时什么都不加，条目回退成官方那四个 required 字段。
+---
+--- 根路径那两组字段互斥，两支（用户裁定 2026-10-11 选 A，见 effort_advertise 那节）：
+---   * 这一行配了 effort 配置（本层的映射表 / 缺省档里出现过 none 以外的档位）→ 写
+---     supports_reasoning / supported_reasoning_efforts / default_reasoning_effort /
+---     supports_reasoning_effort 四个**推导**字段，旧的 picker 与缺省档两个顶层位一并让位；
+---   * 一行都没配（含只配了 none）→ 四个键整体省略（不写 null、不写空数组），那三个
+---     opencodex 位照旧来自「声明 → 引擎自报 → 派生」那条**未改动**的链。
+--- capabilities 命名空间与它里面的判定面在两支里都照常产出。
+---
 --- context_length 两份并存（用户裁定 2026-10-08）：模型对象根层与 capabilities 内各一份，
 --- 同取 row.length，值必然一致。根层那份是给直接读顶层的客户端用的，capabilities 内那份
 --- 保持既有命名空间口径不动。
 local function fill_model_fields(entry, row)
-    -- 顶层 supports_reasoning_effort：操作员声明（卡片 → 条目）优先，未声明时维持**原有
-    -- 派生**——任一份档位读数（可选项、判定面、缺省档）都足以支撑「这台接受
-    -- reasoning_effort」，没有读数则整个键省略。派生这一支的行为逐字节不变（2026-10-05
-    -- 只是把三态的「明确说不支持」接到它前面），所以声明 false 时档位表与缺省档照旧
-    -- 出现在条目上：操作员否掉的是那一位对外声明，不是引擎给过的档位事实。
-    local effort_support = boolean_or_nil(row.declared_effort_support)
-    if effort_support == nil then
-        if row.ladder or row.accepted or row.default_effort then
-            effort_support = true
+    -- 根路径那四个字段：**有 effort 映射时全由它推导，四个键一起出现；没有映射时四个键
+    -- 一个都不出现**（用户裁定 2026-10-11 第 5 条 —— 不写 null、不写空数组冒充「支持零个」）。
+    --
+    -- 配置了映射的那一行同时**不再**产出旧的三个顶层位（supports_reasoning_effort /
+    -- reasoning_effort / reasoning_efforts）：裁定是「虚拟服务上只保留一张 effort 强度映射表」，
+    -- 留着旧位就允许「旧位说一套、映射推出一套」在同一行上并存。旧的三个位只在**没有映射**
+    -- 那一支继续按原样产出，于是纯引擎自报的行（现网的绝大多数：既没配卡片映射也没配条目映射，
+    -- 档位事实全来自上游 /v1/models）逐字节不变 —— 这也是本轮唯一能让 opencodex 那三个位置
+    -- 继续有读数的支路：照它写死的客户端不配映射，因此一行都不受影响。
+    --
+    -- capabilities 命名空间与判定面（out.reasoning_effort）一概不参与这条替换：那是「引擎自己
+    -- 说过哪几档」的读数，不是对外能力声明，被操作员的一张映射表抹掉就是销毁上游事实（硬规则
+    -- 9② 在这一支完整生效）。
+    local advertised = row.effort_advertise
+    local levels = type(advertised) == "table" and advertised.levels or nil
+    if type(levels) == "table" and #levels > 0 then
+        -- 本轮新增的四个根路径字段（用户裁定 2026-10-11）。与下方旧三位**并存**：
+        -- 需求是「为输出增加描述字段」，去除的是虚拟服务条目上的配置，不是对外已有字段名。
+        -- 两位 support 位同一条判据（需求原文：「只要有 effort 配置（除了 none 以外）就必须
+        -- 加上」）。derive 已经在「只剩 none」时整体答 nil，因此走到这里就是「出现过 none
+        -- 以外的档位」，两个位恒 true —— 没有「配了映射却报 false」那一支，那正是裁定要拆掉的
+        -- 自相矛盾。supports_reasoning_effort 这个名字刻意沿用旧位而不是新造：opencodex 与
+        -- 照它写死的客户端读的就是这个名字。
+        entry.supports_reasoning = true
+        entry.supports_reasoning_effort = true
+        -- 根路径这两位是**推导**（映射表说了算），capabilities 里的 supports_reasoning 仍是
+        -- 「声明 → 引擎自报」那份读数（row.reasoning），两者刻意不互相覆盖：命名空间不同，
+        -- 后者是既有契约（e2e S2 的「四个 supports_* 都是 true」钉着它）。同一行上出现
+        -- 「根 true / capabilities false」的唯一前提是操作员既配了映射又在**卡片**上显式勾了
+        -- supports_reasoning=false —— 卡片那五位布尔的拆除面归 W1/W4（本轮裁定只点名虚拟服务
+        -- 条目，卡片字段「除非被这套推导取代」不在本轮自拆范围），这里刻意不越界替它们改写读数。
+        local listed = {}
+        for i = 1, #levels do listed[i] = levels[i] end
+        -- 清单是**新表**而不是 row 里那份引用：响应条目会被下游改（切片单测与 props 链都有这么
+        -- 干的），改了就把同一进程里下一份读数的字节也带跑 —— 字节稳定的纪律赔不起。
+        entry.supported_reasoning_efforts = listed
+        if type(advertised.default) == "string" and advertised.default ~= "" then
+            entry.default_reasoning_effort = advertised.default
         end
     end
-    if effort_support ~= nil then
-        entry.supports_reasoning_effort = effort_support
-    end
-    -- default_effort 在场时旧版必定进入上面那个 if（它是派生条件之一），所以把它挪到
-    -- 分支外是字节等价的——这个"分支外提"不改变任何未声明场景的输出。
-    if row.default_effort then entry.reasoning_effort = row.default_effort end
-    if row.ladder then
-        entry.reasoning_efforts = row.ladder
+    -- 旧三位（reasoning_effort / reasoning_efforts / 顶层 supports_reasoning_effort）：
+    -- 原有链路无条件照旧。包一层 do 只是为了把这段与其上方的新字段 if 分隔开——
+    -- 两条链读的是同一批事实、值一致时互不冲突；卡片场景更只有旧链有值。
+    do
+        -- 顶层 supports_reasoning_effort：操作员声明（卡片 → 条目）优先，未声明时维持**原有
+        -- 派生**——任一份档位读数（可选项、判定面、缺省档）都足以支撑「这台接受
+        -- reasoning_effort」，没有读数则整个键省略。派生这一支的行为逐字节不变（2026-10-05
+        -- 只是把三态的「明确说不支持」接到它前面），所以声明 false 时档位表与缺省档照旧
+        -- 出现在条目上：操作员否掉的是那一位对外声明，不是引擎给过的档位事实。
+        local effort_support = boolean_or_nil(row.declared_effort_support)
+        if effort_support == nil then
+            if row.ladder or row.accepted or row.default_effort then
+                effort_support = true
+            end
+        end
+        if effort_support ~= nil then
+            entry.supports_reasoning_effort = effort_support
+        end
+        -- default_effort 在场时旧版必定进入上面那个 if（它是派生条件之一），所以把它挪到
+        -- 分支外是字节等价的——这个"分支外提"不改变任何未声明场景的输出。
+        if row.default_effort then entry.reasoning_effort = row.default_effort end
+        if row.ladder then
+            entry.reasoning_efforts = row.ladder
+        end
     end
     local out = {}
     if row.length then out.context_length = row.length end
@@ -842,6 +1131,21 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
             end
         end
     end
+    -- 入口自己那一张 effort 映射表（条目层 = profile.effort_map / default_effort）。这是
+    -- 本轮裁定对**虚拟服务**点名的那一层：「默认所有思考都要支持，直接在虚拟服务中配置强度
+    -- 映射（默认使用原始值）」—— 入口配了这张表，四个根路径字段就由它推导，与组内成员的
+    -- 引擎自报无关（成员各自的行仍走它们自己那一层：真实模型行看卡片，入口行看条目）。
+    -- 判据只看条目层自己：一条全局兜底改写不该让每个入口凭空长出「支持推理」的对外声明
+    -- （理由见 resolve_model_caps 里 effort_declared 那一段，两处同一判据）。
+    --
+    -- 与旁边 common_declared_effort_support / common_ladder 一律无关：那两个仲裁的是「成员
+    -- 们的引擎读数齐不齐」，而这里说的是**操作员给这张入口配的那张表**，一份不需要组内共识
+    -- 的声明。配了表的入口行同时不再产出旧的三个顶层位（fill_model_fields 那一段）。
+    -- cfg 只喂**全局缺省档**那一层；model_effort 强制行在这里刻意不查（第四位传 nil）——
+    -- 那条键钉的是**落点模型**（转发链上按 resolved model 查），入口对外没有单一的落点，
+    -- 拿入口名去查只会读到一条操作员从没为这个入口声明过的键。入口行的缺省档因此由
+    -- 「条目自己 > 全局」两层给出，档位清单仍只认条目自己那一张表。
+    local entry_effort = effort_advertise.derive(store_mod, nil, profile, cfg, nil)
     fill_model_fields(entry, {
         length = (profile and positive_int(profile.context_window) or nil)
             or narrowest_number(rows, "length"),
@@ -856,6 +1160,7 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
         ladder = ladder,
         accepted = common_acceptance(rows, default_effort),
         default_effort = default_effort,
+        effort_advertise = entry_effort,
     })
     return entry
 end

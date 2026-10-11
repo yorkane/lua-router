@@ -86,6 +86,12 @@ function _M.document()
     -- The stored snapshot carries the secret for the persistence layer; the
     -- response half of contract 3.4 masks it here.
     snap.upstreams = CS_UPSTREAMS.sanitize_upstream_rows(snap.upstreams)
+    -- 条目级 api-key 同一条款（用户裁定 2026-10-11）：磁盘与 db 里存着明文（那是密钥唯一能活
+    -- 的地方，否则一次 reload 就把门拆了），**对外面**只见掩码 —— api_key 恒 null、
+    -- has_api_key 说有没有存着、api_key_state / api_key_stored 不出这份文档。
+    -- 与 upstreams 那一行同一条纪律：掩码发生在响应边界，不在 snapshot_of 里（那里出来的
+    -- 那份字节就是要落盘的）。
+    snap.virtual_models = CS_SNAPSHOT.sanitize_virtual_rows(snap.virtual_models)
     snap.env_defaults = CS_FACADE.env_defaults()
     -- url stays an explicit null: the watcher is in process, so there is no control
     -- plane address to echo, and the key itself is part of the /_ui/config document
@@ -294,6 +300,7 @@ end
 
 _M.read_json_body = read_json_body
 
+
 --- A mutator's refusal, with the status the operator deserves. The durable layer
 --- turning down a compare-and-set is 409 -- the submitted document was fine, the base
 --- underneath it moved -- and stays distinct from the 400 an invalid body has always
@@ -415,6 +422,47 @@ function _M.handle_config_model_map()
     return respond_json(ngx.HTTP_OK, result)
 end
 
+--- 掩码文档的密钥搬运（用户裁定 2026-10-11）：GET /_ui/config 出来的入口行里 api_key 读起来
+--- 永远是 null，所以「JSON 编辑器原样保存」这一条链上，一行**没说**密钥的 entry 必须继承
+--- 库里那一份，否则一次与密钥无关的整文档保存就把门悄悄拆掉。与 upstreams 段的 previous
+--- （config_store/upstreams.lua 的 build_upstreams）是同一条理由、同一个判据：
+--- 只搬「这行对密钥一个字都没说」的那些行；显式写了 api_key=""（清除）或写了新密钥的行一律
+--- 不动，让 build_entry_key 自己判。
+---
+--- 明文在这一步从存储流向**同一进程内**的 apply 体，不经过任何响应通道：handlers 在配置平面
+--- 之内、不是对外面，所以这不违反「明文不出 config_store 的出口」，那条纪律约束的是响应面
+--- （document / models_document / profile_for 一律掩码）。
+local function carry_virtual_keys_from_store(patch)
+    if type(patch) ~= "table" then return end
+    local entries = rawget(patch, "virtual_models")
+    if not CS_LEXICON.is_array(entries) then return end
+    local cfg = CS_FACADE.current()
+    local stored_by_alias = type(cfg.virtual_profiles) == "table" and cfg.virtual_profiles or {}
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" then
+            local function silent(key)
+                local value = rawget(entry, key)
+                return value == nil or value == JSON_NULL
+            end
+            -- 三件密钥字段全沉默（或 state 明说 keep）才算「这行没提密钥」；写了 "" 是清除，
+            -- 写了新串是设置，两种都必须原样交给 build_entry_key 判，这里一个字都不碰。
+            local says_nothing = silent("api_key") and silent("api_key_stored")
+                and (silent("api_key_state") or entry.api_key_state == "keep")
+            if says_nothing then
+                local alias = type(rawget(entry, "model")) == "string"
+                    and CS_LEXICON.trim(entry.model) or ""
+                local stored = alias ~= "" and stored_by_alias[alias] or nil
+                if type(stored) == "table" and stored.api_key_state == "set"
+                    and type(stored.api_key_stored) == "string"
+                    and stored.api_key_stored ~= "" then
+                    entry.api_key_state = "set"
+                    entry.api_key_stored = stored.api_key_stored
+                end
+            end
+        end
+    end
+end
+
 --- POST /_ui/config/apply  whole-document replace, optional model_map section.
 function _M.handle_config_apply()
     local patch, err = read_json_body()
@@ -428,6 +476,7 @@ function _M.handle_config_apply()
         model_map = rawget(patch, "model_map")
         patch.model_map = nil
     end
+    carry_virtual_keys_from_store(patch)
     local _, apply_err, reconcile = CS_FACADE.apply_document(patch)
     if apply_err then return respond_apply_error(apply_err) end
     local doc = CS_FACADE.document()
@@ -463,5 +512,11 @@ function _M.handle_config_apply()
     if warning then doc.warning = warning end
     return respond_json(ngx.HTTP_OK, doc)
 end
+
+--- Unit hook（与 read_json_body / respond_json 同一条导出缝；必须放在函数定义之后，
+--- Lua 的 local 在那之前还不存在）：整文档保存的密钥搬运。handle_config_apply 在调
+--- apply_document 之前走的就是这一枚，单测与探针直接喂解码后的文档就能验到同一份实现，
+--- 不必为了测试伪造 ngx 请求体。
+_M.carry_virtual_keys_from_store = carry_virtual_keys_from_store
 
 return _M

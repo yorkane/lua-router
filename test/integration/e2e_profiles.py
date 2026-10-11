@@ -72,6 +72,14 @@
                  提交 → 400，且 vm-doc 仍带 prefix_hash、G 的 key 未被洗
                  （再来一发 200 + Bearer sk-X-999）、池里无诱饵、文档无 vm-bad。
                  另测未知 profile policy 400 与旧形状 {model,target} 兼容。
+  S5 entry-key   虚拟服务条目级 api-key（用户裁定 2026-10-11 需求 A）：配了 key 的入口
+                 不带/带错 key → 401 + code api_key_required + WWW-Authenticate，且
+                 **一个字节都不到引擎**（mock 的 auth_denied 与请求行数原地不动、/logs
+                 无 401 行）；带对 key → 200 且引擎看到的是调用方那把 key（转发不是改写）；
+                 没配 key 的入口与真实模型名照旧不受影响（缺省零行为变化）；掩码整文档
+                 保存不拆门；api_key:"" 是清除（回落到 worker 级 key）。同一条目配 effort
+                 映射 → /v1/models 四个推导字段与掩码并存，明文不出 /v1/models、/props、
+                 /workers（取值/省略的完整口径在 e2e_models_advertisement S13/S14）。
 
 观察通道：mock 计数、/last_auth 自省、GET /workers、GET /config、
 /logs route_type、lr_watch_* 计数；端口全部随机；容器一律
@@ -87,6 +95,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (TMP, RUN, IMAGE, CONTAINERS, free_port, http, check,
                   start_mock, mock_lines, start_router, logs, stop_router, chat,
                   wait_ready, cleanup, RESULTS)
+
+
+
+def _jsonish(body):
+    """Decode a response body defensively; the assertion around it does the judging."""
+    try:
+        return json.loads(body)
+    except ValueError:
+        return {}
 
 
 def stop_mock(proc):
@@ -207,6 +224,191 @@ def wait_all_healthy(port, want=2, timeout=40):
     return False
 
 
+# ==================================================== S5 entry api-key + four fields
+def scenario_entry_api_key():
+    """虚拟服务条目级 api-key（用户裁定 2026-10-11 需求 A）与四个推导字段（需求 B）。
+
+    与契约段（test_lua_router.sh 的 virtual_models）的分工：那份钉**门本身的 HTTP 形状**
+    （401 / code / WWW-Authenticate / 三态 / 掩码回显），这份钉**门与转发链的相对位置**——
+    被拒的请求必须一个字节都没到过引擎。这一条只能从 mock 侧看：网关自己说「我没转发」
+    不算证据，对面那台 REQUIRE_AUTH mock 的 auth_denied 计数没跳、/v1/chat/completions
+    的日志行数没增，才是「记账与转发都在门之后」的实证（W2 的位置判据）。
+
+    四字段（需求 B）在这里只钉**存在性与掩码不打架**这一格：一个既配了 key 又配了 effort
+    映射的入口，对外既要说「支持哪几档」，又绝不能把密钥说出来。取值/省略/档位顺序的
+    完整口径在 e2e_models_advertisement 的 S13/S14。
+    """
+    pk, pp = PORT_K[0], PORT_K2[0]
+    start_mock_env(pk, "gated-m", REQUIRE_AUTH=1)
+    start_mock(pp, "plain-m")
+    url_k, url_p = "http://127.0.0.1:%d" % pk, "http://127.0.0.1:%d" % pp
+    name = "lr-prof-s5-%s" % RUN
+    env = {"SMG_POLICY": "round_robin", "SMG_ENABLE_IGW": "1",
+           "NGINX_WORKER_PROCESSES": "1", "SMG_HEALTH_CHECK_INTERVAL_SECS": "1",
+           "SMG_WORKER_URLS": url_p}
+    port = start_router(env, name)
+    if not check("[S5] bootstrap worker healthy", wait_ready(port, 1), logs(name)[:300]):
+        return
+    ENTRY_KEY = "sk-ENTRY-7c1d"
+    WORKER_KEY = "sk-WORKER-123"
+    st, resp = post_json(port, "/workers", {"url": url_k, "model_id": "gated-m",
+                                             "api_key": WORKER_KEY})
+    check("[S5] gated worker registered", st in (200, 202), "%s %s" % (st, str(resp)[:200]))
+    check("[S5] gated worker joins", wait_urls(port, [url_k], 30), logs(name)[:300])
+
+    st, resp = post_profiles(port, [
+        {"model": "vm-key", "target": "gated-m", "workers": [url_k],
+         "api_key": ENTRY_KEY,
+         "effort_map": [{"from": "low", "to": "low"}, {"from": "xhigh", "to": "xhigh"}],
+         "default_effort": "low", "modalities": ["text", "image"]},
+        {"model": "vm-open", "target": "plain-m", "workers": [url_p]},
+    ])
+    check("[S5] an entry with api_key + effort map is accepted", st == 200,
+          "%s %s" % (st, str(resp)[:300]))
+    check("[S5] the write response carries no plaintext", ENTRY_KEY not in json.dumps(resp),
+          str(resp)[:300])
+
+    # ---- the gate answers upstream of everything ----
+    reset_mock(pk)
+    st, body, hdrs = chat(port, "vm-key", "no key at all")
+    la = last_auth(pk) or {}
+    check("[S5] a keyed entry without a key is 401", st == 401, "%s %s" % (st, body[:200]))
+    refused = _jsonish(body)
+    err = refused.get("error") if isinstance(refused.get("error"), dict) else {}
+    check("[S5] the refusal is the gateway's own envelope, not the engine's 401",
+          st == 401 and err.get("code") == "api_key_required"
+          and "missing Authorization" not in body,
+          "%s %s" % (st, body[:250]))
+    check("[S5] the refusal challenges with the standard header",
+          (hdrs.get("WWW-Authenticate") or hdrs.get("www-authenticate"))
+          == 'Bearer realm="lua-router"', json.dumps(hdrs)[:250])
+    check("[S5] a refusal reaches no engine: the mock never saw it",
+          (la.get("auth_denied") or 0) == 0 and la.get("last_authorization") is None,
+          json.dumps(la)[:250])
+    check("[S5] a refusal is not forwarded: the engine request count stayed put",
+          mock_lines(pk, "/v1/chat/completions") == 0, str(mock_lines(pk, "/v1/chat/completions")))
+    # 401 面不产生请求日志行（W2 的位置判据的对外那一面）。
+    st, lbody, _ = http("GET", "http://127.0.0.1:%d/logs?cursor=0&limit=200" % port)
+    rows = json.loads(lbody).get("requests") or []
+    check("[S5] the refusal left no request-log row",
+          st == 200 and not [r for r in rows if r.get("status") == 401],
+          json.dumps(rows)[:300])
+
+    # ---- a wrong key is refused the same way, with the same bytes ----
+    st, body2, hdrs2 = chat(port, "vm-key", "wrong key",
+                            headers={"Authorization": "Bearer wrong-" + ENTRY_KEY})
+    la = last_auth(pk) or {}
+    check("[S5] a wrong key gets the same 401", st == 401, "%s %s" % (st, body2[:200]))
+    check("[S5] missing and wrong are refused identically (no oracle)",
+          body2 == body, "%r != %r" % (body[:120], body2[:120]))
+    check("[S5] the wrong key also never reached the engine",
+          (la.get("auth_denied") or 0) == 0, json.dumps(la)[:200])
+
+    # ---- the right key opens the door, and the caller's bytes ride through ----
+    reset_mock(pk)
+    # chat_until, not chat: a REQUIRE_AUTH worker flips healthy only after a sweep
+    # that reads /v1/models **with** the injected key, so the first attempt can
+    # legitimately answer 503 (S1's vm-g probe waits for the same reason).
+    st, body = chat_until(
+        port, "vm-key", "right key", want=200, timeout=30,
+        headers={"Authorization": "Bearer " + ENTRY_KEY})
+    la = last_auth(pk) or {}
+    check("[S5] the right key is served end to end", st == 200, "%s %s" % (st, body[:200]))
+    check("[S5] the caller's key is what the engine sees (forwarding is not a rewrite)",
+          la.get("last_authorization") == "Bearer " + ENTRY_KEY, json.dumps(la)[:250])
+    st, body, _ = chat(port, "vm-key", "no key again")
+    check("[S5] the door is shut for the next unkeyed attempt", st == 401, "%s %s" % (st, body[:150]))
+
+    # ---- zero default behaviour change: everything else untouched ----
+    st, body, _ = chat(port, "vm-open", "unkeyed entry")
+    check("[S5] an unkeyed entry serves an unkeyed request", st == 200,
+          "%s %s" % (st, body[:200]))
+    st, body, _ = chat(port, "plain-m", "real model direct")
+    check("[S5] the real model behind an unkeyed entry is unaffected", st == 200,
+          "%s %s" % (st, body[:200]))
+    # The gate keys on the ENTRY name: the gated model reached through its own name
+    # is the worker-level gate's business (the mock's 401, not the gateway's), which
+    # is what keeps "one entry, one door" from becoming "one model, one door".
+    st, body = chat_until(port, "gated-m", "direct to the gated model", want=200,
+                          timeout=30)
+    check("[S5] the entry key does not follow the model name (worker gate answers)",
+          st == 200 and "api_key_required" not in body, "%s %s" % (st, body[:200]))
+
+    # ---- four advertised fields next to a masked key (需求 A × 需求 B) ----
+    st, mbody, _ = http("GET", "http://127.0.0.1:%d/v1/models" % port)
+    check("[S5] /v1/models advertises both entries", st == 200
+          and "vm-key" in mbody and "vm-open" in mbody, "%s %s" % (st, mbody[:200]))
+    vrow = {}
+    for e in (json.loads(mbody).get("data") or []):
+        if e.get("id") == "vm-key":
+            vrow = e
+    check("[S5] keyed entry row carries the four derived fields",
+          vrow.get("supports_reasoning") is True
+          and vrow.get("supports_reasoning_effort") is True
+          and vrow.get("supported_reasoning_efforts") == ["low", "xhigh"]
+          and vrow.get("default_reasoning_effort") == "low",
+          json.dumps(vrow)[:400])
+    check("[S5] 手填 modalities 含 image -> capabilities.supports_vision",
+          (vrow.get("capabilities") or {}).get("supports_vision") is True,
+          json.dumps(vrow.get("capabilities"))[:300])
+    orow = {}
+    for e in (json.loads(mbody).get("data") or []):
+        if e.get("id") == "vm-open":
+            orow = e
+    check("[S5] an entry with no effort config gets none of the derived keys",
+          bool(orow) and not [k for k in ("supported_reasoning_efforts",
+                                          "default_reasoning_effort") if k in orow],
+          json.dumps(orow)[:300])
+    check("[S5] /v1/models leaks no plaintext", ENTRY_KEY not in mbody, mbody[:300])
+    st, pbody, _ = http("GET", "http://127.0.0.1:%d/props" % port)
+    check("[S5] /props leaks no plaintext", st == 200 and ENTRY_KEY not in pbody,
+          "%s %s" % (st, pbody[:200]))
+    st, wbody, _ = http("GET", "http://127.0.0.1:%d/workers" % port)
+    check("[S5] /workers leaks no entry plaintext",
+          st == 200 and ENTRY_KEY not in wbody, "%s %s" % (st, wbody[:200]))
+
+    # ---- masked whole-document round-trip keeps the door shut ----
+    doc, cfg = config_doc(port)
+    rows = as_list((cfg or {}).get("virtual_models"))
+    keyed = [r for r in rows if r.get("model") == "vm-key"]
+    check("[S5] the document row is masked, not empty",
+          len(keyed) == 1 and keyed[0].get("api_key") is None
+          and keyed[0].get("has_api_key") is True, json.dumps(keyed)[:300])
+    check("[S5] the persisted fields never appear in the document",
+          "api_key_state" not in json.dumps(rows)
+          and "api_key_stored" not in json.dumps(rows), json.dumps(rows)[:300])
+    st, resp = post_apply(port, {"virtual_models": rows})
+    check("[S5] re-saving the masked rows is accepted", st == 200, "%s %s" % (st, str(resp)[:250]))
+    st, body, _ = chat(port, "vm-key", "after masked save")
+    check("[S5] a masked save does not take the door away", st == 401, "%s %s" % (st, body[:150]))
+    st, body = chat_until(
+        port, "vm-key", "still openable", want=200, timeout=15,
+        headers={"Authorization": "Bearer " + ENTRY_KEY})
+    check("[S5] the same key still opens it after the masked save", st == 200,
+          "%s %s" % (st, body[:150]))
+
+    # ---- the clear spelling is honoured (it is the one the UI's 清除 button sends) ----
+    doc, cfg = config_doc(port)
+    rows = as_list((cfg or {}).get("virtual_models"))
+    cleared = [dict(r, api_key="") if r.get("model") == "vm-key" else r
+               for r in rows]
+    st, resp = post_apply(port, {"virtual_models": cleared})
+    check("[S5] an explicit empty api_key is accepted", st == 200, "%s %s" % (st, str(resp)[:200]))
+    doc, cfg = config_doc(port)
+    keyed = [r for r in as_list((cfg or {}).get("virtual_models"))
+             if r.get("model") == "vm-key"]
+    check("[S5] has_api_key flips to false on clear",
+          len(keyed) == 1 and keyed[0].get("has_api_key") is False, json.dumps(keyed)[:300])
+    st, body = chat_until(port, "vm-key", "cleared entry serves", want=200, timeout=20)
+    la = last_auth(pk) or {}
+    check("[S5] the cleared entry still serves (worker-level key takes over)",
+          st == 200 and la.get("last_authorization") == "Bearer " + WORKER_KEY,
+          "%s %s %s" % (st, body[:120], json.dumps(la)[:200]))
+    check("[S5] no lua errors (S5)", "lua entry thread aborted" not in logs(name),
+          logs(name)[-300:])
+    stop_router(name)
+
+
 def config_doc(port):
     st, body, _ = http("GET", "http://127.0.0.1:%d/config" % port)
     if st != 200:
@@ -286,16 +488,20 @@ def rc_count(resp, key):
     return None
 
 
-def chat_until(port, model, text, want=200, timeout=25):
+def chat_until(port, model, text, want=200, timeout=25, headers=None):
     """chat() retried until the status matches or the budget is spent.
 
     A just-reconciled pool member is unhealthy until the first sweep (1 s
     interval here), so the request racing that window answers 503; the
-    assertions below care about the steady state, not that race."""
+    assertions below care about the steady state, not that race.
+
+    `headers` (default None) is forwarded to chat(); the entry api-key scenario
+    needs to send Authorization, and leaving the default untouched keeps every
+    existing caller byte-identical."""
     deadline = time.time() + timeout
     st, body = 0, ""
     while time.time() < deadline:
-        st, body, _ = chat(port, model, text)
+        st, body, _ = chat(port, model, text, headers=headers)
         if st == want:
             return st, body
         time.sleep(0.5)
@@ -1021,6 +1227,7 @@ PORT_R, PORT_B, PORT_D = [free_port()], [free_port()], [free_port()]
 PORT_C, PORT_C2, PORT_DW, PORT_BB = [free_port()], [free_port()], [free_port()], [free_port()]
 PORT_X, PORT_G1, PORT_G2 = [free_port()], [free_port()], [free_port()]
 PORT_SEED = [free_port()]
+PORT_K, PORT_K2 = [free_port()], [free_port()]
 
 
 def main():
@@ -1030,6 +1237,7 @@ def main():
     scenario_keyctl()
     scenario_immune()
     scenario_apply()
+    scenario_entry_api_key()
     failed = [r for r in RESULTS if not r[0]]
     print("\n=== e2e_profiles: %d checks, %d failed ===" % (len(RESULTS), len(failed)))
     for _, name, detail in failed:

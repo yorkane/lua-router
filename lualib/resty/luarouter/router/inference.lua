@@ -262,6 +262,44 @@ local function extract_prompt_preview(body)
     return nil
 end
 
+--- The api-key gate's answer when the entry is keyed and the request fails it.
+--- One sentence for "no key" and "wrong key" on purpose: telling the two apart
+--- hands an attacker a free oracle on which half of the door opened, and the
+--- constant-time compare inside config_store would be pointless if the message
+--- leaked the same fact. The wording is new (the pinned error families of this
+--- file cover JSON, routing and workers only -- nothing authentication); it says
+--- the three things an operator needs: what is missing, the exact spelling of
+--- the header, and where the key comes from, since the gateway holds it and never
+--- returns it.
+local API_KEY_DENIED = 'virtual model "%s" requires an api key: send the key issued for this entry as the request header "Authorization: Bearer <key>". A missing key and a wrong key are refused the same way. The gateway stores the key itself and never returns it (the admin console shows only that a key is set), so the key comes from whoever provisioned this virtual service.'
+
+--- The client's api key for this request, or nil.
+---
+--- Header choice is deliberately singular: `Authorization: Bearer <key>` is the
+--- scheme this gateway already speaks to its engines (router/control.lua and
+--- router/metrics_ep.lua build exactly that header), it is what every
+--- OpenAI-compatible client sends against these routes by default, and the CORS
+--- layer already advertises `authorization`. `x-api-key` would need the
+--- response-plane header family (router/respond.lua) widened for a second
+--- spelling of the same fact, and a bare `Authorization: <key>` with no scheme is
+--- ambiguous against other auth schemes. Anything that is not `Bearer` answers
+--- nil, which a keyed entry refuses and an unkeyed one never looks at. The token
+--- rides verbatim: config_store documents the supplied key as the raw, untrimmed
+--- string and compares it as such (config_store/profiles.lua
+--- entry_api_key_matches), so this seam trims nothing -- a client that padded its
+--- key with whitespace gets the same 401 as a wrong one.
+local function client_api_key()
+    local auth = ngx.req.get_headers()["authorization"]
+    if type(auth) ~= "string" then
+        return nil
+    end
+    local scheme, token = auth:match("^(%S+)%s+(.+)$")
+    if scheme ~= nil and scheme:lower() == "bearer" then
+        return token
+    end
+    return nil
+end
+
 ---Shared pipeline for every inference route: pick a worker, rewrite the payload,
 ---forward, write the response. Returns the status and (for buffered responses)
 ---the upstream bytes; streaming responses are already on the wire.
@@ -276,6 +314,50 @@ local function route_inference(route, body, raw)
         -- rather than routing as if the field were absent.
         return send_error(400, "invalid_json",
             "request field \"model\" must be a string")
+    end
+    -- 虚拟服务 api-key 门（用户裁定 2026-10-11）：配了 key 的入口只能经过 key 访问。
+    -- 位置与上面那条 400 同族：取到 body.model 之后、任何记账 / 选路 / 转发之前，
+    -- 照 invalid_json 早退分支的形状直接 return send_error —— 不盖 lr_endpoint /
+    -- lr_worker，finish_request 的请求日志分支因此不触发（一次拒绝不会被记成一条
+    -- 路由失败的推理记录），限流槽仍由既有收尾统一归还。
+    -- 判据走 client 所名的**入口名**（不是解析后的落点）：同名遮蔽下入口就是主键，
+    -- 拿真实模型名去绕一个配了 key 的入口是不允许的——那条真实模型自己的行本来就不受
+    -- 影响。降级口径与本文件其余 store 读点一致：store 或读点缺席（半程发布的旧
+    -- build）= 这道门不存在，全场逐字节照旧（缺省零行为变化）；读点在场且答
+    -- requires=true 时，比对函数缺失或调用出错一律**拒绝**——条目既然配了 key，
+    -- 宁可挡住也不空放。
+    do
+        local entry = body.model
+        if type(entry) == "string" and entry ~= "" then
+            local store_mod = store()
+            if store_mod and type(store_mod.entry_requires_api_key) == "function" then
+                local ok_req, requires = pcall(store_mod.entry_requires_api_key, entry)
+                if ok_req and requires == true then
+                    -- entry_api_key_matches answers **two** values (requires, matches);
+                    -- under pcall that is three. An earlier draft captured the pair into
+                    -- two slots, which mapped `matches` onto `requires` -- always true --
+                    -- and the gate let every rejection through (probe A3 caught it). All
+                    -- three ride in their own slot now: pcall failure or a missing
+                    -- compare function = refuse (fail-closed); a live requires=false =
+                    -- pass (the operator unlocked the entry between the two reads, and
+                    -- the zero-change default wins); only requires=true with
+                    -- matches=true counts as a pass.
+                    local ok_match, still_requires, matches
+                    if type(store_mod.entry_api_key_matches) == "function" then
+                        ok_match, still_requires, matches = pcall(
+                            store_mod.entry_api_key_matches, entry, client_api_key())
+                    end
+                    if not (ok_match and (still_requires == false or matches == true)) then
+                        -- 不带 WWW-Authenticate 的 401 不合规（RFC 9110）；本网关的
+                        -- 错误族此前从没有 401，所以这里没有被钉的字节形状要守，加上
+                        -- 标准头是诚实的补充。
+                        ngx.header["WWW-Authenticate"] = 'Bearer realm="lua-router"'
+                        return send_error(401, "api_key_required",
+                            string.format(API_KEY_DENIED, entry))
+                    end
+                end
+            end
+        end
     end
     -- 给 log_inference_request 留一份 prompt 预览：两处入口的 body 都在这里汇合，
     -- 记录阶段（finish_request -> log_inference_request）已经拿不到请求体，

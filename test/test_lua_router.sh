@@ -2881,6 +2881,216 @@ if section virtual_models; then
     request "$BASE" GET /v1/models
     assert_eq "virtual-models: the no-worker answer is unaffected" "$STATUS" "503"
     assert_eq "virtual-models: the 503 stays plain text" "$BODY" "No models available"
+
+    # ==================================================================
+    # W5: entry api-key + effort-map validation + retired entry booleans
+    # (doc/effort-apikey-2026-10-11.md, W1 config_store + W2 router/inference).
+    #
+    # Own container, and the limiter is ENABLED (capacity 50, queue 0) so that the
+    # rate-limit family actually has samples to read: acquire() short-circuits when
+    # SMG_MAX_CONCURRENT_REQUESTS is unset and records nothing at all, which would
+    # turn the limiter checks into a scan for a series that can never be written.
+    metric_value() {
+        # metric_value SERIES -> value of an exact series in the last /metrics body
+        awk -v s="$1" 'index($0, s) == 1 { sub(/^.*[[:space:]]/, ""); print; exit }' \
+            "$TMP_DIR/body"
+    }
+    start_container lr-vkey-$SUIT "$BASE_CONF" SMG_HEALTH_CHECK_INTERVAL_SECS=1 \
+        SMG_MAX_CONCURRENT_REQUESTS=50 SMG_QUEUE_SIZE=0
+    KB=$BASE
+    KGW=$(container_gateway lr-vkey-$SUIT)
+    K_URL="http://$KGW:$MOCK_PORT"
+    K_SECRET="sk-entry-$SUIT-9f2c"
+    register_worker "$KB" "{\"url\":\"$K_URL\",\"model_id\":\"test-model\"}"
+    assert_eq "vkey: worker registered" "$STATUS" "202"
+    wait_healthy_worker "$KB" 25 || fail "vkey worker never became healthy"
+
+    # ---- 1. POST /config/virtual accepts the entry key; the row is masked ----
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"model\":\"vm-key\",\"target\":\"test-model\",\"workers\":[\"$K_URL\"],\"api_key\":\"$K_SECRET\"},{\"model\":\"vm-open\",\"target\":\"test-model\",\"workers\":[\"$K_URL\"]}]}"
+    assert_eq "vkey: an entry api_key is accepted" "$STATUS" "200"
+    assert_json "vkey: the write response masks the key as null" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].api_key | tostring' "null"
+    assert_json "vkey: has_api_key says a key is stored" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].has_api_key | tostring' "true"
+    assert_json "vkey: the persisted fields never join the response" \
+        '[.virtual_models[] | select(.model == "vm-key")][0] | (has("api_key_state") or has("api_key_stored")) | tostring' "false"
+    assert_not_contains "vkey: no secret in the write response" "$BODY" "$K_SECRET"
+    request "$KB" GET /config
+    assert_eq "vkey: GET /config answers 200" "$STATUS" "200"
+    assert_json "vkey: GET row api_key stays null" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].api_key | tostring' "null"
+    assert_json "vkey: GET row has_api_key is true" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].has_api_key | tostring' "true"
+    assert_not_contains "vkey: no secret anywhere in the document" "$BODY" "$K_SECRET"
+    # A row that never had a key is untouched by the masker -- not even a null
+    # api_key -- which is what "new switch, zero default behaviour change" means
+    # for the document bytes every other deployment round-trips.
+    assert_json "vkey: an unkeyed row grows no key fields at all" \
+        '[.virtual_models[] | select(.model == "vm-open")][0] | (has("api_key") or has("has_api_key") or has("api_key_state") or has("api_key_stored")) | tostring' "false"
+    # Same clause, second reader: the worker list must not carry an entry secret.
+    request "$KB" GET /workers
+    assert_not_contains "vkey: no entry secret in /workers" "$BODY" "$K_SECRET"
+
+    # ---- 2. Effort-rung validation keeps the pinned message families ----
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-bad1","target":"test-model","default_effort":"turbo"}]}'
+    assert_eq "vkey: an unknown default_effort is 400" "$STATUS" "400"
+    assert_contains "vkey: the default_effort text names model, value and word list" \
+        "$BODY" "unknown default_effort for virtual model vm-bad1: turbo (want one of"
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-bad2","target":"test-model","effort_map":[{"from":"mega","to":"low"}]}]}'
+    assert_eq "vkey: an unknown effort_map source is 400" "$STATUS" "400"
+    assert_contains "vkey: the source text names model, value and word list" \
+        "$BODY" "unknown effort in virtual model vm-bad2 effort_map: mega (want one of"
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-bad3","target":"test-model","effort_map":[{"from":"low","to":"ultraa"}]}]}'
+    assert_eq "vkey: an unknown effort_map target is 400" "$STATUS" "400"
+    assert_contains "vkey: the target text keeps the effort_map target spelling" \
+        "$BODY" "unknown effort in virtual model vm-bad3 effort_map target: ultraa (want one of"
+    assert_contains "vkey: the word list names all eight rungs" "$BODY" "none, minimal, low, medium, high, xhigh, max, ultra"
+    # A 400 is a whole-table refusal: the bad batch must not touch the accepted rows.
+    request "$KB" GET /config
+    assert_json "vkey: the rejected batches landed nothing" \
+        '[.virtual_models[] | select(.model | startswith("vm-bad"))] | length' "0"
+    assert_json "vkey: the accepted rows survived the rejections" \
+        '[.virtual_models[] | select(.model == "vm-key" or .model == "vm-open")] | length' "2"
+    assert_json "vkey: the surviving row still reports its key" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].has_api_key | tostring' "true"
+
+    # ---- 3. The 401 gate: keyed entry refuses, everything else untouched ----
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"no key"}]}'
+    assert_eq "vkey: a keyed entry without a key is 401" "$STATUS" "401"
+    assert_json "vkey: the refusal names the code" '.error.code' "api_key_required"
+    assert_json "vkey: the refusal type is the 401 status text" '.error.type' "Unauthorized"
+    assert_eq "vkey: the error-code header mirrors the body" \
+        "$(header_of X-SMG-Error-Code)" "api_key_required"
+    assert_eq "vkey: the refusal carries the standard challenge header" \
+        "$(header_of WWW-Authenticate)" 'Bearer realm="lua-router"'
+    assert_contains "vkey: the refusal says which entry it is about" "$BODY" "vm-key"
+
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer wrong-$K_SECRET" \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"wrong key"}]}'
+    assert_eq "vkey: a wrong key is refused the same way" "$STATUS" "401"
+    assert_json "vkey: a wrong key keeps the same code" '.error.code' "api_key_required"
+    assert_eq "vkey: a wrong key keeps the challenge header" \
+        "$(header_of WWW-Authenticate)" 'Bearer realm="lua-router"'
+    # A bare key with no Bearer scheme did not bring a key at all.
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        -H "Authorization: $K_SECRET" \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"bare key"}]}'
+    assert_eq "vkey: a bare key with no Bearer scheme is 401" "$STATUS" "401"
+
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer $K_SECRET" \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"right key"}]}'
+    assert_eq "vkey: the right key is served" "$STATUS" "200"
+    assert_json "vkey: the keyed entry still resolves to its target" '.model' "test-model"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"vm-open","messages":[{"role":"user","content":"unkeyed"}]}'
+    assert_eq "vkey: an unkeyed entry is served without a key" "$STATUS" "200"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"test-model","messages":[{"role":"user","content":"real model"}]}'
+    assert_eq "vkey: the real model behind a keyed entry is unaffected" "$STATUS" "200"
+
+    # The gate answers before any routing bookkeeping: /logs holds only the served
+    # chats (a rejection is not a routed-inference record), and none of the three
+    # refusals above left a row.
+    request "$KB" GET /logs
+    assert_eq "vkey: /logs answers" "$STATUS" "200"
+    assert_json "vkey: a refusal writes no request-log row" \
+        '[.requests[] | select(.status == 401)] | length' "0"
+    assert_json "vkey: /logs holds only the served chats" '.requests | length' "3"
+    assert_json "vkey: every logged row is a 200" \
+        '[.requests[] | select(.status != 200)] | length' "0"
+
+    # Limiter: the gate sits inside route_inference, i.e. *after* limit().acquire(),
+    # so a refusal is not a limiter rejection -- the exporter renders the rejected
+    # series only once it is non-zero, so its absence is the readable fact. Six
+    # attempts went through a capacity-50 bucket (three refusals + three served) and
+    # the allowed counter says exactly six: each refused attempt took one slot and
+    # handed it back through finish_request, so nothing leaked or double-charged.
+    request "$KB" GET /metrics
+    assert_not_contains "vkey: a refusal is never counted as a limiter rejection" "$BODY" \
+        'smg_http_rate_limit_total{result="rejected"}'
+    assert_eq "vkey: every attempt took exactly one limiter slot" \
+        "$(metric_value 'smg_http_rate_limit_total{result="allowed"}')" "6"
+
+    # ---- 4. Masked-document round-trip must not lose the key ----
+    # The JSON editor's "save" is a whole-document POST of exactly these masked
+    # rows (api_key always reads null), so the key has to survive it untouched.
+    request "$KB" GET /config
+    jq -c '{virtual_models: .virtual_models}' "$TMP_DIR/body" >"$TMP_DIR/vkey-doc.json"
+    request "$KB" POST /config/apply -H 'Content-Type: application/json' \
+        --data @"$TMP_DIR/vkey-doc.json"
+    assert_eq "vkey: a whole-document save of the masked rows is accepted" "$STATUS" "200"
+    assert_json "vkey: the round-trip keeps has_api_key" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].has_api_key | tostring' "true"
+    assert_not_contains "vkey: the round-trip response still hides the secret" "$BODY" "$K_SECRET"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"after round-trip"}]}'
+    assert_eq "vkey: the gate still refuses after the round-trip" "$STATUS" "401"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer $K_SECRET" \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"after round-trip"}]}'
+    assert_eq "vkey: the same key still opens the door after the round-trip" "$STATUS" "200"
+    request "$KB" GET /metrics
+    assert_eq "vkey: the allowed counter counts attempts, not successes" \
+        "$(metric_value 'smg_http_rate_limit_total{result="allowed"}')" "8"
+
+    # ---- 5. The other two states: "" clears, null keeps ----
+    request "$KB" GET /config
+    jq -c '{virtual_models: (.virtual_models | map(if .model == "vm-key" then . + {api_key: ""} else . end))}' \
+        "$TMP_DIR/body" >"$TMP_DIR/vkey-clear.json"
+    request "$KB" POST /config/apply -H 'Content-Type: application/json' \
+        --data @"$TMP_DIR/vkey-clear.json"
+    assert_eq "vkey: an explicit empty api_key is accepted (clear)" "$STATUS" "200"
+    assert_json "vkey: the cleared row stops reporting a key" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].has_api_key | tostring' "false"
+    assert_json "vkey: clearing drops the persisted fields, not just the mask" \
+        '[.virtual_models[] | select(.model == "vm-key")][0] | (has("api_key_state") or has("api_key_stored")) | tostring' "false"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"cleared"}]}'
+    assert_eq "vkey: a cleared entry serves without a key" "$STATUS" "200"
+
+    # Re-lock through the same chain: clear only means something if set works again.
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' \
+        --data "{\"entries\":[{\"model\":\"vm-key\",\"target\":\"test-model\",\"workers\":[\"$K_URL\"],\"api_key\":\"$K_SECRET\"},{\"model\":\"vm-open\",\"target\":\"test-model\",\"workers\":[\"$K_URL\"]}]}"
+    assert_eq "vkey: a re-set key is accepted" "$STATUS" "200"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"re-locked"}]}'
+    assert_eq "vkey: the re-locked entry refuses again" "$STATUS" "401"
+
+    # An explicit null is "say nothing", not "clear": this is the byte face of the
+    # dialog's "open the form and it keeps the key" (W4).
+    request "$KB" GET /config
+    jq -c '{virtual_models: (.virtual_models | map(. + {api_key: null}))}' \
+        "$TMP_DIR/body" >"$TMP_DIR/vkey-null.json"
+    request "$KB" POST /config/apply -H 'Content-Type: application/json' \
+        --data @"$TMP_DIR/vkey-null.json"
+    assert_eq "vkey: an explicit null api_key round-trips" "$STATUS" "200"
+    assert_json "vkey: a null submit keeps the key" \
+        '[.virtual_models[] | select(.model == "vm-key")][0].has_api_key | tostring' "true"
+    request "$KB" POST /v1/chat/completions -H 'Content-Type: application/json' \
+        --data '{"model":"vm-key","messages":[{"role":"user","content":"still locked"}]}'
+    assert_eq "vkey: the door is still shut after a null submit" "$STATUS" "401"
+
+    # ---- 6. The five entry booleans retired: accepted, not stored, not guessed ----
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' --data '{"entries":[{"model":"vm-retire","target":"test-model","workers":[],"supports_tool_use":false,"supports_streaming":true,"supports_reasoning":true,"supports_vision":false,"supports_reasoning_effort":false,"default_effort":"low","effort_map":[{"from":"low","to":"low"}]}]}'
+    assert_eq "vkey: the retired entry booleans are still accepted" "$STATUS" "200"
+    assert_json "vkey: none of the five survives the round-trip" \
+        '[.virtual_models[] | select(.model == "vm-retire")][0] | (has("supports_tool_use") or has("supports_streaming") or has("supports_reasoning") or has("supports_vision") or has("supports_reasoning_effort")) | tostring' "false"
+    assert_json "vkey: the effort table that replaces them does survive" \
+        '[.virtual_models[] | select(.model == "vm-retire")][0].default_effort' "low"
+    # hidden / disabled stay (user ruling: they are service switches, not capability
+    # bits) -- and they must not have been taken down with the five above them.
+    request "$KB" POST /config/virtual -H 'Content-Type: application/json' \
+        --data '{"entries":[{"model":"vm-retire","target":"test-model","workers":[],"hidden":false,"disabled":false}]}'
+    assert_eq "vkey: hidden/disabled still round-trip" "$STATUS" "200"
+    assert_json "vkey: the retirement did not take hidden with it" \
+        '[.virtual_models[] | select(.model == "vm-retire")][0].hidden | tostring' "false"
 fi
 
 # ==========================================================================

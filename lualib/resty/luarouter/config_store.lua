@@ -95,6 +95,12 @@ _M.card_effort_ladder = CS_READERS.card_effort_ladder
 -- 一个对外名字，把判据拆成两半就会有人挑错那一半，而这两半恰恰必须同时生效才算数。
 -- 少一个导出面 = 少一种漂移方式。
 _M.any_hidden = CS_READERS.any_hidden
+-- 虚拟服务的 api-key 门（用户裁定 2026-10-11）与 effort 映射推导（能力字段的唯一来源）。
+-- entry_api_key_matches 只回两个布尔，明文永不出口——掩码在响应边界无条件发生才是
+-- 结构性事实（W1 的红线）。
+_M.effort_facts_for = CS_READERS.effort_facts_for
+_M.entry_api_key_matches = CS_READERS.entry_api_key_matches
+_M.entry_requires_api_key = CS_READERS.entry_requires_api_key
 _M.any_disabled = CS_READERS.any_disabled
 _M.model_is_hidden = CS_READERS.model_is_hidden
 _M.model_is_disabled = CS_READERS.model_is_disabled

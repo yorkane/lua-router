@@ -721,6 +721,257 @@ def scenario_group_missing_reading():
 
 
 
+
+
+# ============================================ W5 四字段推导（用户裁定 2026-10-11）
+EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+DERIVED_KEYS = ("supports_reasoning", "supported_reasoning_efforts",
+                "default_reasoning_effort", "supports_reasoning_effort")
+# 省略断言用这一组，不是上面四个：supports_reasoning_effort 是**既有**顶层位（opencodex
+# 一直在读的那个名字），纯引擎自报那条链照旧写它，S2/S5/S12 钉着它的在场。W3 刻意复用这个
+# 名字（「照它写死的客户端读的就是这个名字」），所以「四键整体省略」在 HTTP 面上的准确读法是
+# **三个新键**必须缺席，第四个键由既有那条链说了算。拿四个名字去判缺席 = 拿本轮新增去否定
+# 上一轮已上线的契约，那才是真回归。
+DERIVED_NEW_KEYS = ("supports_reasoning", "supported_reasoning_efforts",
+                    "default_reasoning_effort")
+# The legacy top-level trio that a row with **no** effort configuration keeps (it is the
+# engine self-report chain, untouched by this ruling).
+LEGACY_EFFORT_KEYS = ("reasoning_effort", "reasoning_efforts", "supports_reasoning_effort")
+
+
+def poll_row(port, model_id, want, timeout=15, interval=0.4):
+    """Poll /v1/models until want(row) is true; return (row, raw, ok).
+
+    A just-written profile reaches the advertisement through the config snapshot, and a
+    just-registered engine reaches it through the health sweep, so "assert once right
+    after the POST" would test timing rather than the implementation."""
+    deadline = time.time() + timeout
+    e, raw = {}, ""
+    while time.time() < deadline:
+        st, doc, raw = models_doc(port)
+        e = row(doc, model_id) or {}
+        if want(e):
+            return e, raw, True
+        time.sleep(interval)
+    return e, raw, False
+
+
+def scenario_effort_derived_fields():
+    """条目上那一张 effort 映射表是四个根路径字段**唯一**的数据源（四种配置 × 模态）。
+
+    判别性（旧实现下必红的部分）：
+      * 四个键在旧实现里根本不存在 -> 「有配置必须出现」那几条红；
+      * 「只有 none」与「完全没配置」两支要求四键整体省略（不写 null、不写空数组）——
+        把省略写成 null 或 [] 的实现，会在同一个场景里被 null/[] 的 grep 抓到；
+      * 档位清单必须按词表序而不是配置字节序（pairs() 收集后直接输出会漂），所以本场景
+        用一份**故意乱序**的映射配置，再同一份配置连取两次做逐字节相等对照；
+      * 判定面 capabilities.reasoning_effort 是引擎亲口给的读数，被操作员的一张映射表抹掉
+        就是销毁上游事实（硬规则 9②），这一条与「四个推导字段在场」同时断言才分得出谁被改了。
+    """
+    tag = "S13-effort-derived"
+    pr, pp = free_port(), free_port()
+    start_mock_env(pr, "adv-rich", {"MODELS_RICH": "1"})
+    start_mock_env(pp, "adv-plain")          # 什么能力都不报的引擎
+    port, name, gw = start_conf({}, tag)
+    url_r, url_p = "http://%s:%d" % (gw, pr), "http://%s:%d" % (gw, pp)
+    st, _ = post_worker(port, url_r, "adv-rich")
+    st2, _ = post_worker(port, url_p, "adv-plain")
+    check("[%s] 两台 worker 注册成功" % tag, st in (200, 202) and st2 in (200, 202),
+          "%s/%s" % (st, st2))
+    check("[%s] 两台都健康" % tag, wait_healthy(port, [url_r, url_p]), logs(name)[:400])
+    check("[%s] 富形状那台的能力被采到了" % tag, wait_caps(port, "adv-rich"), logs(name)[:400])
+
+    identity = [{"from": lv, "to": lv} for lv in reversed(EFFORT_ORDER)]  # 乱序写入
+    st, doc = post_json(port, "/config/virtual", {"entries": [
+        # 1) 恒等映射（全 8 档）+ 缺省档 low
+        {"model": "vm-identity", "target": "adv-rich",
+         "effort_map": identity, "default_effort": "low"},
+        # 2) 部分映射：from 侧只有 low/high，缺省档 medium（medium 不在映射里也要进清单）
+        {"model": "vm-partial", "target": "adv-rich",
+         "effort_map": [{"from": "high", "to": "max"}, {"from": "low", "to": "minimal"}],
+         "default_effort": "medium"},
+        # 3) 只有 none -> 四键整体省略（裁定第 5 条）
+        {"model": "vm-none", "target": "adv-rich",
+         "effort_map": [{"from": "none", "to": "none"}], "default_effort": "none"},
+        # 4) 完全没配 effort -> 四键整体省略，旧三位退回引擎自报
+        {"model": "vm-bare", "target": "adv-rich"},
+        # 5) 视觉靠**操作员手填**的条目模态（引擎那边什么都没报）
+        {"model": "vm-entrymod", "target": "adv-plain",
+         "modalities": ["text", "image"],
+         "effort_map": [{"from": "low", "to": "low"}], "default_effort": "low"},
+        # 6) 手填但只有 text -> 视觉判 false（穷尽清单允许反推负向）
+        {"model": "vm-nomod", "target": "adv-plain", "modalities": ["text"],
+         "effort_map": [{"from": "low", "to": "low"}]},
+        # 7) 手填 video -> 与 image 同一条判据
+        {"model": "vm-video", "target": "adv-plain", "modalities": ["text", "video"],
+         "default_effort": "ultra"},
+    ]})
+    check("[%s] 七条入口一次写入被接受" % tag, st == 200, "%s %s" % (st, str(doc)[:300]))
+
+    # ── 1) 恒等映射：四键齐、清单 = 全 8 档、缺省档取配置 ──
+    e, raw, ok = poll_row(port, "vm-identity",
+                          lambda r: r.get("supported_reasoning_efforts") is not None)
+    check("[%s] 恒等映射行出现了 supported_reasoning_efforts" % tag, ok, raw[:300])
+    check("[%s] 恒等映射列出全部 8 档且按词表序（写入是乱序的）" % tag,
+          e.get("supported_reasoning_efforts") == EFFORT_ORDER,
+          json.dumps(e.get("supported_reasoning_efforts")))
+    check("[%s] 恒等映射两位 support 为 true" % tag,
+          e.get("supports_reasoning") is True and e.get("supports_reasoning_effort") is True,
+          json.dumps([e.get("supports_reasoning"), e.get("supports_reasoning_effort")]))
+    check("[%s] default_reasoning_effort 取配置的 low" % tag,
+          e.get("default_reasoning_effort") == "low", json.dumps(e)[:250])
+    check("[%s] 入口行的 required 四字段齐" % tag,
+          all(k in e for k in REQUIRED), json.dumps(e)[:250])
+    check("[%s] 引擎自报的判定面没被映射表抹掉（硬规则 9②）" % tag,
+          caps_of(e).get("reasoning_effort") == ["low", "high", "max"],
+          json.dumps(caps_of(e))[:300])
+    check("[%s] 引擎报 image -> capabilities.supports_vision 为 true" % tag,
+          caps_of(e).get("supports_vision") is True, json.dumps(caps_of(e))[:300])
+
+    # ── 2) 部分映射：清单只列**出现过**的档位（from 侧 + 缺省档），to 侧不虚构 ──
+    e2, raw2, ok2 = poll_row(port, "vm-partial",
+                             lambda r: r.get("supported_reasoning_efforts") is not None)
+    check("[%s] 部分映射行出现了四个推导字段" % tag, ok2 and all(k in e2 for k in DERIVED_KEYS),
+          json.dumps(e2)[:300])
+    check("[%s] 清单 = from 侧(low,high) ∪ 缺省档(medium)，按词表序" % tag,
+          e2.get("supported_reasoning_efforts") == ["low", "medium", "high"],
+          json.dumps(e2.get("supported_reasoning_efforts")))
+    check("[%s] to 侧的 minimal/max 不被虚构成「客户端可点名」的档位" % tag,
+          "minimal" not in (e2.get("supported_reasoning_efforts") or [])
+          and "max" not in (e2.get("supported_reasoning_efforts") or []),
+          json.dumps(e2.get("supported_reasoning_efforts")))
+    check("[%s] 缺省档取条目声明的 medium" % tag,
+          e2.get("default_reasoning_effort") == "medium", json.dumps(e2)[:250])
+
+    # ── 3) 只有 none：四键整体省略 ──
+    e3, _, ok3 = poll_row(port, "vm-none", lambda r: bool(r))
+    check("[%s] 只有 none 的行仍在广告里" % tag, ok3, json.dumps(e3)[:200])
+    check("[%s] 只有 none -> 三个新推导键一个都不出现" % tag,
+          not [k for k in DERIVED_NEW_KEYS if k in e3], json.dumps(e3)[:300])
+    check("[%s] 只有 none 时既有的顶层位不被牵连（仍走引擎自报）" % tag,
+          e3.get("supports_reasoning_effort") is True, json.dumps(e3)[:300])
+    check("[%s] 省略是删键：该行没有 null 也没有 [] 冒充" % tag,
+          ":null" not in json.dumps(e3).replace(" ", "")
+          and ":[]" not in json.dumps(e3).replace(" ", ""), json.dumps(e3)[:300])
+
+    # ── 4) 完全没配：四键省略，旧三位退回引擎自报（现网形状的对照）──
+    e4, _, ok4 = poll_row(port, "vm-bare", lambda r: bool(r))
+    check("[%s] 无 effort 配置的行仍在广告里" % tag, ok4, json.dumps(e4)[:200])
+    check("[%s] 无配置 -> 三个新推导键整体省略" % tag,
+          not [k for k in DERIVED_NEW_KEYS if k in e4], json.dumps(e4)[:300])
+    check("[%s] 无配置时旧三位照旧来自引擎自报（纯增量、零行为变化）" % tag,
+          e4.get("supports_reasoning_effort") is True
+          and [r.get("value") for r in (e4.get("reasoning_efforts") or [])]
+          == ["low", "medium", "high", "max"]
+          and e4.get("reasoning_effort") == "medium",
+          json.dumps(e4)[:400])
+
+    # ── 5/6/7) 视觉只由 modalities 里有没有 image/video 决定 ──
+    e5, _, ok5 = poll_row(port, "vm-entrymod",
+                          lambda r: "supports_vision" in caps_of(r))
+    check("[%s] 手填 image 的条目报出 supports_vision" % tag, ok5, json.dumps(e5)[:300])
+    check("[%s] 手填的模态也进了对外清单（操作员的话不再是死的）" % tag,
+          caps_of(e5).get("input_modalities") == ["text", "image"],
+          json.dumps(caps_of(e5))[:300])
+    check("[%s] 手填 image -> supports_vision 为 true（与引擎自报同等）" % tag,
+          caps_of(e5).get("supports_vision") is True, json.dumps(caps_of(e5))[:300])
+    check("[%s] 手填模态的那张表照样推导出四个字段" % tag,
+          e5.get("supported_reasoning_efforts") == ["low"]
+          and e5.get("supports_reasoning") is True, json.dumps(e5)[:300])
+    e6, _, ok6 = poll_row(port, "vm-nomod", lambda r: "supports_vision" in caps_of(r))
+    check("[%s] 手填但只有 text -> supports_vision 为 false（穷尽清单可反推负向）" % tag,
+          ok6 and caps_of(e6).get("supports_vision") is False, json.dumps(caps_of(e6))[:300])
+    plain_real = row(doc, "adv-plain") or {}
+    check("[%s] 只填 text 的行同时省略缺省档（没声明就没有这一句）" % tag,
+          "default_reasoning_effort" not in e6 and e6.get("default_reasoning_effort") is None,
+          json.dumps(e6)[:300])
+    e7, _, ok7 = poll_row(port, "vm-video", lambda r: "supports_vision" in caps_of(r))
+    check("[%s] 手填 video 与 image 同等（含 video 即视觉）" % tag,
+          ok7 and caps_of(e7).get("supports_vision") is True, json.dumps(caps_of(e7))[:300])
+    check("[%s] 只配缺省档（无映射表）也撑起四个字段：清单 = {ultra}" % tag,
+          e7.get("supported_reasoning_efforts") == ["ultra"]
+          and e7.get("default_reasoning_effort") == "ultra", json.dumps(e7)[:300])
+
+    # ── 反向对照：一条什么 effort 都没配、引擎也什么都不报的真实行 ──
+    st_l, doc_l, raw_l = models_doc(port)
+    plain_real = row(doc_l, "adv-plain") or {}
+    check("[%s] 反向情形不虚构：没配过 effort 的真实行（adv-plain）无新推导键" % tag,
+          bool(plain_real) and not [k for k in DERIVED_NEW_KEYS if k in plain_real],
+          json.dumps(plain_real)[:300])
+    check("[%s] 那台引擎没报任何能力 -> 该行只有 required 四字段" % tag,
+          not (set(plain_real) - set(REQUIRED)), json.dumps(plain_real)[:300])
+
+    # ── 字节稳定：同一份配置两次取值逐字节相同（词表序 vs pairs 顺序）──
+    st, first, raw_a = models_doc(port)
+    st, second, raw_b = models_doc(port)
+    check("[%s] 同一份配置两次 /v1/models 逐字节相同" % tag, raw_a == raw_b,
+          "%r != %r" % (raw_a[:160], raw_b[:160]))
+    check("[%s] 整份响应里没有 JSON null" % tag, "null" not in raw_a, raw_a[:300])
+    check_no_abort(tag, name)
+    stop(name)
+
+
+def scenario_shadowed_entry_with_effort():
+    """同名遮蔽 + 四字段并存：入口抢走真实行名字时，两行各自的形状。
+
+    判别性：真实行被入口顶掉（data 里该 id 只有一行、且带入口的四个推导字段），
+    同一台引擎上另一条**没被抢**的真实行必须仍是引擎自报那份形状（无推导键）。
+    只看入口行会漏掉「遮蔽把别的行一起改了」这种越界；只看真实行会漏掉「入口没赢」。
+    """
+    tag = "S14-shadow-effort"
+    ps, po = free_port(), free_port()
+    start_mock_env(ps, "shadow-me")
+    start_mock_env(po, "other-model", {"MODELS_RICH": "1"})
+    port, name, gw = start_conf({}, tag)
+    url_s, url_o = "http://%s:%d" % (gw, ps), "http://%s:%d" % (gw, po)
+    st, _ = post_worker(port, url_s, "shadow-me")
+    st2, _ = post_worker(port, url_o, "other-model")
+    check("[%s] 两台 worker 注册成功" % tag, st in (200, 202) and st2 in (200, 202),
+          "%s/%s" % (st, st2))
+    check("[%s] 两台都健康" % tag, wait_healthy(port, [url_s, url_o]), logs(name)[:400])
+    _, base_raw, base_ok = poll_row(port, "shadow-me", lambda r: bool(r))
+    check("[%s] 未遮蔽时真实行先出现（对照基线）" % tag, base_ok, base_raw[:300])
+    base_row = row(json.loads(base_raw) if base_ok else None, "shadow-me") or {}
+    check("[%s] 基线：真实行此刻不带任何推导键（还没配 effort）" % tag,
+          not [k for k in DERIVED_KEYS if k in base_row], json.dumps(base_row)[:300])
+
+    st, doc = post_json(port, "/config/virtual", {"entries": [
+        {"model": "shadow-me", "target": "shadow-me",
+         "effort_map": [{"from": "minimal", "to": "minimal"},
+                        {"from": "xhigh", "to": "xhigh"}],
+         "default_effort": "minimal"}]})
+    check("[%s] 同名遮蔽入口（带 effort 映射）被接受" % tag, st == 200,
+          "%s %s" % (st, str(doc)[:300]))
+    e, raw, ok = poll_row(port, "shadow-me",
+                          lambda r: r.get("supported_reasoning_efforts") is not None)
+    check("[%s] 遮蔽行带出推导字段" % tag, ok, raw[:300])
+    check("[%s] 入口赢：该 id 在 data 里只有一行" % tag,
+          len([d for d in (json.loads(raw).get("data") or [])
+               if d.get("id") == "shadow-me"]) == 1, raw[:300])
+    check("[%s] 这一行说的是入口（owned_by 走入口口径 llm-router->shadow-me）" % tag,
+          e.get("owned_by") == "llm-router->shadow-me", json.dumps(e)[:250])
+    check("[%s] 推导清单来自入口那张表（minimal,xhigh）" % tag,
+          e.get("supported_reasoning_efforts") == ["minimal", "xhigh"],
+          json.dumps(e.get("supported_reasoning_efforts")))
+    check("[%s] 缺省档取入口声明的 minimal" % tag,
+          e.get("default_reasoning_effort") == "minimal", json.dumps(e)[:250])
+    # 没被抢的那条真实行必须一个推导键都不长：入口的映射不外溢。
+    other, _, ok_o = poll_row(port, "other-model", lambda r: bool(r))
+    check("[%s] 兄弟真实行仍在" % tag, ok_o, raw[:300])
+    check("[%s] 入口的映射表不外溢到别的行（兄弟行无新推导键）" % tag,
+          not [k for k in DERIVED_NEW_KEYS if k in other], json.dumps(other)[:400])
+    check("[%s] 兄弟行仍走引擎自报那三位" % tag,
+          other.get("supports_reasoning_effort") is True
+          and bool(other.get("reasoning_efforts")), json.dumps(other)[:300])
+    # 遮蔽是双向的：名字被抢的入口照常服务，请求面不许因为「入口 vs 真实」而变。
+    st, body, _ = http("POST", "http://127.0.0.1:%d/v1/chat/completions" % port,
+                       {"model": "shadow-me",
+                        "messages": [{"role": "user", "content": "shadowed probe"}]})
+    check("[%s] 同名遮蔽入口照常服务" % tag, st == 200, "%s %s" % (st, str(body)[:200]))
+    check_no_abort(tag, name)
+    stop(name)
+
+
 # ============================================================ S7–S10 广告面开关
 #
 # 被测实现：router.lua 的 models_advertise 那一节（提交 030dab5）。/v1/models 多了一个
@@ -1243,6 +1494,7 @@ def scenario_declared_file_is_authoritative():
 # 判别性用的场景过滤器（只影响"跑哪几组"，不影响任何断言）：
 #   LR_SCENARIOS=all  缺省，全跑（门禁口径）
 #   LR_SCENARIOS=adv  只跑 S7-S10，即广告面开关那四组
+#   LR_SCENARIOS=eff  只跑 S13/S14（effort 映射推导的四个字段与同名遮蔽并存）
 # 存在的理由：配合 LR_LEGACY_LUALIB 把开关那四组单独跑在改动前的 router.lua 或某个变异体
 # 上，不必为了看一组红而等其余六组跑完。缺省不设该变量时行为与原来逐字节一致。
 SCENARIOS = (os.environ.get("LR_SCENARIOS", "all") or "all").strip().lower()
@@ -1257,8 +1509,8 @@ def main():
           % (LEGACY_LUALIB or "off", SCENARIOS))
     # 过滤器写错也要响：LR_SCENARIOS 拼错时两组都不跑，RESULTS 为空，末尾那句
     # "0 failed" 会让门禁以为这份 e2e 全绿过。缺省（不设这个变量）的行为与原来一致。
-    if SCENARIOS not in ("all", "", "core", "adv"):
-        print("FAIL: LR_SCENARIOS must be all|core|adv (got: %s)" % SCENARIOS)
+    if SCENARIOS not in ("all", "", "core", "adv", "eff"):
+        print("FAIL: LR_SCENARIOS must be all|core|adv|eff (got: %s)" % SCENARIOS)
         cleanup()
         sys.exit(2)
     if _want("core"):
@@ -1270,6 +1522,9 @@ def main():
         scenario_card_effort_ladder()
         scenario_virtual_entries()
         scenario_group_missing_reading()
+    if _want("eff"):
+        scenario_effort_derived_fields()
+        scenario_shadowed_entry_with_effort()
     if _want("adv"):
         scenario_switch_off_is_byte_identical()
         scenario_switch_on_advertises_only_entries()

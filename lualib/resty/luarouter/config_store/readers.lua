@@ -45,6 +45,10 @@ function _M.env_defaults()
     if not CS_FACADE._env_defaults then
         local snap = CS_SNAPSHOT.snapshot_of(CS_SNAPSHOT.cfg_from_env())
         snap.upstreams = CS_UPSTREAMS.sanitize_upstream_rows(snap.upstreams)
+        -- 条目级密钥对外只以掩码出现（用户裁定 2026-10-11）：env 层的入口行本来就长不出
+        -- api_key（env_upstreams 是唯一带密钥的 env 形状），这一行是给「任何人以后往 env 层
+        -- 加条目密钥」留的同一道闸 —— 掩码在响应边界上无条件发生，不依赖上游有没有造出秘密。
+        snap.virtual_models = CS_SNAPSHOT.sanitize_virtual_rows(snap.virtual_models)
         CS_FACADE._env_defaults = snap
     end
     return CS_FACADE._env_defaults
@@ -397,7 +401,13 @@ end
 --- 接受别名或 profile 表——router 手上往往已经有 profile_for 的拷贝，省一次回查。
 --- 返回的是新表，调用方改不坏存储（与 profile_for 的拷贝纪律同口径）。
 ---@param alias_or_profile string|table
----@return table|nil { default_effort=, effort_map=, modalities=, supports_tool_use= }
+---@return table|nil { default_effort=, effort_map=, modalities= }
+---
+--- 2026-10-11 用户裁定 A：原来这里还带 supports_tool_use —— 条目层那五张独立布尔位
+--- （tool_use / streaming / reasoning / vision / reasoning_effort）已从配置层拆除，
+--- 对外那四位改由 effort 映射与 modalities 推导（本文件下方的 effort_facts_for）。
+--- 卡片的同名读数不走这条路：router 侧直接读 cfg.model_configs（resolve_model_caps）。
+---@see CS_PROFILES.effort_facts
 function _M.entry_declaration(alias_or_profile)
     local profile
     if type(alias_or_profile) == "table" then
@@ -421,9 +431,58 @@ function _M.entry_declaration(alias_or_profile)
     if type(profile.modalities) == "table" then
         field("modalities", { table.unpack(profile.modalities) })
     end
-    -- 三态：false 要原样带出去（它是要参与决策的声明），nil 不写键。
-    field("supports_tool_use", profile.supports_tool_use)
     return out
+end
+
+-- ---------------------------------------------- 条目级密钥与 effort 推导的对外读点
+--
+-- 两枚函数都是 CS_PROFILES 上那一份实现的薄壳（facade 走读面，实现只有一份）。放在一起的
+-- 理由与 upstreams 层的 sanitize_upstream_row / build_upstreams 分家同一条：明文的**存放与
+-- 比对**在 profiles.lua（写侧），**读面**在这里（读侧），任何一层都不把明文交出去。
+--
+-- 缺省零行为变化（AGENTS.md）：没配 key 的条目 requires=false、matches=true，所以既有的
+-- 全部部署在热路径上拿到的答案与改动前完全一致（W2 的接缝据此一个字节都不改）。
+
+---@see CS_PROFILES.entry_requires_api_key
+--- 这个入口**要不要** api-key（不碰明文，也不返回明文）。W2 鉴权接缝与 UI 徽标都读它。
+---@param alias_or_profile string|table @ 入口名，或手上已有的 profile 拷贝
+---@return boolean
+function _M.entry_requires_api_key(alias_or_profile)
+    return CS_PROFILES.entry_requires_api_key(alias_or_profile) == true
+end
+
+---@see CS_PROFILES.entry_api_key_matches
+--- 库内比对：调用方带来的 key 是不是这条入口存着的那一把。返回两个布尔，明文只在内部走动。
+---@param alias_or_profile string|table
+---@param supplied string|nil
+---@return boolean requires, boolean matches
+function _M.entry_api_key_matches(alias_or_profile, supplied)
+    local requires, matches = CS_PROFILES.entry_api_key_matches(alias_or_profile, supplied)
+    if not requires then return false, true end
+    return true, matches == true
+end
+
+--- 这个入口的 effort 映射「实际配了哪些档位、缺省档是什么」。
+---
+--- 只给**推导所需的事实**，不给 /v1/models 的那四个字段：合成（写哪个键、什么时候整键省略、
+--- 组内怎么共识）是 router/models_api.lua 的活（W3），配置层一旦写出字段名就有了第二份对外
+--- 口径。形状见 config_store/profiles.lua 的 effort_facts：
+---   * levels        = 配置里出现过的档位（default_effort 与 effort_map 的 from / to 都算），
+---                    按 lexicon 的 EFFORT_LEVELS 顺序去重排序；
+---   * default_effort= 条目声明的缺省档（没有则 nil）；
+---   * beyond_none   = levels 里除 none 以外还有档位（决定那四位要不要出现）；
+---   * 两位都没配置 → nil = 「没说」，调用方整组键省略。
+---@param alias_or_profile string|table
+---@return table|nil facts
+function _M.effort_facts_for(alias_or_profile)
+    local profile
+    if type(alias_or_profile) == "table" then
+        profile = alias_or_profile
+    elseif type(alias_or_profile) == "string" and alias_or_profile ~= "" then
+        profile = CS_FACADE.current().virtual_profiles[alias_or_profile]
+    end
+    if type(profile) ~= "table" then return nil end
+    return CS_PROFILES.effort_facts(profile)
 end
 
 -- ------------------------------------------------------ policy (hot path) reads

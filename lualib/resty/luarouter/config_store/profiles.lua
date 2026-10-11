@@ -359,6 +359,71 @@ local function build_entry_modalities(alias, raw)
     return ordered
 end
 
+--- 条目级 API 密钥（用户裁定 2026-10-11：配了 key 的入口只能经过 api-key 访问）。
+---
+--- 三态纪律逐字照抄 upstreams 层（config_store/upstreams.lua 的 upstream_from_entry），
+--- 连文案家族一起复用而不新造句子：缺键 / null = keep（不动），空串 = clear，非空串 =
+--- set；`api_key_state` 是 UI 与磁盘可以直接表态的另一半拼法，`api_key_stored` 是
+--- **持久化**那一份（掩码文档原样提交回来时靠它把密钥留在原地）。
+---
+--- 为什么明文只活在 config_store 内部：与 upstreams 层「明文永不回显」同一条纪律
+--- （contract 3.4）。对外面只见掩码（snapshot.lua 的 sanitize_virtual_rows：api_key 恒
+--- null、has_api_key 说有没有存着，api_key_state / api_key_stored 不出库），比对只在
+--- store 内部做（readers.lua 的 entry_api_key_matches）。热路径拿到的是「这个条目要不要
+--- key」那个布尔，永远不是 key 本身 —— 交出明文的那一层就是泄密的那一层：profile 会被
+--- profile_for 拷贝给 router、被 snapshot_of 落到磁盘、被 document() 发给 JSON 编辑器，
+--- 任何一个忘了脱敏就是一个把密钥送出网关的出口，所以「明文不出这个模块」必须是结构性的
+--- 而不是逐调用点的细心。
+---
+--- `previous` 是**同一个入口**上一份存着的 {api_key_state=, api_key_stored=}：沉默的一行
+--- 继承它。理由与 build_upstreams 的 previous 逐字相同 —— 掩码文档里 api_key 读起来永远
+--- 是 null，不继承的话一次与密钥无关的编辑就会把门悄悄拆掉；显式的空串仍然清除。
+---@return string|nil state, string|nil stored, string|nil err
+local function build_entry_key(alias, entry, previous)
+    local state, stored = "keep", nil
+    local declared = rawget(entry, "api_key_state")
+    if declared ~= nil and declared ~= JSON_NULL then
+        if declared ~= "keep" and declared ~= "set" and declared ~= "clear" then
+            return nil, nil, string.format(
+                "virtual model %s api_key_state must be keep, set or clear", alias)
+        end
+        state = declared
+    end
+    local explicit, explicit_field
+    for _, field in ipairs({ "api_key", "api_key_stored" }) do
+        local value = rawget(entry, field)
+        if value ~= nil and value ~= JSON_NULL then
+            explicit, explicit_field = value, field
+            break
+        end
+    end
+    if explicit ~= nil then
+        if type(explicit) ~= "string" then
+            return nil, nil, string.format(
+                "virtual model %s %s must be a string or null", alias, explicit_field)
+        end
+        -- 两端空白不是密钥的一部分：操作员从聊天窗口粘进来的串带个尾空格是常态，留下它
+        -- 就等于配了一把客户端永远配不上的锁。洗完整串为空 = 「说了要清除」。
+        local key = CS_LEXICON.trim(explicit)
+        if key == "" then
+            state, stored = "clear", nil
+        else
+            state, stored = "set", key
+        end
+    elseif state == "set" then
+        CS_LEXICON.ngx_log_warn("luarouter virtual model ", alias,
+            " api_key_state set without api_key_stored; treating as keep")
+        state = "keep"
+    end
+    if state == "keep" and stored == nil and type(previous) == "table"
+        and previous.api_key_state == "set"
+        and type(previous.api_key_stored) == "string"
+        and CS_LEXICON.trim(previous.api_key_stored) ~= "" then
+        state, stored = "set", CS_LEXICON.trim(previous.api_key_stored)
+    end
+    return state, stored, nil
+end
+
 --- tool use 能力声明：三态。缺键 / null = nil = 「不知道」（不等于 false），读侧据此
 --- 继续退到引擎自报；写了 false 就是操作员说了「这个入口不支持工具」，必须落盘成 false。
 ---@return boolean|nil value, string|nil err
@@ -388,7 +453,7 @@ end
 
 --- 八个声明字段一起装配；任何一条非法都整条入口拒绝保存（与 context_window 同纪律）。
 ---@return table|nil fields, string|nil err
-local function build_entry_declarations(alias, entry)
+local function build_entry_declarations(alias, entry, previous)
     local out = {}
     local default_effort, derr = build_entry_default_effort(alias, rawget(entry, "default_effort"))
     if derr then return nil, derr end
@@ -399,19 +464,27 @@ local function build_entry_declarations(alias, entry)
     local modalities, moderr = build_entry_modalities(alias, rawget(entry, "modalities"))
     if moderr then return nil, moderr end
     if modalities then out.modalities = modalities end
-    local tool_use, terr = build_entry_supports_tool_use(alias, rawget(entry, "supports_tool_use"))
-    if terr then return nil, terr end
-    if tool_use ~= nil then out.supports_tool_use = tool_use end
-    -- 四条新能力位走同一个循环：漏一条 = 该字段被静默忽略、往返丢失，而循环让「四条
-    -- 都装配」成为结构性事实而不是逐字段的细心。名字与卡片、UI 完全同名（扁平三态，
-    -- 与已上线的 supports_tool_use 同形状；刻意不塞进 supports:{} 子对象，那会让
-    -- supports_tool_use 变成两条路径并被已钉住它的测试咬住）。
-    for _, field in ipairs({ "supports_streaming", "supports_reasoning",
-                             "supports_vision", "supports_reasoning_effort" }) do
-        local value, ferr = build_entry_supports_flag(alias, field, rawget(entry, field))
-        if ferr then return nil, ferr end
-        if value ~= nil then out[field] = value end
-    end
+    -- **2026-10-11 拆除**（用户裁定 A）：条目层的五张独立布尔位 supports_tool_use /
+    -- supports_streaming / supports_reasoning / supports_vision / supports_reasoning_effort
+    -- 一律从配置层与解析里去掉，上面那段共享循环随之消失。理由是「显式声明说 false、
+    -- effort 映射又说 true」这种自相矛盾不该存在：这四位的对外读数现在**由 effort 映射
+    -- 与 modalities 推导**（推导事实见本文件的 effort_facts，字段合成在 router/models_api.lua），
+    -- 保留一条可以覆盖推导的旁路就等于给每条推导再配一个开关。
+    -- 刻意**没有**在这里为它们保留「接受但忽略」的兼容支（与条目层的 policy / effort 那两条
+    -- 弃用字段不同）：那两位被裁定为「继续往返、别当 bug 修」，而这一族被裁定为**去掉**，
+    -- 老配置里剩下的布尔会在下一次落盘时自然消失，不再参与任何对外读数。
+    -- 卡片（model_configs）上的同名字段**不在本轮拆除范围**：它说的是落点引擎自己，
+    -- 由卡片层继续按「声明 > 引擎自报 > 省略」说话（config_store/snapshot.lua 的卡片段与
+    -- router/models_api.lua 的 resolve_model_caps 不变）。
+    --
+    -- 「隐藏」与「禁用」（用户裁定 2026-10-09）**不并进上面那族**，也原样保留：那五位是对外
+    -- 读数（capabilities.supports_*），而这两条不是 —— hidden 说的是「这个名字别出现在
+    -- /v1/models 里」（照常服务），disabled 说的是「这台实例别再被服务了」（连被发现的资格
+    -- 都没有）。同一份字节形状却是完全不同的一族语义，混在一起会把「加一条能力位」变成
+    -- 「顺手加一条服务开关」的隐患；逐条写出来也让 UI 侧在源码里看得见它们的不同。
+    -- 解析口径照抄（build_entry_supports_flag 就是 absent/null→nil、真布尔→值、其它→400）。
+    -- 两条都必须装配：入口级「只藏不禁」与「只禁不藏」是两种真实配置，合并成一条就等于让
+    -- 操作员二选一。
     -- 「隐藏」与「禁用」（用户裁定 2026-10-09）：**不并进上面那个循环**。那五位是能力位，对外
     -- 读数会因为它们变化（capabilities.supports_*），而这两条不是对外读数 —— hidden 说的是
     -- 「这个名字别出现在 /v1/models 里」（照常服务），disabled 说的是「这台实例别再被服务了」
@@ -426,6 +499,12 @@ local function build_entry_declarations(alias, entry)
     local disabled_val, disberr = build_entry_supports_flag(alias, "disabled", rawget(entry, "disabled"))
     if disberr then return nil, disberr end
     if disabled_val ~= nil then out.disabled = disabled_val end
+    -- 条目级密钥与那两位一样是「操作员说的话」，走同一个装配口：state 与 stored 成对进
+    -- profile，缺席（keep 且无 stored）就什么键都不长（「新开关缺省零行为变化」）。
+    local key_state, key_stored, kerr = build_entry_key(alias, entry, previous)
+    if kerr then return nil, kerr end
+    if key_state ~= "keep" then out.api_key_state = key_state end
+    if key_stored ~= nil and key_stored ~= "" then out.api_key_stored = key_stored end
     if next(out) == nil then return nil end
     return out
 end
@@ -567,7 +646,8 @@ end
 --- instead bind each candidate to its own model, in which case the representative
 --- target is derived from the first explicit binding. Both shapes round-trip; the
 --- legacy {model, target} entry is untouched by this branch.
-local function profile_from_entry(alias, entry, shadow)
+---@param previous table|nil @ 同一个入口上一份存着的 profile（只为 api_key 的 keep 继承读它）
+local function profile_from_entry(alias, entry, shadow, previous)
     if type(entry) ~= "table" then
         return nil, "virtual model entries must be objects"
     end
@@ -726,26 +806,26 @@ local function profile_from_entry(alias, entry, shadow)
                 ", which no longer applies there (configure it on the model card)")
         end
     end
-    -- 条目级的四个新声明位（2026-10-04 裁定放行；理由见 build_entry_declarations）。
-    -- 必须在 rawget 白名单里显式写出：profile_from_entry 是逐字段读取，漏一个字段就等于
-    -- 该字段被静默忽略、往返丢失。
-    local declarations, decl_err = build_entry_declarations(alias, entry)
+    -- 条目级声明位（2026-10-04 裁定放行；2026-10-11 用户裁定 A 拆掉五张独立布尔位；
+    -- 理由见 build_entry_declarations）。必须在 rawget 白名单里显式写出：profile_from_entry
+    -- 是逐字段读取，漏一个字段就等于该字段被静默忽略、往返丢失。
+    local declarations, decl_err = build_entry_declarations(alias, entry, previous)
     if decl_err then return nil, decl_err end
     if declarations then
         profile.default_effort = declarations.default_effort
         profile.effort_map = declarations.effort_map
         profile.modalities = declarations.modalities
-        profile.supports_tool_use = declarations.supports_tool_use
-        -- 四条能力位与 tool use 同一条往返链（漏一条 = 磁盘上那一份永远读不回来）
-        profile.supports_streaming = declarations.supports_streaming
-        profile.supports_reasoning = declarations.supports_reasoning
-        profile.supports_vision = declarations.supports_vision
-        profile.supports_reasoning_effort = declarations.supports_reasoning_effort
+        -- 五张能力位在 2026-10-11 从这里去掉（对外读数改由 effort 映射 / modalities 推导）。
         -- 「隐藏」与「禁用」走同一条往返链：它们是入口级的声明位，装配 / 落盘 / 读回 / 展示
         -- 四位一体，热路径上的读法只有 config_store 的那两份判定（readers.lua 的
         -- model_is_hidden 管广告、model_is_disabled 管服务与候选）。
         profile.hidden = declarations.hidden
         profile.disabled = declarations.disabled
+        -- 密钥对走同一条装配口：明文自此只活在 config_store 的 profile 里 —— 落盘由
+        -- snapshot_of 写 persistence 字段，回显由 sanitize_virtual_rows 抹成掩码，比对由
+        -- readers.entry_api_key_matches 在库内做。热路径上的 profile_for 拷贝**不**带这两键。
+        profile.api_key_state = declarations.api_key_state
+        profile.api_key_stored = declarations.api_key_stored
     end
     return profile, nil
 end
@@ -764,10 +844,13 @@ end
 -- 崩在 "attempt to call global 'assert_no_alias_chain'"。
 local assert_no_alias_chain, assert_bindings_no_alias
 
-local function build_profiles(entries, existing, shadow)
+---@param previous_keys table|nil @ alias -> 上一份 profile，只给 api_key 的 keep 继承用；
+---  缺省（nil）退回 existing —— apply_profiles 传的就是存量表，语义正是「同一入口的上一份」。
+local function build_profiles(entries, existing, shadow, previous_keys)
     -- nil 是「调用方没表态」= 写入侧（apply_profiles 与整文档 apply_document 都是），
     -- 因此现查引擎读数；读路径由 cfg_from_document 显式传 reload 上下文。
     if shadow == nil then shadow = new_shadow_context(nil) end
+    local key_source = previous_keys ~= nil and previous_keys or existing
     local built = {}
     for _, entry in ipairs(entries or {}) do
         if type(entry) ~= "table" then
@@ -790,7 +873,8 @@ local function build_profiles(entries, existing, shadow)
                 "virtual model %s needs a target model (an entry needs both model and target)",
                 alias)
         end
-        local profile, perr = profile_from_entry(alias, entry, shadow)
+        local profile, perr = profile_from_entry(alias, entry, shadow,
+            key_source and key_source[alias])
         if not profile then return nil, perr end
         built[alias] = profile
     end
@@ -940,6 +1024,156 @@ assert_bindings_no_alias = function(built, existing, alias, profile, shadow)
     return nil
 end
 
+-- ------------------------------------------------- effort 映射的推导事实
+--
+-- 2026-10-11 用户裁定 A：虚拟服务条目上**只留一张 effort 强度映射表**（default_effort +
+-- effort_map，缺省即 from==to 的恒等透传），对外那四个 reasoning 字段全部由这张表**推导**。
+-- 本节因此只提供「推导所需的事实」，刻意不写那四个字段名 —— 字段合成（写哪个键、缺席规则、
+-- 组内共识）是 W3 在 router/models_api.lua 的活，配置层一旦写死键名就会出现第二份对外口径。
+--
+-- 三条口径写在这里而不是调用方：
+--   * 档位集合是**配置里实际出现过**的名字（default_effort、effort_map 的 from 与 to 都算），
+--     按 lexicon 的 EFFORT_LEVELS 顺序去重排序 —— 不是任何硬编码的示例表；
+--   * 「除了 none 以外才算」这条判据以 `beyond_none` 给出，W3 读一个布尔就够，不必自己再判；
+--   * 完全没配置（两位都空）答 nil = 「没说」，与旁边「整个键省略」的对外规则一一对应，
+--     有配置但只出现 none 时**不**是 nil（levels={"none"}、beyond_none=false）—— 操作员那句话
+--     是说了的，只是不足以撑起能力位，两种情形交给 W3 分别处理比在这里合并更诚实。
+--
+-- 手改磁盘的脏值不会污染推导：档位名一律重新过 normalize_effort，洗不出名字的（键被写成
+-- 数字、值拼错）整条跳过，网关不替操作员猜一个近似档位（与卡片阶梯的清洗同口径）。
+
+--- 档位名 -> EFFORT_LEVELS 里的位次（越小越前）。惰性构造：lexicon 的表是权威名册，
+--- 这里只缓存它派生出的次序，不复制第二份档位名单。
+local effort_rank
+local function rank_of(level)
+    if effort_rank == nil then
+        effort_rank = {}
+        local levels = CS_LEXICON.effort_levels()
+        for i = 1, #levels do effort_rank[levels[i]] = i end
+    end
+    return effort_rank[level]
+end
+
+--- 一条映射表里「实际出现过」的档位集合。两种磁盘/UI 拼法都收：查表形状 {from=to} 与数组
+--- 形状 { {from=,to=}, ... }（profile 上存的是前者，但这份事实也供调用方手上的 profile
+--- 拷贝使用，拷贝可能出自别的装配路径 —— 与 readers.effort_map_view 收两种拼法同理）。
+---@param profile table|nil @ 存储里的 profile 或 profile_for 的拷贝
+---@return table|nil facts @ nil = 完全没配置；否则 {levels=, default_effort=, beyond_none=}
+local function effort_facts(profile)
+    if type(profile) ~= "table" then return nil end
+    local seen, count = {}, 0
+    local function note(value)
+        local level = CS_LEXICON.normalize_effort(value)
+        if not level or level == false then return end
+        if rank_of(level) == nil then return end   -- 不在词表（理论上不可能）：不猜
+        if not seen[level] then seen[level] = true count = count + 1 end
+    end
+    note(profile.default_effort)
+    local map = profile.effort_map
+    if type(map) == "table" then
+        -- 数组拼法的判据与 readers.effort_map_view 逐字一致（首元素是带 from 的表）：
+        -- 两处对「同一份字节是数组还是查表」必须给同一个答案，否则同一份配置在推导面与
+        -- 改写面上会读到两套档位。
+        local array_like = #map > 0 and type(map[1]) == "table"
+            and rawget(map[1], "from") ~= nil
+        if next(map) ~= nil then
+            if array_like then
+                for _, item in ipairs(map) do
+                    if type(item) == "table" then
+                        note(rawget(item, "from"))
+                        note(rawget(item, "to"))
+                    end
+                end
+            else
+                for from, to in pairs(map) do
+                    note(from)
+                    note(to)
+                end
+            end
+        end
+    end
+    if count == 0 and profile.default_effort == nil then return nil end
+    local levels = {}
+    for level in pairs(seen) do levels[#levels + 1] = level end
+    table.sort(levels, function(a, b) return rank_of(a) < rank_of(b) end)
+    local beyond_none = false
+    for i = 1, #levels do
+        if levels[i] ~= "none" then beyond_none = true break end
+    end
+    local default_effort = CS_LEXICON.normalize_effort(profile.default_effort)
+    if default_effort == false then default_effort = nil end
+    return { levels = levels, default_effort = default_effort, beyond_none = beyond_none }
+end
+
+-- ------------------------------------------------- 条目级密钥的库内比对
+--
+-- 「明文不出 config_store 的出口」在这两枚函数上落地：对外面（snapshot_of 的落盘字段 +
+-- sanitize_virtual_rows 的掩码）只说「有没有存着」，要问「带来的 key 对不对」只能进到这里
+-- 问，比对用的是库内那一份明文，调用方拿回来的是两个布尔。
+--
+-- 缺省零行为变化：没配 key 的条目 requires=false、matches=true —— 热路径（W2 的接缝）
+-- 因此对既有部署一个字节都不改，只有配了 key 的那几条入口开始要求 key。
+-- 比较用逐字节全量遍历（不是 `==`）：这是一道对外可见的门，早退比较会把「前缀对了多少」
+-- 变成可测的时间差，虽然在这个位置上它还不足以拼出密钥，但没有理由白送这一位信息。
+
+--- 常数时间字符串比较：先扫完整个较短串，长度不同也已经走完了等量的循环。
+---@param a string
+---@param b string
+---@return boolean
+local function constant_time_equal(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    local diff = #a - #b
+    local n = #a < #b and #a or #b
+    for i = 1, n do
+        local x, y = a:byte(i), b:byte(i)
+        if x ~= y then diff = diff + 1 end
+    end
+    return diff == 0
+end
+
+local function profile_lookup(alias_or_profile)
+    if type(alias_or_profile) == "table" then
+        -- profile_for 的拷贝不带密钥（那是它的对外形状），因此表上查不到时再按它自带的
+        -- 入口名回查存储一次：接缝手上往往只有那份拷贝，不该为此再要求调用方传别名。
+        local name = rawget(alias_or_profile, "model")
+        if rawget(alias_or_profile, "api_key_state") == nil
+            and type(name) == "string" and name ~= "" then
+            local cfg = CS_FACADE.current()
+            local stored = type(cfg.virtual_profiles) == "table" and cfg.virtual_profiles[name] or nil
+            if type(stored) == "table" then return stored end
+        end
+        return alias_or_profile
+    end
+    if type(alias_or_profile) ~= "string" or alias_or_profile == "" then return nil end
+    local cfg = CS_FACADE.current()
+    if type(cfg.virtual_profiles) ~= "table" then return nil end
+    local profile = cfg.virtual_profiles[alias_or_profile]
+    return type(profile) == "table" and profile or nil
+end
+
+--- 这个条目**要不要** api-key（不碰任何明文）。热路径的便宜判据：false = 全场照旧。
+---@param alias_or_profile string|table
+---@return boolean
+local function entry_requires_api_key(alias_or_profile)
+    local profile = profile_lookup(alias_or_profile)
+    if profile == nil then return false end
+    return rawget(profile, "api_key_state") == "set"
+        and type(rawget(profile, "api_key_stored")) == "string"
+        and rawget(profile, "api_key_stored") ~= ""
+end
+
+--- 库内比对：带来的 key 是不是这条入口存着的那一把。
+---@param alias_or_profile string|table
+---@param supplied string|nil @ 调用方带来的 key（未经 trim 的原样；两侧空白不参与比较）
+---@return boolean requires, boolean matches
+local function entry_api_key_matches(alias_or_profile, supplied)
+    if not entry_requires_api_key(alias_or_profile) then return false, true end
+    local profile = profile_lookup(alias_or_profile)
+    if profile == nil then return false, true end
+    if type(supplied) ~= "string" or supplied == "" then return true, false end
+    return true, constant_time_equal(supplied, profile.api_key_stored)
+end
+
 -- ------------------------------------------------- 跨子模块直调的原文 local
 -- 这些函数在原文里是同文件 local 直调、从未挂在 _M 上；拆开后由调用方直接 require 本表
 -- 调用（不经 facade，所以既不是新增导出、也不给单测多开一个可替换点）。
@@ -954,5 +1188,12 @@ _M.new_shadow_context = new_shadow_context
 _M.declared_cap = declared_cap
 _M.declared_util = declared_util
 _M.norm_pool_url = norm_pool_url
+-- 条目 effort 映射的推导事实（2026-10-11 用户裁定 A）：只读、纯函数，W3 的字段合成与 UI
+-- 都从这一份取，配置层不写死那四个对外字段名。
+_M.effort_facts = effort_facts
+-- 条目级 api-key 的两枚库内读点：明文只在这里可比对（见上面的小节注释）。W2 的鉴权接缝
+-- 只需要这两枚，永远不需要 key 本身。
+_M.entry_requires_api_key = entry_requires_api_key
+_M.entry_api_key_matches = entry_api_key_matches
 
 return _M

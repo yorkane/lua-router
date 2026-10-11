@@ -366,13 +366,23 @@ local function snapshot_of(cfg)
             entry.effort_map = effort_pairs(profile.effort_map)
         end
         if profile.modalities then entry.modalities = { table.unpack(profile.modalities) } end
-        -- 能力位 false 是结论、必须写成 false；缺席是沉默、必须整个键不出现（写 null
-        -- 会让老 build 与 JSON 编辑器把「擦掉声明」与「说了不支持」读成同一件事）。
-        -- 与卡片那五条用 nul 相反：条目层是可选字段缺席的约定（见上面 default_effort 一段）。
-        for _, field in ipairs({ "supports_tool_use", "supports_streaming",
-                                 "supports_reasoning", "supports_vision",
-                                 "supports_reasoning_effort" }) do
-            if profile[field] ~= nil then entry[field] = profile[field] end
+        -- **2026-10-11 用户裁定 A**：条目层五张独立布尔位（supports_tool_use /
+        -- supports_streaming / supports_reasoning / supports_vision /
+        -- supports_reasoning_effort）连同上面那个共享循环一起拆除。它们不再被解析、不再落盘、
+        -- 也不再回显，对外那四位由 effort 映射与 modalities **推导**（推导事实见
+        -- config_store/profiles.lua 的 effort_facts，字段合成在 router/models_api.lua）。
+        -- 于是老配置里剩下的那五位在第一次落盘时从磁盘上消失 —— 这是裁定的预期结果，不是回归。
+        -- 卡片（model_configs）那五条照旧走上面的 nul 家族：本轮不动它。
+        --
+        -- 条目级 api-key 的**持久化半**（用户裁定 2026-10-11）：state + stored 随快照落盘，
+        -- 与旁边 upstreams 段的 api_key_state / api_key_stored 完全同一形状（照抄那个字段名，
+        -- 让读配置的人与 JSON 编辑器只学一次）。明文在这里是**必需**的 —— LMR_CONFIG_FILE 是
+        -- 只读镜像、db 是权威源，密钥只能存在这一层，否则一次 reload 就把门拆了。
+        -- 「永不回显」约束的是对外面（document / profiles_list / env_defaults 的掩码，见
+        -- sanitize_virtual_rows），不是磁盘。缺席 = 没配过 key = 两键都不出现（绝不无中生有）。
+        if profile.api_key_state ~= nil then entry.api_key_state = profile.api_key_state end
+        if profile.api_key_stored ~= nil and profile.api_key_stored ~= "" then
+            entry.api_key_stored = profile.api_key_stored
         end
         -- 「隐藏」与「禁用」与那五位同一条条目层纪律：false 是结论、必须写成 false，缺席是
         -- 沉默、整个键不出现（写 null 会让老 build 与 JSON 编辑器把「擦掉声明」与「说了不隐藏」
@@ -455,6 +465,43 @@ local function snapshot_of(cfg)
         snap.models_virtual_only = cfg.models_virtual_only
     end
     return snap
+end
+
+--- 虚拟入口行的**对外掩码**（用户裁定 2026-10-11）：条目级 api-key 的三态纪律照抄
+--- upstreams 层（config_store/upstreams.lua 的 sanitize_upstream_row），逐字同一条款 ——
+--- `api_key` 在场且恒 null（JSON 编辑器把它读成「存着的密钥不动」），`has_api_key` 说库里
+--- 有没有存着，持久化字段 `api_key_state` / `api_key_stored` **绝不出库**。
+---
+--- 为什么单独一份而不是复用 upstreams 那枚：两族字段的其它键不一样（入口行没有
+--- priority / cost / labels / disable_health_check 那批默认值要补），而 upstreams 那份会
+--- 无条件写出 `api_key = JSON_NULL` 并把行改写成它认识的形状；复制一份最小实现比把两种行
+--- 形状塞进一个函数更诚实。两份共享的是**条款**而不是代码。
+---
+--- 无密钥的行原样返回（不复制），这样 document / env_defaults 里所有没配过 key 的入口保持
+--- 逐字节不变（AGENTS.md「新开关缺省零行为变化」），也省掉每次列表请求分配 N 张表。
+---@param row table @ snapshot_of 的 virtual_models 一行
+---@return table
+local function sanitize_virtual_row(row)
+    if type(row) ~= "table" then return row end
+    local keyed = row.api_key_state ~= nil or row.api_key_stored ~= nil
+    if not keyed then return row end
+    local out = {}
+    for key, value in pairs(row) do
+        if key ~= "api_key" and key ~= "api_key_state" and key ~= "api_key_stored" then
+            out[key] = value
+        end
+    end
+    out.api_key = JSON_NULL
+    out.has_api_key = (row.api_key_state == "set") == true
+    return out
+end
+
+--- 整表版本；入参可能是 snapshot_of 的数组（也可能已经是空数组元表），一律返回新表。
+function _M.sanitize_virtual_rows(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do out[#out + 1] = sanitize_virtual_row(row) end
+    if #out == 0 then return CS_LEXICON.arr(out) end
+    return out
 end
 
 -- --------------------------------------------------------------- validation

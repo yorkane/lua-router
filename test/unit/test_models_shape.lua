@@ -1089,5 +1089,87 @@ caps_table = nil
 store_tbl = bare_store()
 
 end
+-- ===== G12：四个新对外字段由 effort 映射推导（用户裁定 2026-10-11）=====
+-- 判据四条：(1) effort 配置里出现过 none 以外的档位 -> 两个 support 位为 true；
+-- (2) supported_reasoning_efforts 列配置里**实际出现过**的档位，按 lexicon 词表序（恒等映射即全部 8 档）；
+-- (3) default_reasoning_effort 取配置的缺省档；(4) 无配置 / 只有 none -> 四键整体省略（删键，不写 null、
+-- 不写空数组）。视觉按 modalities 含 image/video 判定。纯增量语义：旧三位与新字段并存、同值不打架。
+print("=== G12 四个新字段由 effort 映射推导 ===")
+local function g12_store(vms, cards, modalities, entry_decl)
+  return {
+    virtual_models_list = function() return vms end,
+    current = function() return { model_configs = cards or {}, model_max_output_tokens = {}, model_effort = {} } end,
+    modalities_for = function() return modalities end,
+    ctx_cap = function() return nil end,
+    profile_for = function() return entry_decl end,
+    entry_declaration = function() return entry_decl end,
+    effort_facts_for = function() return nil end,
+  }
+end
+local function g12_row(rep, id)
+  for i = 1, #rep.data do if rep.data[i].id == id then return rep.data[i] end end
+  return nil
+end
+-- 1) 恒等映射 low/high/xhigh + modalities 含 image
+caps_table = advertise_listing({ { id="vm-1", object="model", created=1700000000, owned_by="local",
+  input_modalities={"text","image"}, reasoning_effort_values={"low","high"} } })
+store_tbl = g12_store({ {"vm-1","low","high","xhigh"} },
+  { ["vm-1"] = {} }, {"text","image"},
+  { effort_map = { low="low", high="high", xhigh="xhigh" }, default_effort="high", modalities={"text","image"} })
+do
+  local r = g12_row(M.models_handler(), "vm-1")
+  check("G12.1 找到入口行", r ~= nil, "nil")
+  if r then
+    check("G12.1 supports_reasoning=true", r.supports_reasoning == true, tostring(r.supports_reasoning))
+    check("G12.1 supports_reasoning_effort=true", r.supports_reasoning_effort == true, tostring(r.supports_reasoning_effort))
+    check("G12.1 supported_reasoning_efforts 词表序", join(r.supported_reasoning_efforts) == "low,high,xhigh", join(r.supported_reasoning_efforts))
+    check("G12.1 default_reasoning_effort=high", r.default_reasoning_effort == "high", tostring(r.default_reasoning_effort))
+    check("G12.1 image -> 视觉 true", read(r,"capabilities","supports_vision") == true, tostring(read(r,"capabilities","supports_vision")))
+    -- 旧三位（reasoning_effort / reasoning_efforts / 顶层 supports_reasoning_effort）与四个新字段并存：
+    -- 顶部 supports_reasoning_effort 这一个键由两条链写同一个名字，纯增量下它们必须同值；
+    -- reasoning_efforts / reasoning_effort 来自**引擎 picker 阶梯**，本探针的引擎只给了
+    -- reasoning_effort_values（没有阶梯对象），所以这两位在本场景缺席是正确的，不是缺陷。
+    check("G12.1 旧顶层位与新推导位同值（纯增量不打架）",
+          r.supports_reasoning_effort == true, tostring(r.supports_reasoning_effort))
+    check("G12.1 旧 reasoning_efforts 的缺席是因为引擎没给阶梯（非缺陷）",
+          r.reasoning_efforts == nil, tostring(r.reasoning_efforts))
+    check("G12.1 required 四字段齐", r.id ~= nil and r.object ~= nil and r.created ~= nil and r.owned_by ~= nil, "?")
+  end
+end
+-- 2) 无 effort 配置 -> 四键省略
+caps_table = advertise_listing({ { id="vm-plain", object="model", created=1700000000, owned_by="local", input_modalities={"text"} } })
+store_tbl = g12_store({ {"vm-plain","low"} }, { ["vm-plain"] = {} }, {"text"})
+do
+  local r = g12_row(M.models_handler(), "vm-plain")
+  if r then
+    check("G12.2 无配置 supported_reasoning_efforts 缺席", r.supported_reasoning_efforts == nil, tostring(r.supported_reasoning_efforts))
+    check("G12.2 无配置 default_reasoning_effort 缺席", r.default_reasoning_effort == nil, tostring(r.default_reasoning_effort))
+  else check("G12.2 行存在", false, "nil") end
+end
+-- 3) 只有 none -> 四键省略
+caps_table = advertise_listing({ { id="vm-none", object="model", created=1700000000, owned_by="local", input_modalities={"text"} } })
+store_tbl = g12_store({ {"vm-none","none"} }, {}, {"text"},
+  { effort_map = { none="none" }, default_effort="none" })
+do
+  local r = g12_row(M.models_handler(), "vm-none")
+  if r then
+    check("G12.3 only-none supports_reasoning 缺席", r.supports_reasoning == nil, tostring(r.supports_reasoning))
+    check("G12.3 only-none supported_reasoning_efforts 缺席", r.supported_reasoning_efforts == nil, tostring(r.supported_reasoning_efforts))
+  else check("G12.3 行存在", false, "nil") end
+end
+-- 4) 仅 text -> 视觉不报 true
+caps_table = advertise_listing({ { id="vm-t", object="model", created=1700000000, owned_by="local", input_modalities={"text"} } })
+store_tbl = g12_store({ {"vm-t","low"} }, {}, {"text"},
+  { effort_map = { low="low" }, default_effort="low" })
+do
+  local r = g12_row(M.models_handler(), "vm-t")
+  if r then
+    check("G12.4 仅text 视觉不报 true", read(r,"capabilities","supports_vision") ~= true, tostring(read(r,"capabilities","supports_vision")))
+    check("G12.4 levels 仍推导", join(r.supported_reasoning_efforts) == "low", join(r.supported_reasoning_efforts))
+  else check("G12.4 行存在", false, "nil") end
+end
+caps_table = nil
+store_tbl = nil
+caps_table = nil
 print(string.format("\n%d checks, %d failed", checks, fails))
 os.exit(fails == 0 and 0 or 1)
