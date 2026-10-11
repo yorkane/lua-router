@@ -145,3 +145,15 @@ cache_aware 亲和在长上下文（Codex 那种几十万字节的会话）下�
 （spill_pages 峰值 ~5700，单条 109k-token 会话占 kv_capacity 393216 的 28%，并发即挤出 GPU）。
 再压冷率的下一档：--device-state-slots 2->4（GPU checkpoint 池）或 --host-kv-mib 65536->131072，
 属显存预算权衡，暂缓。真实 Codex 流量回合间隔远短于 260s，命中路径已通。
+
+## 定尺的边界条件（1M-token 输入，实测）
+
+swift 引擎 --max-context 196608：单条路由文本超过约 1.08M 字符（196608 token × 5.5）的请求，
+在引擎侧就被 400 拒（context_length_exceeded），根本到不了亲和层——失败的 400 请求不进亲和树
+（tree_chars 保持 24，不污染）。所以 SMG_MAX_TREE_SIZE 这个每租户字符闸约束的不是单条 1M-token 请求
+（那条已被引擎挡在门外），而是同一后端实例上多条最大可入站会话（各约 1M 字符级路由文本）的累积插入。
+实测标定 5.5 chars/token：30M/租户只够个位数满尺寸会话并存，100M/租户约容 15-18 条，护栏仍交给
+节点数闸（SMG_MAX_TREE_NODES 缺省 200k/树）+ 增量淘汰（SMG_EVICT_BUDGET），二者与内存/RSS 才是真约束
+（6.6M 字符仅占 RSS 34MB）。发版部署：21.k:8801/8802/8800 与 235.t:8800 均置 SMG_MAX_TREE_SIZE=100000000，
+镜像 pub/lua-router:20261011-fc037af（门禁 full 22/0/0 锚点 gates-20261011-082738.log，代码基线 fc037af）。
+217.t:8800 是另一条模型线（Ornith-1.5）的独立生产，按红线未动，待用户确认。
