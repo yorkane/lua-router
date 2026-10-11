@@ -99,14 +99,22 @@
                       {{ tv('virtualMapCovered') }} · {{ (row.effort_map || []).map(entry => entry.from + '→' + entry.to).join(', ') }}</q-badge>
                     <q-badge outline :color="(row.modalities || []).length ? 'teal-4' : 'grey-6'" class="chip-soft">
                       {{ (row.modalities || []).length ? tv('virtualModalityCovered') + ' ' + (row.modalities || []).join('/') : c.unknown }}</q-badge>
-                    <!-- 颜色与文案同源于 toolUseText：未声明（null / undefined）都是灰，
-                         只有真写了 true/false 才上色，避免「灰底却按已声明着色」 -->
-                    <q-badge outline :color="toolUseDeclared(row) ? 'teal-4' : 'grey-6'" class="chip-soft">
-                      {{ toolUseText(row.supports_tool_use) }}</q-badge>
-                    <!-- 四个能力位各一枚 chip：灰 = 未声明（让位引擎自报），只有真布尔上色 -->
-                    <q-badge v-for="cap in capSummary(row)" :key="'vc' + index + '-' + cap.key" outline
-                             :color="cap.value ? 'teal-4' : 'orange-4'" class="chip-soft">
-                      {{ cap.label }}: {{ cap.value ? cjText('capDeclaredYes') : cjText('capDeclaredNo') }}</q-badge>
+                    <!-- 推理能力 chip（用户裁定 2026-10-11 选 A）：条目上那五张独立布尔位已从配置层
+                         拆除，对外 supports_reasoning 一族**由这张条目的 effort 配置推导**。灰 = 没配
+                         任何 none 以外的档位 = 四个键整体省略；teal 画出实际进清单的档位。映射表留空
+                         就是全档位原值透传（默认所有思考都支持，由客户端点名） -->
+                    <q-badge outline :color="entryEffortFacts(row).beyondNone ? 'teal-4' : 'grey-6'" class="chip-soft">
+                      {{ entryEffortFacts(row).beyondNone ? tv('virtualReasoningOn') + ' · ' + entryEffortFacts(row).levels.join('/') : tv('virtualReasoningOff') }}
+                      <q-tooltip>{{ tv('virtualReasoningDeriveHint') }}</q-tooltip></q-badge>
+                    <!-- 条目级 api-key 存在位（用户裁定 2026-10-11）：只画服务端给的 has_api_key，
+                         明文永不回显、也不从这份文档里读。灰 = 没配 = 不要求 key（缺省零行为变化）；
+                         teal = 这条入口只能经 api-key 访问，不带或带错都是 401 -->
+                    <q-badge outline :color="row.has_api_key ? 'teal-4' : 'grey-6'" class="chip-soft">
+                      <q-icon name="mdi-key-variant" size="12px"></q-icon>&nbsp;{{ row.has_api_key ? tv('virtualKeySet') : tv('virtualKeyNone') }}
+                      <q-tooltip>{{ row.has_api_key ? tv('virtualKeySetHint') : tv('virtualKeyNoneHint') }}</q-tooltip></q-badge>
+                    <!-- retired：磁盘上仍写着那五张独立布尔位时打橙色 chip（后端已不再解析，
+                         下一次编辑落盘就会消失）——不可见却还在磁盘上的设置必须看得见 -->
+                    <q-badge v-for="chip in retiredSupportChips(row)" :key="'vr' + index + '-' + chip" outline color="orange-4" class="chip-soft">{{ chip }}</q-badge>
                     <q-badge v-for="chip in legacyChips(row)" :key="'vl' + index + '-' + chip" outline color="orange-4" class="chip-soft">{{ chip }}</q-badge>
                     <span style="flex:1 1 auto"></span>
                     <div class="row-actions">
@@ -145,8 +153,16 @@
           <!-- 虚拟模型条目编辑对话框：形状照本页模型卡片对话框（q-dialog + dialog-fields +
                form-grid-2）与 workers.html saveDecls 的整表保存链路。两个子表（档位改写 /
                实际模型组）保持行内直改——它们本身就是条目式，不再套一层弹窗。控件密度：
-               身份 2 列，缺省档位 + 五个三态位 + 四个能力位 3 列；三态位保持 clearable 下拉
-               而不是 radio（塌缩成 2 项就画不出「不知道」那一档，见本页三态纪律注释）。 -->
+               身份 2 列，缺省档位 + 条目级 api-key 3 列。
+               **2026-10-11 用户裁定 1（选 A）**：条目上原有的五张独立布尔位（supports_reasoning /
+               supports_reasoning_effort / supports_vision / supports_streaming / supports_tool_use）
+               连同它们刚画出来的那四个能力位下拉一并去掉——后端 W1 已不再解析、不再落盘它们，
+               留着控件等于给操作员一个不生效的假开关。虚拟服务上唯一的思考配置就是下面那张
+               effort 强度映射表，对外那四个 reasoning 字段全部由它推导（推导口径与
+               router/models_api.lua 的 effort_advertise.derive 同源，见 entryEffortFacts）。
+               视觉能力由模态勾选推断（勾了 image / video 就是支持），同样不再单独摆布尔位。
+               三态位保持 clearable 下拉而不是 radio（塌缩成 2 项就画不出「不知道」那一档，
+               见本页三态纪律注释）——这条纪律现在只作用于仍保留的 hidden / disabled 两位。 -->
           <q-dialog v-model="virtualOpen">
             <q-card class="dialog-card virtual-dialog">
               <q-card-section>
@@ -165,24 +181,26 @@
                   <div class="form-grid-3">
                     <q-select v-model="virtualForm.default_effort" dense outlined dark :options="effortOptions" map-options emit-value clearable
                               :label="tv('virtualEffortField')" :hint="tv('virtualEffortHint')" @update:model-value="touchRow(virtualForm)"></q-select>
-                    <q-select v-model="virtualForm.supports_tool_use" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="tv('virtualToolField')" :placeholder="tv('virtualToolUnknown')" :hint="tv('virtualToolHint')"
-                              @update:model-value="touchRow(virtualForm)"></q-select>
-                    <!-- 条目层四个能力位：与卡片同名字段，卡片就这一位说过话时卡片赢（后端
-                         resolve_model_caps 的 declared() 一条链），留空 = 删键 = 交给引擎自报 -->
-                    <q-select v-model="virtualForm.supports_streaming" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualStreamingField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualStreamingHint')"
-                              @update:model-value="touchRow(virtualForm)"></q-select>
-                    <q-select v-model="virtualForm.supports_reasoning" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualReasoningField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualReasoningHint')"
-                              @update:model-value="touchRow(virtualForm)"></q-select>
-                    <q-select v-model="virtualForm.supports_vision" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualVisionField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualVisionHint')"
-                              @update:model-value="touchRow(virtualForm)"></q-select>
-                    <q-select v-model="virtualForm.supports_reasoning_effort" dense outlined dark :options="toolUseOptions" map-options emit-value clearable
-                              :label="cjText('virtualEffortSupportField')" :placeholder="tv('virtualToolUnknown')" :hint="cjText('virtualEffortSupportHint')"
-                              @update:model-value="touchRow(virtualForm)"></q-select>
+                    <!-- 条目级 API 密钥（用户裁定 2026-10-11 需求 A）：三态照抄 upstreams 层
+                         （契约 3.4）—— 提交时**不带这个键** = 不动已存密钥、空串 = 清除、非空 = 设置。
+                         回显永远是掩码：GET 里 api_key 恒 null，「有没有存着」只看 has_api_key，
+                         所以「输入框留空」绝不能被读成「清空」（那是 keep）。清除走显式动作。 -->
+                    <q-input v-model="virtualForm.api_key" dense outlined dark type="password" autocomplete="new-password"
+                             :label="tv('virtualKeyField')" :hint="virtualKeyHint" :disable="virtualForm.clearKey"
+                             @update:model-value="touchRow(virtualForm)"></q-input>
                   </div>
+                  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+                    <q-badge outline :color="virtualForm.hasApiKey ? 'teal-4' : 'grey-6'" class="chip-soft">
+                      <q-icon name="mdi-key-variant" size="12px"></q-icon>&nbsp;{{ virtualForm.hasApiKey ? tv('virtualKeySet') : tv('virtualKeyNone') }}</q-badge>
+                    <q-btn v-if="virtualForm.hasApiKey && !virtualForm.clearKey" flat dense no-caps size="sm"
+                           class="secondary-button" icon="mdi-key-remove-outline" :label="tv('virtualKeyClear')"
+                           @click="setVirtualKeyClear(true)"><q-tooltip>{{ tv('virtualKeyClearHint') }}</q-tooltip></q-btn>
+                    <q-btn v-if="virtualForm.clearKey" flat dense no-caps size="sm" class="secondary-button"
+                           icon="mdi-undo" :label="tv('virtualKeyUndoClear')" @click="setVirtualKeyClear(false)"></q-btn>
+                    <span class="muted" style="font-size:11px">{{ virtualKeyStateText }}</span>
+                  </div>
+                  <div v-if="retiredSupportChips(virtualForm).length" class="warn-banner"
+                       style="font-size:11.5px;padding:6px 9px;border-radius:8px">{{ retiredSupportNote }}</div>
                   <!-- 「隐藏」与「禁用」的入口层（用户裁定 2026-10-09）：与卡片层的两位各自独立，
                        判定按「或」汇合（卡片或入口任一说了 true 即命中）。三态下拉而不是勾选框，
                        理由与卡片对话框那两位同一条：留空 = 删键 = 没说，false 是结论。 -->
@@ -200,12 +218,21 @@
                                     :options="modalityOptions" color="purple-4" dense
                                     @update:model-value="value => setRowModalities(virtualForm, value)"></q-option-group>
                     <div class="muted" style="font-size:11px">{{ tv('virtualModalitiesHint') }}</div>
+                    <!-- 视觉能力不再是一位独立布尔（用户裁定 2026-10-11 需求 B + 最终裁定 3）：
+                         模态里勾了 image 或 video 就直接判「视觉为 true」，所以这里把推断结果
+                         当场画出来，操作员不必再猜「勾了模态到底算不算声明了视觉」 -->
+                    <div class="muted" style="font-size:11px;margin-top:4px">{{ virtualVisionInferredText }}</div>
                     <div class="muted" style="font-size:11px;margin-top:4px">{{ tv('declarationDisclosure') }}</div>
                   </div>
                   <!-- 入口档位改写：与 default_effort 独立生效（后端 request_effort_for 逐 from
                        问 卡片 → 条目 → 全局），所以缺省档位留空时这张表照样起作用 -->
                   <div>
                     <div class="rows-head q-mb-xs">{{ tv('virtualMapTitle') }} · {{ tv('virtualMapCopy') }}</div>
+                    <!-- 虚拟服务上唯一的思考配置（用户裁定 2026-10-11 选 A）：默认所有思考都支持，
+                         所以「留空」不是没配，而是**全档位原值透传**。两个动作把这句话画出来：
+                         一键铺开 = 按词表写满 from==to 的恒等映射（磁盘上显式，对外清单恒 8 档）；
+                         清空 = 回到同一个语义但字节更少。二者对外读数等价，差别只在配置里写没写 -->
+                    <div class="muted" style="font-size:11.5px;margin-bottom:4px">{{ virtualMapDefaultText }}</div>
                     <div class="rows-list">
                       <div v-for="(one, mi) in (virtualForm.effort_map || [])" :key="'vem' + mi" class="row-edit"
                            style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) auto">
@@ -216,7 +243,16 @@
                                   :label="t.mapTo" @update:model-value="touchRow(virtualForm)"></q-select>
                         <q-btn flat round dense icon="mdi-close" color="red-4" @click="removeEntryEffortMapRow(virtualForm, mi)"><q-tooltip>{{ c.del }}</q-tooltip></q-btn>
                       </div>
-                      <div><q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualMapAdd')" @click="addEntryEffortMapRow(virtualForm)"></q-btn></div>
+                      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+                        <q-btn flat dense no-caps icon="mdi-plus" class="secondary-button" :label="tv('virtualMapAdd')" @click="addEntryEffortMapRow(virtualForm)"></q-btn>
+                        <q-btn flat dense no-caps icon="mdi-grid" class="secondary-button" :label="tv('virtualMapFillIdentity')"
+                               :disable="entryMapComplete(virtualForm)" @click="fillEntryEffortMapIdentity(virtualForm)">
+                          <q-tooltip>{{ tv('virtualMapFillIdentityHint') }}</q-tooltip></q-btn>
+                        <q-btn flat dense no-caps icon="mdi-backup-restore" class="secondary-button" color="orange-4"
+                               :label="tv('virtualMapClear')" :disable="!(virtualForm.effort_map || []).length"
+                               @click="clearEntryEffortMap(virtualForm)"><q-tooltip>{{ tv('virtualMapClearHint') }}</q-tooltip></q-btn>
+                        <span class="muted" style="font-size:11px">{{ virtualMapDerivedText }}</span>
+                      </div>
                     </div>
                   </div>
                   <!-- 实际模型组：每行一个模型名，可选把该行绑到某个实例 -->
@@ -576,14 +612,20 @@
           + '不想声明就把整个键删掉，写 null 或空数组会被旧 build 误判）。'
           + 'target 是旧形状的代表值，写了 targets 时可省。条目另有八个声明位：default_effort（入口缺省档位，留空=完全不覆盖）、'
           + 'effort_map（[{from,to}]，无论 default_effort 填没填都生效）、modalities（text/image/video/audio 数组）、'
-          + 'supports_tool_use（true|false，缺键=不知道），以及同样三态的四个能力位 '
-          + 'supports_streaming / supports_reasoning / supports_vision / supports_reasoning_effort'
-          + '（都是 true|false，缺键=不知道，写非布尔会被拒绝）；档位按 卡片→条目→全局 逐字段逐 from 继承，'
-          + '能力位按 卡片→条目→引擎自报→整键省略 取值（卡片压过条目），与 tool 一样只影响对外声明、'
-          + '网关不拦截、不改写任何输出预算。调度策略不在这里配（在路由策略页）。'
+          + 'modalities（text/image/video/audio 数组）与 api_key（三态见下）。'
+          + '**2026-10-11 用户裁定 A**：条目上的五个独立布尔位 supports_tool_use / '
+          + 'supports_streaming / supports_reasoning / supports_vision / supports_reasoning_effort '
+          + '已从配置层拆除——后端不再解析、不再落盘，磁盘残留会在第一次落盘时消失。对外那四个 '
+          + 'reasoning 字段（supports_reasoning / supported_reasoning_efforts / '
+          + 'default_reasoning_effort / supports_reasoning_effort）全部由这张条目的 effort 映射推导：'
+          + 'effort_map 留空 = 全档位原值透传（默认所有思考都支持）；写了映射则清单取 from 侧 ∪ '
+          + 'default_effort、none 以外有档位才出四个键。视觉由 modalities 含 image/video 推断。'
+          + 'api_key 与 upstreams 同一条三态：缺键/null = 不动已存、"" = 清除、非空 = 设置；'
+          + '配了密钥的入口只能经 api-key 访问（401）。档位按 卡片→条目→全局 逐字段逐 from 继承。'
+          + '调度策略不在这里配（在路由策略页）。'
           + '本对话框无损读写：读到的 candidates 与任何未识别的键都原样写回，只过滤顶层段键，绝不过滤行内字段。',
-        jsonCopyKeys: 'upstreams 的 api_key 回显恒 null（脱敏）：提交时保持 null 或删掉该键 = 不动已存密钥，'
-          + '填 "" = 清除，填值 = 设置。',
+        jsonCopyKeys: 'upstreams 与 virtual_models 条目的 api_key 回显恒 null（脱敏）：提交时保持 null 或删掉该键 = 不动已存密钥，'
+          + '填 "" = 清除，填值 = 设置。virtual_models 行里的 has_api_key 是服务端存在位：条目对话框提交时由管理台抹掉，JSON 里原样带回也会被后端忽略——密钥去留只由 api_key 的三态决定。',
         jsonPlaceholder: '加载配置后此处显示可编辑 JSON 子集',
         jsonHint: '解析失败不发请求；应用成功后本页表单同步刷新。',
         jsonCopyBtn: '复制',
@@ -643,14 +685,6 @@
         colCaps: '能力声明',
         capStreaming: '流式', capReasoning: '推理', capVision: '视觉', capEffortSupport: '档位',
         capDeclaredYes: '支持', capDeclaredNo: '不支持', capDeclaredUnknown: '未声明',
-        virtualStreamingField: '流式（streaming）',
-        virtualReasoningField: '推理（reasoning）',
-        virtualVisionField: '视觉（vision）',
-        virtualEffortSupportField: '档位支持（effort）',
-        virtualStreamingHint: '三态：支持 / 不支持 / 不声明。卡片就这一位说过话时卡片赢，卡片沉默才轮到这一条；两边都不说才让给引擎自报，都没有时整个键省略。只影响 /v1/models 的对外声明，网关不据此拦截任何请求。',
-        virtualReasoningHint: '三态：支持 / 不支持 / 不声明。卡片就这一位说过话时卡片赢，卡片沉默才轮到这一条；两边都不说才让给引擎自报，都没有时整个键省略。只影响 /v1/models 的对外声明，网关不据此拦截任何请求。',
-        virtualVisionHint: '三态：支持 / 不支持 / 不声明。卡片就这一位说过话时卡片赢，卡片沉默才轮到这一条（上面模态勾选的推断也一起让位给它）；两边都不说才让给引擎自报，都没有时整个键省略。只影响 /v1/models 的对外声明，网关不据此拦截任何请求。',
-        virtualEffortSupportHint: '三态：支持 / 不支持 / 不声明，落在顶层 supports_reasoning_effort。卡片先说，卡片沉默才轮到这一条；两边都不说就退回原有派生（组内有档位读数才是 true）。填「不支持」时组内其它成员也不能把它抬回 true。只影响 /v1/models 的对外声明，不改任何档位改写。',
       },
       'en-US': {
         jsonButton: 'Config JSON',
@@ -666,19 +700,27 @@
           + 'the per-card max_output_tokens (the advertised single-turn output ceiling) — the two numbers are not '
           + 'comparable (root ruling 2026-10-08); delete the '
           + 'whole key to drop the declaration — null or [] is misread by older builds). target is the '
-          + 'representative value of the old shape and can be omitted once targets is set. An entry also carries eight '
-          + 'declaration fields: default_effort (entry default effort; blank = no override at all), effort_map '
-          + '([{from,to}], applies whether or not default_effort is set), modalities (text/image/video/audio array) and '
-          + 'supports_tool_use (true|false; an absent key means unknown) plus the four same-shaped flags '
-          + 'supports_streaming / supports_reasoning / supports_vision / supports_reasoning_effort '
-          + '(all true|false, an absent key means unknown, a non-boolean is rejected). Effort is inherited card -> entry -> global, '
-          + 'field by field and per from; each capability flag resolves card -> entry -> engine report -> key omitted, '
-          + 'with the card winning over the entry, and like tool use it only changes the advertisement: the gateway blocks '
-          + 'nothing on it and rewrites no output budget. Scheduling policy lives on the routing page. This dialog reads and writes losslessly: '
-          + 'only top-level sections are filtered, candidates and any unrecognised key are written back verbatim, '
-          + 'and inline row fields are never filtered.',
-        jsonCopyKeys: 'upstreams.api_key is always shown as null (masked): keep it null or delete the key to leave '
-          + 'the stored secret alone, submit "" to clear it, or submit a value to set it.',
+          + 'representative value of the old shape and can be omitted once targets is set. What an entry declares: '
+          + 'default_effort (entry default effort; blank = no override at all), effort_map '
+          + '([{from,to}], applies whether or not default_effort is set), modalities (text/image/video/audio array) '
+          + 'and api_key (tri-state, see below). '
+          + 'Root ruling A (2026-10-11): the five standalone entry flags supports_tool_use / supports_streaming / '
+          + 'supports_reasoning / supports_vision / supports_reasoning_effort were removed from the config layer — '
+          + 'the backend neither parses nor persists them, and leftovers on disk disappear on the first save. The four '
+          + 'reasoning fields the entry advertises (supports_reasoning / supported_reasoning_efforts / '
+          + 'default_reasoning_effort / supports_reasoning_effort) are all **derived** from this entry\'s effort '
+          + 'configuration: an empty effort_map means pass-through of every level (reasoning supported by default); '
+          + 'once a map is written the advertised ladder is its from side plus default_effort, and the four keys only '
+          + 'appear when some level beyond none is present. Vision is inferred from modalities containing image or '
+          + 'video. api_key follows the same tri-state as upstreams: an absent key or null leaves the stored secret '
+          + 'alone, "" clears it, a value sets it; an entry with a key only answers api-key requests (401 otherwise). '
+          + 'Effort is inherited card -> entry -> global, field by field and per from. Scheduling policy lives on the '
+          + 'routing page. This dialog reads and writes losslessly: only top-level sections are filtered, candidates '
+          + 'and any unrecognised key are written back verbatim, and inline row fields are never filtered.',
+        jsonCopyKeys: 'api_key is always shown as null (masked) on upstream rows and on virtual_models rows: keep it '
+          + 'null or delete the key to leave the stored secret alone, submit "" to clear it, or submit a value to set '
+          + 'it. has_api_key on a virtual row is a server-side presence bit: the entry dialog strips it before '
+          + 'submitting and the backend ignores it in the JSON — only the api_key tri-state decides whether a key is stored.',
         jsonPlaceholder: 'Editable JSON subset appears here once the config loads',
         jsonHint: 'Nothing is sent when parsing fails; the form on this page refreshes after a successful apply.',
         jsonCopyBtn: 'Copy',
@@ -728,14 +770,6 @@
         colCaps: 'Capabilities',
         capStreaming: 'stream', capReasoning: 'reason', capVision: 'vision', capEffortSupport: 'effort',
         capDeclaredYes: 'supported', capDeclaredNo: 'unsupported', capDeclaredUnknown: 'not declared',
-        virtualStreamingField: 'Streaming',
-        virtualReasoningField: 'Reasoning',
-        virtualVisionField: 'Vision',
-        virtualEffortSupportField: 'Effort support',
-        virtualStreamingHint: 'Tri-state: supported / unsupported / not declared. The card wins when it spoke about this flag; this row only answers when the card stayed silent, and the engine report only fills what neither declared — with nothing from any side the key is dropped. Changes only the /v1/models advertisement; the gateway blocks nothing on it.',
-        virtualReasoningHint: 'Tri-state: supported / unsupported / not declared. The card wins when it spoke about this flag; this row only answers when the card stayed silent, and the engine report only fills what neither declared — with nothing from any side the key is dropped. Changes only the /v1/models advertisement; the gateway blocks nothing on it.',
-        virtualVisionHint: 'Tri-state: supported / unsupported / not declared. The card wins when it spoke about this flag; this row only answers when the card stayed silent (it also overrides the modality ticks above), and the engine report fills only what neither declared — with nothing from any side the key is dropped. Changes only the /v1/models advertisement; the gateway blocks nothing on it.',
-        virtualEffortSupportHint: 'Tri-state: supported / unsupported / not declared, landed on the top-level supports_reasoning_effort. The card speaks first; this row only answers when the card stayed silent, and with nothing declared the existing derivation stays (true when the group has any effort reading). Choosing "unsupported" cannot be lifted back to true by another member. Changes only the /v1/models advertisement and rewrites no effort mapping.',
       }
     }
 
@@ -771,8 +805,13 @@
         const virtualSelfKey = ref('')
         const virtualForm = reactive({
           model: '', targets: [], context_window: '', default_effort: null, effort_map: [], modalities: [],
-          supports_tool_use: null, supports_streaming: null, supports_reasoning: null,
-          supports_vision: null, supports_reasoning_effort: null,
+          // 2026-10-11 用户裁定 A：条目上那五张独立布尔位（supports_tool_use / supports_streaming /
+          // supports_reasoning / supports_vision / supports_reasoning_effort）不再进表单 —— 后端已不
+          // 解析、不落盘它们，对外那四位由 effort 映射推导、视觉由模态推断。磁盘残留由
+          // retiredSupportChips 显式打出来，并在提交时硬性抹掉（见 virtualEntryFromRow）。
+          // 条目级 api-key（需求 A）：三态由「输入框写了什么 + clearKey 勾选」表达，
+          // hasApiKey 是服务端存在位的快照（只读，绝不被当作「操作员说的话」提交回去）。
+          api_key: '', clearKey: false, hasApiKey: false,
           // 「隐藏」/「禁用」（用户裁定 2026-10-09）：与那五位同为三态，null = 操作员没说
           // （后端缺席与 null 都读作「不知道」），false 是结论，两者在往返里绝不合并。
           hidden: null, disabled: null,
@@ -833,14 +872,100 @@
         ])
         // 三态 → 文案：null 与 false 分别是「不知道」和「不支持」，两者绝不合并显示
         // 「这张卡/这一条到底声明过没有」：只有真布尔算声明，undefined 与 null 都是沉默
-        function toolUseDeclared (row) {
-          const value = row && row.supports_tool_use
-          return value === true || value === false
-        }
         function toolUseText (value) {
           if (value === true) return t.value.toolUseYes
           if (value === false) return t.value.toolUseNo
           return t.value.toolUseUnknown
+        }
+
+        // ── 条目级 effort 推导（用户裁定 2026-10-11 选 A）──
+        // 虚拟服务上唯一的思考配置是 default_effort + effort_map 这一张表；对外那四个
+        // reasoning 字段（supports_reasoning / supported_reasoning_efforts /
+        // default_reasoning_effort / supports_reasoning_effort）全部由它推导。这里复刻
+        // router/models_api.lua 的 effort_advertise.derive 在本条目那一层的口径：
+        //   * 清单 = effort_map 的 from 侧（to 必须是非空字符串才算这条配了）∪ default_effort，
+        //     按词表 EFFORTS（window.lmrApi.effortLevels，与后端 lexicon 同源）的顺序去重排序；
+        //     to 不进清单——客户端能点名的是 from 域，报 to 会让客户端点到 400；
+        //   * 清单里只剩 none（或整表没配）→ 四个键整体省略：beyondNone=false；
+        //   * effort_map 留空且没配缺省档 = 全档位原值透传 ——「默认所有思考都支持」正是由
+        //     这个默认表达（客户端点名的档位原样转发），beyondNone=false 与「支持」不矛盾：
+        //     省略四个键的入口不做任何档位改写，档位由客户端与引擎自己说了算。
+        // 只算本条目这一层：卡片与全局不进条目行的推导（与后端的对外判据同一层序口径）。
+        const RETIRED_SUPPORT_FIELDS = ['supports_tool_use', 'supports_streaming', 'supports_reasoning',
+          'supports_vision', 'supports_reasoning_effort']
+        function entryEffortFacts (row) {
+          const set = Object.create(null)
+          ;(Array.isArray(row && row.effort_map) ? row.effort_map : []).forEach(pair => {
+            const from = normalizeEffort(pair && pair.from)
+            const to = normalizeEffort(pair && pair.to)
+            if (from && to) set[from] = true
+          })
+          const de = normalizeEffort(row && row.default_effort)
+          if (de) set[de] = true
+          const levels = EFFORTS.filter(level => set[level] === true)
+          return { levels, beyondNone: levels.some(level => level !== 'none') }
+        }
+        // 磁盘残留的老能力位：后端已不解析这些键，但 raw（服务端原样条目）里可能还带着它们。
+        // 与 workers.html 对 max_power_w 的处置同一条纪律：编辑一次就当面抹掉，并先打出来
+        // ——「被 UI 隐藏但仍留在配置里的字段」不能变成看不见的设置。
+        function retiredSupportChips (row) {
+          const src = row && row.raw && typeof row.raw === 'object' ? row.raw : row
+          if (!src || typeof src !== 'object') return []
+          return RETIRED_SUPPORT_FIELDS.filter(field => src[field] === true || src[field] === false)
+        }
+        const retiredSupportNote = computed(() => {
+          const names = retiredSupportChips(virtualForm)
+          return names.length ? tv('virtualRetiredFlags', { fields: names.join(', ') }) : ''
+        })
+
+        // ── 条目级 api-key 的三态交互（需求 A；语义照抄 workers.html declForm）──
+        // 回显面 api_key 恒 null（掩码），存在位只看 has_api_key。因此「输入框留空且没碰过」
+        // 必须是 keep（不动已存），绝不能因为回显是 null 就写成清空——清除只走显式动作。
+        function setVirtualKeyClear (flag) {
+          virtualForm.clearKey = Boolean(flag)
+          if (virtualForm.clearKey) virtualForm.api_key = ''
+          touchRow(virtualForm)
+        }
+        const virtualKeyHint = computed(() => (virtualForm.hasApiKey
+          ? tv('virtualKeyHintSet') : tv('virtualKeyHintNew')))
+        const virtualKeyStateText = computed(() => {
+          if (virtualForm.clearKey) return tv('virtualKeyClearPending')
+          if (virtualForm.hasApiKey) return tv('virtualKeyMasked')
+          return tv('virtualKeyUnsetShort')
+        })
+        // 视觉推断的实时读数（最终裁定 3）：模态里含 image 或 video 就直接判视觉为 true，
+        // 无论这份模态是引擎自报还是操作员手填——所以勾了模态就等于声明了视觉，这里当场画出来
+        const virtualVisionInferredText = computed(() => {
+          const mods = Array.isArray(virtualForm.modalities) ? virtualForm.modalities : []
+          return mods.some(item => item === 'image' || item === 'video')
+            ? tv('virtualVisionInferredOn') : tv('virtualVisionInferredOff')
+        })
+
+        // effort 映射区的两处增量（裁定 1 + 需求 B「默认所有思考都支持」）：
+        // 留空=原值透传的提示 + 一键铺开恒等映射 + 一键清空回透传。
+        const virtualMapDefaultText = computed(() => (
+          (virtualForm.effort_map || []).length ? tv('virtualMapFilledNote') : tv('virtualMapEmptyNote')
+        ))
+        const virtualMapDerivedText = computed(() => {
+          const facts = entryEffortFacts(virtualForm)
+          return facts.beyondNone
+            ? tv('virtualMapDerivesOn', { levels: facts.levels.join(' / ') })
+            : tv('virtualMapDerivesOff')
+        })
+        // 一键铺开：按词表写满 from==to 的恒等映射。档位全部来自 EFFORTS（后端 lexicon 的
+        // 8 档词表），不硬编码第二张表——词表改了这里跟着变，对外清单也跟着变（同一口径）。
+        function fillEntryEffortMapIdentity (row) {
+          row.effort_map = EFFORTS.map(level => ({ from: level, to: level }))
+          row.dirty = true
+        }
+        function entryMapComplete (row) {
+          const list = Array.isArray(row && row.effort_map) ? row.effort_map : []
+          const covered = new Set(list.map(pair => normalizeEffort(pair && pair.from)).filter(Boolean))
+          return EFFORTS.every(level => covered.has(level))
+        }
+        function clearEntryEffortMap (row) {
+          row.effort_map = []
+          row.dirty = true
         }
 
         // ── 四个能力位（2026-10-05：UI 可配 → 落到 /v1/models 的对外声明）──
@@ -982,11 +1107,10 @@
             rows.push({ model: entry.model, registered: false, sources: [], virtual: true, group,
               contextWindow: Number.isFinite(cw) && cw >= 1 ? cw : null,
               default_effort: declarations.default_effort, effort_map: declarations.effort_map,
-              modalities: declarations.modalities, supports_tool_use: declarations.supports_tool_use,
-              supports_streaming: declarations.supports_streaming,
-              supports_reasoning: declarations.supports_reasoning,
-              supports_vision: declarations.supports_vision,
-              supports_reasoning_effort: declarations.supports_reasoning_effort })
+              // 2026-10-11 裁定 A：条目层的五张独立布尔位不再装配进这张表。卡片表那一列回答的是
+              // 「这张卡片声明过什么」，而别名没有卡片时它就是沉默（未声明）——对外那四位由
+              // effort 映射推导，读数在入口行的 chip 上，不在卡片表里重复一份口径
+              modalities: declarations.modalities })
           })
           return rows
         })
@@ -995,9 +1119,10 @@
         // false（后端 config_store 刻意把 nil 与 false 分家，UI 这边合一次就白分）。
         // effort_map 兼容后端两种形状：UI 往返的 [{from,to}] 数组与 profile 里的查表。
         function entryDeclarations (entry) {
-          const out = { default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
-            supports_streaming: null, supports_reasoning: null,
-            supports_vision: null, supports_reasoning_effort: null,
+          // 2026-10-11 用户裁定 A：条目上那五张独立布尔位不再解析、不再装配 —— 对外四位由
+          // effort 映射推导、视觉由模态推断。这里只留档位、映射、模态，加上 api-key 的
+          // 服务端存在位（掩码：api_key 恒 null，只有 has_api_key 可读）。
+          const out = { default_effort: null, effort_map: [], modalities: [], has_api_key: false,
             // 「隐藏」/「禁用」（用户裁定 2026-10-09）：同一条三态读侧 —— 只有真布尔算声明，
             // null / 缺键 / 脏值一律读成「没说」（后端 nil 与 false 分家，UI 合一次就白分）
             hidden: null, disabled: null }
@@ -1022,12 +1147,8 @@
             // text 是常开位（后端一律补上），编辑面只留媒体位；整组取消勾选 = 不声明
             out.modalities = entry.modalities.filter(item => typeof item === 'string' && item !== 'text')
           }
-          if (typeof entry.supports_tool_use === 'boolean') out.supports_tool_use = entry.supports_tool_use
-          // 四个新位同一条纪律：只有真布尔算声明，脏值（字符串 / 数字 / null）一律读成
-          // 「没说」而不是 false —— 后端把 nil 与 false 分家，UI 这边合一次就白分
-          CAP_FIELDS.forEach(field => {
-            if (typeof entry[field] === 'boolean') out[field] = entry[field]
-          })
+          // 掩码文档里 api_key 恒 null：存在位只看服务端算好的 has_api_key 布尔，缺键 = 没配过
+          out.has_api_key = entry.has_api_key === true
           // 「隐藏」/「禁用」同一条读侧：只有真布尔算声明，脏值读成「没说」而不是 false
           OPERATOR_SWITCH_FIELDS.forEach(field => {
             if (typeof entry[field] === 'boolean') out[field] = entry[field]
@@ -1386,16 +1507,14 @@
             targets,
             context_window: (typeof cw === 'number' && cw >= 1) || (typeof cw === 'string' && /^\d+$/.test(cw.trim()) && Number(cw) >= 1)
               ? String(cw) : '',
-            // 入口级声明位：读进编辑面，但提交与否仍由 dirty 决定（见 virtualEntryFromRow）
+            // 入口级声明位：读进编辑面，但提交与否仍由 dirty 决定（见 virtualEntryFromRow）。
+            // 2026-10-11 裁定 A 之后只剩档位与模态两位：那五张独立布尔位不再装配进行，
+            // 磁盘残留在 raw 里，由 retiredSupportChips 显式标出、保存时抹除。
             default_effort: declared.default_effort,
             effort_map: declared.effort_map,
             modalities: declared.modalities,
-            supports_tool_use: declared.supports_tool_use,
-            // 四个能力位与 tool use 同一条读侧：读进编辑面，提交与否仍由 dirty 决定
-            supports_streaming: declared.supports_streaming,
-            supports_reasoning: declared.supports_reasoning,
-            supports_vision: declared.supports_vision,
-            supports_reasoning_effort: declared.supports_reasoning_effort,
+            // 条目级 api-key 的存在位快照（掩码文档只给这个布尔，明文永不入库到前端）
+            has_api_key: declared.has_api_key,
             // 「隐藏」/「禁用」与那五位同一条读侧：读进编辑面，提交与否仍由 dirty 决定
             hidden: declared.hidden,
             disabled: declared.disabled,
@@ -1412,9 +1531,9 @@
           virtualSelfKey.value = ''
           Object.assign(virtualForm, {
             model: '', targets: [{ model: '', worker: '' }], context_window: '',
-            default_effort: null, effort_map: [], modalities: [], supports_tool_use: null,
-            supports_streaming: null, supports_reasoning: null,
-            supports_vision: null, supports_reasoning_effort: null,
+            default_effort: null, effort_map: [], modalities: [],
+            // 新条目没有已存密钥：掩码位 false，输入框写什么就是什么（非空 = set）
+            api_key: '', clearKey: false, hasApiKey: false,
             hidden: null, disabled: null,
             raw: null, dirty: true
           })
@@ -1432,13 +1551,10 @@
             default_effort: row.default_effort || null,
             effort_map: (row.effort_map || []).map(one => ({ from: one.from, to: one.to })),
             modalities: (row.modalities || []).slice(),
-            // 三态回显照 openCard 的纪律：只有真布尔回填，null/脏值一律落「不知道」
-            supports_tool_use: typeof row.supports_tool_use === 'boolean' ? row.supports_tool_use : null,
-            supports_streaming: typeof row.supports_streaming === 'boolean' ? row.supports_streaming : null,
-            supports_reasoning: typeof row.supports_reasoning === 'boolean' ? row.supports_reasoning : null,
-            supports_vision: typeof row.supports_vision === 'boolean' ? row.supports_vision : null,
-            supports_reasoning_effort: typeof row.supports_reasoning_effort === 'boolean'
-              ? row.supports_reasoning_effort : null,
+            // api-key 的打开态照 workers.html declToForm：输入框一律空（掩码不回显），
+            // clearKey 复位 false ——「这次打开」还没表达任何关于密钥的话，留空即 keep。
+            // hasApiKey 只是存在位快照，给徽章与「清除」按钮用，绝不写回提交体
+            api_key: '', clearKey: false, hasApiKey: row.has_api_key === true,
             // 「隐藏」/「禁用」同一条回显纪律：只有真布尔回填，其余落「没说」
             hidden: typeof row.hidden === 'boolean' ? row.hidden : null,
             disabled: typeof row.disabled === 'boolean' ? row.disabled : null,
@@ -1594,6 +1710,16 @@
         function virtualEntryFromRow (row) {
           const entry = { ...(row.raw || {}) }
           entry.model = cleanModelName(row.model)
+          // 服务端派生位绝不跟着提交体出库（workers.html buildEntry 同法）：它们是掩码文档
+          // 给 UI 看的读数，不是操作员说的话；api_key_state / api_key_stored 更是后端持久化半，
+          // 手写它们等于替网关决定密钥去留。
+          delete entry.has_api_key
+          delete entry.api_key_state
+          delete entry.api_key_stored
+          // 被裁定拆除的五张独立布尔位：无论这一行编辑没编辑，都从提交体里抹掉。后端 W1 已经不
+          // 解析它们（磁盘残留下次落盘自然消失），UI 这边一并抹干净，免得整表替换把它们原样带回
+          // ——与 workers.html 硬性抹除 max_power_w 是同一条纪律。
+          RETIRED_SUPPORT_FIELDS.forEach(field => { delete entry[field] })
           if (!row.dirty) return entry
           const group = groupOfRow(row)
           // 一台实例只能代表一个模型（后端 build_candidate_bindings 会拒绝一 worker 两 model），
@@ -1636,14 +1762,14 @@
           // 而编辑面画不出这个区别，所以这里选择删键，让「不知道」与「只收文本」不混。
           if (caps.length) entry.modalities = ['text', ...caps]
           else delete entry.modalities
-          if (row.supports_tool_use === true || row.supports_tool_use === false) entry.supports_tool_use = row.supports_tool_use
-          else delete entry.supports_tool_use
-          // 四个能力位与 tool use 同一支：false 是结论、null 是沉默，两者在提交时绝不合并；
-          // 「留空」一律删键（可选字段缺席而不是 null 是本仓既有的往返约定）
-          CAP_FIELDS.forEach(field => {
-            if (row[field] === true || row[field] === false) entry[field] = row[field]
-            else delete entry[field]
-          })
+          // 条目级 api-key（需求 A）：三态照抄 upstreams 层（契约 3.4）。顺序是「清除 > 新值 > 沉默」：
+          // 勾了清除就写空串（后端读作 clear）；否则写了非空就是设置（set）；都没写就**删键**——
+          // 缺键与 null 在后端都读作 keep（不动已存），所以「输入框留空」绝不能写成空串，
+          // 那等于替操作员拆掉一把他没说要拆的门。
+          const typedKey = String(row.api_key || '')
+          if (row.clearKey) entry.api_key = ''
+          else if (typedKey.trim()) entry.api_key = typedKey.trim()
+          else delete entry.api_key
           // 「隐藏」/「禁用」与那五位同一条提交纪律：dirty 才改写，留空 = 删键（不是 null、
           // 更不是 false）。两位都只在磁盘配置层说得出口（后端刻意不给它们 env 层），
           // 所以这里写出去的就是操作员的那句话本身（用户裁定 2026-10-09）
@@ -2353,10 +2479,17 @@
           // max_output_tokens（卡片声明的最大输出 token 数）：卡片输入框的校验与表格列，
           // 漏导出 = 模板块静默消失（Vue 对 undefined 调函数直接抛 TypeError，界面无提示）
           maxOutputTokensRule, maxOutputTokensText,
-          // 入口级声明位（effort / tools / vision）：档位下拉复用 effortOptions，
+          // 入口级声明位与卡片三态位：档位下拉复用 effortOptions，
           // 三态下拉与文案用 toolUseOptions/toolUseText，能力位增删与提交走 setRowModalities，
           // 漏导出任何一项就是那一块 UI 静默消失（模板用 with(_ctx) 解析，编译期不报错）
-          toolUseOptions, toolUseText, toolUseDeclared, setRowModalities, addEntryEffortMapRow, removeEntryEffortMapRow,
+          toolUseOptions, toolUseText, setRowModalities, addEntryEffortMapRow, removeEntryEffortMapRow,
+          // 条目 effort 推导 + 条目级 api-key（用户裁定 2026-10-11）：入口行的推理 chip、
+          // 对话框里的密钥输入/清除/状态读数、映射区的铺开/清空/推导读数全部经这些标识符进
+          // 模板——漏一项就是那块 UI 静默消失（本页这个坑踩过三次，模板编译期不报错）
+          entryEffortFacts, retiredSupportChips, retiredSupportNote,
+          virtualKeyHint, virtualKeyStateText, setVirtualKeyClear, virtualVisionInferredText,
+          virtualMapDefaultText, virtualMapDerivedText,
+          fillEntryEffortMapIdentity, entryMapComplete, clearEntryEffortMap,
           // 四个能力位（卡片对话框 + 条目编辑区 + 卡片表那一列）：模板引用 cjText 与
           // capSummary/capSummaryEmpty，漏一项就是那块 UI 静默消失（模板用 with(_ctx) 解析，
           // 编译期不报错；本项目这个坑踩过三次）
