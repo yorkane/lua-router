@@ -157,3 +157,18 @@ swift 引擎 --max-context 196608：单条路由文本超过约 1.08M 字符（1
 （6.6M 字符仅占 RSS 34MB）。发版部署：21.k:8801/8802/8800 与 235.t:8800 均置 SMG_MAX_TREE_SIZE=100000000，
 镜像 pub/lua-router:20261011-fc037af（门禁 full 22/0/0 锚点 gates-20261011-082738.log，代码基线 fc037af）。
 217.t:8800 是另一条模型线（Ornith-1.5）的独立生产，按红线未动，待用户确认。
+## 217.t:8800 部署（2026-10-11）
+
+217.t:8800（另一条模型线：Ornith-1.5-35B / Huihui-Ornith + startlux，经 ninfer 8200-8202，非 swift-1.5）
+由用户明确要求后一并滚到 pub/lua-router:20261011-fc037af、SMG_MAX_TREE_SIZE=100000000。
+部署链：/home/aigc/llm-router/deploy/docker-compose.lua-router.yml.tpl（.tpl + ${LR_*} 变量模板，非普通 compose），
+拉起命令 = docker compose -p lua-router-8800 -f docker-compose.lua-router.yml.tpl up -d --force-recreate，
+env 变量 LR_CONTAINER_NAME=lua-router-8800 LR_PORT=8800 LR_METRICS_PORT=29000 LR_CONFIG_DIR=/data/app/lua-router/config LR_HEALTHCHECK_DISABLE=false（全部从运行容器恢复）。
+备份 docker-compose.lua-router.yml.tpl.bak-20261011-release。滚动后 4 worker 全 healthy、sqlite 后端=1（规则11）、
+两模型 /v1/models 官方四字段齐、无-effort 与流式 chat 200、0 错误行。
+
+发现（既有，非本次部署引入）：客户端带 reasoning_effort=high 打 Ornith 会 400
+reasoning_effort_not_supported——该错误由**引擎 8200 直连也返回**（Huihui-Ornith 引擎只认 none），字符串不在网关源码；
+effort 解析代码在 5fa719d→fc037af 一行未动，非回归。这台 .tpl 的 LMR_MODEL_EFFORT 强制层 key 与转发用的引擎真名
+（Huihui-Ornith…）对不上时 high 会透传给引擎→400；日常流量 20 条里 14 条不带 effort（200）、4 条显式 none（200），
+high 那 2 条是本调查探针。属配置层 key 口径的既有小缺口，未在本次擅改（需重建带真实流量的生产，风险不对等）。
