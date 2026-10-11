@@ -20,10 +20,10 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261010-043633.log`（tier=full、`KEEP_GOING=1`、
-`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `c829642`）。代码基线：
-`lualib/` **75 个 Lua 文件 / 36 407 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
-单测 18 文件、契约 **687 项 / 24 段**、文档 36 份。
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261011-082738.log`（tier=full、`KEEP_GOING=1`、
+`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `fc037af`）。代码基线：
+`lualib/` **75 个 Lua 文件 / 36 686 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
+单测 18 文件、契约 **702 项 / 24 段**、文档 39 份。
 
 > 锚点取在 2026-10-05 的重构树上：facade + 子模块拆分（router / config_store / registry /
 > watcher / gpu_load / mesh / observability）+ 公共传输库 `httpc.lua` + UI 入口迁移
@@ -653,6 +653,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-pool-merge.md](doc/gap-pool-merge.md) | 服务池页：运行态与声明态的统一视图、归属徽章、上限的事实来源 |
 | [doc/caps-redesign-2026-10-06.md](doc/caps-redesign-2026-10-06.md) | 容量语义重设计的执行契约：三条裁定、字段/三态/绿灯优先/429 的逐节口径、UI 契约与波次文件所有权 |
 | [doc/gap-worker-caps.md](doc/gap-worker-caps.md) | 每服务容量三态：并发上下限 + GPU 利用率上限、候选集硬排除与绿灯优先、全池到顶 429、功率上限退役史与残余缺口 |
+| [doc/gap-affinity-eviction-2026-10-11.md](doc/gap-affinity-eviction-2026-10-11.md) | 长上下文会话亲和失效事故：SMG_MAX_TREE_SIZE 每租户字符闸过小 → LRU 每 120s 弹光长会话 → min_load 并列随机甩机 → 前缀缓存整段重 prefill；8801/8802 A/B 定因、1M-token 输入定尺（5.5 chars/token 实测标定）、ninfer 引擎侧 host-KV 扩层记录 |
 | [doc/parity-cpu-ablation.md](doc/parity-cpu-ablation.md) | 1.54x CPU 回退定责与消融实验计划 |
 | [doc/parity-contract.md](doc/parity-contract.md) | 契约对拍原始报告（33 组） |
 | [doc/parity-routing.md](doc/parity-routing.md) | 路由行为对拍原始报告 |
