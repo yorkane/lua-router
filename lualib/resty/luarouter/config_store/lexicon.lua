@@ -367,6 +367,17 @@ function _M._reset_pool_module_caches()
     CS_FACADE._env_defaults = nil
     CS_FACADE._policy_view_dirty = true
     CS_FACADE.reset_env_upstreams_cache()
+    -- The cap rulebook (registry/loads.lua) is memoised inside upstreams.lua the
+    -- same way this file memoises the registry facade: a run that probed it while
+    -- the module was unloaded keeps the "false" verdict, and the cap gate in
+    -- cap_tiers_said stays silently off. A unit test that preloads the real
+    -- registry has to be able to flip that verdict, so the reset walks the whole
+    -- lazy-require roster. Guarded: a tree without the cap gate (older snapshot)
+    -- must not break this hook.
+    local reset_cap_rule = CS_FACADE._reset_cap_rule_cache
+    if type(reset_cap_rule) == "function" then
+        reset_cap_rule()
+    end
 end
 
 ---Router config for the pool knobs, or nil when the router is not initialised.

@@ -1139,6 +1139,55 @@ if section workers; then
     request "$BASE" PUT "/workers/$PUT_ID" -H 'Content-Type: application/json' --data '{}'
     assert_eq "PUT /workers/{id} with an empty object is 202" "$STATUS" "202"
 
+    # ---- PUT /workers/{id}: the three capacity ceilings are range-gated at the
+    # doorway (doc/cap-put-ceiling-task.md). 21.k:8802 measured the old shape:
+    # {"max_concurrency":77} answered 202, the pool echo showed 77, and the
+    # declaration layer refused it into the snapshot on every later request
+    # ("live now, gone after a restart"). The gate shares registry/loads' one
+    # rulebook with POST /config/upstreams, so an out-of-range ceiling is a 400
+    # here, the record never sees the value, and the rest of the batch (priority)
+    # lands nowhere either.
+    request "$BASE" PUT "/workers/$PUT_ID" -H 'Content-Type: application/json' \
+        --data '{"max_concurrency":77}'
+    assert_eq "PUT /workers/{id} out-of-range max_concurrency is 400" "$STATUS" "400"
+    assert_json "PUT cap 400 code" '.error.code' "BAD_REQUEST"
+    assert_contains "PUT cap 400 names the shared ceiling wording" "$BODY" \
+        "'max_concurrency' must be at most 32"
+    request "$BASE" GET "/workers/$PUT_ID"
+    assert_json "the refused ceiling never entered the record" \
+        'has("max_concurrency") | tostring' "false"
+    request "$BASE" PUT "/workers/$PUT_ID" -H 'Content-Type: application/json' \
+        --data '{"max_gpu_util":101,"priority":42}'
+    assert_eq "PUT /workers/{id} out-of-range max_gpu_util is 400" "$STATUS" "400"
+    request "$BASE" GET "/workers/$PUT_ID"
+    assert_json "a refused batch lands no key at all (priority untouched)" \
+        '.priority' "91"
+    assert_json "... and no utilisation ceiling either" \
+        'has("max_gpu_util") | tostring' "false"
+    # The legal boundary of every tier still rides the same 202 path (the gate
+    # must not become a narrower door than the document it shares).
+    request "$BASE" PUT "/workers/$PUT_ID" -H 'Content-Type: application/json' \
+        --data '{"min_concurrency":1,"max_concurrency":32,"max_gpu_util":100}'
+    assert_eq "PUT /workers/{id} accepts the legal boundary (202)" "$STATUS" "202"
+    request "$BASE" GET "/workers/$PUT_ID"
+    assert_json "PUT boundary applied max_concurrency" '.max_concurrency' "32"
+    assert_json "PUT boundary applied max_gpu_util" '.max_gpu_util' "100"
+    # The clearing sentinels keep their 202 (0 clears a concurrency rung, -1
+    # clears the utilisation rung) -- the self-heal's writes rely on this path.
+    request "$BASE" PUT "/workers/$PUT_ID" -H 'Content-Type: application/json' \
+        --data '{"max_concurrency":0,"max_gpu_util":-1}'
+    assert_eq "PUT /workers/{id} clearing sentinels stay 202" "$STATUS" "202"
+    request "$BASE" GET "/workers/$PUT_ID"
+    assert_json "the cleared concurrency rung is absent, not an explicit 0" \
+        'has("max_concurrency") | tostring' "false"
+    assert_json "the cleared utilisation rung is absent" \
+        'has("max_gpu_util") | tostring' "false"
+    # The pre-existing configuration on this worker is readable throughout
+    # (the worker's identity and the earlier label write survive the refusals).
+    request "$BASE" GET "/workers/$PUT_ID"
+    assert_json "the worker keeps its identity after the refusals" '.model_id' "put-model"
+    assert_json "the earlier label write is intact" '.metadata.tier' "gold"
+
     request "$BASE" DELETE "/workers/$PUT_ID"
     assert_eq "cleanup the PUT target worker" "$STATUS" "202"
 

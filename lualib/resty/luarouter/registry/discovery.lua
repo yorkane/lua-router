@@ -14,6 +14,12 @@ local M = {}
 local cjson = require "cjson.safe"
 local keys = require "resty.luarouter.registry.keys"
 local recs = require "resty.luarouter.registry.records"
+-- The cap rulebook (registry/loads.lua). The facade has already loaded loads before
+-- this module (registry.lua requires keys/url/caps/records/health/loads, then discovery),
+-- so this is a cached-table return in production; records -> caps does the same thing for
+-- the same reason: a submodule borrowing its sibling's one implementation beats a second
+-- copy of the ranges beside either caller.
+local loads = require "resty.luarouter.registry.loads"
 
 local json_encode = cjson.encode
 local json_decode = cjson.decode
@@ -261,9 +267,18 @@ local UPDATE_NUMBER_FIELDS = {
     -- normalizer at read time - cap_limit for the two request-count rungs (<=0 folds
     -- to "unlimited", so a PUT of 0 is the ordinary way to clear one) and util_limit
     -- for the percent (its zero is the strictest rung, so a ceiling is cleared with a
-    -- negative number or by the declaration dropping the key, never with 0). That is
-    -- why no bespoke validator lives here; the contract's non-numeric-400 rule applies
-    -- unchanged.
+    -- negative number or by the declaration dropping the key, never with 0). The
+    -- contract's non-numeric-400 rule applies unchanged. What *values* a ceiling may
+    -- hold is decided once, in registry/loads.lua's cap_range_refusal, and the loop
+    -- below asks it per field: the same 1..31 / 1..32 / 0..100 gate the declaration
+    -- layer applies, so PUT and POST /config/upstreams answer the same way. Before
+    -- this shared call the two disagreed (tonumber only here, ranges only there): an
+    -- out-of-range ceiling entered the live record, the mirror refused it into the
+    -- snapshot, and every request after that logged "the ceiling is live now but will
+    -- not survive a restart" (measured on 21.k:8802 with {"max_concurrency":77}).
+    -- The clearing sentinels the self-heal writes (0 for a concurrency rung, -1 for
+    -- the utilisation rung) stay inside the gate by design, so reconcile keeps its
+    -- 202 path.
     "max_concurrency", "min_concurrency", "max_gpu_util",
     "health_check_timeout_secs", "health_check_interval_secs",
     "health_success_threshold", "health_failure_threshold",
@@ -297,6 +312,18 @@ function M.update(worker_id, patch)
             local number = tonumber(value)
             if not number then
                 return nil, string.format("field '%s' must be a number", field),
+                    "validation"
+            end
+            -- One call into the registry's single cap rulebook for the three ceilings
+            -- (an unknown field name answers nil, so priority / cost / the health knobs
+            -- pass through untouched). The refusal reuses this file's own validation
+            -- shape -- field-name-prefixed message plus the "validation" kind -- which
+            -- control.lua maps onto the existing 400 / BAD_REQUEST branch; no new error
+            -- shape is invented here. The record is never written for a refused batch:
+            -- the return happens before anything joins `changes`.
+            local refusal = loads.cap_range_refusal(field, value)
+            if refusal then
+                return nil, string.format("field '%s' %s", field, refusal),
                     "validation"
             end
             changes[field] = number

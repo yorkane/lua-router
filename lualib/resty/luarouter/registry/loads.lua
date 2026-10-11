@@ -243,6 +243,120 @@ function M.inflight_requests(id)
     return shdict():get(K_LOAD .. id) or 0
 end
 
+---------------------------------------------------------------- declared ranges
+--
+-- The one rulebook for the three per-worker ceilings, and the only place their ranges are
+-- written down (doc/caps-redesign-2026-10-06.md section 1). Two doorway faces read it, which
+-- is the whole reason it lives here instead of beside either caller:
+--   * the pool side: registry/discovery.lua's UPDATE_NUMBER_FIELDS loop, reached by
+--     PUT /workers/{id} (the 服务池 "编辑 worker" 弹窗);
+--   * the declaration layer: config_store/upstreams.lua's cap_tiers_said, which both
+--     upstream_from_entry (POST /config/upstreams) and validate_cap_patch (the control
+--     plane's caps mirror) go through.
+-- Before this the two disagreed: the PUT loop only ran tonumber, so
+-- {"max_concurrency":77} walked into the live record and the /workers echo, and died on its
+-- way into the snapshot, where the document holds at most 32. Measured on 21.k:8802, the
+-- gateway logged "the ceiling is live now but will not survive a restart" on every request
+-- -- an in-flight limit the pool enforces but the document cannot carry is a gate that
+-- quietly reopens at the next container rebuild, with the echo still showing the number.
+-- Refusing it at the doorway is the honest answer, and it is the same answer both faces give.
+--
+--   min_concurrency  integer 1..31   (the green threshold; 31 is the highest floor that can
+--                                      still sit strictly below the 32 ceiling of its rung)
+--   max_concurrency  integer 1..32   (the red ceiling)
+--   max_gpu_util     integer 0..100  (a whole percentage; 0 is the strictest legal rung, so
+--                                      this tier cannot share the concurrency normalizer)
+--
+-- What "unlimited" is stays with the read-time normalizers, unchanged: cap_limit folds any
+-- <= 0 to nil, util_limit folds only a negative / non-numeric to nil because its zero is a
+-- conclusion rather than an absence. A PUT of 0 to clear a concurrency rung and a PUT of -1
+-- to clear the utilisation rung are the documented spellings (and the self-heal's clear
+-- sentinels) -- both keep their 202, so this gate answers one question only: is a value that
+-- *means a number* a number the configuration system can carry?
+--
+-- The integrality postures are deliberately asymmetric, and they are the declaration layer's
+-- own, kept verbatim so the pool side inherits them without changing what the document has
+-- always accepted: a fractional max_concurrency is legal (cap_limit floors 2.5 to a
+-- plausible 2 -- the create path has always said so), while a fractional min is a typo (it
+-- is the green threshold, and the floor would have hidden the rounding), and the utilisation
+-- tier has no honest reading of 55.5 at all (a DCMG sample is a whole percent).
+local MIN_CONCURRENCY_LIMIT = 31
+local MAX_CONCURRENCY_LIMIT = 32
+local MAX_GPU_UTIL_LIMIT = 100
+
+---The refusal wording for one tier, after the field name. Each face prefixes it its own way
+---("field 'x' ..." on the pool, "upstream <url> x ..." on the document), so the sentence
+---- and therefore the range it states -- is spelled by this module alone.
+---@param field string @ one of the three cap field names
+---@return string wording
+function M.cap_range_wording(field)
+    if field == "max_gpu_util" then
+        return string.format("must be a whole percentage between 0 and %d", MAX_GPU_UTIL_LIMIT)
+    end
+    if field == "min_concurrency" then
+        return string.format("must be an integer between 1 and %d", MIN_CONCURRENCY_LIMIT)
+    end
+    return string.format("must be at most %d", MAX_CONCURRENCY_LIMIT)
+end
+
+---Why one declared ceiling cannot be carried, or nil when it can.
+---
+--- The acceptance set is *derived* from the tier normalizers rather than restated beside
+--- them: a value goes through cap_limit / util_limit first, and only a reading that the
+--- readers would actually store is measured against its range. That is what makes the two
+--- doorway faces one rule instead of two -- the pool side (discovery.lua's PUT loop) and
+--- the declaration layer (config_store/upstreams.lua's cap_tiers_said) cannot disagree
+--- about a value because neither of them decides it, this function does.
+---@param field string @ one of the three cap field names; any other name passes, which is
+---  what lets the PUT loop call this for every numeric field without a field-name branch
+---@param value any @ the raw reading from the request body / document
+---@return string|nil refusal @ the tier wording, set only when the value is out of range
+function M.cap_range_refusal(field, value)
+    if field == "max_gpu_util" then
+        local number = tonumber(value)
+        if number == nil or number ~= number
+            or number == math.huge or number == -math.huge then
+            return nil   -- not a reading: util_limit folds it to unlimited, as it always did
+        end
+        if number < 0 then
+            return nil   -- the documented clearing spelling for this tier
+        end
+        if number > MAX_GPU_UTIL_LIMIT or math.floor(number) ~= number then
+            return M.cap_range_wording(field)
+        end
+        return nil
+    end
+    if field ~= "min_concurrency" and field ~= "max_concurrency" then
+        -- Not a ceiling at all (priority / cost / the health knobs): every caller may hand
+        -- this its whole numeric field list, so an unknown name is "nothing to say" rather
+        -- than a branch the caller has to pre-filter.
+        return nil
+    end
+    -- The two request-count rungs are judged on what cap_limit would store, so the tier's
+    -- "unlimited" spellings (absent, non-numeric, NaN, +/-inf, anything <= 0) stay outside
+    -- the gate here exactly as they are outside it there: PUT 0 / -1 is how a ceiling is
+    -- cleared, and the self-heal's clear sentinel relies on it.
+    local cap = M.cap_limit(value, true)
+    if cap == nil then
+        return nil
+    end
+    if field == "min_concurrency" then
+        -- Integrality is judged on the raw reading, not on the normalized one: cap_limit
+        -- *floors*, so by the time a reader looks, a typo like 1.5 has already become a
+        -- plausible 1. The green threshold is a gate, not a score, so a fractional reading
+        -- says nothing about what was meant. (A fractional *max* is not refused: the
+        -- create path has always called 2.5 a legal 2.)
+        if cap ~= tonumber(value) or cap < 1 or cap > MIN_CONCURRENCY_LIMIT then
+            return M.cap_range_wording(field)
+        end
+        return nil
+    end
+    if cap > MAX_CONCURRENCY_LIMIT then
+        return M.cap_range_wording(field)
+    end
+    return nil
+end
+
 ---------------------------------------------------------------- capacity verdict
 --
 -- Per-worker ceilings on the two things that actually run a serving instance out of

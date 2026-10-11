@@ -50,9 +50,23 @@ local function new_shdict()
     }
 end
 local shared = { luarouter_config = new_shdict() }
+-- 第 8 段（池侧 PUT 越界）跑**真 registry**，需要 keys.shdict 的那两块 dict。
+-- shdict 惰性解析后 memo，整份文件共用同一张表，reset 走 flush_all 而不是换表。
+shared.lr_workers = new_shdict()
+shared.lr_locks = new_shdict()
 
 local RE_GSUB = { ["^\\s+"] = "^%s+", ["\\s+$"] = "%s+$" }
+-- registry/url.lua 的 normalize_url 用 "/+$"（gsub 锚点为 /+$/）剥尾斜杠。
+local RE_GSUB = { ["^\\s+"] = "^%s+", ["\\s+$"] = "%s+$", ["/+$/"] = "/+$" }
 local RE_FIND = { ["^\\d+$"] = "^%d+$", ["[,;\\n]+"] = "[,;%c]+" }
+-- registry 的 normalize_url / parse_worker_id 走 ngx.re.match（第 8 段用到）。
+-- 与 RE_FIND 同一纪律：没登记的模式记进 unmapped，收尾必须为空，桩不许悄悄骗人。
+local RE_MATCH = {
+    ["^https?://"] = "^https?://",
+    ["^https?://[^/]+"] = "^https?://[^/]+",
+    ["^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"] =
+        "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$",
+}
 local unmapped = {}
 local function map_re(list, pattern, where)
     local mapped = list[pattern]
@@ -86,6 +100,17 @@ _G.ngx = {
             if ctx then ctx.pos = to + 1 end
             return from, to
         end,
+        match = function(subject, pattern, _o, ctx)
+            local mapped = RE_MATCH[pattern]
+            if not mapped then
+                unmapped[#unmapped + 1] = "match:" .. tostring(pattern)
+                return nil
+            end
+            local from, to = string.find(subject, mapped, 1)
+            if not from then return nil end
+            if ctx then ctx.pos = to + 1 end
+            return { [0] = subject:sub(from, to) }
+        end,
     },
     req = {
         read_body = function() end,
@@ -98,6 +123,49 @@ _G.ngx = {
 }
 _G.LMR_ENV_CACHE = { LMR_CONFIG_FILE = CONFIG_PATH }
 
+-- 真 registry 的两颗外部依赖桩（第 8 段跑真 facade 用）：resty.lock 经
+-- resty.core 要 authz 基座的 ngx.config，真 sha224 经 resty.openssl 拉
+-- ngx/base64 撞同一堵墙。锁的互斥与哈希的真值都不是本文件钉的东西（id 只
+-- 用来取回自己写的记录），preload 桩让 registry 域在纯 Lua 口径下可加载。
+package.preload["resty.lock"] = function()
+    return { new = function()
+        return { lock = function() return true end, unlock = function() return true end }
+    end }
+end
+package.preload["resty.openssl.digest"] = function()
+    local md = {}
+    function md.new()
+        local acc = ""
+        local obj = {}
+        function obj:update(s) acc = acc .. tostring(s); return true end
+        function obj:final()
+            local hex = {}
+            for i = 1, 28 do
+                local b = (string.byte(acc, (i % #acc) + 1) * (i * 37 + 11)) % 256
+                hex[#hex + 1] = string.format("%02x", b)
+            end
+            return table.concat(hex)
+        end
+        return obj
+    end
+    return md
+end
+
+-- 判据本体 = **真** registry/loads 的 cap_range_refusal / cap_range_wording
+-- （config_store/upstreams.lua 的 cap_rule 注释点名的就是这个预加载形状：
+-- resty.lock/digest 走 preload 桩，真模块在纯 Lua 口径下可加载）。
+-- 桩位走 package.loaded：6b 的声明层门与第 8 段的池侧门因此共用同一份判据，
+-- 本文件不复制任何规则 —— 复制一份范围表就是任务书禁止的「另造规则」。
+-- facade 预登记后 require 它，keys/loads 的 R 晚绑定与生产同一条路径。
+local ok_registry, registry_real = pcall(require, "resty.luarouter.registry")
+local REG_LOADS
+if ok_registry then
+    REG_LOADS = package.loaded["resty.luarouter.registry.loads"]
+end
+
+-- 兜底桩（只在真模块加载不了的环境生效）：按 registry/loads 的派生形状接 ——
+-- 先过本文件既有的 cap_limit / util_limit 归一器，再对档取范围。6b 的断言在
+-- 这份兜底判据上同样成立（判别性反证 B 就是把它换成恒 nil 来验 6b 咬的是判据）。
 --------------------------------------------------------------------------
 -- registry 替身：url -> record 的内存池（protected 行 = discovery 非 config）
 --------------------------------------------------------------------------
@@ -125,6 +193,78 @@ local function util_limit(value)
     local n = tonumber(value)
     if n == nil or n ~= n or n == math.huge or n == -math.huge or n < 0 then return nil end
     return math.floor(n)
+end
+
+-- 判据本体（桩位）。真 registry/loads 可用时就用**真**的那份（上面预加载的
+-- REG_LOADS）；加载不了的环境才用这份兜底，且按 registry/loads 的派生形状接：
+-- 先过上面这两个归一器，再对档取范围，与真模块同一结构。
+--
+-- 为什么桩必须带 cap_range_refusal：config_store/upstreams.lua 的 cap_rule()
+-- 取的是 package.loaded 上的**子模块** resty.luarouter.registry.loads（刻意不
+-- 走 facade，因为 facade 在纯 Lua 单测里被换成内存池桩）。子模块缺席时
+-- cap_rule() 返回 nil，cap_tiers_said 的 "rule and rule.cap_range_refusal(...)"
+-- 静默跳过校验，越界值于是走进快照，这就是本次 6b 红 8 条的成因。缺它不是
+-- 「少测一点」，是声明层的门在单测口径下根本不存在，别当兼容删掉。
+local MIN_CONCURRENCY_LIMIT, MAX_CONCURRENCY_LIMIT, MAX_GPU_UTIL_LIMIT = 31, 32, 100
+local function fallback_wording(field)
+    if field == "max_gpu_util" then
+        return string.format("must be a whole percentage between 0 and %d", MAX_GPU_UTIL_LIMIT)
+    end
+    if field == "min_concurrency" then
+        return string.format("must be an integer between 1 and %d", MIN_CONCURRENCY_LIMIT)
+    end
+    return string.format("must be at most %d", MAX_CONCURRENCY_LIMIT)
+end
+local function fallback_refusal(field, value)
+    if field == "max_gpu_util" then
+        local number = tonumber(value)
+        if number == nil or number ~= number
+            or number == math.huge or number == -math.huge then
+            return nil   -- not a reading: util_limit folds it to unlimited
+        end
+        if number < 0 then
+            return nil   -- this tier's clearing spelling
+        end
+        if number > MAX_GPU_UTIL_LIMIT or math.floor(number) ~= number then
+            return fallback_wording(field)
+        end
+        return nil
+    end
+    if field ~= "min_concurrency" and field ~= "max_concurrency" then
+        return nil   -- not a ceiling: callers may hand the whole field list in
+    end
+    local cap = cap_limit(value, true)
+    if cap == nil then
+        return nil   -- <=0 / NaN / inf / non-numeric = the rung is cleared
+    end
+    if field == "min_concurrency" then
+        if cap ~= tonumber(value) or cap < 1 or cap > MIN_CONCURRENCY_LIMIT then
+            return fallback_wording(field)
+        end
+        return nil
+    end
+    if cap > MAX_CONCURRENCY_LIMIT then
+        return fallback_wording(field)
+    end
+    return nil
+end
+local RULEBOOK = REG_LOADS
+if type(RULEBOOK) ~= "table" or type(RULEBOOK.cap_range_refusal) ~= "function"
+    or type(RULEBOOK.cap_range_wording) ~= "function" then
+    RULEBOOK = {
+        cap_limit = cap_limit, util_limit = util_limit,
+        cap_range_refusal = fallback_refusal, cap_range_wording = fallback_wording,
+    }
+end
+-- 判别性反证 B 的注入口（一次性、显式开）：LR_CAP_RULE_VOID=1 把桩位判据换成
+-- 「恒说无话」的形状。6b 与第 8 段必须因此变红 —— 绿了就说明这些断言其实不
+-- 经过判据（比如门在别处、或断言测的是复制的规则）。生产路径不读本开关。
+if os.getenv("LR_CAP_RULE_VOID") == "1" then
+    RULEBOOK = {
+        cap_limit = cap_limit, util_limit = util_limit,
+        cap_range_refusal = function() return nil end,
+        cap_range_wording = function(field) return fallback_wording(field) end,
+    }
 end
 
 local function make_registry_stub()
@@ -203,6 +343,13 @@ end
 local store
 local function use_registry(mod)
     package.loaded["resty.luarouter.registry"] = mod
+    -- 桩的**子模块**桩位：facade 被换成内存池桩后，upstreams.lua 的 cap_rule()
+    -- 仍按名字取 resty.luarouter.registry.loads（真实路径与桩路径同一个键）。
+    -- 这里必须一并登记判据，否则 cap_rule() 在换桩之后 require 不到判据 →
+    -- 声明层的门静默消失（本次 6b 红 8 条的成因）。登记发生在
+    -- _reset_pool_module_caches 之前：reset 会连带清掉 upstreams 里
+    -- cap_rulebook 的 memo，下一句 cap_tiers_said 重新解析到这份判据。
+    package.loaded["resty.luarouter.registry.loads"] = RULEBOOK
     store = require "resty.luarouter.config_store"
     store._reset_pool_module_caches()
 end
@@ -602,7 +749,145 @@ eq(row_field(A, "min_concurrency"), 31, "(6b) floor 31")
 eq(row_field(A, "max_concurrency"), 32, "(6b) ceiling 32")
 
 --------------------------------------------------------------------------
--- 7. 收尾：未映射的 ngx.re 模式必须为空（否则上面的替身在骗人）
+-- 8. 池侧 PUT /workers/{id} 的越界拒绝（doc/cap-put-ceiling-task.md）
+--
+-- 6b 钉的是声明层（cap_tiers_said），这一段钉**门本身**：PUT 的执行方是
+-- registry.update（registry/discovery.lua 的 UPDATE_NUMBER_FIELDS 循环）。
+-- 21.k:8802 实测的缺口就在这儿：池侧只 tonumber，于是越界的 77 走进活记录与
+-- /workers 回显、死在进快照的路上，每条请求刷一句
+-- "the ceiling is live now but will not survive a restart"。声明层与池侧现在
+-- 调同一份判据（registry/loads.cap_range_refusal），两侧必须答得一模一样。
+--
+-- 这一段跑**真 registry**，不跑内存池桩：要钉的是 discovery.lua 里那处
+-- cap_range_refusal 调用，桩照抄判据的话判别性反证（回退产品代码）就不会红。
+-- 真 facade 在段首交还 package.loaded，段尾换回桩。外部依赖只剩两颗 preload
+-- 桩（resty.lock 的互斥、sha224 的真值都不是本段钉的东西）。
+--------------------------------------------------------------------------
+check(ok_registry and registry_real ~= nil,
+    "(8) premise: the real registry domain loads in the pure-Lua caliber")
+if registry_real ~= nil then
+    reset_state(false)          -- 不换桩：真 facade 留在 package.loaded 上
+    shared.lr_workers:flush_all()
+    local registry = registry_real
+    local added, add_err = registry.add({
+        url = A, model_id = "alpha",
+        max_concurrency = 8, min_concurrency = 2, max_gpu_util = 60,
+    }, {})
+    eq(add_err, nil, "(8) premise: the real registry accepted an in-range record",
+        tostring(add_err))
+    eq(type(added), "table", "(8) premise: add answered the accepted result")
+    local POOL_ID = type(added) == "table" and added.id
+    local function rec_field(field)
+        local rec = registry.record(POOL_ID)
+        return rec and rec[field]
+    end
+    eq(rec_field("max_concurrency"), 8, "(8) premise: the record carries the seeded ceiling")
+
+    -- 1) 越界并发档：当场拒，kind 是 validation（control.lua 按这个 kind 映射 400）
+    local refused, refuse_err, refuse_kind = registry.update(POOL_ID,
+        { max_concurrency = 77 })
+    eq(refused, nil, "(8) PUT max_concurrency=77 is refused at the pool doorway")
+    check(type(refuse_err) == "string"
+        and refuse_err:find("'max_concurrency' must be at most 32", 1, true) ~= nil,
+        "(8) with the shared rulebook's wording", tostring(refuse_err))
+    eq(refuse_kind, "validation",
+        "(8) as a validation refusal: the kind control.lua maps onto 400")
+    eq(rec_field("max_concurrency"), 8,
+        "(8) the record keeps the ceiling it had: the value never entered it")
+
+    -- 2) 另两档同口径（声明层怎么答，门就怎么答）
+    local u101, e101, k101 = registry.update(POOL_ID, { max_gpu_util = 101 })
+    eq(u101, nil, "(8) PUT max_gpu_util=101 is refused too")
+    check(type(e101) == "string"
+        and e101:find("'max_gpu_util' must be a whole percentage between 0 and 100", 1, true) ~= nil,
+        "(8) naming the utilisation tier's range", tostring(e101))
+    eq(k101, "validation", "(8) same kind")
+    local umin, emin, kmin = registry.update(POOL_ID, { min_concurrency = 33 })
+    eq(umin, nil, "(8) PUT min_concurrency=33 is refused (the floor tops out one below the ceiling)")
+    check(type(emin) == "string"
+        and emin:find("'min_concurrency' must be an integer between 1 and 31", 1, true) ~= nil,
+        "(8) naming the floor's range", tostring(emin))
+    eq(kmin, "validation", "(8) same kind")
+    -- 分数绿档是笔误（cap_limit 会 floor，读数面看不出被抹掉的那一位）
+    local uhalf, ehalf = registry.update(POOL_ID, { min_concurrency = 1.5 })
+    eq(uhalf, nil, "(8) a fractional min_concurrency is refused as a typo")
+    check(type(ehalf) == "string", "(8) with an error", tostring(ehalf))
+    eq(rec_field("min_concurrency"), 2, "(8) the floor on the record is untouched by all of it")
+    eq(rec_field("max_gpu_util"), 60, "(8) so is the utilisation ceiling")
+
+    -- 3) 一批里有一档越界：整批拒，合法的同伴档位也不许悄悄落盘
+    local mixed, mixed_err, mixed_kind = registry.update(POOL_ID,
+        { max_concurrency = 8, max_gpu_util = 101 })
+    eq(mixed, nil, "(8) a batch with one out-of-range tier is refused as a whole")
+    eq(mixed_kind, "validation", "(8) with the validation kind")
+    check(type(mixed_err) == "string"
+        and mixed_err:find("max_gpu_util", 1, true) ~= nil,
+        "(8) and names the tier that broke the batch", tostring(mixed_err))
+    eq(rec_field("max_concurrency"), 8, "(8) the refused batch wrote nothing")
+
+    -- 4) 正向：三档的合法边界走同一条 202 路径（门不许比文档还窄）
+    local ok_all, ok_err = registry.update(POOL_ID,
+        { min_concurrency = 31, max_concurrency = 32, max_gpu_util = 100 })
+    eq(ok_err, nil, "(8) the legal boundary 31/32/100 is accepted", tostring(ok_err))
+    eq(type(ok_all), "table", "(8) the accepted update answers {worker_id,url}")
+    eq(rec_field("min_concurrency"), 31, "(8) floor applied")
+    eq(rec_field("max_concurrency"), 32, "(8) ceiling applied")
+    eq(rec_field("max_gpu_util"), 100, "(8) utilisation applied")
+    -- 分数红档照旧合法：cap_limit 的 floor 语义（创建路径一直说 2.5 是个合法的 2）
+    local ok_frac, frac_err = registry.update(POOL_ID, { max_concurrency = 2.5 })
+    eq(frac_err, nil, "(8) a fractional max_concurrency stays legal on the pool side",
+        tostring(frac_err))
+    eq(rec_field("max_concurrency"), 2.5, "(8) stored raw, read floored")
+    eq(registry.cap_limit(rec_field("max_concurrency"), true), 2,
+        "(8) and the reader floors it to 2, as it always did")
+
+    -- 5) 非 cap 字段不受影响：整张数字字段表都过门，陌生名字答案是「无话」
+    local knobs, knobs_err = registry.update(POOL_ID,
+        { priority = 999, cost = 1.5, health_check_timeout_secs = 9999 })
+    eq(knobs_err, nil, "(8) priority / cost / the health knobs are not range-gated",
+        tostring(knobs_err))
+    eq(rec_field("priority"), 999, "(8) priority applied as written")
+    eq(rec_field("cost"), 1.5, "(8) cost applied as written")
+    eq(rec_field("health_check_timeout_secs"), 9999, "(8) and the health knob too")
+
+    -- 6) 清除哨兵保持既有语义（自愈的 clear 写入依赖这条 202 路径）
+    local cleared, clear_err = registry.update(POOL_ID, { max_concurrency = 0 })
+    eq(clear_err, nil, "(8) PUT 0 clears a concurrency rung (202 path intact)",
+        tostring(clear_err))
+    eq(rec_field("max_concurrency"), 0, "(8) stored as the sentinel the readers fold")
+    eq(registry.cap_limit(rec_field("max_concurrency")), nil,
+        "(8) and cap_limit reads it back as unlimited")
+    local util_clear, util_err = registry.update(POOL_ID, { max_gpu_util = -1 })
+    eq(util_err, nil, "(8) PUT -1 clears the utilisation rung (its zero is a gate, not an absence)",
+        tostring(util_err))
+    eq(rec_field("max_gpu_util"), -1, "(8) stored as the negative sentinel")
+    eq(registry.util_limit(rec_field("max_gpu_util")), nil,
+        "(8) and util_limit reads it back as unlimited")
+    local util_zero, util_zero_err = registry.update(POOL_ID, { max_gpu_util = 0 })
+    eq(util_zero_err, nil, "(8) util 0 is the strictest legal rung, not a refusal",
+        tostring(util_zero_err))
+    eq(rec_field("max_gpu_util"), 0, "(8) and it is stored as 0")
+
+    -- 7) 全池扫尾：任何一条记录都不带越界读数（回显里不许出现 77 这件事的池侧形式）
+    local leaked = nil
+    for _, record in ipairs(registry.records()) do
+        local cap = registry.cap_limit(record.max_concurrency)
+        local floor = registry.cap_limit(record.min_concurrency)
+        local util = registry.util_limit(record.max_gpu_util)
+        if (cap ~= nil and cap > 32) or (floor ~= nil and (floor < 1 or floor > 31))
+            or (util ~= nil and (util < 0 or util > 100)) then
+            leaked = record.id
+        end
+    end
+    eq(leaked, nil, "(8) no record in the pool carries an out-of-range reading")
+
+    -- 段尾：把桩交还 package.loaded，后面的收尾与所有前段保持池桩口径
+    use_registry(make_registry_stub())
+    shared.lr_workers:flush_all()
+end
+
+--------------------------------------------------------------------------
+-- 9. 收尾：未映射的 ngx.re 模式必须为空（否则上面的替身在骗人）
 --------------------------------------------------------------------------
 local seen = {}
 for _, entry in ipairs(unmapped) do

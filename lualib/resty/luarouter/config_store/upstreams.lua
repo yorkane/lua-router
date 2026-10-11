@@ -17,13 +17,39 @@ local _M = {}
 
 local UPSTREAMS_LIMIT = 256
 
--- Ranges from doc/caps-redesign-2026-10-06.md §1, kept as named constants because three
--- separate code paths (parse, the console's own copy of the rule, and the error text) have
--- to agree on them: min 1..31 leaves room below a max of 32 so the strict-less-than rule
--- always has a legal spelling, and util 0..100 is a whole percentage.
-local MIN_CONCURRENCY_LIMIT = 31
-local MAX_CONCURRENCY_LIMIT = 32
-local MAX_GPU_UTIL_LIMIT = 100
+-- The ranges themselves live in exactly one place: registry/loads.lua (the pool side of
+-- the same feature), where discovery.lua's PUT /workers loop consults them. The two
+-- doorway faces must answer identically -- a ceiling the pool can store but the document
+-- cannot carry is the "live now, gone after a restart" shape measured on 21.k:8802 -- so
+-- this file asks the rulebook instead of restating 1..31 / 1..32 / 0..100 (AGENTS.md
+-- forbids a second copy of the rules). doc/caps-redesign-2026-10-06.md section 1 pins the
+-- numbers: min 1..31 leaves room below a max of 32 so the strict-less-than rule always has
+-- a legal spelling, and util 0..100 is a whole percentage.
+local cap_rulebook
+
+---The shared cap rulebook, lazily. The registry facade is deliberately NOT the lookup
+---path: pure-Lua unit tests replace the facade with an in-memory pool stub, and the
+---rulebook has to be the real implementation for them as well (test_caps_persist
+---preloads the one registry/keys field set registry/loads needs at load time so the
+---module itself loads without resty.lock/ffi). A lazy pcall matches the discipline the
+---store_registry helpers already follow: module missing -> nil, and the caller decides
+---what refusing to validate means -- silently dropping the gate is not an option here,
+---because the whole file exists to stop a refused value walking into the snapshot.
+---@return table|nil rulebook @ cap_range_refusal / cap_range_wording, or nil when the
+---  registry domain cannot be loaded at all (pure-Lua test boxes without the tree)
+local function cap_rule()
+    if cap_rulebook ~= nil then
+        return cap_rulebook or nil
+    end
+    local ok, mod = pcall(require, "resty.luarouter.registry.loads")
+    if ok and type(mod) == "table" and type(mod.cap_range_refusal) == "function"
+        and type(mod.cap_range_wording) == "function" then
+        cap_rulebook = mod
+    else
+        cap_rulebook = false
+    end
+    return cap_rulebook or nil
+end
 
 -- Per-instance capacity gates (doc/caps-redesign-2026-10-06.md §1). The three fields share
 -- one field list so parse / defaults / drift / patch / create cannot drift apart, and one
@@ -105,71 +131,29 @@ end
 ---@return table|nil caps_said @ field -> canonical number, for named tiers that landed
 ---@return string|nil err
 local function cap_tiers_said(canonical, said)
+    -- The gate itself is one call per named tier into the registry's rulebook, so the
+    -- pool side and this side cannot drift apart (see cap_rule above). Each face keeps
+    -- only what is genuinely its own: the *stored* number is decided by the tier
+    -- reader (declared_cap / declared_util -- the same normalizers the pool's readers
+    -- use, which is what makes drift converge), and the wording gains this file's
+    -- "upstream <url>" prefix on top of the shared sentence.
+    local rule = cap_rule()
     local caps_said = {}
     for _, field in ipairs(CAP_FIELDS) do
         local value = rawget(said, field)
         if value ~= nil and value ~= JSON_NULL then
-            if field == "max_gpu_util" then
-                local number = tonumber(value)
-                if number ~= nil and number == number
-                    and number ~= math.huge and number ~= -math.huge then
-                    if number < 0 then
-                        -- "said nothing": the reader folds it to unlimited either way.
-                        number = nil
-                    elseif number > MAX_GPU_UTIL_LIMIT or math.floor(number) ~= number then
-                        return nil, string.format(
-                            "upstream %s max_gpu_util must be a whole percentage between 0 and %d",
-                            canonical, MAX_GPU_UTIL_LIMIT)
-                    end
-                else
-                    number = nil
-                end
-                if number ~= nil then
-                    -- The registry reader stays the authority for the *stored* value (same
-                    -- posture as the concurrency tier): the range checks above decide what
-                    -- counts as said-vs-400, declared_util decides the canonical number
-                    -- that lands in the row.
-                    local cap = CS_PROFILES.declared_util(number)
-                    if cap ~= nil then
-                        caps_said[field] = cap
-                    end
-                end
-            elseif field == "max_concurrency" then
-                local cap = CS_PROFILES.declared_cap(value, true)
-                if cap ~= nil then
-                    if cap > MAX_CONCURRENCY_LIMIT then
-                        return nil, string.format(
-                            "upstream %s max_concurrency must be at most %d",
-                            canonical, MAX_CONCURRENCY_LIMIT)
-                    end
-                    caps_said[field] = cap
-                end
-            else
-                local cap = cap_normalize(field, value)
-                -- A floor that folds to "unlimited" (<= 0, NaN, ±inf, a non-number) says
-                -- nothing here, exactly like the other two tiers: clearing a floor is a
-                -- legitimate write for the in-place mirror, which is the only writer that
-                -- reaches a row already holding one. Whether *naming* the tier and having
-                -- it fold to nothing is instead a typo is a question about the row being
-                -- written, not about the number, so the create path decides it for itself
-                -- right after this call -- the mirror's "a named tier that normalizes to
-                -- unlimited clears that tier" contract stays as it was.
-                if cap ~= nil then
-                    -- Integrality is tested on the raw reading, not on the normalized one:
-                    -- cap_limit *floors* a fractional value (that is what makes 2.5 a legal
-                    -- max_concurrency), so by the time this branch sees it a typo like 1.5
-                    -- has already become a plausible 1. A floor is not a number the operator
-                    -- has to be protected from rounding -- it is the green threshold, so a
-                    -- fractional reading is a typo and says nothing about what was meant.
-                    local number = tonumber(value)
-                    if number == nil or cap ~= number
-                        or cap < 1 or cap > MIN_CONCURRENCY_LIMIT then
-                        return nil, string.format(
-                            "upstream %s min_concurrency must be an integer between 1 and %d",
-                            canonical, MIN_CONCURRENCY_LIMIT)
-                    end
-                    caps_said[field] = cap
-                end
+            local refusal = rule and rule.cap_range_refusal(field, value)
+            if refusal then
+                return nil, string.format("upstream %s %s %s", canonical, field, refusal)
+            end
+            -- The registry readers stay the authority for the stored value: the gate
+            -- above decides what counts as said-vs-400, the normalizer decides the
+            -- canonical number that lands in the row (and folds a "cleared" reading to
+            -- nil, i.e. key-absent -- for the utilisation tier that is how its negative
+            -- clearing sentinel is honoured, since 0 there is a gate, not an absence).
+            local cap = cap_normalize(field, value)
+            if cap ~= nil then
+                caps_said[field] = cap
             end
         end
     end
@@ -391,9 +375,10 @@ local function upstream_from_entry(entry, index)
     -- clear it (its docstring: a named tier that normalizes to unlimited clears the
     -- tier), so the shared rulebook decides ranges and this line decides declarations.
     if rawget(said_caps, "min_concurrency") ~= nil and caps_said.min_concurrency == nil then
-        return nil, string.format(
-            "upstream %s min_concurrency must be an integer between 1 and %d",
-            canonical, MIN_CONCURRENCY_LIMIT)
+        local rule = cap_rule()
+        local wording = rule and rule.cap_range_wording("min_concurrency")
+            or "must be an integer between 1 and 31"
+        return nil, string.format("upstream %s min_concurrency %s", canonical, wording)
     end
     local conflict = cap_tiers_conflict(canonical, caps_said)
     if conflict then return nil, conflict end
@@ -875,6 +860,7 @@ _M.mirror_shaped_row = mirror_shaped_row
 _M.build_upstreams = build_upstreams
 _M.previous_upstream_map = previous_upstream_map
 _M.caps_only_row = caps_only_row
+_M._reset_cap_rule_cache = function() cap_rulebook = nil end
 _M.sanitize_upstream_rows = sanitize_upstream_rows
 _M.upstream_from_entry = upstream_from_entry
 

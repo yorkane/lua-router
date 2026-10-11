@@ -69,6 +69,11 @@ _M.upstreams_revision = CS_PERSISTENCE.upstreams_revision
 
 -- upstreams
 _M.reconcile_upstreams = CS_UPSTREAMS.reconcile_upstreams
+-- Unit hook (cap-rulebook memo): the shared cap rulebook is lazily required by
+-- upstreams.lua and memoised there; the pool-cache reset below has to forget it
+-- as well, or a test run that started without the rulebook keeps running the
+-- gateless snapshot path. Function reference, not a value copy: upstreams owns it.
+_M._reset_cap_rule_cache = CS_UPSTREAMS._reset_cap_rule_cache
 
 -- snapshot
 _M.cfg_from_document = CS_SNAPSHOT.cfg_from_document
