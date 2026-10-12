@@ -378,3 +378,48 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 > `lr_gpu_load_util_gpu{worker=...}` 会永久留在 `/metrics`
 > （本轮在 8802 实测到已删 mock 18301–18303 的序列仍在）。登记与后续修法见
 > [gap-worker-caps.md](gap-worker-caps.md) §11 第 10 条。
+
+## fleet 现状快照与 2026-10-12 一轮（21.k:8800 生产 + 8802 测试）
+
+> 本节是**当前 fleet 状态**的记录入口；每实例逐项事实（镜像/compose/池/负载 env/口令/漂移处置）在
+> [deploy-state.md](deploy-state.md)，10-12 这轮的真机验收矩阵与回滚手册在
+> [deploy-8802-20261012-proxy-auth.md](deploy-8802-20261012-proxy-auth.md)（测试）与
+> [deploy-8800prod-20261012-proxy-auth.md](deploy-8800prod-20261012-proxy-auth.md)（生产）。
+> 上面 2026-10-01 的 21.k:8801 小节与 235.t 各节保留为当时记录，其中「21.k 只部署了 8801」的
+> fleet 形状已被后续接管/新增改写：现役是五个实例（235.t:8800、21.k:8800/8801/8802、217.t:8800）。
+
+### 本轮发布物
+
+- 代码锚点 `69b5d53`（fix(auth): 代理来源头前置否决按「出现即认证」实现——值一概不解析），已推 origin/main。
+- 全量门禁 `GATE_TIER=full GATE_JOBS=6`：**22 passed / 0 failed / 0 skipped**，
+  归档 `/data/tmp/lr-gates/gates-20261012-160634.log`（`/data/tmp/gate_full_proxyv2.log` 为同轮副本）。
+  单测 `test/unit/test_admin_auth.lua` 191 checks / 0 failed。
+- 镜像 `pub/lua-router:20261012-69b5d53`（digest `sha256:f952ee507dd9…`），由新入库的
+  `script/build-image.sh` 从绿锚点直构建推 ACR。**tag 规范自本轮起为 `YYYYMMDD-<短sha>`**，
+  一台构建、多实例复用，不再按端口打 tag。
+
+### 顺序与结果
+
+1. 21.k:8802（测试）先滚：`docker-compose.yml` 镜像行 `20261012-b5130da → 20261012-69b5d53`，
+   `pull && up -d`；矩阵全绿，浏览器 playwright-cli 复核管理台四页渲染。
+2. 21.k:8800（生产，用户授权）同一 digest 滚 + 新增 `SMG_ADMIN_AUTH_PASS`（本轮 `test123`，
+   操作员换正式口令后 `docker compose up -d`）；其余 env 逐字未动（`SMG_MAX_TREE_SIZE 1e8`、
+   watcher DENY_PORT、prom 负载通道、`LR_HTTP_INCLUDE`）。
+   备份目录 `/data1/app/lua-router-8800/backup-20261012T163349Z/`（compose + config 全量 +
+   SQLite 在线一致性快照）；配置 rev 前后都是 `44 10504bd6`＝升级窗口零写入。
+3. 21.k:8801 / 235.t:8800 / 217.t:8800 **本轮未动**，分别停在 `20261011-fc037af`、
+   `20261011-fc037af`、`8800-20261011-89f0ad0`。
+
+### 这轮证明的事（一句话）
+
+反代与网关同机时，旧版 loopback 豁免会被 APISIX 写的 `X-Real-IP` 无条件触发（生产两入口已取证），
+新版按「来源头出现即认证」封掉：伪造 `X-Real-IP: 127.0.0.1` / `X-Forwarded-For: 127.0.0.1` 无凭据一律 401，
+而豁免面（直连 loopback 无代理头 200、未配口令实例整道门关闭、数据面与匿名只读面）逐项未缩水。
+**缺省零行为变化**在这轮实测成立：8801 未配口令，带伪造来源头无凭据仍 200。
+
+### 回滚
+
+- 21.k:8800：两条 sed（镜像行回 `8800-20261011-89f0ad0` + 删 `SMG_ADMIN_AUTH_PASS` 行）后 `up -d`，
+  旧镜像本机在盘，秒级；配置 db 无需回滚。
+- 21.k:8802：镜像行回 `20261012-b5130da`（上一版已在该测试实例验过）。
+- 其余三台本轮无变更，无回滚动作。

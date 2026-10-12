@@ -14,16 +14,23 @@ stream_options / effort），不整表重编码。调用方给的输出预算（
 代理、网关自身鉴权、Kubernetes 服务发现、OTel 六个平面整体删除（git 历史可恢复）；mesh、
 DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [doc/todo-deferred.md](doc/todo-deferred.md)）。
 
-**信任边界**：网关层零鉴权——`/workers`、根数据面（`/config` `/logs` `/stats` `/props`）、`/model-map`、`/ha` 与推理面全部开放，
-只可部署在 authz 边缘之后或可信内网。worker 记录里的 `api_key` 是本路由向**上游**出示的
-凭据，不是挡在自己前面的门。
+**信任边界**：网关自身不做调用方鉴权——推理面（`/v1/*` `/generate`）、`/props`、`/ha` 与 `/_mesh/internal/*` 保持开放，
+worker 记录里的 `api_key` 是本路由向**上游**出示的凭据，不是挡在自己前面的门。
+**管理面自 2026-10-12 起有独立的 Basic Auth**（用户裁定：不走 authz 体系，网关自己校验）：
+`/` 与 `*.html`、根数据面 `/config*` `/logs*` `/stats` `/slots` `/tools`、`/u/config*` 别名族，以及 klib 控制面
+`/workers` `/model-map` `/flush_cache` 都在门内；用户名恒 `lua-router`，口令取 env `SMG_ADMIN_AUTH_PASS`（只走 env）。
+两条豁免：口令未配置/空串 = 整道门关闭（缺省逐字节零行为变化）、来源是 loopback 免凭据；
+一条前置否决：请求里出现 `X-Real-IP` / `X-Forwarded-For` / `Forwarded` 任一头名就收回 loopback 豁免（值一概不解析）。
+口径与落点见 [doc/gap-admin-auth.md](doc/gap-admin-auth.md)。口令是明文 base64，因此本层只在
+「可信内网」或「前面已有 TLS 终结边缘」的前提下启用；跨不可信网络须先终结 TLS。
 
 ## 当前基线
 
-全量门禁权威日志：`/data/tmp/lr-gates/gates-20261011-082738.log`（tier=full、`KEEP_GOING=1`、
-`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `fc037af`）。代码基线：
-`lualib/` **75 个 Lua 文件 / 36 686 行**（七个域拆成 facade + 子模块，见 doc/architect.md §3）、
-单测 18 文件、契约 **702 项 / 24 段**、文档 39 份。
+全量门禁权威日志：`/data/tmp/lr-gates/gates-20261012-160634.log`（tier=full、`KEEP_GOING=1`、
+`GATE_JOBS=6`、`SKIP_ENV=none`，**22 passed / 0 failed / 0 skipped**，代码基线 `69b5d53`；
+`HEAD=d3ae572` 之后的三个提交只动 doc/ 与 `script/build-image.sh`，代码树与该锚点逐字节一致）。代码基线：
+`lualib/` **76 个 Lua 文件 / 37 778 行**（七个域拆成 facade + 子模块，新增单文件 `admin_auth.lua`，见 doc/architect.md §3）、
+单测 **19 个 .lua（门禁 luajit 17 + resty 4 口径）+ 1 个宿主 node**、契约 **765 项 / 24 段**、`doc/` 44 份。
 
 > 锚点取在 2026-10-05 的重构树上：facade + 子模块拆分（router / config_store / registry /
 > watcher / gpu_load / mesh / observability）+ 公共传输库 `httpc.lua` + UI 入口迁移
@@ -43,8 +50,8 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | 门禁 | 计数 | 覆盖 |
 |---|---|---|
 | build / conf | — / 2 语法 OK | 镜像构建（含一次 `openresty -t`）；生产模板 + 裸 conf 双语法门 |
-| unit | luajit 16 + resty 4 口径 | luajit 侧 tree 67 / tree_bounds 44 / state_bounds 51 / observability 35 / policies 118 / hash 795 / mesh 391 / watcher 461 / gpu_load 489 / routing_dyn 122 / profiles 907 / caps_persist 70 / caps_routing 157 / models_shape 130 / models_advertise 74 / effort_layers 32；resty 侧 tree 67 / policies 118 / hash 795 / integration 125（全部 0 failed） |
-| contract | **687 / 0 failed / 2 notes** | 24 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
+| unit | luajit 17 + resty 4 口径（+ 宿主 node 1） | luajit 侧 tree 67 / tree_bounds 44 / state_bounds 51 / observability 35 / policies 118 / hash 795 / mesh 391 / watcher 461 / gpu_load 489 / routing_dyn 122 / profiles 907 / caps_persist 150 / caps_routing 157 / models_shape 146 / models_advertise 74 / effort_layers 32 / **admin_auth 191**（六段变异反证全红）；resty 侧 tree 67 / policies 118 / hash 795 / integration 125；node 侧 ui_merge 128（全部 0 failed） |
+| contract | **765 / 0 failed / 2 notes** | 24 段 wire 契约（分段构成见 `test/test_lua_router.sh` 头部；`discovery` 段测的是 `/model_info` 元数据发现，与已删除的 K8s 发现无关） |
 | probes | 26 / 0 | 策略工厂、配置旋钮、map 切分、裸 JSON 改写、卡片档位 env 层穿透 worker |
 | e2e_stateful | 101 / 0 | bucket / prefix_hash / manual / failback / 快照 / 多进程 / add worker / responses 元数据回填与断开语义 + DP 展开 31 项 |
 | e2e_policies | 65 / 0 | 各策略真流量 + 虚拟别名与 effort 注入 |
@@ -55,18 +62,20 @@ DP 展开、服务端 TLS 保留。TODO 不实现：wasm、MCP（唯一口径 [d
 | mesh_http / mesh_two | 47 / 37 | mesh 真实 HTTP（对端 apply/sync、worker 镜像、/ha/policies）；双真容器互 seed 收敛、docker stop 分区恢复、retire 广播 |
 | e2e_policy_parity | 47 / 0 | prefix_hash / bucket / power_of_two / random 与 Rust 的量化对拍（Rust 启动等待预算 240s） |
 | e2e_watcher | 125 / 0 | 内建 watcher：三源发现、九条原守卫逐条断言 + 第 10 条守卫（探针确认不可用即**物理摘除**，[6]/[7] 显式关 temp-disable；含滞回与单轮保险丝）、**reject 三档保行 + td: 临时禁用（[8]，9bf3c07 现行默认）**、model-map 改名、容器重启重发现 |
-| e2e_profiles | 110 / 0 | 虚拟服务入口与 upstreams：白名单 / 入口名走按模型策略（`model_policies[入口名]` 是别名级 policy 停用后的替代入口）/ 停用字段仍接受、仍落盘、解析时 warn 而热路径不读 / api_key 三态与脱敏 / 30s 自愈 / apply 原子性 |
+| e2e_profiles | 146 / 0 | 虚拟服务入口与 upstreams：白名单 / 入口名走按模型策略（`model_policies[入口名]` 是别名级 policy 停用后的替代入口）/ 停用字段仍接受、仍落盘、解析时 warn 而热路径不读 / api_key 三态与脱敏 / 30s 自愈 / apply 原子性 |
 | e2e_token_accounting | 62 / 0 | 流式 include_usage 透明注入+剥帧、四类 token 指标、400 兜底 sticky |
 | e2e_gpu_load | 58 / 0 | GPU 负载双源：worker /metrics 抓取与远程 Prometheus 查询写入 registry（mock 的 /metrics 带 `gpu` 标签，利用率通道走同一条路；逐卡归属与容量判定的断言在 e2e_caps S3/S3b） |
 | e2e_routing_dyn | 51 / 0 | 路由动态变更：全局与 per-model 策略热切换免重启、非法名 400 不生效 |
 | e2e_caps | 199 / 0 | 虚拟模型入口映射一组实际模型（不同上游的相同/不同模型、IGW 开关两路、candidates 与 workers 交集语义）+ 每服务容量三态（S2 三态与 `load_state`、S3/S3b GPU 利用率上限与**逐卡归属**、S4 亲和被打断、S5 全池到顶 **429**、S5b 对照 503、S5c 缺省零变化、S5d 声明层三字段边界、S8 声明层 caps 跨重启存活、**S9 控制面 PUT/POST /workers 的上限镜像进声明层并活过两次 docker restart（含删 worker 清镜像、孤儿不复活、config 行不走镜像）**；读数缺失不排除、上限不摘健康） |
-| e2e_models_advertisement | 210 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 + S12 卡片档位勾选（探测基线 / 勾选接管 / 判定面只跟引擎说过的） |
+| e2e_models_advertisement | 262 / 0 | `/v1/models` 对外形状（官方四字段 required、扩展字段来源优先级、组内聚合与「缺读数即删键」）+ 「只广告虚拟入口」开关 + S12 卡片档位勾选（探测基线 / 勾选接管 / 判定面只跟引擎说过的）+ S13/S14 推导档位新键位（`capabilities.reasoning_effort`，根路径 `supported_reasoning_efforts` 已移除） |
 | e2e_tls_chain | 112 / 0 / 2 notes | 运行时 PKI、四类握手负例、RSA+ECDSA×TLS1.2/1.3、SNI 同端口双证书、证书/私钥不配对 fail-closed |
 
-契约 687 的 24 段构成：gate 3、public 34、workers 75、inference 38、headers 13、mesh 44、
+契约 765 的 24 段构成：gate 3、public 34、workers 90、inference 38、headers 13、mesh 44、
 not_found 15、observability 53、proxy_endpoints 56、policy_hint 13、ui_fixed 64、tls_upstream 11、
-cb_race 6、igw 7、caps 23、discovery 5、prometheus 17、probes 29、cors 37、virtual_models 15、
+cb_race 6、igw 7、caps 23、discovery 5、prometheus 17、probes 29、cors 37、virtual_models 78、
 ratelimit 14、inflight_age 32、tls_server 19、profiles_upstreams 64。
+（`workers` 段 75→90 与 `virtual_models` 段 15→78 是本轮控制面容量口径与 `/v1/models` 形状断言对齐；
+`admin_auth` 的覆盖在 unit 门与 `conf` 接线清单断言里，不占契约段。）
 
 ## 目录
 
@@ -635,8 +644,10 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-session-2026-10-04.md](doc/gap-session-2026-10-04.md) | 上下文窗口语义翻转、/v1/models 形状、effort 三层继承与踩坑记录（接手前建议先读） |
 | [doc/gap-config-store.md](doc/gap-config-store.md) | 配置持久化：sqlite/postgres/file 三态后端、CAS、镜像与采纳 |
 | [doc/ui-trim-legacy-pages.md](doc/ui-trim-legacy-pages.md) | 管理台相对原版 webui 的页面差异与旧工具页移除记录 |
-| [doc/deploy-state.md](doc/deploy-state.md) | 三实例部署现状、生效后端怎么查、已知配置漂移与死代码清单 |
+| [doc/deploy-state.md](doc/deploy-state.md) | 五实例 fleet 现状（2026-10-12 实测：镜像/compose/池/负载 env/管理面口令）、生效后端怎么查、已知漂移与处置、死代码清单 |
 | [doc/deploy-fleet.md](doc/deploy-fleet.md) | 21.k:8801 与 235.t:8800 的 fleet 部署与验证记录（含部署后验证清单） |
+| [doc/deploy-8800prod-20261012-proxy-auth.md](doc/deploy-8800prod-20261012-proxy-auth.md) | 21.k:8800 生产升级（代理来源前置否决）真机验收矩阵与回滚手册 |
+| [doc/deploy-8802-20261012-proxy-auth.md](doc/deploy-8802-20261012-proxy-auth.md) | 同一构建在 21.k:8802 测试实例的先一轮验证（含 playwright 复核） |
 | [doc/scope-trim.md](doc/scope-trim.md) | 范围收敛判定书：模块 KEEP/DELETE/TRIM、量化收益、执行记录 |
 | [doc/todo-deferred.md](doc/todo-deferred.md) | TODO 档（MCP、wasm）的唯一口径与启用时的最小方案 |
 | [doc/gap-mesh.md](doc/gap-mesh.md) | mesh / HA 的 CRDT 设计、带宽代价与围栏 |

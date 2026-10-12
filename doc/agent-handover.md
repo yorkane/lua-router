@@ -383,7 +383,10 @@ gap-session-2026-10-04.md（上下文窗口语义翻转、/v1/models 形状、ef
 以及这一轮踩过的坑——**接手前建议先读这一份**）、
 refactor-arch-2026-10-05.md（**本轮 facade + 子模块拆分 + UI 入口迁移的执行契约与落地结果**，
 含实测计数表与四条 backlog 登记）、
-deploy-state.md（三实例部署现状、生效后端怎么查、已知配置漂移与死代码清单）、
+deploy-state.md（**五实例 fleet 现状**：镜像/compose/池/负载 env/管理面口令逐项实测、生效后端怎么查、已知漂移与处置、死代码清单）、
+deploy-fleet.md（历次部署与真机验证记录，含 2026-10-12 一轮的发布物与回滚顺序）与
+deploy-8800prod-20261012-proxy-auth.md / deploy-8802-20261012-proxy-auth.md（代理来源前置否决在
+生产与测试实例的真机验收矩阵 + 回滚手册，是 8800 下一次升级前的操作依据）、
 ui-trim-legacy-pages.md（管理台相对原版 webui 的页面差异）、parity-cpu-ablation.md。
 
 **对拍与真实评测（数据留档，引用前注意树龄）**：parity-contract/routing/policy-extra/perf-v2、
