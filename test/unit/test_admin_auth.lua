@@ -26,8 +26,7 @@ local PASS_ENV = "SMG_ADMIN_AUTH_PASS"
 local SENTINEL = {}
 local env_ngx
 env_ngx = {
-    var = { remote_addr = "10.0.0.9", uri = "/config",
-            http_x_real_ip = nil, http_x_forwarded_for = nil },
+    var = { remote_addr = "10.0.0.9", uri = "/config" },
     header = {},
     status = nil,
     req = { get_headers = function() return env_ngx.__headers or {} end },
@@ -170,51 +169,107 @@ ok(auth.required("1127.0.0.1") == true, "prefix match must not hit 1127/")
 ok(auth.required(nil) == true, "unknown address = no exemption (fail closed)")
 
 --------------------------------------------------------------------------
--- 2.1 反代来源还原（2026-10-12：8802 经 APISIX，remote_addr 恒 127.0.0.1）
---   required(nil) 走 real_client_addr()：X-Real-IP 优先，其次 XFF 最左段，
---   都无才 remote_addr；代理头只在直连对端是 loopback 时采信。
---   显式传 addr 的第一参保持纯函数语义（测试与任何直传调用不受头影响）。
+-- 2.1 代理来源头：只看「出现没有」，值一概不解析（2026-10-12：8802 经 APISIX，
+--     remote_addr 恒 127.0.0.1，豁免被反代无条件触发）。
+--   这一组钉的是「出现即认证」，不是「按值还原来源」：X-Real-IP 写 127.0.0.1、
+--   XFF 写空串、Forwarded 写畸形值，一概要凭据。任何「按值取地址」的实现都会
+--   在这一组红（变异 B 即钉这个）。
+--   显式传 addr 的第一参同样是「直传纯函数」语义：头出现时它让位于头。
 --------------------------------------------------------------------------
-local function with_proxy_headers(remote, xri, xff)
+local function with_proxy_headers(remote, hdr)
     env_ngx.var.remote_addr = remote
-    env_ngx.var.http_x_real_ip = xri
-    env_ngx.var.http_x_forwarded_for = xff
+    env_ngx.__headers = hdr
 end
 local function clear_proxy_headers()
-    with_proxy_headers("10.0.0.9", nil, nil)
+    env_ngx.__headers = {}
 end
 
--- 反代（对端 loopback）声明的原始客户端非环 → 必须鉴权（修复的核心断言）
-with_proxy_headers("127.0.0.1", "203.0.113.1", nil)
-ok(auth.required() == true, "proxied X-Real-IP public client needs auth")
-with_proxy_headers("127.0.0.1", nil, "203.0.113.1")
-ok(auth.required() == true, "proxied XFF-only public client needs auth")
-with_proxy_headers("127.0.0.1", nil, "203.0.113.1, 10.0.0.1, 127.0.0.1")
-ok(auth.required() == true, "xff chain takes the leftmost hop")
-with_proxy_headers("127.0.0.1", nil, " 198.51.100.7 , 10.0.0.1")
-ok(auth.required() == true, "xff segments tolerate spaces around the leftmost ip")
-with_proxy_headers("127.0.0.1", "10.252.25.217", "203.0.113.1")
-ok(auth.required() == true, "x-real-ip wins over xff (proxy-rewritten header is the trusted one)")
--- 反代声明原始客户端就是本机 → 豁免跟着 X-Real-IP 走
-with_proxy_headers("127.0.0.1", "127.0.0.1", nil)
-ok(auth.required() == false, "proxied loopback client stays exempt")
--- X-Real-IP 空串 = 头缺失，继续看 XFF / peer
-with_proxy_headers("127.0.0.1", "", "203.0.113.9")
-ok(auth.required() == true, "empty X-Real-IP falls through to XFF")
-with_proxy_headers("127.0.0.1", "", "")
-ok(auth.required() == false, "empty proxy headers fall through to loopback peer")
--- 直连（无代理头）豁免逐字节不变
+-- 出现即认证：值的形状完全不影响判定
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = "203.0.113.1" })
+ok(auth.required() == true, "X-Real-IP present declares a proxy -> needs auth")
+with_proxy_headers("127.0.0.1", { ["X-Forwarded-For"] = "203.0.113.1" })
+ok(auth.required() == true, "X-Forwarded-For present -> needs auth")
+with_proxy_headers("127.0.0.1", { ["Forwarded"] = "for=203.0.113.1" })
+ok(auth.required() == true, "RFC 7239 Forwarded present -> needs auth")
+-- 客户端伪造的 loopback 声明不获豁免（本组是「值不解析」的核心证据）
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = "127.0.0.1" })
+ok(auth.required() == true, "spoofed X-Real-IP: 127.0.0.1 does NOT grant the exemption")
+with_proxy_headers("127.0.0.1", { ["X-Forwarded-For"] = "127.0.0.1" })
+ok(auth.required() == true, "spoofed XFF: 127.0.0.1 does NOT grant the exemption")
+with_proxy_headers("127.0.0.1", { ["X-Forwarded-For"] = "127.0.0.1, 10.0.0.1" })
+ok(auth.required() == true, "multi-hop XFF is not parsed: leftmost 127 grants nothing")
+with_proxy_headers("127.0.0.1", { ["Forwarded"] = "for=\"127.0.0.1\";by=127.0.0.1" })
+ok(auth.required() == true, "a Forwarded that names loopback is still a proxy declaration")
+-- 空值 / 畸形值 / 提取失败：全部按「出现」处理，不回落到 peer
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = "" })
+ok(auth.required() == true, "empty X-Real-IP is presence, not absence")
+with_proxy_headers("127.0.0.1", { ["X-Forwarded-For"] = "" })
+ok(auth.required() == true, "empty XFF is presence, not absence")
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = "not-an-ip" })
+ok(auth.required() == true, "malformed X-Real-IP still needs auth")
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = { "127.0.0.1", "127.0.0.1" } })
+ok(auth.required() == true, "duplicated X-Real-IP (ngx table value) needs auth")
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = true })
+ok(auth.required() == true, "non-string header value needs auth")
+-- 键名大小写不敏感（真机 raw=true 返回原始大小写）
+with_proxy_headers("127.0.0.1", { ["x-real-ip"] = "10.0.0.1" })
+ok(auth.required() == true, "lower-case x-real-ip matches")
+with_proxy_headers("127.0.0.1", { ["X-REAL-IP"] = "10.0.0.1" })
+ok(auth.required() == true, "upper-case X-REAL-IP matches")
+with_proxy_headers("127.0.0.1", { ["x-FoRwArDeD-fOr"] = "10.0.0.1" })
+ok(auth.required() == true, "mixed-case x-forwarded-for matches")
+-- 头表取不到 = 按最坏情况（与 required(nil) 的 fail closed 同向）
+env_ngx.__headers = "not-a-table"
+ok(auth.required() == true, "unreadable header table fails closed")
+-- 头出现时压过显式直传的 loopback 地址
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = "127.0.0.1" })
+ok(auth.required("127.0.0.1") == true, "a proxy header outranks an explicit loopback addr")
+-- 直连（无代理头）逐字节不变
 clear_proxy_headers()
 env_ngx.var.remote_addr = "127.0.0.1"
-ok(auth.required() == false, "direct loopback without headers stays exempt")
--- 直连非环的伪造头不采信：remote_addr 已是非环，判定地址恒 peer
-with_proxy_headers("203.0.113.7", "127.0.0.1", "127.0.0.1")
-ok(auth.required() == true, "spoofed X-Real-IP from a direct peer is not honored")
-with_proxy_headers("203.0.113.7", nil, "127.0.0.1")
-ok(auth.required() == true, "spoofed XFF from a direct peer is not honored")
+ok(auth.required() == false, "direct loopback without proxy headers stays exempt")
+env_ngx.var.remote_addr = "203.0.113.7"
+ok(auth.required() == true, "direct remote peer unchanged")
+ok(auth.has_proxy_origin_header({}) == false, "empty header table: no proxy declared")
+ok(auth.has_proxy_origin_header({ ["Authorization"] = "Basic x", Cookie = "a" }) == false,
+    "unrelated headers do not declare a proxy")
+ok(auth.has_proxy_origin_header({ ["X-Real-Ip-Client"] = "1.2.3.4" }) == false,
+    "a lookalike header name is not X-Real-IP")
+ok(auth.has_proxy_origin_header({ ["X-Forwarded-Proto"] = "https" }) == false,
+    "X-Forwarded-Proto is not a source header")
+ok(auth.has_proxy_origin_header({ ["Forwarded"] = "for=1.2.3.4" }) == true,
+    "Forwarded is in the roster")
+-- 豁免一优先级不破：口令未配置时整道门关闭，代理头不擅自开门
+set_pass(nil)
+with_proxy_headers("127.0.0.1", { ["X-Real-IP"] = "203.0.113.1" })
+ok(auth.required() == false, "pass unset: gate stays closed even behind a proxy")
 clear_proxy_headers()
-ok(auth.real_client_addr() == "10.0.0.9", "real_client_addr returns peer when no headers")
+set_pass("s3cret")
 
+-- guard 面（真机接线形状：Authorization 与代理头同在一表）
+local function call_guard_h(mod, remote, hdr, uri)
+    env_ngx.var.remote_addr = remote
+    env_ngx.__headers = hdr
+    env_ngx.var.uri = uri or "/config"
+    env_ngx.header = {}
+    env_ngx.status = nil
+    env_ngx.__exit = nil
+    local okcall, err = pcall(mod.guard)
+    if not okcall and err ~= SENTINEL then error(err) end
+    env_ngx.__headers = {}
+    return env_ngx.__exit, env_ngx.header
+end
+exit_code = call_guard_h(auth, "127.0.0.1", { ["X-Real-IP"] = "203.0.113.1" })
+ok(exit_code == 401, "reverse-proxied client without credential -> 401", exit_code)
+exit_code = call_guard_h(auth, "127.0.0.1", { ["X-Real-IP"] = "203.0.113.1",
+    Authorization = basic("lua-router", "s3cret") })
+ok(exit_code == nil, "reverse-proxied client with credential passes", exit_code)
+exit_code = call_guard_h(auth, "127.0.0.1", { ["X-Real-IP"] = "127.0.0.1" })
+ok(exit_code == 401, "proxied peer 127.0.0.1 with a header -> 401 (the bug being fixed)",
+    exit_code)
+exit_code = call_guard_h(auth, "127.0.0.1", { Authorization = basic("lua-router", "wrong"),
+    ["X-Forwarded-For"] = "203.0.113.1" })
+ok(exit_code == 401, "proxied wrong credential -> 401")
 
 --------------------------------------------------------------------------
 -- 3. 头校验：全部 fail closed，不区分失败原因
@@ -249,12 +304,8 @@ ok(auth.check_header(basic("lua-router ", "s3cret"), "s3cret") == false, "traili
 --------------------------------------------------------------------------
 -- 4. guard：放行 / 401 的形状
 --------------------------------------------------------------------------
-local function call_guard(mod, addr, header, uri, preserve_proxy_headers)
-    if addr ~= nil then env_ngx.var.remote_addr = addr end
-    if not preserve_proxy_headers then
-        env_ngx.var.http_x_real_ip = nil
-        env_ngx.var.http_x_forwarded_for = nil
-    end
+local function call_guard(mod, addr, header, uri)
+    env_ngx.var.remote_addr = addr
     env_ngx.var.uri = uri or "/config"
     env_ngx.__headers = header and { Authorization = header } or {}
     env_ngx.header = {}
@@ -291,25 +342,6 @@ set_pass(nil)
 exit_code, headers = call_guard(auth, "203.0.113.7", nil)
 ok(exit_code == nil, "pass unset: remote peer anonymous", exit_code)
 ok(headers["WWW-Authenticate"] == nil, "pass unset: no challenge at all")
-
--- guard 面：反代进来的公网客户端,无凭据 401、带凭据过
---   上一组把口令清掉了（缺省零行为变化那两条），这里必须重新钉上口令，
---   否则「门整道关闭」会伪装成「反代还原生效」把断言全灌成绿色。
-set_pass("s3cret")
-local function call_guard_p(mod, remote, header, uri, xri, xff)
-    with_proxy_headers(remote, xri, xff)
-    return call_guard(mod, nil, header, uri, true)
-end
-exit_code = call_guard_p(auth, "127.0.0.1", nil, "/config", "203.0.113.1", nil)
-ok(exit_code == 401, "reverse-proxied public client without credential -> 401")
-exit_code = call_guard_p(auth, "127.0.0.1", basic("lua-router", "s3cret"), "/config",
-    "203.0.113.1", nil)
-ok(exit_code == nil, "reverse-proxied public client with credential passes")
-exit_code = call_guard_p(auth, "127.0.0.1", nil, "/config", nil, "203.0.113.1")
-ok(exit_code == 401, "xff-only proxied public client -> 401")
-exit_code = call_guard_p(auth, "127.0.0.1", nil, "/config", "127.0.0.1", nil)
-ok(exit_code == nil, "proxied loopback client stays anonymous")
-clear_proxy_headers()
 
 --------------------------------------------------------------------------
 -- 5. 静态入口判定：只挑入口文档
@@ -371,8 +403,7 @@ ok(auth.const_eq(123, "123") == false, "const_eq non-string never matches")
 local function expect_red(name, src)
     local mod = load_src(src, name)
     local red = {}
-    env_ngx.var.http_x_real_ip = nil
-    env_ngx.var.http_x_forwarded_for = nil
+    env_ngx.__headers = {}
     local probes = {
         { "no pass exemption",
           function() set_pass(nil); return call_guard(mod, "203.0.113.7", nil) end },
@@ -403,6 +434,87 @@ expect_red("drop-loopback-exemption", splice(REAL_SRC,
 -- (3) 空串不再等同未配置
 expect_red("empty-string-is-credential", splice(REAL_SRC,
     '    if value == nil or value == "" then', "    if value == nil then"))
+
+--------------------------------------------------------------------------
+-- 7.1 代理来源头两段变异反证（§2.1 断言的判别性）
+--------------------------------------------------------------------------
+-- 变异 A：删掉代理头这一段（required 退回只看 remote_addr）—— 反代 401 断言必须红
+local no_proxy = splice(REAL_SRC,
+    "    -- 代理来源头先于地址豁免：头一出现，remote_addr 就不再是「可直证的来源」。\n"
+    .. "    if _M.has_proxy_origin_header() then\n        return true\n    end\n", "")
+local np_mod = load_src(no_proxy, "proxy_drop_presence")
+set_pass("s3cret")
+ok(call_guard_h(np_mod, "127.0.0.1", { ["X-Real-IP"] = "203.0.113.1" }) == nil,
+    "mutation A: without the presence check the proxied peer reads as loopback (suite catches it)")
+ok(call_guard_h(np_mod, "203.0.113.7", nil) == 401,
+    "mutation A: direct remote peer still challenged")
+
+-- 变异 B：把「只看出现」换成「按值还原来源地址」（正是被推翻的 v1 形状）——
+--   「伪造 127.0.0.1 要凭据」那几条必须红。这条反证钉住裁定本身：
+--   实现者一旦去解析值，本套件当场红。
+local by_value = splice(REAL_SRC,
+    "    local t = headers\n"
+    .. "    if t == nil then\n"
+    .. "        if ngx == nil or type(ngx.req) ~= \"table\"\n"
+    .. "            or type(ngx.req.get_headers) ~= \"function\" then\n"
+    .. "            -- 纯 Lua 环境（无请求上下文）：调用方直传 addr 的语义不受影响。\n"
+    .. "            return false\n"
+    .. "        end\n"
+    .. "        -- raw=true 拿原始键名，下面统一小写比对（不用默认表，免得依赖其大小写归一）。\n"
+    .. "        t = ngx.req.get_headers(0, true)\n"
+    .. "    end\n"
+    .. "    if type(t) ~= \"table\" then\n"
+    .. "        return true\n"
+    .. "    end\n"
+    .. "    for name in pairs(t) do\n"
+    .. "        if type(name) == \"string\" then\n"
+    .. "            local lower = name:lower()\n"
+    .. "            for i = 1, #_M.PROXY_ORIGIN_HEADERS do\n"
+    .. "                if lower == _M.PROXY_ORIGIN_HEADERS[i] then\n"
+    .. "                    return true\n"
+    .. "                end\n"
+    .. "            end\n"
+    .. "        end\n"
+    .. "    end\n"
+    .. "    return false",
+    "    local t = headers\n"
+    .. "    if t == nil then\n"
+    .. "        if ngx == nil or type(ngx.req) ~= \"table\"\n"
+    .. "            or type(ngx.req.get_headers) ~= \"function\" then\n"
+    .. "            return false\n"
+    .. "        end\n"
+    .. "        t = ngx.req.get_headers(0, true)\n"
+    .. "    end\n"
+    .. "    if type(t) ~= \"table\" then\n"
+    .. "        return true\n"
+    .. "    end\n"
+    .. "    local function value_of(name)\n"
+    .. "        for k, v in pairs(t) do\n"
+    .. "            if type(k) == \"string\" and k:lower() == name then\n"
+    .. "                if type(v) == \"table\" then v = v[1] end\n"
+    .. "                if type(v) == \"string\" and v ~= \"\" then return v end\n"
+    .. "            end\n"
+    .. "        end\n"
+    .. "        return nil\n"
+    .. "    end\n"
+    .. "    local xri = value_of(\"x-real-ip\")\n"
+    .. "    if xri then return not _M.is_loopback(xri) end\n"
+    .. "    local xff = value_of(\"x-forwarded-for\")\n"
+    .. "    if xff then\n"
+    .. "        local first = xff:match(\"^%s*([^,]+)\")\n"
+    .. "        if first then return not _M.is_loopback((first:gsub(\"%s+$\", \"\"))) end\n"
+    .. "        return true\n"
+    .. "    end\n"
+    .. "    return value_of(\"forwarded\") ~= nil")
+local bv_mod = load_src(by_value, "proxy_parse_value")
+set_pass("s3cret")
+ok(call_guard_h(bv_mod, "127.0.0.1", { ["X-Real-IP"] = "127.0.0.1" }) == nil,
+    "mutation B: a value-parsing implementation exempts a spoofed 127.0.0.1 (suite catches it)")
+ok(call_guard_h(bv_mod, "127.0.0.1", { ["X-Forwarded-For"] = "127.0.0.1, 10.0.0.1" }) == nil,
+    "mutation B: leftmost-hop parsing is likewise spoofable")
+ok(call_guard_h(bv_mod, "127.0.0.1", { ["X-Real-IP"] = "203.0.113.1" }) == 401,
+    "mutation B: a public address is still challenged (this group pins parsing, not presence)")
+set_pass(nil)
 -- (4) 比对退回逐字符短路（豁免不变，但 check_header 必须仍然全对 —— 这一支钉的是
 --     「断言不依赖 const_eq 的实现细节」，所以它红在 const_eq 那组而不是豁免组）
 local short_circuit = splice(REAL_SRC,
@@ -420,44 +532,6 @@ else
     io.write("FAIL: short-circuit mutation broke the header suite unexpectedly\n")
 end
 
-
-
---------------------------------------------------------------------------
--- 7.1 反代还原的两段变异反证（§2.1 断言的判别性）
---------------------------------------------------------------------------
--- 变异 A：删掉代理头还原段（required 退回只看 remote_addr）—— 反代 401 断言必须红
-local no_proxy = splice(REAL_SRC,
-    "    local peer = ngx.var.remote_addr\n"
-    .. "    -- 非 loopback 直连：代理头一概不信，remote_addr 就是判定地址。\n"
-    .. "    if not _M.is_loopback(peer) then\n        return peer\n    end\n"
-    .. "    local xri = ngx.var.http_x_real_ip\n"
-    .. "    if type(xri) == \"string\" and xri ~= \"\" then\n        return xri\n    end\n"
-    .. "    local xff = ngx.var.http_x_forwarded_for\n"
-    .. "    if type(xff) == \"string\" and xff ~= \"\" then\n"
-    .. "        local first = xff:match(\"^%s*([^,]+)\")\n"
-    .. "        if first then\n            return (first:gsub(\"%s+$\", \"\"))\n        end\n"
-    .. "    end\n    return peer",
-    "    return ngx.var.remote_addr")
-local np_mod = load_src(no_proxy, "proxy_drop_restore")
-set_pass("s3cret")
-ok(call_guard_p(np_mod, "127.0.0.1", nil, "/config", "203.0.113.1", nil) == nil,
-    "mutation: without proxy restore the reverse-proxied peer reads as loopback (suite catches it)")
-ok(call_guard_p(np_mod, "203.0.113.7", nil, "/config", "127.0.0.1", nil) == 401,
-    "mutation: direct non-loopback peer still challenged")
-clear_proxy_headers()
-
--- 变异 B：删掉「只在直连对端是 loopback 时采信」的信任条件 —— 直连伪造头豁免断言必须红
-local no_trust = splice(REAL_SRC,
-    "    -- 非 loopback 直连：代理头一概不信，remote_addr 就是判定地址。\n"
-    .. "    if not _M.is_loopback(peer) then\n        return peer\n    end\n", "")
-local nt_mod = load_src(no_trust, "proxy_drop_trust")
-set_pass("s3cret")
-ok(call_guard_p(nt_mod, "203.0.113.7", nil, "/config", "127.0.0.1", nil) == nil,
-    "mutation: without the loopback-only trust condition a spoofed header exempts (suite catches it)")
-ok(call_guard_p(nt_mod, "127.0.0.1", nil, "/config", "203.0.113.1", nil) == 401,
-    "mutation: proxied public client still challenged (this group pins the trust condition, not the restore)")
-clear_proxy_headers()
-set_pass(nil)
 
 --------------------------------------------------------------------------
 -- 8. klib 控制面过滤器（洞 2）：管理型拦、数据面/公开面放行

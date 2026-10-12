@@ -33,9 +33,8 @@ function _M.password()
 end
 
 ---是否 loopback 来源。整段 127/8 都算（本机任何回环地址等价），IPv6 只认 ::1。
----直连场景下 remote_addr 就是真实对端。经反代时看 real_client_addr()：它对
----X-Real-IP / X-Forwarded-For 的采信条件已经收敛在「直连对端是 loopback」之内，
----所以本函数拿到的地址在两种部署形状下都是该被豁免判定的那个。
+---直连场景下 remote_addr 就是真实对端；本网关没有 real_ip 递归还原，所以经代理时
+---拿到的是代理地址 —— 那属于「非 loopback」，会要凭据，方向是安全侧。
 ---@param addr string|nil
 ---@return boolean
 function _M.is_loopback(addr)
@@ -48,57 +47,68 @@ function _M.is_loopback(addr)
     return addr:sub(1, 4) == "127."
 end
 
----真实客户端地址（用户裁定 2026-10-12 追加：proxy forwarded origin 检测）。
+---代理来源头的名字（小写比对）。出现任一条即认定请求经过代理。
+_M.PROXY_ORIGIN_HEADERS = { "x-real-ip", "x-forwarded-for", "forwarded" }
+
+---请求里是否出现代理来源头（用户裁定 2026-10-12：proxy forwarded origin 检测）。
 ---
 ---要修的洞：反代与网关同机时（8802 经 APISIX：8802-248.ai-t.wtvdev.com ->
 ---127.0.0.1:8802），remote_addr 恒 127.0.0.1，loopback 豁免被反代无条件触发，
----Basic Auth 形同虚设。修法是把豁免判定挪到「代理头声明的原始客户端」上：
----  1. X-Real-IP（APISIX/OpenResty 反代会用真实对端覆写此头）
----  2. 否则 X-Forwarded-For 的第一段（逗号分隔可能有多跳，最左是原始客户端）
----  3. 都没有才退回 remote_addr —— 直连（无代理头）行为逐字节不变
+---Basic Auth 形同虚设。
 ---
----代理头只在「直连对端是 loopback」时才采信（ngx_http_realip_module 的
----set_from 同款信任条件）。这不是保守，是这套部署形状成立的前提：8802 以
----host 网络监听 0.0.0.0，局域网可直连——若谁都能靠自带头拿豁免，那攻击者
----curl -H 'X-Real-IP: 127.0.0.1' 就绕过了整个鉴权。采信条件写死后，伪造头
----只可能来自直连（对端 IP 已暴露为非 loopback -> 忽略头 -> 要凭据）或本机
----进程（本来就有豁免，伪造与否等价）。
+---**判定只看「头出现没有」，完全不看值**，这是刻意的：X-Real-IP / X-Forwarded-For /
+---Forwarded 的语义是「上一跳替我转发的，值由那一跳说了算」，而在本仓的部署形状里
+---这一跳是客户端可以自填、且没有任何东西替我们覆写校验的。一旦去解析值，就得回答
+---「信哪一段、按哪条优先级、值畸形时怎么办」，每一个答案都是新的绕过面（空值、
+---'127.0.0.1, 10.0.0.1' 这种多段、客户端预填的最左段、重复头取第一个还是最后一个）。
+---所以本函数把这三条头当成一个布尔量：**出现 = 来源不可直证 = 必须认证**。
+---伪造的 '127.0.0.1'、空值、畸形值、提取失败，一概要凭据（请求上下文内取不到头
+---也按最坏情况处理，与 is_loopback(nil) 的 fail-closed 方向一致）。
 ---
----仍然存在的残余风险，如实记录：经反代进来的客户端可以在 XFF 最左段预填
----127.0.0.1，而反代对 XFF 是追加不是覆写；XFF 优先序低于 X-Real-IP 正是为此
----——反代覆写的 X-Real-IP 才可信。当前 APISIX 会设 X-Real-IP，所以只要经它
----转发这条就不成立；若哪天反代不再覆写 X-Real-IP 而只剩 XFF，豁免面会跟着
----退化，届时应去掉豁免或改由 authz 边缘鉴权。跨不可信网络部署同理。
----@return string|nil @真实客户端地址；取不到时返回 remote_addr（nil 由调用方 fail closed）
-function _M.real_client_addr()
-    local peer = ngx.var.remote_addr
-    -- 非 loopback 直连：代理头一概不信，remote_addr 就是判定地址。
-    if not _M.is_loopback(peer) then
-        return peer
+---代价如实记录：经反代访问管理台的本机操作员不再匿名（要输凭据），直连 127.0.0.1
+---的本机 curl 不受影响。这条变化是修复的目的本身，不是副作用。
+---@param headers table|nil @请求头表；缺省取当前请求。键按大小写不敏感比对
+---@return boolean
+function _M.has_proxy_origin_header(headers)
+    local t = headers
+    if t == nil then
+        if ngx == nil or type(ngx.req) ~= "table"
+            or type(ngx.req.get_headers) ~= "function" then
+            -- 纯 Lua 环境（无请求上下文）：调用方直传 addr 的语义不受影响。
+            return false
+        end
+        -- raw=true 拿原始键名，下面统一小写比对（不用默认表，免得依赖其大小写归一）。
+        t = ngx.req.get_headers(0, true)
     end
-    local xri = ngx.var.http_x_real_ip
-    if type(xri) == "string" and xri ~= "" then
-        return xri
+    if type(t) ~= "table" then
+        return true
     end
-    local xff = ngx.var.http_x_forwarded_for
-    if type(xff) == "string" and xff ~= "" then
-        local first = xff:match("^%s*([^,]+)")
-        if first then
-            return (first:gsub("%s+$", ""))
+    for name in pairs(t) do
+        if type(name) == "string" then
+            local lower = name:lower()
+            for i = 1, #_M.PROXY_ORIGIN_HEADERS do
+                if lower == _M.PROXY_ORIGIN_HEADERS[i] then
+                    return true
+                end
+            end
         end
     end
-    return peer
+    return false
 end
 
 ---这个请求是否需要 Basic Auth。判定顺序即两条豁免的原文顺序。
----@param addr string|nil @来源地址；nil 时取 real_client_addr()（含反代还原）
+---@param addr string|nil @来源地址；nil 时取当前请求的 remote_addr
 ---@return boolean
 function _M.required(addr)
     if _M.password() == nil then
         return false
     end
+    -- 代理来源头先于地址豁免：头一出现，remote_addr 就不再是「可直证的来源」。
+    if _M.has_proxy_origin_header() then
+        return true
+    end
     if addr == nil then
-        addr = _M.real_client_addr()
+        addr = ngx.var.remote_addr
     end
     return not _M.is_loopback(addr)
 end
@@ -172,7 +182,7 @@ end
 ---鉴权闸门本体：接在受保护 location 的 access 阶段（handler 之前，401 不会走到任何
 ---业务逻辑，也就不会泄露 handler 的行为）。
 function _M.guard()
-    if not _M.required() then
+    if not _M.required(ngx.var.remote_addr) then
         return
     end
     local pass = _M.password()
