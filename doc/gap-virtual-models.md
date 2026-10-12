@@ -210,9 +210,12 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
   改之前真实模型那一支只有 `{id, object, owned_by}`，整个漏了 `created`，属于不合规。`created` 取上游答里的读数，
   取不到用常量 `MODEL_CREATED_UNKNOWN = 0`（`router.lua:3579`），入口行恒 0；**不塞 `ngx.time()`**——同一条目每次请求
   产出不同字节，等于打掉客户端缓存与前后对比。
-- **单模型行**保持 `owned_by = "llm-router->"..<model>`（契约钉死的 legacy 形状，逐字节不变）。
-- **多模型行**改标 `owned_by = "llm-router"` + `owned_by_models`（整组），供 UI 展示。真实模型行恒 `"local"`：
-  引擎自报的 `owned_by` 是各家上游的说法，而有客户端在按 `"local"` 判「这是我方实例」。
+> **2026-10-11 用户裁定推翻下面两条对 `owned_by` 的定义（现行口径见本节末）：**单模型行
+> `llm-router-><model>`、多模型行 `llm-router` + `owned_by_models` 均已退役，原文保留只为留痕。
+
+- ~~**单模型行**保持 `owned_by = "llm-router->"..<model>`（契约钉死的 legacy 形状，逐字节不变）。~~
+- ~~**多模型行**改标 `owned_by = "llm-router"` + `owned_by_models`（整组），供 UI 展示。真实模型行恒 `"local"`：
+  引擎自报的 `owned_by` 是各家上游的说法，而有客户端在按 `"local"` 判「这是我方实例」。~~
 - **扩展字段收在 `capabilities` 命名空间**，旁挂 `supports_reasoning_effort` / `reasoning_effort` /
   `reasoning_efforts` 三个 opencodex 位置上的键（都不是官方字段，官方 SDK 只读那四个 required）。填充纪律是
   **操作员 config 声明 > 引擎自报 > 整个键省略**；省略是删键——不写 `null`、不写空数组（`[]` 是一份「一个都不支持」
@@ -236,6 +239,15 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
   （实测样例两份就不一致：阶梯 low/medium/high/max，判定面只有 low/high/max）。
 - 「与真实 worker 同名则丢弃别名」这条规则守的是**入口自己的 id**，不会因为某个被映射的模型名
   与入口重名而误伤。
+
+**现行口径（2026-10-11 用户裁定，推翻本节上面两条划线项）**：`owned_by` 全表恒为网关自身
+`"lua-router"`——真实模型行、单目标入口行、多目标入口行同一常量，不带目标名，也不再有
+`owned_by_models`（整个字段退役：入口对外只以 `id`（入口名）表达，覆盖哪几个实际模型是网关侧
+路由知识，由 `/workers` 与声明层负责）。理由：`llm-router-><model>` 与 `owned_by_models` 会把
+池子里的模型名直接泄给任何能读 `/v1/models` 的客户端。引擎自报的 `owned_by`（含 `local`）
+依旧采进 `registry.model_caps` 留档，只是永不上外。判别位迁移：入口行与真实行的区分只剩
+`created`（入口恒 0）与能力读数来源，客户端**不许**再拿 `owned_by` 当判别位。
+入口行的能力聚合口径不受影响：被遮蔽引擎的读数仍经组内聚合成 `capabilities`，删掉的只是归属信息。
 
 ### 5.1 能力数据的两个来源，以及 registry 侧为什么不读上游的 `context_window`
 
@@ -274,7 +286,9 @@ UI 与文档契约；`config_store._M.ctx_cap`（`config_store.lua:1937`）与 `
 
 ### 5.2 别和 `GET /_ui/v1/models` 搞混
 
-`ui.models()`（`ui.lua:198`）是管理台模型选择器用的**另一份**列表：每条恒 `created: 0`、`owned_by: "llm-router"`，
+`ui.models()`（`ui.lua:198`）是管理台模型选择器用的**另一份**列表：每条恒 `created: 0`、
+`owned_by: "lua-router"`（2026-10-12 起与 `/v1/models` 同口径；旧值 `"llm-router"` 与入口行的
+`llm-router-><model>` / `owned_by_models` 一并退役，picker 不再携带任何上游模型名），
 另带 `status.value`，只用来枚举候选名，**不承载本节任何能力读数**。
 
 ## 6. upstreams 声明层

@@ -33,6 +33,7 @@
       （q38fn 是另一个真实模型，8024 在跑）。这一步验证「引擎背书的同名能建成」。
    c. 验广告：`GET /v1/models` 里 Q38-Flash-Next 恰好一行，owned_by 是入口口径（单成员 llm-router->q38fn），
       created 恒 0；真实 Q38-Flash-Next 不再单独出现。
+      （> 2026-10-11 起 owned_by 口径已由新裁定取代：全表恒 `lua-router`，不带目标名、无 `owned_by_models`——本文里"单成员 llm-router->…"的说法作废，见 doc/gap-virtual-models.md §5。遮蔽形状（恰好一行、created 恒 0）不受影响。）
    d. 验路由：POST /v1/chat/completions model=Q38-Flash-Next → 200，且 `GET /_ui/logs` 里
       **forwarded_model 是 q38fn**（证明落到 targets 指定的那个），worker 是 8024。
    e. 验「可以在虚拟服务中配置」：给同名入口 Q38-Flash-Next 配一张模型卡（如 ctx=65535、effort_map），

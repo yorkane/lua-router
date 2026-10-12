@@ -27,6 +27,7 @@
 - 广告面：`/v1/models` 只广告**入口** X 一行（id=X，owned_by 按入口规则：单成员 llm-router-><m>、
   多成员 llm-router + owned_by_models），**不再单独广告真实 X**。`/workers` 仍能看见那台 worker
   （它是运行态事实，与「客户端不可达」是两件事）。
+  （> 2026-10-11 起 owned_by 口径已由新裁定取代：全表恒 `lua-router`，不带目标名、无 `owned_by_models`，见 doc/gap-virtual-models.md §5。本节其余描述不受影响。）
 - 配置面：允许建这样的入口。需要一条「X 确实是引擎真实模型」的判据来区分「配置声明」与
   「引擎陈述」——**不得把操作员的声明当引擎背书**。判据取 registry 侧：`records.all_models()`
   （records.lua:780）∩ `models_are_verified`（records.lua:937，从没探过 = 不算）。探不着的名字

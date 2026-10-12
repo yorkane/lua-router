@@ -345,7 +345,7 @@ def scenario_entry_api_key():
     check("[S5] keyed entry row carries the four derived fields",
           vrow.get("supports_reasoning") is True
           and vrow.get("supports_reasoning_effort") is True
-          and vrow.get("supported_reasoning_efforts") == ["low", "xhigh"]
+          and (vrow.get("capabilities") or {}).get("reasoning_effort") == ["low", "xhigh"]
           and vrow.get("default_reasoning_effort") == "low",
           json.dumps(vrow)[:400])
     check("[S5] 手填 modalities 含 image -> capabilities.supports_vision",
@@ -356,7 +356,7 @@ def scenario_entry_api_key():
         if e.get("id") == "vm-open":
             orow = e
     check("[S5] an entry with no effort config gets none of the derived keys",
-          bool(orow) and not [k for k in ("supported_reasoning_efforts",
+          bool(orow) and not [k for k in ("reasoning_efforts",
                                           "default_reasoning_effort") if k in orow],
           json.dumps(orow)[:300])
     check("[S5] /v1/models leaks no plaintext", ENTRY_KEY not in mbody, mbody[:300])

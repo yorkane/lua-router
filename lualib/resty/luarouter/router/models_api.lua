@@ -55,8 +55,10 @@ local text_response = inference.text_response
 -- id 的取值集合与排序不变：registry 的 worker 判定、watcher 的覆盖探针和客户端的
 -- 模型选择全按 id 建，动了会连带影响选路。别名遮蔽规则的**方向**已于 2026-10-07 由
 -- 用户裁定反转（方案 A）：入口名与真实模型名同名时**入口赢**——列表里 X 恰好一行，
--- id 仍是 X，owned_by 走入口口径，真实那一行不再单独出现。Rust
+-- id 仍是 X，真实那一行不再单独出现。Rust
 -- inject_virtual_models 的「真实 worker 保留名字」是旧口径，见该函数的注释。
+-- 自 2026-10-11 起 owned_by 全表恒为 lua-router（不暴露上游模型信息），入口行与真实行
+-- 的区分只剩 created 与能力读数的来源；别把 owned_by 当判别位用。
 -- 被遮蔽的那台实例仍在 /workers 里、仍是入口 targets 的落点，只是客户端不能再按这个
 -- 名字点名访问它；转发体的 model 也仍是真实引擎名（lr_bound_model，不在本文件）。
 
@@ -1067,16 +1069,16 @@ local function fill_model_fields(entry, row)
     if next(out) ~= nil then entry.capabilities = out end
 end
 
---- 真实模型那一行。owned_by 的口径保持不动（本仓所有 worker 都是操作员自己起的
---- 实例 = "local"）：引擎自报的 owned_by 是各家上游的说法，而有客户端在按 "local"
---- 判「这是我方实例」。
+-- 真实模型那一行。owned_by 恒为网关自身（用户裁定 2026-10-11：对外一律 lua-router，
+-- 不暴露任何上游模型信息）。引擎自报的 owned_by 是各家上游的说法，一概不上外；
+-- 「这是我方实例」这一位由 id 与 /workers 表达，不再靠 owned_by 的取值集合。
 local function advertise_real_model(store_mod, cfg, caps_by_model, model)
     local caps = type(caps_by_model) == "table" and caps_by_model[model] or nil
     local entry = {
         id = model,
         object = "model",
         created = positive_int(caps and caps.created) or MODEL_CREATED_UNKNOWN,
-        owned_by = "local",
+        owned_by = "lua-router",
     }
     fill_model_fields(entry, resolve_model_caps(store_mod, cfg, model, caps))
     return entry
@@ -1115,20 +1117,11 @@ local function advertise_virtual_entry(store_mod, cfg, caps_by_model, alias, tai
         object = "model",
         created = MODEL_CREATED_UNKNOWN,
     }
-    if #tail == 1 then
-        -- One model behind the entry: exactly the pre-group answer, byte for byte, so
-        -- clients (and the contract) that read owned_by as "which engine this alias
-        -- stands for" keep working for legacy rows.
-        entry.owned_by = "llm-router->" .. tail[1]
-    else
-        -- A real group: the gateway owns the entry and the models behind it belong to
-        -- whichever engines serve them. Naming one of them would advertise the entry as
-        -- that single model's alias again, which is the semantics that just got
-        -- retired; the full list rides a separate field so the pinned OpenAI-shaped
-        -- owned_by keeps its old meaning.
-        entry.owned_by = "llm-router"
-        entry.owned_by_models = tail
-    end
+    -- 单目标与多目标同一口径：owned_by 恒为网关自身，不带目标名，也不另挂整组名单
+    -- （用户裁定 2026-10-11：不暴露模型信息）。入口对外只靠 id（入口名）表达；
+    -- 它覆盖哪几个实际模型是网关侧的路由知识，由 /workers 与声明层负责。
+    -- 被遮蔽引擎的读数仍经组内聚合成能力对外（见下方 fill），这里只删归属信息。
+    entry.owned_by = "lua-router"
     -- 组内**声明层**的 supports_reasoning_effort 共识，与普通位用的 common_boolean 差一支：
     -- 任何一台明确说 false 就是 false（操作员关掉了这一位，必须关得住，不能被别的成员的
     -- 沉默拖成「没人说话」）；要给出 true 则每台都得亲口说 true（与 common_boolean 同样
@@ -1391,10 +1384,11 @@ end
 ---name and the real row behind it is dropped, so that an id which routes
 ---through the entry's target group is never also advertised as a plain
 ---local model.
----Synthetic entries still carry created 0 and owned_by "llm-router-><target>",
----and the whole list is re-sorted by id.
+--Synthetic entries still carry created 0; owned_by is the gateway constant for every
+--row (2026-10-11 ruling: never expose upstream model identity), and the whole list is
+--re-sorted by id.
 ---
----Why the entry wins: the old direction advertised X as owned_by "local" while
+--Why the entry wins: the old direction advertised X as a plain engine row while
 ---route_inference resolved X to the entry's group, so the worker that actually
 ---served X was screened out by the group gate and every model=X request died with
 ---503 "healthy engines serve none of the mapped models" — an advertisement the
@@ -1436,8 +1430,8 @@ local function inject_virtual_models(data, sources)
         end
     end
     -- 真实那一半：与入口同名的行摘掉（=「真实 X 不再单独可达」的对外那一面）。
-    -- 判据精确到 id 相等 —— 组内成员名不参与（advertise_virtual_entry 的
-    -- owned_by_models 仍如实挂着整组），否则「Y 也被某入口映射」会把 Y 那行误删。
+    -- 判据精确到 id 相等 —— 组内成员名不参与（入口行只以 id 表达自己，不再携带整组
+    -- 名单），否则「Y 也被某入口映射」会把 Y 那行误删。
     local kept = 0
     for i = 1, #data do
         if not shadowed[data[i].id] then

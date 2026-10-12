@@ -29,6 +29,9 @@ package.loaded["resty.luarouter.router"] = _M
 
 local hb = require "resty.luarouter.hb"
 local observability = require "resty.luarouter.observability"
+-- klib 控制面的 Basic Auth 闸门（本文件 handle() 在 OPTIONS 短路后调用
+-- guard_klib；判定与豁免全在 admin_auth.lua，doc/gap-admin-auth.md）。
+local admin_auth = require "resty.luarouter.admin_auth"
 local policy_mod = require "resty.luarouter.policy"
 local registry = require "resty.luarouter.registry"
 -- Wired gap module: cluster mesh (doc/gap-mesh.md). It is load-safe without ngx
@@ -249,6 +252,12 @@ _M.handle = function()
         finish_request(started, method, path)
         return
     end
+    -- klib 控制面 Basic Auth（用户裁定 2026-10-12，doc/gap-admin-auth.md §6）。
+    -- 单点挂在这里而不是逐 handler：/workers /model-map /flush_cache 与数据面
+    -- /v1/*、公开面共用本 dispatcher，guard_klib 是 fail-open 路径过滤器
+    -- （admin_auth.lua 注释写明两类后果不对称，宁可漏拦不误拦），数据面天然
+    -- 不受影响。必须在 OPTIONS 短路之后 —— 浏览器预检从不带凭据。
+    admin_auth.guard_klib()
     instance:handle({})
     finish_request(started, method, path)
 end

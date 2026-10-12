@@ -25,6 +25,7 @@ test_models_shape / test_models_advertise 的 cases 表，入口名全都不撞�
 3. 派生表 sync_virtual_view / resolve_model 主逻辑未改：同名场景下 resolve_model 自返回 X，自洽不报错。
 4. 广告面（models_api.lua）：同名时只广告入口一行，id=X，owned_by 走入口口径（单成员 llm-router-><m>，
    多成员 llm-router + owned_by_models），真实 X 不再单独出现；created 恒 0。
+   （> 2026-10-11 起 owned_by 口径已由新裁定取代：全表恒 `lua-router`，不带目标名、无 `owned_by_models`，见 doc/gap-virtual-models.md §5。遮蔽形状（恰好一行、id=X、created 恒 0）不受影响。）
 
 ## 必写的用例（缺一条都不算完成）
 

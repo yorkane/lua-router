@@ -77,8 +77,9 @@
 #                  漏 created）；S2 采集链路把引擎自报的 capabilities/reasoning_efforts
 #                  如实带出来，同一场景用两个不同的 context_length 跑两遍证明这个数不是
 #                  网关造的；S3 缺数据=删键，不出现 null / [] / {}；S4 操作员 config 卡片
-#                  压过引擎广告（引擎那个数整份响应里不许出现）；S5 虚拟入口的 owned_by
-#                  老口径与组内聚合能力；S6 组内**有一台没给长度读数**时入口行必须删键
+#                  压过引擎广告（引擎那个数整份响应里不许出现）；S5 全表 owned_by 恒
+#                  lua-router（2026-10-11 裁定，不带目标名/整组名单）与组内聚合能力；
+#                  S6 组内**有一台没给长度读数**时入口行必须删键
 #                  （都有读数时照报最窄的对照断言与之成对，防修过头）。跑盘上 lualib，
 #                  判别性通道 LR_LEGACY_LUALIB=<旧树>)
 #   mesh_two       integration/test_mesh_two.py (two real routers: converge,
@@ -605,7 +606,7 @@ gate_unit() {
     # HTTP 面上都看不到症状 —— 镜像行的 建/改/清/删、「默认值=没说」这条能扛住
     # snapshot 往返的认得判据、孤儿镜像不被 reconcile 建成 config 行、删 worker 连带
     # 清除。e2e_caps S9 钉的是端到端那一半（真 docker restart 后上限真的挡流量）。
-    for t in test_tree test_tree_bounds test_state_bounds test_observability test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_persist test_caps_routing test_models_shape test_models_advertise test_effort_layers; do
+    for t in test_tree test_tree_bounds test_state_bounds test_observability test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_persist test_caps_routing test_models_shape test_models_advertise test_effort_layers test_admin_auth; do
         printf '\n-- luajit %s\n' "$t"
         run_unit_luajit "$t" || rc=1
     done

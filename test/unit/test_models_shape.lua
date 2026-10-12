@@ -12,7 +12,7 @@
 -- 手法），这样"上游原文 -> 对外读数"整条链没有一处是手写替身。
 --
 -- 判别性纪律：LR_MODELS_TEST_LEGACY_SRC 指向改动前的 router.lua 时，同一组断言跑在旧
---   实现上，除"入口 owned_by 老口径"与"503 分支"这两组回归守卫以外全部必须红。
+--   实现上，除"503 分支"与 G9 字节稳定这两组回归守卫以外全部必须红。
 --   一条断言在 legacy 下也绿，说明它没测到东西。
 --
 -- 运行：
@@ -353,22 +353,24 @@ check("G2 半个读数：没说的一律删键（无 null / 无 [] / 无 {}）",
       and rawget(e_h, "reasoning_efforts") == nil,
       encode(block(e_h, "capabilities") or {}))
 
-print("=== G3 虚拟入口的 owned_by 老口径（有客户端在读，钉死） ===")
--- legacy 绿：这两条钉的是改动前已有的行为，属回归守卫（刻意如此）。
+print("=== G3 owned_by 统一口径（用户裁定 2026-10-11：全表恒 lua-router，不暴露模型信息） ===")
+-- legacy 红：旧实现真实行是 local、入口行是 llm-router-><名> / llm-router +
+-- owned_by_models，以下每一条在旧实现下都红。
 models_list = { "test-model" }
 caps_table = {}
 store_tbl = bare_store()
 store_tbl.virtual_models_list = function() return { { "alias-a", "test-model" } } end
 local rep_s = M.models_handler()
 local e_s = find(rep_s, "alias-a")
-check("G3 单目标 owned_by == llm-router-><目标模型名>",
-      e_s and e_s.owned_by == "llm-router->test-model",
+check("G3 单目标 owned_by == lua-router（不带目标名）",
+      e_s and e_s.owned_by == "lua-router",
       e_s and tostring(e_s.owned_by) or "<entry gone>")
-check("G3 单目标不带 owned_by_models", e_s and rawget(e_s, "owned_by_models") == nil)
+check("G3 单目标不带 owned_by_models（整组名单已退役）",
+      e_s and rawget(e_s, "owned_by_models") == nil)
 check("G3 单目标 created == 0", e_s and e_s.created == 0,
       e_s and tostring(e_s.created))
-check("G3 真实模型 owned_by 仍是 local",
-      find(rep_s, "test-model").owned_by == "local")
+check("G3 真实模型 owned_by == lua-router（引擎自报值一律不上外）",
+      find(rep_s, "test-model").owned_by == "lua-router")
 
 models_list = { "Q38-Flash-Next", "kimi-code/k3" }
 store_tbl.virtual_models_list = function()
@@ -376,12 +378,11 @@ store_tbl.virtual_models_list = function()
 end
 local rep_g = M.models_handler()
 local e_g = find(rep_g, "grp")
-check("G3 多目标 owned_by == llm-router", e_g and e_g.owned_by == "llm-router",
+check("G3 多目标 owned_by == lua-router", e_g and e_g.owned_by == "lua-router",
       e_g and tostring(e_g.owned_by) or "<entry gone>")
-check("G3 多目标 owned_by_models 是目标列表",
-      e_g and type(e_g.owned_by_models) == "table"
-      and join(e_g.owned_by_models) == "Q38-Flash-Next,kimi-code/k3",
-      e_g and join(e_g.owned_by_models))
+check("G3 多目标不带 owned_by_models（整组名单已退役，入口只以 id 表达）",
+      e_g and rawget(e_g, "owned_by_models") == nil,
+      e_g and tostring(e_g.owned_by))
 check("G3 多目标 created == 0（组的 created 不继承成员）",
       e_g and e_g.created == 0, e_g and tostring(e_g.created))
 -- id 的取值集合与排序也在这条链上：registry 的 worker 判定与客户端选模型全按 id 建。
@@ -429,8 +430,8 @@ check("G4 判定面 = 引擎亲口说的 3 档，不掺阶梯里的 medium",
       join(cap_r.reasoning_effort) == "low,high,max", join(cap_r.reasoning_effort))
 check("G4 created 用上游读数而不是 0", e_r.created == 1700000000,
       tostring(e_r.created))
-check("G4 真实模型的 owned_by 仍是 local（引擎自报不上外）",
-      e_r.owned_by == "local", tostring(e_r.owned_by))
+check("G4 真实模型的 owned_by == lua-router（引擎自报不上外，网关也不点名上游）",
+      e_r.owned_by == "lua-router", tostring(e_r.owned_by))
 -- 判别性的另一半：改一个上游读数，对外读数必须跟着变（否则上面几条全是恒真）。
 local mutated = copy_table(UPSTREAM_K3)
 mutated.capabilities = copy_table(UPSTREAM_K3.capabilities)
@@ -818,19 +819,19 @@ check("G10 T9 全表条数 = 未被遮蔽的真实模型 + 入口（不多不少
       #rep_shadow.data == 2, ids_of(rep_shadow))
 check("G10 T9 id 集合按升序且无重复", ids_of(rep_shadow) == "plain-b,shadow-solo",
       ids_of(rep_shadow))
-check("G10 T9 那一行是入口行：单成员 owned_by == llm-router-><绑定名>",
-      e_shadow ~= nil and e_shadow.owned_by == "llm-router->shadow-solo",
+check("G10 T9 那一行是入口行：owned_by == lua-router（遮蔽不改变统一口径，归属信息不外泄）",
+      e_shadow ~= nil and e_shadow.owned_by == "lua-router",
       e_shadow and tostring(e_shadow.owned_by) or "<entry gone>")
-check("G10 T9 入口行不带 owned_by_models（单成员的老口径不因遮蔽改变）",
+check("G10 T9 入口行不带 owned_by_models（遮蔽与不遮蔽都不带整组名单）",
       e_shadow ~= nil and rawget(e_shadow, "owned_by_models") == nil)
 check("G10 T9 入口行 created 恒 0（不继承被遮蔽引擎的读数）",
       e_shadow ~= nil and e_shadow.created == 0,
       e_shadow and tostring(e_shadow.created) or "<entry gone>")
 check("G10 T9 遮蔽后 required 四字段仍然齐",
       #missing_required(e_shadow) == 0, join(missing_required(e_shadow)))
-check("G10 T9 未同名的真实行不受影响（那一行还在、owned_by 仍 local）",
+check("G10 T9 未同名的真实行不受影响（那一行还在、owned_by 恒网关名）",
       count_id(rep_shadow, "plain-b") == 1
-      and find(rep_shadow, "plain-b").owned_by == "local", ids_of(rep_shadow))
+      and find(rep_shadow, "plain-b").owned_by == "lua-router", ids_of(rep_shadow))
 -- 判别性的另一半：入口行说的是被遮蔽那台引擎的读数。若实现把入口行做成「谁都不继承」的
 -- 空行（顺手改遮蔽方向时最容易犯），下面这条立刻红。
 check("G10 T9 入口行的数值读数来自被遮蔽的那台引擎",
@@ -858,7 +859,7 @@ check("G10 T10 判别性：撤掉入口声明后同一格回到引擎自报的 2
       read(find(rep_cw_off, "shadow-solo"), "capabilities", "context_length") == 262144,
       tostring(read(find(rep_cw_off, "shadow-solo"), "capabilities", "context_length")))
 
--- (c) 多成员同名入口：owned_by 走「入口拥有整组」那一支，被遮蔽的名字仍在组里如实挂着。
+-- (c) 多成员同名入口：owned_by 恒网关名，被遮蔽的名字不再随对外字段挂出（2026-10-11 裁定）。
 models_list = { "grp-x", "member-b" }
 advertise_listing(listing_of({ id = "grp-x", object = "model",
     capabilities = { context_length = 262144 } }))
@@ -869,18 +870,17 @@ end
 local rep_grp = M.models_handler()
 local e_grp = find(rep_grp, "grp-x")
 check("G10 T9 多成员同名入口也只出一行", count_id(rep_grp, "grp-x") == 1, ids_of(rep_grp))
-check("G10 T9 多成员入口 owned_by == llm-router（入口口径，不是 local）",
-      e_grp ~= nil and e_grp.owned_by == "llm-router",
+check("G10 T9 多成员入口 owned_by == lua-router（统一口径，不是引擎自报值）",
+      e_grp ~= nil and e_grp.owned_by == "lua-router",
       e_grp and tostring(e_grp.owned_by) or "<entry gone>")
-check("G10 T9 owned_by_models 如实挂着整组（含被遮蔽的那个名字）",
-      e_grp ~= nil and type(e_grp.owned_by_models) == "table"
-      and join(e_grp.owned_by_models) == "grp-x,member-b",
-      e_grp and join(e_grp.owned_by_models or {}))
+check("G10 T9 多成员入口不带 owned_by_models（被遮蔽的名字不随对外字段挂出）",
+      e_grp ~= nil and rawget(e_grp, "owned_by_models") == nil,
+      e_grp and tostring(e_grp.owned_by))
 check("G10 T9 多成员同名入口 created 恒 0",
       e_grp ~= nil and e_grp.created == 0, e_grp and tostring(e_grp.created))
-check("G10 T9 未同名的成员行照旧单独广告（遮蔽只吃 id 相等的那一行）",
+check("G10 T9 未同名的成员行照旧单独广告（遮蔽只吃 id 相等的那一行，owned_by 恒网关名）",
       count_id(rep_grp, "member-b") == 1
-      and find(rep_grp, "member-b").owned_by == "local", ids_of(rep_grp))
+      and find(rep_grp, "member-b").owned_by == "lua-router", ids_of(rep_grp))
 
 -- (d) 判据精确到入口名：组内成员名与某真实模型同名时**不许**误伤那一行。
 -- 判别性：若有人把摘除判据从「入口名」放宽成「名册里出现过的任何名字」，
@@ -892,9 +892,9 @@ store_tbl.virtual_models_list = function() return { { "ent", "m-a", "m-b" } } en
 local rep_member = M.models_handler()
 check("G10 组员名与真实模型同名不误伤：三行都在（ent,m-a,m-b）",
       ids_of(rep_member) == "ent,m-a,m-b", ids_of(rep_member))
-check("G10 组员那两行的 owned_by 仍是 local",
-      find(rep_member, "m-a").owned_by == "local"
-      and find(rep_member, "m-b").owned_by == "local")
+check("G10 组员那两行的 owned_by 恒网关名",
+      find(rep_member, "m-a").owned_by == "lua-router"
+      and find(rep_member, "m-b").owned_by == "lua-router")
 
 -- (e) 同名 + 重复别名：真实行只摘一次，入口行按名册顺序保留第一条。
 models_list = { "dup-name" }
@@ -904,9 +904,10 @@ store_tbl.virtual_models_list = function()
     return { { "dup-name", "one" }, { "dup-name", "two" } }
 end
 local rep_dup = M.models_handler()
-check("G10 同名重复别名不重复 id，且保留名册里第一条",
+-- 保留第一条的可观测面：owned_by 统一后只剩 created/能力读数（tail 派生值），这里钉 id 唯一。
+check("G10 同名重复别名不重复 id，且保留名册里第一条（id 唯一）",
       count_id(rep_dup, "dup-name") == 1
-      and find(rep_dup, "dup-name").owned_by == "llm-router->one",
+      and find(rep_dup, "dup-name").owned_by == "lua-router",
       ids_of(rep_dup) .. " / " .. tostring(find(rep_dup, "dup-name").owned_by))
 caps_table = nil
 store_tbl = bare_store()

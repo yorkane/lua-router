@@ -78,14 +78,15 @@ local cjson = require "cjson.safe"
 
 -- ------------------------------------------------------------------ 桩
 -- advertise_virtual_entry 属于**另一条**纪律（入口行的形状），由 test_models_shape.lua
--- 与 e2e_models_advertisement 钉。这里桩成"required 四字段 + 由 alias/tail 派生的 owned_by"
--- 这一最小形状，让 only_data 的判定不被行内容干扰；正因为字段是从入参派生的，"每入口一
--- 行""去重保留第一条""tail 原样透传""单/多目标的 owned_by 口径"在这份桩上仍然可观测。
+-- 与 e2e_models_advertisement 钉。这里桩成"required 四字段 + 由 alias/tail 派生的
+-- _tail"这一最小形状，让 only_data 的判定不被行内容干扰；自 2026-10-11 裁定起
+-- owned_by 是全表常量（不暴露模型信息），桩同步为常量，"每入口一行""去重保留第一条"
+-- "tail 原样透传"在这份桩上仍然可观测（尾组信息改由 _tail 钉，不再借 owned_by 表达）。
 local entry_calls = 0
 local function stub_advertise(store_mod, cfg, caps_by_model, alias, tail)
     entry_calls = entry_calls + 1
     return { id = alias, object = "model", created = 0,
-             owned_by = (#tail == 1) and ("llm-router->" .. tail[1]) or "llm-router",
+             owned_by = "lua-router",
              _tail = tail, _store = store_mod, _cfg = cfg, _caps = caps_by_model }
 end
 
@@ -303,11 +304,11 @@ check("G5 组内目标按 tail 透传（多目标入口不许退化成单目标�
       data ~= nil and data[1]._tail ~= nil and #data[1]._tail == 2
       and data[1]._tail[1] == "alpha" and data[1]._tail[2] == "beta",
       data and data[1]._tail and table.concat(data[1]._tail, ",") or "nil")
-check("G5 单目标入口的 owned_by 老口径不受开关影响",
-      data ~= nil and data[2].owned_by == "llm-router->beta",
+check("G5 单目标入口 owned_by == lua-router（不受开关影响，不带目标名）",
+      data ~= nil and data[2].owned_by == "lua-router",
       data and tostring(data[2].owned_by) or "nil")
-check("G5 多目标入口 owned_by == llm-router",
-      data ~= nil and data[1].owned_by == "llm-router",
+check("G5 多目标入口 owned_by == lua-router",
+      data ~= nil and data[1].owned_by == "lua-router",
       data and tostring(data[1].owned_by) or "nil")
 reset_state()
 local dup = { { "vm-dup", "one" }, { "vm-dup", "two" }, { "vm-keep", "three" } }
@@ -348,8 +349,8 @@ local d4 = MA.only_data(store_with_rows(clash), {}, {})
 check("G5 T9 入口名与真实模型同名时开关分支照样出入口行（不读真实名册、无对手）",
       d4 ~= nil and #d4 == 2 and d4[1].id == "real-a" and d4[2].id == "vm-quiet",
       d4 and (tostring(#d4) .. ":" .. tostring(d4[1].id) .. "," .. tostring(d4[2].id)) or "nil")
-check("G5 T9 同名入口的 owned_by 走入口口径（多成员 llm-router + created 恒 0）",
-      d4 ~= nil and d4[1].owned_by == "llm-router" and d4[1].created == 0
+check("G5 T9 同名入口的 owned_by 走统一口径（恒 lua-router + created 恒 0）",
+      d4 ~= nil and d4[1].owned_by == "lua-router" and d4[1].created == 0
       and d4[1]._tail[1] == "real-a" and d4[1]._tail[2] == "extra",
       d4 and tostring(d4[1].owned_by) or "nil")
 reset_state()

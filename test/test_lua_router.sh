@@ -2862,8 +2862,10 @@ if section virtual_models; then
         '[.data[] | select(.id == "alias-a")][0].object' "model"
     assert_json "virtual-models alias shape: created" \
         '[.data[] | select(.id == "alias-a")][0].created' "0"
-    assert_json "virtual-models alias shape: owned_by" \
-        '[.data[] | select(.id == "alias-a")][0].owned_by' "llm-router->test-model"
+    assert_json "virtual-models alias shape: owned_by (2026-10-11: constant, no target leak)" \
+        '[.data[] | select(.id == "alias-a")][0].owned_by' "lua-router"
+    assert_json "owned_by is lua-router on every row (real and entry alike)" \
+        '[.data[] | select(.owned_by != "lua-router")] | length' "0"
     assert_json "virtual-models data is sorted by id" \
         '.data | map(.id) == (map(.id) | sort) | tostring' "true"
     # An alias routes to its target, so advertising it must match behaviour.

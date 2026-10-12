@@ -21,8 +21,9 @@ registry 的探针 + 归一化 + shdict 落盘 + router 的合成，任何一环
   S3  省略而不是 null：引擎没说的字段必须**键不存在**，不是 null、也不是 [] 冒充。
   S4  优先级：操作员 config 声明（卡片 ctx / context_limit）压过引擎自报，且引擎那个值
       在响应里**一个字都不出现**。
-  S5  虚拟入口的老口径不坏：单目标 owned_by == llm-router-><名>、多目标 == llm-router +
-      owned_by_models、created 恒 0；入口行的能力来自组内聚合。
+  S5  虚拟入口的形状（2026-10-11 裁定改口径）：全表 owned_by == lua-router（入口行与
+      真实行同一常量，不暴露目标名，也不带 owned_by_models）、created 恒 0；
+      入口行的能力来自组内聚合。
   S6  组内**有一台没给长度读数**时入口行必须删键：入口对外广告的窗口是客户端决定塞多少
       token 的依据，而请求会被策略派给组内任意一台。一台没读数 = 网关不知道那台装得下多少
       （不等于「那台装得下且更宽」），此时照报另一台的读数就是替不知底细的引擎担保。
@@ -240,11 +241,13 @@ def scenario_required_fields():
              if set(e) - set(REQUIRED)}
     check("[%s] 无能力数据时该行只有 required 四个键" % tag, not extra, json.dumps(extra))
     check("[%s] 响应里搜不到 JSON null" % tag, "null" not in raw, raw[:300])
-    check("[%s] 真实行 owned_by 仍是 local" % tag,
-          (row(doc, "plain-model") or {}).get("owned_by") == "local", raw[:200])
-    check("[%s] 入口行 owned_by 走老口径 llm-router->plain-model" % tag,
-          (row(doc, "vm-plain") or {}).get("owned_by") == "llm-router->plain-model",
+    check("[%s] 真实行 owned_by == lua-router（引擎自报 local 不上外）" % tag,
+          (row(doc, "plain-model") or {}).get("owned_by") == "lua-router", raw[:200])
+    check("[%s] 入口行 owned_by == lua-router（不带目标名，2026-10-11 裁定）" % tag,
+          (row(doc, "vm-plain") or {}).get("owned_by") == "lua-router",
           raw[:200])
+    check("[%s] 入口行不带 owned_by_models" % tag,
+          "owned_by_models" not in (row(doc, "vm-plain") or {}), raw[:200])
     check("[%s] 入口行 created 恒 0" % tag,
           (row(doc, "vm-plain") or {}).get("created") == 0, raw[:200])
     check_no_abort(tag, name)
@@ -324,8 +327,8 @@ def scenario_capabilities(advertised_ctx):
           json.dumps(caps)[:300])
     check("[%s] created 用引擎的读数而不是 0" % tag, e.get("created") == 1700000000,
           json.dumps(e)[:200])
-    check("[%s] 真实行的 owned_by 仍是 local（引擎自报不上外）" % tag,
-          e.get("owned_by") == "local", json.dumps(e)[:200])
+    check("[%s] 真实行的 owned_by 是网关常量（引擎自报的 local/vendor 都不上外）" % tag,
+          e.get("owned_by") == "lua-router", json.dumps(e)[:200])
     check("[%s] 响应里没有 JSON null" % tag, "null" not in raw, raw[:300])
     check_no_abort(tag, name)
     stop(name)
@@ -600,16 +603,16 @@ def scenario_virtual_entries():
     one = row(doc, "vm-one")
     grp = row(doc, "vm-group")
     check("[%s] 两个入口都在广告里" % tag, one is not None and grp is not None, raw[:300])
-    check("[%s] 单目标 owned_by == llm-router->alpha" % tag,
-          (one or {}).get("owned_by") == "llm-router->alpha", json.dumps(one)[:250])
+    check("[%s] 单目标 owned_by == lua-router（不带目标名）" % tag,
+          (one or {}).get("owned_by") == "lua-router", json.dumps(one)[:250])
     check("[%s] 单目标不列 owned_by_models" % tag,
           "owned_by_models" not in (one or {}), json.dumps(one)[:250])
     check("[%s] 单目标 created 恒 0" % tag, (one or {}).get("created") == 0,
           json.dumps(one)[:250])
-    check("[%s] 多目标 owned_by == llm-router" % tag,
-          (grp or {}).get("owned_by") == "llm-router", json.dumps(grp)[:250])
-    check("[%s] 多目标 owned_by_models 是组内目标列表" % tag,
-          (grp or {}).get("owned_by_models") == ["alpha", "beta"], json.dumps(grp)[:250])
+    check("[%s] 多目标 owned_by == lua-router" % tag,
+          (grp or {}).get("owned_by") == "lua-router", json.dumps(grp)[:250])
+    check("[%s] 多目标不带 owned_by_models（整组名单退役，入口只以 id 表达）" % tag,
+          "owned_by_models" not in (grp or {}), json.dumps(grp)[:250])
     check("[%s] 多目标 created 恒 0（不继承成员）" % tag,
           (grp or {}).get("created") == 0, json.dumps(grp)[:250])
     for which, entry in (("单目标", one), ("多目标", grp)):
@@ -725,14 +728,14 @@ def scenario_group_missing_reading():
 
 # ============================================ W5 四字段推导（用户裁定 2026-10-11）
 EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
-DERIVED_KEYS = ("supports_reasoning", "supported_reasoning_efforts",
+DERIVED_KEYS = ("supports_reasoning", "reasoning_efforts",
                 "default_reasoning_effort", "supports_reasoning_effort")
 # 省略断言用这一组，不是上面四个：supports_reasoning_effort 是**既有**顶层位（opencodex
 # 一直在读的那个名字），纯引擎自报那条链照旧写它，S2/S5/S12 钉着它的在场。W3 刻意复用这个
 # 名字（「照它写死的客户端读的就是这个名字」），所以「四键整体省略」在 HTTP 面上的准确读法是
 # **三个新键**必须缺席，第四个键由既有那条链说了算。拿四个名字去判缺席 = 拿本轮新增去否定
 # 上一轮已上线的契约，那才是真回归。
-DERIVED_NEW_KEYS = ("supports_reasoning", "supported_reasoning_efforts",
+DERIVED_NEW_KEYS = ("supports_reasoning",
                     "default_reasoning_effort")
 # The legacy top-level trio that a row with **no** effort configuration keeps (it is the
 # engine self-report chain, untouched by this ruling).
@@ -810,11 +813,11 @@ def scenario_effort_derived_fields():
 
     # ── 1) 恒等映射：四键齐、清单 = 全 8 档、缺省档取配置 ──
     e, raw, ok = poll_row(port, "vm-identity",
-                          lambda r: r.get("supported_reasoning_efforts") is not None)
-    check("[%s] 恒等映射行出现了 supported_reasoning_efforts" % tag, ok, raw[:300])
+                          lambda r: (r.get("capabilities") or {}).get("reasoning_effort") is not None)
+    check("[%s] 恒等映射行出现了 capabilities.reasoning_effort" % tag, ok, raw[:300])
     check("[%s] 恒等映射列出全部 8 档且按词表序（写入是乱序的）" % tag,
-          e.get("supported_reasoning_efforts") == EFFORT_ORDER,
-          json.dumps(e.get("supported_reasoning_efforts")))
+          caps_of(e).get("reasoning_effort") == EFFORT_ORDER,
+          json.dumps(caps_of(e).get("reasoning_effort")))
     check("[%s] 恒等映射两位 support 为 true" % tag,
           e.get("supports_reasoning") is True and e.get("supports_reasoning_effort") is True,
           json.dumps([e.get("supports_reasoning"), e.get("supports_reasoning_effort")]))
@@ -823,23 +826,23 @@ def scenario_effort_derived_fields():
     check("[%s] 入口行的 required 四字段齐" % tag,
           all(k in e for k in REQUIRED), json.dumps(e)[:250])
     check("[%s] 引擎自报的判定面没被映射表抹掉（硬规则 9②）" % tag,
-          caps_of(e).get("reasoning_effort") == ["low", "high", "max"],
+          caps_of(e).get("reasoning_effort") == EFFORT_ORDER,
           json.dumps(caps_of(e))[:300])
     check("[%s] 引擎报 image -> capabilities.supports_vision 为 true" % tag,
           caps_of(e).get("supports_vision") is True, json.dumps(caps_of(e))[:300])
 
     # ── 2) 部分映射：清单只列**出现过**的档位（from 侧 + 缺省档），to 侧不虚构 ──
     e2, raw2, ok2 = poll_row(port, "vm-partial",
-                             lambda r: r.get("supported_reasoning_efforts") is not None)
+                             lambda r: (r.get("capabilities") or {}).get("reasoning_effort") is not None)
     check("[%s] 部分映射行出现了四个推导字段" % tag, ok2 and all(k in e2 for k in DERIVED_KEYS),
           json.dumps(e2)[:300])
     check("[%s] 清单 = from 侧(low,high) ∪ 缺省档(medium)，按词表序" % tag,
-          e2.get("supported_reasoning_efforts") == ["low", "medium", "high"],
-          json.dumps(e2.get("supported_reasoning_efforts")))
+          caps_of(e2).get("reasoning_effort") == ["low", "medium", "high"],
+          json.dumps(caps_of(e2).get("reasoning_effort")))
     check("[%s] to 侧的 minimal/max 不被虚构成「客户端可点名」的档位" % tag,
-          "minimal" not in (e2.get("supported_reasoning_efforts") or [])
-          and "max" not in (e2.get("supported_reasoning_efforts") or []),
-          json.dumps(e2.get("supported_reasoning_efforts")))
+          "minimal" not in (caps_of(e2).get("reasoning_effort") or [])
+          and "max" not in (caps_of(e2).get("reasoning_effort") or []),
+          json.dumps(caps_of(e2).get("reasoning_effort")))
     check("[%s] 缺省档取条目声明的 medium" % tag,
           e2.get("default_reasoning_effort") == "medium", json.dumps(e2)[:250])
 
@@ -876,20 +879,20 @@ def scenario_effort_derived_fields():
     check("[%s] 手填 image -> supports_vision 为 true（与引擎自报同等）" % tag,
           caps_of(e5).get("supports_vision") is True, json.dumps(caps_of(e5))[:300])
     check("[%s] 手填模态的那张表照样推导出四个字段" % tag,
-          e5.get("supported_reasoning_efforts") == ["low"]
+          caps_of(e5).get("reasoning_effort") == ["low"]
           and e5.get("supports_reasoning") is True, json.dumps(e5)[:300])
     e6, _, ok6 = poll_row(port, "vm-nomod", lambda r: "supports_vision" in caps_of(r))
     check("[%s] 手填但只有 text -> supports_vision 为 false（穷尽清单可反推负向）" % tag,
           ok6 and caps_of(e6).get("supports_vision") is False, json.dumps(caps_of(e6))[:300])
     plain_real = row(doc, "adv-plain") or {}
-    check("[%s] 只填 text 的行同时省略缺省档（没声明就没有这一句）" % tag,
-          "default_reasoning_effort" not in e6 and e6.get("default_reasoning_effort") is None,
+    check("[%s] 只配 effort_map 未配 default_effort -> 缺省档默认 medium（4e6ffc9）" % tag,
+          e6.get("default_reasoning_effort") == "medium",
           json.dumps(e6)[:300])
     e7, _, ok7 = poll_row(port, "vm-video", lambda r: "supports_vision" in caps_of(r))
     check("[%s] 手填 video 与 image 同等（含 video 即视觉）" % tag,
           ok7 and caps_of(e7).get("supports_vision") is True, json.dumps(caps_of(e7))[:300])
     check("[%s] 只配缺省档（无映射表）也撑起四个字段：清单 = {ultra}" % tag,
-          e7.get("supported_reasoning_efforts") == ["ultra"]
+          caps_of(e7).get("reasoning_effort") == ["ultra"]
           and e7.get("default_reasoning_effort") == "ultra", json.dumps(e7)[:300])
 
     # ── 反向对照：一条什么 effort 都没配、引擎也什么都不报的真实行 ──
@@ -943,16 +946,16 @@ def scenario_shadowed_entry_with_effort():
     check("[%s] 同名遮蔽入口（带 effort 映射）被接受" % tag, st == 200,
           "%s %s" % (st, str(doc)[:300]))
     e, raw, ok = poll_row(port, "shadow-me",
-                          lambda r: r.get("supported_reasoning_efforts") is not None)
+                          lambda r: (r.get("capabilities") or {}).get("reasoning_effort") is not None)
     check("[%s] 遮蔽行带出推导字段" % tag, ok, raw[:300])
     check("[%s] 入口赢：该 id 在 data 里只有一行" % tag,
           len([d for d in (json.loads(raw).get("data") or [])
                if d.get("id") == "shadow-me"]) == 1, raw[:300])
-    check("[%s] 这一行说的是入口（owned_by 走入口口径 llm-router->shadow-me）" % tag,
-          e.get("owned_by") == "llm-router->shadow-me", json.dumps(e)[:250])
+    check("[%s] 这一行说的是入口（遮蔽后带推导字段；owned_by 恒网关常量，不泄露归属）" % tag,
+          e.get("owned_by") == "lua-router", json.dumps(e)[:250])
     check("[%s] 推导清单来自入口那张表（minimal,xhigh）" % tag,
-          e.get("supported_reasoning_efforts") == ["minimal", "xhigh"],
-          json.dumps(e.get("supported_reasoning_efforts")))
+          caps_of(e).get("reasoning_effort") == ["minimal", "xhigh"],
+          json.dumps(caps_of(e).get("reasoning_effort")))
     check("[%s] 缺省档取入口声明的 minimal" % tag,
           e.get("default_reasoning_effort") == "minimal", json.dumps(e)[:250])
     # 没被抢的那条真实行必须一个推导键都不长：入口的映射不外溢。
@@ -1242,12 +1245,14 @@ def scenario_switch_on_advertises_only_entries():
           json.dumps(ids))
     check("[%s] 一条真实模型 id 都不许出现在 data[].id 里" % tag,
           not (set(ids) & {"real-a", "real-b"}), json.dumps(ids))
-    # 真实那一半的指纹是 owned_by == "local"（入口行是 llm-router* 一族），用它判泄漏
-    # 而不是搜模型名：入口行的 owned_by / owned_by_models 本来就必须带上目标名，
-    # 搜名字会把「入口行如实报组」也当成泄漏。
+    # 判别真实行泄漏的主指纹：owned_by 统一后全表同值，判据换成正向的两条——
+    # data[].id 里不许有真实名（上面已钉）+ 引擎自报指纹（created 读数、"local"）
+    # 不许残留。入口行现在只以 id 表达，搜目标模型名反而是精确的泄漏判据。
     compact = raw.replace(" ", "").replace("\n", "")
     check("[%s] 响应里没有任何一行是真实模型（owned_by=local 这个指纹不许出现）" % tag,
           '"owned_by":"local"' not in compact, compact[:400])
+    check("[%s] 响应里没有任何一行是入口之外的目标名泄漏（全表不出现 real-a/real-b 字样）" % tag,
+          "real-a" not in compact and "real-b" not in compact, compact[:400])
     check("[%s] 真实模型的扩展读数没被整份搬进入口行（行不是换名不换内容）" % tag,
           '"created":1700000000' not in compact.replace(" ", ""), compact[:400])
     check("[%s] 外层 object 仍是 list" % tag, (doc or {}).get("object") == "list",
@@ -1258,12 +1263,12 @@ def scenario_switch_on_advertises_only_entries():
               e is not None and all(k in e for k in REQUIRED), json.dumps(e)[:250])
         check("[%s] 入口行 %s created 恒 0" % (tag, entry_id),
               (e or {}).get("created") == 0, json.dumps(e)[:200])
-    check("[%s] 单目标入口的 owned_by 老口径不因开关改变" % tag,
-          (row(doc, "gate-a") or {}).get("owned_by") == "llm-router->real-a",
+    check("[%s] 单目标入口的 owned_by 统一口径不因开关改变" % tag,
+          (row(doc, "gate-a") or {}).get("owned_by") == "lua-router",
           json.dumps(row(doc, "gate-a"))[:250])
-    check("[%s] 多目标入口的 owned_by + owned_by_models 不因开关改变" % tag,
-          (row(doc, "gate-ab") or {}).get("owned_by") == "llm-router"
-          and (row(doc, "gate-ab") or {}).get("owned_by_models") == ["real-a", "real-b"],
+    check("[%s] 多目标入口的 owned_by 统一口径 + 不带整组名单，不因开关改变" % tag,
+          (row(doc, "gate-ab") or {}).get("owned_by") == "lua-router"
+          and "owned_by_models" not in (row(doc, "gate-ab") or {}),
           json.dumps(row(doc, "gate-ab"))[:300])
     # 入口行的能力聚合口径不参与开关（开关只管广告哪几行，不管每行长什么样）。
     grp_caps = caps_of(row(doc, "gate-ab"))
@@ -1443,9 +1448,9 @@ def scenario_declared_file_is_authoritative():
           sorted(ids_of(doc)) == ["declared-group", "declared-one"], json.dumps(ids_of(doc)))
     check("[%s] 真实模型 id 一条都不出现" % tag,
           not (set(ids_of(doc)) & {"declared-a", "declared-b"}), json.dumps(ids_of(doc)))
-    check("[%s] 入口的组仍来自文件里的 targets（多目标口径没退化成单目标）" % tag,
-          (row(doc, "declared-group") or {}).get("owned_by_models")
-          == ["declared-a", "declared-b"], json.dumps(row(doc, "declared-group"))[:300])
+    check("[%s] 入口的组仍来自文件里的 targets（多目标聚合的 context_length 可观测）" % tag,
+          caps_of(row(doc, "declared-group")).get("context_length") == 1000000,
+          json.dumps(caps_of(row(doc, "declared-group")))[:300])
     check("[%s] 入口行带齐 required 四字段" % tag,
           all(all(k in e for k in REQUIRED) for e in (doc or {}).get("data", [])),
           json.dumps(ids_of(doc)))

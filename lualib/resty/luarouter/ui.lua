@@ -197,8 +197,8 @@ end
 --- aliases; the picker keys off status.value, everything registered is loaded.
 ---
 --- 名字撞车时**入口赢**（2026-10-07 用户裁定方案 A），与 router/models_api.lua 的
---- inject_virtual_models 同一个方向：入口 X 存在时那个名字那一行是入口行
---- （owned_by 走入口口径），被遮蔽的真实名不再单独出现。两份列表是给客户端选模型
+--- inject_virtual_models 同一个方向：入口 X 存在时那个名字那一行是入口行，
+--- 被遮蔽的真实名不再单独出现。两份列表是给客户端选模型
 --- 用的，"能不能点名访问"必须和 /v1/models 说同一句话 —— 运行态事实（那台实例仍在
 --- 池里、仍是入口 targets 的落点）由 /workers 与 worker 表负责，不在这里表达。
 --- 判据精确到「名字等于某个入口名」：组内成员名不参与，未遮蔽的真实名照常出现。
@@ -228,7 +228,7 @@ function _M.models()
                         id = id,
                         object = "model",
                         created = 0,
-                        owned_by = "llm-router",
+                        owned_by = "lua-router",
                         status = { value = "loaded" },
                     }
                 end
@@ -236,34 +236,21 @@ function _M.models()
         end
     end
     if store_ok then
-        -- virtual_models_list() 现在是「变长行」：{ alias, 实际模型... }。1 对多之后
-        -- 只读 [2] 会把整组入口重新标成「某一个模型的别名」——那正是本轮退役掉的旧语义。
-        -- 单模型行保持 "llm-router-><model>" 逐字节不变（picker 与契约钉的是 legacy 形状）；
-        -- 多模型行改标网关自己拥有，并把整组放进 owned_by_models 供 UI 展示。
+        -- 入口行的 owned_by 恒为 "lua-router"（2026-10-11 用户裁定，与 /v1/models 同口径）：
+        -- 旧的 "llm-router-><model>" 与 owned_by_models 会把池子里的模型名泄给任何
+        -- 能读这份列表的客户端，整支退役。行尾的实际模型名册不再进 picker 列表；
+        -- 运行态落点由 /workers 与 worker 表负责，不在这里表达。
         for _, row in ipairs(rows) do
             local alias = row[1]
-            local tail = {}
-            for j = 2, #row do
-                local m = row[j]
-                if type(m) == "string" and m ~= "" then tail[#tail + 1] = m end
-            end
             if not seen[alias] then
                 seen[alias] = true
-                local entry = {
+                data[#data + 1] = {
                     id = alias,
                     object = "model",
                     created = 0,
+                    owned_by = "lua-router",
                     status = { value = "loaded" },
                 }
-                if #tail == 1 then
-                    entry.owned_by = "llm-router->" .. tail[1]
-                elseif #tail > 1 then
-                    entry.owned_by = "llm-router"
-                    entry.owned_by_models = tail
-                else
-                    entry.owned_by = "llm-router"
-                end
-                data[#data + 1] = entry
             end
         end
     end

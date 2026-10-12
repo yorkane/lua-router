@@ -120,9 +120,13 @@
    `ngx.time()`**——那会让同一条目每次请求产出不同字节，打掉客户端缓存与前后对比。② 扩展字段（`capabilities`
    命名空间与旁挂的 `supports_reasoning_effort` / `reasoning_effort` / `reasoning_efforts`，都不是官方字段）的来源
    优先级固定为**操作员 config 声明 > 引擎自报（`registry.model_caps`）> 整个键省略**，**宁可不报也不猜**；省略是删键，
-   不写 `null`、不写空数组冒充「支持零个」。③ **`data[].id` 的取值集合与 `owned_by` 语义是老契约**——真实模型恒
-   `"local"`，单目标入口 `"llm-router-><model>"`、多目标入口 `"llm-router"` + 整组 `owned_by_models`；registry 的
-   worker 判定、watcher 的覆盖探针与客户端的模型选择全按 id 与 owned_by 建，改动前必须先想清楚。
+   不写 `null`、不写空数组冒充「支持零个」。③ **`data[].id` 的取值集合与 `owned_by` 语义是老契约**——`owned_by`
+   **全表恒为 `"lua-router"`**（用户裁定 2026-10-11，对齐 opencodex 标准形状：不向任何能读 `/v1/models` 的客户端
+   暴露上游模型名）。旧口径已删除：单目标入口 `"llm-router-><model>"`、多目标入口 `"llm-router"` + 整组
+   `owned_by_models`、引擎自报的 `"local"` 都不再上外（引擎归属仍采进 `registry.model_caps` 留档）。入口行与真实行
+   的区分只剩 `created`（入口恒 0）与能力读数来源，客户端不许再拿 `owned_by` 当判别位。`data[].id` 取值集合与
+   `created` 契约不变；registry 的 worker 判定、watcher 的覆盖探针全按 id 建。管理台 picker
+   （`/_ui/v1/models`）与 `/v1/models` 同口径（2026-10-12 起）。
    另注：registry 采集能力时刻意**不读上游条目的顶层 `context_window`**（那是本网关配置层的字段名，混进引擎读数
    就是重犯 2026-10-04 那次把声明总窗口当单次输出预算的事故）。
 10. **门禁里的统计断言不许用「拟合优度没拒绝」当「等价成立」的证据。** χ² 检验的 `E[χ²] = df = k-1`，

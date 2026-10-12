@@ -104,6 +104,14 @@ env LR_METRICS_SCAN_LIMIT;
 env SMG_LOAD_UTIL_ENABLED;
 env SMG_LOAD_UTIL_KEYS;
 env SMG_LOAD_UTIL_QUERY;
+# 管理台 Basic Auth（用户裁定 2026-10-12，doc/gap-admin-auth.md）：
+#   SMG_ADMIN_AUTH_PASS  管理口令。未配置或空串 = 整道门关闭（缺省零行为变化）；
+#                        来源是 loopback（127/8 或 ::1）时也免凭据。
+#                        口令走明文 base64，只在 HTTPS 或可信内网下才安全。
+# 用户名恒为 lua-router，不设开关。漏声明 = nginx 从 worker 剥掉 = 静默不生效
+# （AGENTS.md 硬规则 11-3），三份 conf 必须同步。
+env SMG_ADMIN_AUTH_PASS;
+
 
 
 worker_processes ${WORKER_PROCESSES};
@@ -208,6 +216,12 @@ ${TLS_SERVER_EXTRA}
         # 未知路径）才 fallback 到 named @lmr_klib 走 klib.router。exact location 优先级
         # 高于本块，故 /props /config /logs 等根 exact 端点不受影响。
         location / {
+            # 管理台入口文档的 Basic Auth（用户裁定 2026-10-12，doc/gap-admin-auth.md）。
+            # 只对 / 与 *.html 发挑战：access 阶段跑在 try_files 之前，整块一拦会把
+            # 未命中的代理路径（/v1/* /health /metrics 这些由 api-key 或匿名面回答的
+            # 请求）一起锁死；js/css 无秘密，浏览器收到 401 挑战后会带凭据重试入口。
+            # 口令未配置或来源 loopback 时 guard_static 直接放行（缺省零行为变化）。
+            access_by_lua_block { require("resty.luarouter.admin_auth").guard_static() }
             set_by_lua_block $lmr_admin_root {
                 local ok, store = pcall(require, "resty.luarouter.config_store")
                 local dir = ok and store and store.env("LMR_UI_DIR") or os.getenv("LMR_UI_DIR")
