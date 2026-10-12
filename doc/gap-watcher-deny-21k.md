@@ -36,7 +36,7 @@ worker 进程里的常驻成本，与业务流量无关（同机 up 46h 的 8801
 
 ## 建议写进 compose 的值
 
-缺省表是**并集**语义（`discover.lua:743-749`：操作员写的 deny 与缺省表取并集；只有显式
+缺省表是**并集**语义（`watcher/discover.lua` 的 `collect` deny 装配处（2026-10-05 拆分后不钉行号）：操作员写的 deny 与缺省表取并集；只有显式
 给了 `SMG_WATCHER_ALLOW_PORT` 时缺省表才不参与），所以只需要补本机特有的那些：
 
     SMG_WATCHER_ENABLED: "1"

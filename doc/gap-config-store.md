@@ -149,6 +149,6 @@ env 整层再没有机会生效——连「删掉文件回到 env 缺省」这�
 | `store_file.lua` | 文件后端：原子写、sidecar、摘要、`edited_externally`、`mirror` |
 | `store_sqlite.lua` | SQLite：建表、参数化写、guarded UPDATE |
 | `store_postgres.lua` | PostgreSQL（pgmoon），连接失败即不可用 |
-| `config_store.lua` 的 `store()` | 惰性解析 + init 阶段排除 |
-| `config_store.lua` 的 `read_snapshot` / `write_snapshot` | 三层读、durable-first 写、镜像同步 |
-| `config_store.lua` 的 `migrate_once` | 每进程一次的首次导入 |
+| `config_store/persistence.lua` 的 `store()` | 惰性解析后端 + `ngx.get_phase()=="init"` 排除（facade 上的 `_M.store` 是它的 re-export） |
+| `config_store/persistence.lua` 的 `read_snapshot` / `write_snapshot` | 三层读、durable-first 写、镜像同步 |
+| `config_store/persistence.lua` 的 `migrate_once` | 每进程一次的首次导入 |

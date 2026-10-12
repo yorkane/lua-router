@@ -6,6 +6,10 @@
 本阶段只新增文件，`router.lua` / `conf/*` 未改，因此部署形态不变：
 `/ha/*` 仍然由 router.lua 的 `mesh_disabled_handler` 返回固定 503。接线见 §4。
 
+> **现状与上句相反（2026-10-12 核对）**：上面那两句是本文写作那一阶段的形状，接线已在 §4 落地——
+`router.lua` 注册 `mesh.ROUTES`，开关打开即由 mesh 分发，`mesh_disabled_handler` 只在 mesh 关闭那一支
+应答。按上句去读实现会读反；引现状以 `router.lua` 的路由表为准。
+
 参考实现对照：
 `gateway/src/routers/mesh/handlers.rs`、`gateway/src/server.rs:1393-1404`、
 `smg-mesh-1.0.0/src/{stores,crdt,sync,partition,rate_limit_window,service}.rs`。

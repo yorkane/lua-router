@@ -10,7 +10,7 @@
 #
 # Usage:
 #   bash test/final_gates.sh                    # quick tier (default, ~3 min)
-#   GATE_TIER=full bash test/final_gates.sh     # all 21 gates (release/count/
+#   GATE_TIER=full bash test/final_gates.sh     # all 22 gates (release/count/
 #                                               # pre-production changes)
 #   SKIP_ENV=mesh_http GATE_TIER=full bash ...  # skip named gates (recorded)
 #   GATE_ONLY=unit bash test/final_gates.sh     # single gate (any tier)
@@ -92,7 +92,7 @@
 # Tiers (GATE_TIER=quick|full, default quick):
 #   quick = build conf unit contract probes — the fast-verifiable core
 #           (~3 min). Enough for ordinary edits.
-#   full  = all 21 gates (~12-17 min serial). Required for release builds,
+#   full  = all 22 gates (~12-17 min serial). Required for release builds,
 #           README/handover count updates and production image replacement;
 #           a quick-tier green log never counts as a full-green anchor.
 #

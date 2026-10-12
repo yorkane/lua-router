@@ -1,6 +1,14 @@
 # 虚拟入口遮蔽同名实际模型（2026-10-07 用户裁定 · 方案 A）
 
-> 三份勘察：/data/tmp/lr-map-shadow-01-parse.md、-02-advertise.md、-03-tests.md。先读这三份再动手。
+> 三份勘察：/data/tmp/lr-map-shadow-01-parse.md、-02-advertise.md、-03-tests.md（写作当时本机
+> /data/tmp 的易失产物，不保证仍在）。
+>
+> **本文身份（2026-10-12）**：2026-10-07 的**用户裁定原文**，方案 A 已落地（写入层守卫 +
+> 引擎背书判据、判别用例 T1–T11，落地 commit 见 doc/docs-cleanup-2026-10-12.md §1 表）。
+> 下面「今天的行为」一节记的是
+> **方案 A 要消掉的旧形状**，不是现状，别按它编码；该节与后文的「文件:行号」锚全指 2026-10-05
+> facade 拆分前的单体文件，已全部失效（口径见 docs-cleanup §2）。现行判据看
+> doc/gap-virtual-models.md §2 与 §9 第 2 条。
 
 ## 裁定原文
 

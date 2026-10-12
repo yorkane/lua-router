@@ -6,7 +6,7 @@
 
 ## 变更内容
 
-- compose：镜像行替换 + **新增 `SMG_ADMIN_AUTH_PASS`**（值不落文档；本轮测试口令沿用 8802 的 test123，操作员可后续在 compose 里换成正式口令并 `docker compose up -d`）。
+- compose：镜像行替换 + **新增 `SMG_ADMIN_AUTH_PASS`**（值不落文档；本轮为临时测试口令，操作员后续在 compose 里换成正式口令并 `docker compose up -d`）。
 - 其余 env 逐字未动：`SMG_MAX_TREE_SIZE: 1e8`、watcher DENY_PORT、prom 载荷通道、LR_HTTP_INCLUDE 全部保留。
 - 部署位置：21.k host 网络，`/data1/app/lua-router-8800/docker-compose.yml`，容器 `lua-router-8800`。
 

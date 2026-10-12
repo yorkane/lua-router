@@ -131,4 +131,6 @@ worker 轮换后旧键永久留在 `lr_workers`。
 
 - 生产快照与中间产物：21.k `/data/tmp/lr21x/`（`out/phase1_*.jsonl` 是 T/C 对照原始数据）
 - 重启前后对照脚本：`/data/tmp/lr21x/{before,restart,post,verify}.sh`
-- 之前的网关天花板与后端容量报告：`doc/backend-ceiling-cpu.md`
+- 之前的网关天花板与后端容量报告 `backend-ceiling-cpu.md`：**该报告从未入库**（写作于当时勘察会话的
+  本机 `/data/tmp/`，易失产物），仓库内不可查；其「后端容量是天花板主因」的结论已由本文的 CPU 定责与
+  doc/gap-worker-caps.md 的容量三态间接吸收，引用时按仓库内文档引

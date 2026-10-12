@@ -11,6 +11,11 @@
 > 单测 5 文件、Lua 15 837 行（-44%）。用户裁定的最终差异：mesh 保留（本文原判 DELETE，用户改 KEEP）；
 > discovery 契约段 5 项保留（测的是 /model_info 元数据发现，属 KEEP 面）。
 >
+> **身份与现状（2026-10-12）**：KEEP / DELETE 判定仍有效（恢复已删平面只能 git revert，见 AGENTS.md
+> 硬规则 6）；文中的路径与「网关层端点全开放」是裁剪当日快照：`/_ui/admin/` 已于 2026-10-08 迁根到
+> 站点根 `/`（`/_ui/*` 整片 404），零鉴权自 2026-10-12 起有一道独立的管理面 Basic Auth（口径见
+> doc/gap-admin-auth.md 与 AGENTS.md 硬规则 5）。
+>
 > 同日追加：watcher 合并（`f87b04f`，`watcher.lua` 2024 行 + `e2e_watcher` 门 65/0 + 单测 253/0）与管理控制台 `/_ui/admin/`（`c79264c`，Quasar UMD 静态三页：服务池/模型覆盖/日志监控）已落地；独立 llm-watcher 容器退役。
 > 
 >> 本文是裁剪判定书：逐模块给 KEEP / DELETE / TRIM 与理由，量化收益，列出测试面影响与
@@ -114,4 +119,3 @@ gRPC policy hint；conf/ 删 grpc-server.conf.template、grpc-readiness.conf、g
 6. mesh（模块 + mesh 段 + mesh_http/mesh_two 两门 + /ha 路由）
 7. otel（待确认后）
 8. 每步跑对应门禁子集；全部完成后全量门禁 + 刷新 README/architect.md 计数 + 重建生产镜像。
-

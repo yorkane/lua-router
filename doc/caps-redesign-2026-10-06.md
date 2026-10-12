@@ -1,8 +1,18 @@
 # 容量语义重设计 + 日志页改造（2026-10-06 执行契约）
 
 > 用户裁定来源：本轮对话三条需求（并发上下限三态 / 功率改利用率 / 日志页合并与列序）。
-> 事实基础：/data/tmp/lr-map-caps-2026.md、lr-map-gpuload-2026.md、lr-map-ui2-2026.md。
-> 本设计**覆盖** doc/gap-worker-caps.md（2026-10-01）与 AGENTS.md §4 的旧容量口径，其余硬规则照旧。
+> 事实基础：/data/tmp/lr-map-caps-2026.md、lr-map-gpuload-2026.md、lr-map-ui2-2026.md
+> （三份都是写作当时本机 `/data/tmp/` 的易失勘察产物，**非仓库交付物**，不保证仍在；现行口径以本文件与
+> doc/gap-worker-caps.md 为准，测试面直接读 test/integration/e2e_caps.py 的头注）。
+> 本设计**覆盖** doc/gap-worker-caps.md（2026-10-01）与当时 AGENTS.md §4 的旧容量口径，其余硬规则照旧。
+>
+> **本文是 2026-10-06 的执行契约，功率相关结论已被后续裁定推翻**：§1 说「功率采集链 `pw:` 与
+> `lr_gpu_load_power_*` 指标**保留**（纯观测，仍有读者）」已作废——功率一族（采集链、键、指标、
+> `max_power_w`）于 2026-10-09 整体移除（用户裁定：21.k 实测八实例瓦特读数恒同值、零区分度），
+> `rg 'lr_gpu_load_power|pw:' lualib/` 现在零命中；声明层残留的 `max_power_w` 也不再「warn 一次并丢弃」，
+> 而是与任何未知字段一样静默忽略。**现行容量口径只看 doc/gap-worker-caps.md**（三字段
+> `min_concurrency` / `max_concurrency` / `max_gpu_util`），本文其余部分（并发三态、利用率上限、
+> 日志页列序）仍是可追溯的落地依据。
 
 ## 0. 三条不可违反的红线（延续）
 
@@ -24,7 +34,8 @@
   **保留**（纯观测，仍有读者），只是不再参与容量判定。理由：删采集要动六族指标 + e2e 断言，
   收益不抵风险；用户要换的是「上限这个判定指标」。
 - 旧配置里写了 max_power_w 的：解析时 warn 一次并丢弃该键，**不迁移**（新字段无等价值，猜一个
-  功率→利用率换算等于替操作员做决定）。/_ui/config GET 如实不返回它。
+  功率→利用率换算等于替操作员做决定）。/config GET 如实不返回它（本文写于 2026-10-06，当时的端点名是
+  /_ui/config；2026-10-08 迁根后 /_ui/* 整片 404）。
 
 ## 2. 三态与判定（registry 侧，UI 只显示不算）
 
@@ -79,7 +90,8 @@
 
 - smg_worker_capacity_excluded_total{reason}：concurrency→concurrency_max，power→gpu_util；
   新增 smg_worker_capacity_preferred_idle_total（绿灯优先让位次数）。
-- e2e_caps 改造点（/data/tmp/lr-map-caps-2026.md §6.4 有完整 11 条）：S2 并发改三态、
+- e2e_caps 改造点（完整 11 条当时列在易失勘察文件 /data/tmp/lr-map-caps-2026.md §6.4，现行断言面以
+  test/integration/e2e_caps.py 为准）：S2 并发改三态、
   S3 功率改 util、S5 全场到顶 503→429 且文案精确匹配、S3b 逐卡守卫改 util 口径。
 - test_caps_routing G4/G5/G8 补三态与绿灯优先；**注意它用桩替换 capacity_exclusion**
   (:108)，要新增一组不打桩的真实现断言。

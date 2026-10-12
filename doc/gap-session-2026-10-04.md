@@ -26,6 +26,13 @@
 配了 `context_limit`（模型卡片，= 服务真实能力）时，配置期校验 `context_window < context_limit`，
 违反**拒绝保存**。组内多个 `context_limit` 取**最小值**判定（一组由入口不控制的引擎提供）。
 
+> **上一条已于 2026-10-08 整体废止（用户裁定，见 AGENTS.md 裁定块第 4 条）**：模型卡片那一格改名
+> `max_output_tokens`，语义是**单次输出预算的对外声明**，与入口的 `context_window`（**上下文总窗口**）
+> 是两个不可比的量，拿一个判另一个就是重犯本节第 1 条那次「把三个量当一个数」的事故。
+> `config_store.validate_declared_context_windows` 连同 UI 侧同款预校验（橙色徽章、输入框报错、保存按钮禁用）
+> 已一并移除（commit 7e8bfff）：`context_window` 现在只做正整数校验 + 解析 / 落盘 / 往返 / 展示。
+> 现行口径见 [gap-virtual-models.md](gap-virtual-models.md) §4。
+
 相关：[gap-virtual-models.md](gap-virtual-models.md)。
 
 ## 2. `/v1/models` 的形状
@@ -38,6 +45,11 @@
 
 四个 `supports_*` 位（tool_use / streaming / reasoning / vision）+ 顶层 `supports_reasoning_effort`
 **全部可配**，三态（true / false / **键缺席**），优先级 **config 声明 > 引擎自报 > 整个键省略**。
+
+> **上一条只到 2026-10-10 为止**：2026-10-11 裁定 A 把这五位从**虚拟服务条目**上一并拆除（不留
+> 「接受但忽略」的兼容支），入口对外的 reasoning 声明改由条目层的 `effort_map` 推导；模型卡片
+> （`model_configs`）上的同名字段不在拆除范围，仍按「声明 > 引擎自报 > 省略」说话。现行字段表看
+> doc/gap-virtual-models.md §2，五条裁定原文见 doc/docs-cleanup-2026-10-12.md §1.1。
 
 **三态必须逐分支判，不能写 `declared or engine`**——Lua 里 `false or engine` 取的是 engine，
 操作员明确说的「不支持」会被引擎的 `true` 顶掉。
@@ -58,6 +70,11 @@
 `effort_map` 是**无论 default 空不空都生效**的映射。
 
 ## 4. per-GPU 功率
+
+> **本节整节是历史**：`power_w` 采集链、`max_power_w` 上限与 `power_of_two` 的功率口径已于
+> 2026-10-09 整体移除（用户裁定：21.k 实测八实例瓦特读数恒同值、零区分度），`rg 'lr_gpu_load_power|pw:'
+> lualib/` 现在零命中。本节留作的唯一价值是记录「逐卡归属」这个设计问题的来历——它现在由 GPU
+> **利用率**通道承担（`assign_util`，见 doc/gap-gpu-load.md §10 与 doc/gap-worker-caps.md）。
 
 生产现象：8 个 worker 的 `power_w` **全是 342.371**，而真实 GPU 功率是 94/84/284/208/89/94/431/95 W。
 `power_of_two` 与 `max_power_w` 硬排除全靠这个信号，零区分度 = 失效。

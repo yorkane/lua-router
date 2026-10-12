@@ -1,8 +1,9 @@
 # Agent 交接说明（lua-router）
 
 > 写给接手本仓库的 agent：目标是用最少考古成本进入正确的工作状态。本文只写**当前事实**与**操作纪律**，
-> 设计推导在 git 历史与保留文档里（§7 地图）。最后核对：2026-10-06（容量语义重设计后首份全量门禁
-> **22/22 全绿**，锚点 `/data/tmp/lr-gates/gates-20261006-051452.log`，tier=full）。
+> 设计推导在 git 历史与保留文档里（§7 文档索引指针）。最后核对：2026-10-12（管理面 Basic Auth 落地后首份全量门禁
+> **22/22 全绿**，权威锚点 `/data/tmp/lr-gates/gates-20261012-164729.log`；同码并行轮 160634 逐门计数一致，
+> tier=full，代码树 `69b5d53`）。
 >
 > **本文引用代码的口径：文件 + 函数名，不钉行号。** 2026-10-05 把七个 2000+ 行的大文件拆成
 > facade + 子模块，旧树里所有「文件:行号」引用随之全部漂移（同一个行号在拆分前后指向不同函数），
@@ -14,53 +15,70 @@ lua-router 是 LLM 推理网关的 OpenResty/Lua 实现（原 Rust smg 的功能
 **多 GPU 服务的服务发现与请求调度器**——8 策略选路、健康/熔断/限流、DP 展开、mesh HA、进程内 watcher
 （原独立 llm-watcher 容器已合并退役）、GPU 负载双源 + 利用率准入、路由策略热切换、token 核算、
 虚拟模型＝**对下游暴露的服务主入口**、1 对多映射一组实际模型（`targets[]`，由调度策略在这一整组里选路；
-条目级**只允许 `context_window`** 一个覆盖字段，per-alias `policy`/`effort` 已停用）、持久化 upstreams、
+条目级只允许**声明位**覆盖（`context_window` / `max_output_tokens` / `default_effort`+`effort_map` / `modalities` / `hidden` / `disabled` / `api_key`，清单见 doc/gap-virtual-models.md §2；per-alias `policy`/`effort` 已停用））、持久化 upstreams、
 每服务并发/利用率上限（候选集硬排除）、Quasar UMD 管理控制台（页面入口 **/**（站点根，2026-10-08 admin 迁根），原版 webui 入口 **/u/**（不变）；旧入口 /a 与 /a/ 各 302 到 /，**/_ui/* 全部取消**；
-管理台四页：**服务池**（运行态池 + 声明层同页，原「远程服务」页已并入）/ **模型管理** /
+管理台四页按使用频度：**模型管理**（虚拟模型入口页，最常用的配置）/ **服务池**（运行态池 + 声明层同页，原「远程服务」页已并入）/
 **路由策略** / **日志**）。
 
-已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放）、K8s 发现、OTel。
+已删面（git 历史可恢复）：gRPC/PD、history 存储、tokenizer/parse 代理、网关鉴权（全开放；
+2026-10-12 起管理面加回 Basic Auth，见 doc/gap-admin-auth.md）、K8s 发现、OTel。
 TODO 不实现：wasm、MCP（doc/todo-deferred.md）。
 
-基线（2026-10-08，树 HEAD `71ac5d4`）：**全量门禁 22/22 全绿 / 0 skipped**（tier=full，锚点
-`/data/tmp/lr-gates/gates-20261008-080618.log`；含契约 **691 项 / 24 段**、`e2e_caps` **175 checks**、
-`test_caps_routing` **157 checks**、`test_gpu_load` **402 checks**、`e2e_models_advertisement` **210 checks**
-（S12 卡片档位勾选）、`test_profiles` **907** / `test_models_shape` **124**）。代码：
-**`lualib/` 75 个 Lua 文件 / 36 110 行**（七个域 = facade + 子模块，其余单文件；行数口径
-`find lualib -name '*.lua' | xargs wc -l`），单测 16 个文件（门禁 luajit 15 + resty 4 口径）。
-文档 30 份。仓库：github.com/yorkane/lua-router（public，main 直推）。
+基线（2026-10-12，代码树 `69b5d53`；到 `ac2600c` 为止只动 doc/ 与 script/）：**全量门禁 22/22 全绿 / 0 skipped**
+（tier=full，权威日志 `/data/tmp/lr-gates/gates-20261012-164729.log`，同码并行轮 160634 逐门计数一致；
+含契约 **765 项 / 24 段**、`e2e_caps` **199 checks**、
+`test_caps_routing` **157 checks**、`test_caps_persist` **150 checks**、`test_gpu_load` **489 checks**、
+`e2e_models_advertisement` **262 checks**（S12 卡片档位勾选）、`test_models_shape` **146**、
+`test_models_advertise` **74**、`test_profiles` **907**、`test_watcher` **461**、`test_admin_auth` **191**、
+`test_effort_layers` **32**、`e2e_watcher` **125**、`e2e_profiles` **146**、`e2e_tls_chain` **112**）。
+
+**代码规模与文档份数不在本文钉**（facade 拆分后每轮都在动，钉住就是下一轮的第一处过期）：
+`find lualib -name "*.lua" | wc -l` / `find lualib -name "*.lua" | xargs wc -l` / `ls test/unit/`；
+**文档面不靠计数**——README〈文档索引〉是唯一完整索引，用 `python3 script/check_docs_index.py` 双向比对（§7）；
+七个域 = facade + 子模块，其余单文件。上面对数的那批 checks 与门禁日志同锚，才是本文的口径来源。
+2026-10-12 一轮清理把六份**已完成任务书**与两组**已废止口径的 8802 取证截图**移出工作树
+（`cap-put-ceiling-task` / `cap-put-test-task` / `efforts-maxtok-task` / `shadowing-core-task` /
+`shadowing-test-task` / `shadowing-verify-task` 六份 .md，`verify-8802-20261003/` 两张、
+`verify-8802-20261004-ctx/` 四张 PNG），需要时查 git 历史（`git log --diff-filter=D`）；
+判据：任务书全部有落地 commit + 测试证据，指导价值已被代码与本文列出的现行规格吸收；
+`verify-8802-20261004-ctx` 那组截图所证的「配置期校验」UI 已被用户裁定废止，留着主动误导。
+保留在 `doc/` 的历史类文档不归档：parity-* / real-eval.md（数据留档）、`shadowing-2026-10-07.md`
+（遮蔽裁定原文，现行判据的唯一出处）、两份 `deploy-*20261012-proxy-auth.md`
+（生产回滚依据，fleet 记录吸收前暂留）。`effort-apikey-2026-10-11.md` 走的是另一条判据：五条最终裁定
+**先并入 doc/docs-cleanup-2026-10-12.md §1.1 再移除**，引它时引并入后的那份。
+仓库：github.com/yorkane/lua-router（public，main 直推）。
 
 ## 1. 仓库与生产
 
 | 项 | 值 |
 |---|---|
 | 本机路径 | /home/aigc/ChatGPT/lua-router（独立 git 仓） |
-| 生产实例 | 235.t 容器 `lua-router-8800`，主口 8800，metrics 29000，镜像 `lua-router:8800-20261005-1`（容器 running；**该 tag 构建于 13:19，早于本轮 17:29 之后的拆分 commit**，实测容器内无 `router/` 等子模块目录，即生产此刻跑的是**拆分前的树**，重构版尚未推 8800——本轮验证只在 21.k:8802 上做，见 doc/refactor-arch-2026-10-05.md §9.4） |
+| 生产实例 | 235.t 容器 `lua-router-8800`，主口 8800，metrics 29000，镜像 `…cr.aliyuncs.com/pub/lua-router:20261011-fc037af`（容器 running，StartedAt 2026-10-12T03:23Z）。镜像命名于 2026-10-12 起统一为 `pub/lua-router:YYYYMMDD-<短sha>`，发布脚本 `script/build-image.sh`（绿锚点直构建推 ACR）。fleet 现状（权威表 doc/deploy-state.md，2026-10-12 实测）：只有 21.k:8800（生产）与 21.k:8802（**测试**）滚到 `20261012-69b5d53` 并配了口令；21.k:8801（测试环境的并行旧实例，硬规则 3）、217.t:8800 与本机 235.t:8800（生产）仍在 `fc037af` / `89f0ad0`——那两版没有 `admin_auth.lua`，**配了口令也不生效**；顺序永远是 8802 测试通过才推生产；部署与回滚记录见 doc/deploy-8802-20261012-proxy-auth.md（测试）与 doc/deploy-8800prod-20261012-proxy-auth.md（生产） |
 | 编排 | /data/app/lua-router/docker-compose.yml（host 网络、unless-stopped、watcher 全开、docker.sock ro 挂载、配置持久化 /data/app/lua-router/config） |
 | 回滚 | `docker stop lua-router-8800 && docker start llm-router-8800`（Rust 版容器已停保留） |
 | 隧道 | https://8800-235.ai-t.wtvdev.com 经 authz 登录墙；直连 http://10.252.25.235:8800 或本机 127.0.0.1:8800 无墙 |
-| 信任边界 | 网关层**零鉴权**（auth 已删）：/workers、根数据面（/config /logs /stats /props）、/model-map 全开放，只许 authz 边缘之后/可信内网 |
+| 信任边界 | 管理面（`/`、`*.html`、`/config*`、`/logs*`、`/stats`、`/slots`、`/tools`、`/u/config*` 九条别名，以及 klib 控制面 `/workers` `/model-map` `/flush_cache`）在配了 `SMG_ADMIN_AUTH_PASS` 时要 Basic 凭据（用户名恒 `lua-router`；loopback 直连免凭据，但请求里出现 `X-Real-IP`/`X-Forwarded-For`/`Forwarded` 任一头名就取消该豁免；未配/空串=整道门关闭，缺省零行为变化）。数据面 `/v1/*` 与公开面 `/health` `/metrics` `/v1/models` `/v1/loads` `/ha/*` `/_mesh/internal/*` 与 `/u/` 对话面**仍然开放**。完整口径见 doc/gap-admin-auth.md。只许 authz 边缘之后/可信内网 |
 | 勿碰 | authz 容器、SearXNG(8080)、qdrant-faces(6334 gRPC 口)、face-*/va-*/pg18/n8nc/resdown/wx-liushi-monitor 等生产容器 |
 
 ## 2. 代码地图
 
 ```
-lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域是「facade + 同名子目录」，
+lualib/resty/luarouter/  （文件数与行数现测：find lualib -name '*.lua' | xargs wc -l）：七个域是「facade + 同名子目录」，
   其余仍是单文件。facade 只做 require + _M re-export（预登记 package.loaded 让子模块回指同一张表），
   对外契约 = facade 的 _M 名册，逐名保留（单测换桩、conf 的 *_by_lua、五方借用点都按原名取）。
 
-  router.lua(364) facade：klib 路由表 build() + handle() + preflight + 全量 re-export
-    router/candidates.lua(576)  热路径：policy_for + candidates_for 门序（健康→白名单/绑定→
+  router.lua(374) facade：klib 路由表 build() + handle() + preflight + 全量 re-export
+    router/candidates.lua(847)  热路径：policy_for + candidates_for 门序（健康→白名单/绑定→
         模型许可→容量硬排除→组门）+ group_key_name + group_policy_hint + card_key 族
     router/jsonutil.lua(1000)   顶层精确改写族 set_top_field / rewrite_model / merge_top_object
         / patch_response_metadata + DP rank 注入 + 路由文本抽取 + usage + SSE + 会话指纹
-    router/forward.lua(850)     streaming 泵 + 重试环 + forward 主循环；转发名读 worker.lr_bound_model
+    router/forward.lua(880)     streaming 泵 + 重试环 + forward 主循环；转发名读 worker.lr_bound_model
         后交给 jsonutil.rewrite_model（整组一致拒绝的 503 文案「healthy engines serve none of the
         mapped models」也在这里）
-    router/models_api.lua(969)  /v1/models 对外形状：models_handler / advertise_real_model /
+    router/models_api.lua(1599)  /v1/models 对外形状：models_handler / advertise_real_model /
         advertise_virtual_entry / fill_model_fields / inject_virtual_models / resolve_model_caps /
         common_acceptance / declared_max_output_tokens（AGENTS.md 硬规则 9 全在此文件）
-    router/inference.lua(526)   推理面（别名解析、effort 三层继承、output_budget_of 纯读、
+    router/inference.lua(608)   推理面（别名解析、effort 三层继承、output_budget_of 纯读、
         apply_ctx_cap / entry_ctx_cap 两条恒「无改写」空壳）+ 公开面 health 族
     router/profiles.lua(305)    config_store 之上的 profile 读层缝：profile_model_group +
         两条恒 nil 停用缝 profile_policy_name / profile_effort_value（刻意保留，不是死代码）
@@ -68,86 +86,94 @@ lualib/resty/luarouter/  75 个 .lua / 32 419 行（wc -l 实测）：七个域�
         discard_body / read_response_body（本轮漏 export 的三个名字就是它，见 §3 教训）
     router/respond.lua(318)     错误应答 / CORS / request id / 请求头与标签白名单
     router/metrics_ep.lua(430)  metrics 聚合渲染 + engine_metrics / model_info（load-safe）
-    router/control.lua(483)     控制面 workers CRUD / flush_cache / v1/loads / model-map +
+    router/control.lua(616)     控制面 workers CRUD / flush_cache / v1/loads / model-map +
         观测与 mesh handler + server 级 preflight_guard
     router/reqlog.lua(167)      log_inference_request 组装一条 RequestRecord + finish_request 收尾
     router/host.lua(45)         进程级惰性访问器 cfg() / limit() / store()——不进导出契约
-  config_store.lua(133) facade：require + 69 个导出逐名 re-export
+  config_store.lua(165) facade：require + 逐名 re-export（导出面 79 枚，实测 grep -c '^_M.'；facade 头注释自述的 68 是拆分当时的数）
     config_store/persistence.lua(540)  硬边界：全模块只有本文件碰 shdict / 后端 / 文件 IO
         （三层读写 + CAS 冲突 409 + persist + migrate_once + 四枚 revision token 读点）
-    config_store/snapshot.lua(801)     空快照语义 + sync_virtual_view / new_card / snapshot_of /
+    config_store/snapshot.lua(936)     空快照语义 + sync_virtual_view / new_card / snapshot_of /
         cfg_from_document / cfg_from_env（原配置期校验 validate_declared_context_windows
         已于 2026-10-08 移除：声明窗口与单次输出预算是两个不可比的量，不再互校）
-    config_store/profiles.lua(783)     组装配：build_target_group / target_group_of /
+    config_store/profiles.lua(1216)    组装配：build_target_group / target_group_of /
         build_context_window / profile_from_entry（停用的 per-alias policy/effort 各在此 warn 一次）
         + assert_no_alias_chain 别名链守卫；explicit_target / explicit_targets 旗标同在此文件
-    config_store/upstreams.lua(563)    声明层校验脱敏 + upstream_drifts / patch / reconcile_upstreams
-    config_store/readers.lua(542)      current / ctx_cap / virtual_ctx_cap / 模态 / policy 热路径读 /
+    config_store/upstreams.lua(867)    声明层校验脱敏 + upstream_drifts / patch / reconcile_upstreams
+    config_store/readers.lua(831)      current / ctx_cap / virtual_ctx_cap / 模态 / policy 热路径读 /
         policy_document（入口名也进行集）/ effort 三层查表
-    config_store/mutators.lua(452)     apply_* 家族 + 整表写 + profile_policy / profile_effort
+    config_store/mutators.lua(641)     apply_* 家族 + 整表写 + profile_policy / profile_effort
         （活着的死 reader，热路径无调用者）
-    config_store/handlers.lua(389)     watcher 桥 + document / models_document + 10 个 handle_config_*
-    config_store/lexicon.lua(355)      helper、词表、JSON 形状小工具、对端模块惰性取用
+    config_store/handlers.lua(522)     watcher 桥 + document / models_document + 10 个 handle_config_*
+    config_store/lexicon.lua(440)      helper、词表、JSON 形状小工具、对端模块惰性取用
     config_store/httpc.lua(155)        raw_request（唯一生产读者是 props 的 /props 代理）
-    config_store/env.lua(117)          ENV_NAMES 名册 + capture_env / env + LMR_UPSTREAMS_FILE 种子
+    config_store/env.lua(120)          ENV_NAMES 名册 + capture_env / env + LMR_UPSTREAMS_FILE 种子
         （新 env 漏进这里 = 静默走未配置降级，AGENTS.md 硬规则 11）
-  registry.lua(169) facade：把 keys/url/caps/records/health/loads/discovery + 公共 httpc 按原名 re-export
-    registry/records.lua(1122)  规格解析 + models 助手族 + add/remove + 读出视图 + info +
+  registry.lua(173) facade：把 keys/url/caps/records/health/loads/discovery + 公共 httpc 按原名 re-export
+    registry/records.lua(1138)  规格解析 + models 助手族 + add/remove + 读出视图 + info +
         candidate_allows_model（组门的 fail-open 谓词）+ patch_record
-    registry/discovery.lua(803) 探针与覆盖度 probe_advertised_entries / refresh_models / model_caps /
+    registry/discovery.lua(833) 探针与覆盖度 probe_advertised_entries / refresh_models / model_caps /
         record_model_caps（models_verified 那枚印章）+ PUT update + 元数据发现 + DP 展开 + 作业队列 + 种子
     registry/caps.lua(647)      上游能力采集（自包含纯域：model_caps_from_listing / from_entry / merge）
-    registry/loads.lua(479)     负载折叠 + capacity_exclusion 每服务上限判定（lo:/gu: 两个读数；
+    registry/loads.lua(708)     负载折叠 + capacity_exclusion 每服务上限判定（lo:/gu: 两个读数；
         读数未知→不排除，set_gpu_util 拒收负值/NaN/±inf）
-    registry/keys.lua(336)      lr_workers 键格局 + shdict 懒解析 + resty.lock + worker id + 名单 + mesh 写钩子
+    registry/keys.lua(346)      lr_workers 键格局 + shdict 懒解析 + resty.lock + worker id + 名单 + mesh 写钩子
+                                + 临时禁用位 K_TEMP_DISABLE（`td:` 键，探针分档用，见 §4）
     registry/health.lua(273)    健康位与熔断（open→half_open 唯一恢复 CAS 在此，charge 用 incr、flip 锁内重查）
     registry/url.lua(118)       url 规范化与拨号助手
   httpc.lua(181)  本轮新增的公共传输库：cosocket 连接池 + HTTP 原语（自旧 registry 的 E 块提升）。
     只有 registry.lua require 它，其余五方借用点按原名经 registry 借，零改动。
   watcher.lua(65) facade
-    watcher/reconcile.lua(575)  内部不许再拆：十条守卫的唯一判定点 + 探针分档摘除 + 单轮保险丝（§4）
-    watcher/discover.lua(458)   三源发现纯层 + docker unix_get/collect；DENY_PORT 只在 proc 扫描分支
+    watcher/reconcile.lua(938)  内部不许再拆：十条守卫的唯一判定点 + 探针分档摘除 + 单轮保险丝（§4）
+    watcher/discover.lua(784)   三源发现纯层 + docker unix_get/collect；DENY_PORT 只在 proc 扫描分支
                                 生效（就在 collect 的 deny 装配处），docker 分支不过它 → SMG_WATCHER_CONTAINER_IPS=0
-    watcher/live.lua(437)       live 入口 + make_fetch/probe_pool + registry 适配 + run_pass/tick/start
-    watcher/env.lua(415)        26 枚 SMG_WATCHER_* new_config + URL 规范化 + 自端口
+    watcher/live.lua(690)       live 入口 + make_fetch/probe_pool + registry 适配 + run_pass/tick/start
+    watcher/env.lua(519)        SMG_WATCHER_* new_config 名册（含 PROBE_TEMP_DISABLE）+ URL 规范化 + 自端口
     watcher/modelmap.lua(251)   model-map 解析 + effective_map/apply_model_map
     watcher/ledger.lua(229)     台账 new_ledger
-    watcher/probe.lua(176)      严格探针 classify/probe_verdict 三档判定（分档语义逐行原样）
-  gpu_load.lua(80) facade
-    gpu_load/parse.lua(629)  exposition 解析族 · cards.lua(492) 卡归属与利用率折叠
-    gpu_load/runpass.lua(526) run_pass 主循环（stats 字段口径单点定义）· seams.lua(305) 九枚 live seams
-    gpu_load/parse.lua(765) 利用率解析（util_fraction 0..100→0..1 / util_by_card 逐卡归约）
-    gpu_load/cards.lua(848) 四路利用率口径 assign_util（认不出卡回退整机 max 并计 lr_gpu_load_util_fallback_total）
-    gpu_load/export.lua(304) 指标导出 + 定时器（两通道：负载 xl: / 利用率 gu: 供 max_gpu_util）
+    watcher/probe.lua(181)      严格探针 classify/probe_verdict 三档判定（分档语义逐行原样）
+  gpu_load.lua(72) facade
+    gpu_load/parse.lua(646)  exposition 解析族 + 利用率解析（util_fraction 0..100→0..1 /
+        util_by_card 逐卡归约）· cards.lua(617) 卡归属与利用率折叠，含四路口径 assign_util
+        （认不出卡回退整机 max 并计 lr_gpu_load_util_fallback_total）
+    gpu_load/runpass.lua(637) run_pass 主循环（stats 字段口径单点定义）· seams.lua(325) 九枚 live seams
+    gpu_load/export.lua(266) 指标导出 + 定时器（两通道：负载 xl: / 利用率 gu: 供 max_gpu_util）
     gpu_load/prom.lua(209)   Prom 客户端
   mesh.lua(59) facade
     mesh/crdt.lua(1368)  不拆：时钟/LWW/版本向量 + 成员表 + 分区检测 + observe_worker + 快照合并
                          （幻影键修复的正确性依赖这些同域）
     mesh/sync.lua(481)   cosocket http_request + sync_with + ROUTES/dispatch + SMG_MESH_* + 单例
     mesh/handlers.lua(425) /_mesh/internal/* 四条 + 13 条 /ha/* · wire.lua(151) 编解码 · rate.lua(127) 限流窗
-  observability.lua(1469) facade：写侧原语（counter/observe/gauge + 键文法）+ record_* + HELP 权威表 +
+  observability.lua(1448) facade：写侧原语（counter/observe/gauge + 键文法）+ record_* + HELP 权威表 +
     prometheus_text —— 与导出器同域不拆（键文法是隐式契约，契约门只测最终文本）
     observability/logstore.lua(600)  请求日志环形缓冲 + 查询 DSL + /logs 三 handler + stats()
     observability/inflight.lua(246)   在飞年龄 tracker（lr_stats 的 1024 定长槽）
-  单文件（未拆）：hash.lua(964) BLAKE3 环位/ketama/粘滞键 · policy.lua(901) 策略分发（random/rr/pot/manual 内联）
+  单文件（未拆）：admin_auth.lua(260) 管理面 Basic Auth（2026-10-12 用户裁定新增；password / is_loopback /
+    has_proxy_origin_header / required / check_header / challenge / guard / guard_static /
+    klib_challenge_worthy / guard_klib；口径见 §1 信任边界与 doc/gap-admin-auth.md）
+    · hash.lua(964) BLAKE3 环位/ketama/粘滞键 · policy.lua(1138) 策略分发（random/rr/pot/manual 内联）
     · init.lua(547) fork 前接线（env 快照 + hb/watcher/mesh/负载定时器 + on_log 兜底）
-    · hb.lua(417) 健康巡检 + 熔断计数 + /v1/loads 扇出 + gpu_load 挂载点
-    · config.lua(394) env→配置对象 · ui.lua(348) 根数据面与 /u 的 API 别名 handler 族
+    · hb.lua(431) 健康巡检 + 熔断计数 + /v1/loads 扇出 + gpu_load 挂载点
+    · config.lua(457) env→配置对象 · ui.lua(356) 根数据面与 /u 的 API 别名 handler 族
     · props.lua(225) /props 快照与引擎代理（with_ctx 是 ctx_cap——模型卡 ctx / 平铺 model_ctx——的
       唯一生产读者，只换回显的 n_ctx / n_ctx_train）
-    · limit.lua(209) 全局并发闸门 + 排队 · store_*{dispatcher,file,sqlite,postgres} 配置后端
-    · policies/（6 文件 2314 行）tree/cache_aware/bucket/consistent_hashing/prefix_hash + utils
-  单测 test/unit/ 16 个文件：门禁跑 luajit 15（tree/tree_bounds/state_bounds/observability/policies/hash/mesh/watcher/gpu_load/routing_dyn/
-  profiles/caps_routing/models_shape/models_advertise/effort_layers）+ resty 4（tree/policies/hash/
-  integration），其中 tree/policies/hash 双口径各跑一次。
+    · limit.lua(209) 全局并发闸门 + 排队 · store_*{dispatcher,file,sqlite,postgres} 配置后端(328/227/318/189)
+    · policies/（6 文件 2567 行）tree/cache_aware/bucket/consistent_hashing/prefix_hash + utils
+  单测 test/unit/ 19 个 .lua + 1 个 .mjs：门禁跑 luajit 17（tree/tree_bounds/state_bounds/observability/
+  policies/hash/mesh/watcher/gpu_load/routing_dyn/profiles/caps_persist/caps_routing/models_shape/
+  models_advertise/effort_layers/admin_auth）+ resty 4（tree/policies/hash/integration，其中
+  integration 125 检查，tree/policies/hash 与 luajit 口径双跑各一次）+ node 1
+  （test/unit/test_ui_merge.mjs 128 检查，从盘上 html 抽真函数）。test_cb_stream.lua 不在门禁名单里。
 
 ui/                  原版 llama.cpp webui（规范入口 /u/）+ ui/admin/（Quasar UMD 管理台四页，
                      规范入口 /（站点根，由 conf/nginx.conf.template 的 `location /` 提供，try_files 未命中回落
                      @lmr_klib 走 klib 路由表）：模型管理/服务池/路由策略/日志；upstreams.html 只剩重定向占位，
                      服务池同页呈现运行态池 + 声明层，上限以声明为准、cap_owner==='declared' 的行
                      隐藏运行态编辑入口）。旧入口 /a 与 /a/ 各 302 到 /（相对引用 + no-store）；
-                     /_ui/* 全部取消：无 302、无别名、无静态块，落 404 sink（唯一例外：/_ui/logs、
-                     /_ui/stats、/_ui/logs/backends 仍在 klib 路由表里，router.lua 未动）。管理台数据面在根上的
+                     /_ui/* 全部取消：无 302、无别名、无静态块，落 404 sink（klib 路由表里残留的 /_ui/logs、
+                     /_ui/stats、/_ui/logs/backends 三条注册也随 7e8bfff 一并删除，/ 之前那句「唯一例外」
+                     已作废；三个 handler 本体仍在 observability.lua 导出，供根别名与单测按原名取用）。
+                     管理台数据面在根上的
                      exact 别名族：/config* /logs* /stats /props。
                      控件纪律：本仓 vendor 的 Quasar UMD 里 QToggle / QOptionGroup 不经 BaseField
                      渲染，实测 :hint 不生成 .q-field__bottom，toggle / option-group 的说明文字
@@ -185,7 +211,7 @@ conf/                nginx.conf.template（生产模板，envsubst）+ lua-route
 
 ```bash
 cd /home/aigc/ChatGPT/lua-router
-bash test/final_gates.sh                     # 快速档（缺省 5 门，约 3 分钟）——普通修改够用
+bash test/final_gates.sh                     # 快速档（缺省 build/conf/unit/contract/probes 五门，约 3 分钟）——普通修改够用
 GATE_TIER=full bash test/final_gates.sh      # 全量 22 门（串行 13–14 分钟）——发版/计数/生产替换
 GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 TEST_ONLY=inflight_age bash test/test_lua_router.sh   # 契约单段
@@ -203,7 +229,15 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
 
 **已知 flake/坑**：
 
-- `e2e_policy_parity` 的 random χ² 检验有约 5% 假阳率（临界 5.991）——失败先看是不是贴线抖动，单独重跑该门即可。
+- `e2e_policy_parity` 的 **χ² 已从判据降为报告项**（AGENTS.md 硬规则 10）：拟合优度检验的
+  `E[χ²] = df`，公式里没有样本量，`P(χ² > 5.991) = 5.00%` 与 N 无关——α=0.05 等于每轮全量门禁自带
+  约 5% 的红概率预算，**加大 N 一分不减**（实测 N=240→4800 稳定在 4.9%–5.1%）。现行判据是
+  **TOST 等价性检验**（`e2e_policy_parity.py` 的 `tost_uniform`），等价边界 `d=0.065`
+  （`LR_PP_TOST_D`，N=1200；按「实测到过的最差真实行为」定，不是按统计最优——d=0.055 在实测最差行为上
+  仍红 4.4%，发版门禁不能接受），random 轮用 `LR_PP_TOST_D_RANDOM=0.008`。TOST 的软肋是**过散**
+  （β-binomial ρ）：iid 下假红 3.8e-10，但 ρ=0.01 时 N=1200 上红率升到 0.17，所以它红了先怀疑环节流漂移，
+  **加大 N 只会更糟**，对策是放宽 d。配套纪律：单侧阈值同样要标定，`Rust with-loads` 旧的
+  `share < 0.30` 在 N=240 下放过真退化 0.187（约 1/5），等于没检——新增或调阈值前先算尾概率。
 - `e2e_policy_parity` 的 Rust 对照实例启动等待预算已 90s→**240s**（`2feab96`）：**并行门禁下
   （`GATE_JOBS=6`）Rust 首轮健康周期实测 75–120s**，90s 会在机器忙时误红。红之前先看日志里
   Rust 侧等待用了多久，再怀疑产品代码。
@@ -214,12 +248,14 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
   消音手段是 `SMG_WATCHER_DENY_PORT`（lua_socket_log_errors off 在 timer 阶段挡不住），机制见
   doc/gap-watcher-merge.md 偏差 13。
 - 写 watcher 相关用例时记住 §4 的分档：**还在发现源里但 `/v1/models` 答不出 `data[].id`**（确定性否定）
-  的实例会在下一轮（`SMG_WATCHER_INTERVAL_SECS`，缺省 15 s）被直接摘除，不等 grace；**连不上／无应答**
-  （传输层未知）要连够 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）轮才摘，中途成功即清零；**从发现源消失**才走
-  `SMG_WATCHER_REMOVE_GRACE_SECS`(300)/`KEEP_LAST_GRACE_SECS`(1800)。探针摘除还受单轮保险丝（超过 owned
-  一半则只 warn，`SMG_WATCHER_PROBE_FUSE=0` 关闭）约束，写「一批全摘」的用例时记得它。想让一个不答
-  `/v1/models` 的 mock 留在池里测别的维度，得把它从发现源里摘掉（而不是让它继续被报出来），或置
-  `SMG_WATCHER_ALLOW_REMOVE=0`（此时只警告一次、不删），见 gap-watcher-merge.md §1.1。
+  的实例会在下一轮（`SMG_WATCHER_INTERVAL_SECS`，缺省 15 s）被临时禁用——退出选路、registry 行保留，
+  不等 grace（2026-10-09 起默认不物理删行，`SMG_WATCHER_PROBE_TEMP_DISABLE=0` 才退回当轮删行）；
+  **连不上／无应答**（传输层未知）要连够 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）轮才摘，中途成功即清零；
+  **从发现源消失**才走 `SMG_WATCHER_REMOVE_GRACE_SECS`(300)/`KEEP_LAST_GRACE_SECS`(1800)。物理摘除还受单轮
+  保险丝（超过 owned 一半则只 warn，`SMG_WATCHER_PROBE_FUSE=0` 关闭）约束——临时禁用不计入保险丝——
+  写「一批全摘」的用例时记得它。想让一个不答 `/v1/models` 的 mock 留在池里测别的维度，得把它从发现源里
+  摘掉（而不是让它继续被报出来），或置 `SMG_WATCHER_ALLOW_REMOVE=0`（此时只警告一次、不删），
+  见 gap-watcher-merge.md §1.1。
 
 ## 4. 设计红线（改动前必读）
 
@@ -229,6 +265,30 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
   luarouter_config）；进程内可变状态只许 cache_aware 树、bucket 计数、mesh 成员表（三者都已钉 worker=1 或有衰减文档）。
 - **缺省零行为变化**：所有新开关（SMG_WATCHER_ENABLED、SMG_LOAD_SOURCE、policy 覆盖）缺省时对外行为
   与旧版逐字节一致，这是门禁判据的一部分。
+- **管理面这道门的覆盖面必须等于它声称的范围**（用户裁定 2026-10-12，改这块前读 doc/gap-admin-auth.md）：
+  首版只挂根数据面，留下两个绕过洞——`/u/config*` 是同一批 handler 的别名族（匿名可写同一份配置）、
+  klib 控制面 `/workers` 匿名可改运行态名册。**门的覆盖面小于声称范围 = 门形同虚设**，两族现在都进门。
+  三个挂点各司其职，少一个就是洞：`guard()` 挂在 `conf/ui.conf` 的 24 条 exact location（前缀 location 会
+  shadow 同名静态文件，exact 纪律不破）；`guard_static()` 挂 `location /`（access 阶段跑在 try_files 之前，
+  整块一拦会把本该由 `@lmr_klib` 回答的 `/v1/*` `/health` `/metrics` 一起锁死，所以只对 `/` 与 `*.html` 发挑战，
+  浏览器拿到 401 后会对同源后续请求带凭据，js/css 这类无秘密资源放行不减弱保护）；`guard_klib()` 是
+  `router.lua` 的 `handle()` 里**单点**挂（逐 handler 挂要动 15 个注册点、漏一条就是一个洞，而且挂不到
+  OPTIONS 短路之后——预检从不带凭据，预检过门会把跨域管理台整体变成 401）。
+  klib 清单刻意 **fail-open**（默认放行、名单内才拦），判据是后果不对称：数据面/公开面被误拦 = 推理流量与
+  监控当场断，管理面漏拦 = 多一条匿名路。所以**新增受管路径要在 `KLIB_ADMIN_PREFIXES` 显式添一行**，
+  `/metrics` `/v1/loads` `/ha/*` `/_mesh/internal/*` `/wasm*` 与 404 sink 是名单外的既定成员（抓取必须匿名、
+  健康链 hb 逐秒读 `/v1/loads`、节点间 401 会被记成对端故障）。前缀匹配带斜杠边界（`/workersfoo` 不拦）。
+  代理来源前置否决按**头名出现与否**判定，**值一概不解析**：`X-Real-IP`/`X-Forwarded-For`/`Forwarded`
+  的语义是「上一跳说了算」，而 nginx 层没有 `set_real_ip_from` 受信网段保证那一跳写了什么；一旦去解析值，
+  就得回答「信哪条头、XFF 取哪段、畸形算不算、重复头取哪个」，每个答案都是新的绕过面（`-H 'X-Real-IP: 127.0.0.1'`
+  在按值还原的实现里直接拿到豁免，这就是被推翻的 v1）。要让经反代的本机操作员继续匿名，正确做法是在反代剥头
+  或用受信网段 realip，把信任决策留在唯一知道链路的那一层，不是在网关里解析代理头。
+  401 的信息量必须为零：非 Basic/解不开/缺分隔/用户名错/密码错同一个 401，比对走常量时间；realm 是不带秘密的
+  文案位。口令只走 env（`SMG_ADMIN_AUTH_PASS`），三份 conf 的 `env` 白名单必须同步登记（与硬规则 11-3 同一条纪律，
+  漏登记的现象是「配了但静默不生效」）。
+  **接线完整性只有清单断言拦得住**：`test_admin_auth.lua` 逐行扫 `conf/ui.conf` 钉 24 条 guard 挂载，
+  判定函数全对但漏挂一条 location 正是洞 1 的成因；六段变异反证（删口令豁免/删 loopback 豁免/空串当口令/
+  klib 清单摘掉 `/workers`/去掉斜杠边界/换成数据面前缀）必须红。
 - **每服务容量是「三态 + 候选集层面的硬排除」，并且「读数未知 → 不排除」**（用户裁定 2026-10-01 立基，
   2026-10-06 重设计为三字段三态）：worker 记录上的 `min_concurrency`（下限，缺席=1）/ `max_concurrency`
   （上限，≤32）/ `max_gpu_util`（GPU 利用率上限 0..100，**0 是最严档不是清除**）。`registry.capacity_state`
@@ -278,21 +338,30 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
   `apply_ctx_cap` 的第四参是「条目级优先且独占」：条目说话时不再叠加按落点模型的卡（两者现为恒
   「无改写」空壳，见 AGENTS.md 裁定块）；`config_store/readers.lua` 的 `ctx_cap` 对虚拟名本身恒返回
   nil，防的就是条目名泄漏进卡路径。
-- **探针失败分档，后果不同**（用户裁定 2026-10-01，改这块前先读；完整口径与表格见
-  gap-watcher-merge.md §1.1，本节与它必须逐字同义）：
+- **探针失败分档，后果不同**（用户裁定 2026-10-01 立基，2026-10-09 commit `9bf3c07` 改了 reject 档的后果；
+  改这块前先读；完整口径与表格见 gap-watcher-merge.md §1.1，本节与它必须逐字同义）：
   - **转发路径上的探测**（hb 健康巡检、gpu_load 抓 /metrics 与远程 Prom）失败只损失精度——降级、keep-last、
     grace、纯在飞计数，绝不让监控故障拖垮转发，也不因单次探测失败摘 worker。健康判定本来就是
     连续失败到 failure_threshold 才翻健康位，翻位也只是退出选路，不删行。
   - **watcher 严格探针**（每轮 `classify()` 读 `GET /v1/models` 的 `data[].id`）按「对方到底答没答」分三档：
-    - **确定性否定**——探针拨通并拿到了 HTTP 回答，但内容不合要求（读不出 `data[].id`、`/server_info`
-      命中 router 自指纹、模型数超 `max_models`）：当轮立即 `release()`，跳过
-      `SMG_WATCHER_REMOVE_GRACE_SECS`(300) 与 `SMG_WATCHER_KEEP_LAST_GRACE_SECS`(1800)。
+    - **确定性否定（reject 档）**——探针拨通并拿到了 HTTP 回答，但内容不合要求（读不出 `data[].id`、
+      `/server_info` 命中 router 自指纹、模型数超 `max_models`）：**默认不再物理删行，改为临时禁用保行**。
+      registry 行原样留着，只写 `td:` 键（`registry/keys.lua` 的 `K_TEMP_DISABLE`，TTL = 3×interval），
+      `router/candidates.lua` 在候选装配时排除它，探针恢复轮显式 `clear_temp_disable` 立刻回池；
+      每轮 warn 一次（`entry.warned` 静音），**不进保险丝计数**（它永不删行）。
+      开关 `SMG_WATCHER_PROBE_TEMP_DISABLE=0` 退回旧的「当轮立即 `release()`、跳过
+      `SMG_WATCHER_REMOVE_GRACE_SECS`(300) 与 `SMG_WATCHER_KEEP_LAST_GRACE_SECS`(1800)」。
+      新指标 `smg_worker_temp_disabled_total`。同轮还落了一条「禁用即摘」：条目带 `disabled` 的已注册行
+      走同一个 `release()` 出口退出池子。
+      物理摘除自此只留两个信号：发现源不再报它（走守卫 5/6 的 grace + keep-last）与传输层未知累计到阈值。
+      AGENTS.md 硬规则 4 的该行已按本口径同步（2026-10-12），两份话术一致。
     - **传输层未知**——连不上／超时／TLS 失败／接受 TCP 后无应答：计入该 owned 条目的连续失败数，
       达到 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）才摘；未达阈值保留原行，任一轮成功即清零。
     - **不触发摘除**——`no probe transport`（网关自身缺 fetch）与 `require_health` 未通过（注册准入
       开关，不是摘除理由）：既不摘也不计数。
-  - 两档摘除都受**单轮保险丝**约束：一次 reconcile 内被探针摘掉的 owned 条目超过 owned 总数一半时降级为
-    只 warn 不摘（防网关自身故障一次清空全池），`SMG_WATCHER_PROBE_FUSE=0` 关闭。
+  - 两档物理摘除（发现源消失走 grace + keep-last、传输层未知累计到阈值）都受**单轮保险丝**约束：一次
+    reconcile 内被探针摘掉的 owned 条目超过 owned 总数一半时降级为只 warn 不摘（防网关自身故障一次清空
+    全池），`SMG_WATCHER_PROBE_FUSE=0` 关闭。临时禁用档不计入保险丝。
   - 都不放宽原有守卫：config upstream 与守卫 3 首接触快照的 protected 条目仍不由 watcher 删除，
     `SMG_WATCHER_ALLOW_REMOVE=false` 时只警告一次、不删。恢复无旁路：下一轮读到真实 `data[].id` 就按新
     服务同一套门槛重新注册，但 `registry.add` 会重置健康位与外部负载读数，重新接流要等
@@ -315,18 +384,36 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
 ## 5. 生产操作清单
 
 ```bash
-# 构建 + 替换（当前树）：
-cd /home/aigc/ChatGPT/lua-router && docker build -t lua-router:8800-$(date +%Y%m%d)-N -t lua-router:latest .
-sed -i 's#lua-router:8800-[0-9-]*#lua-router:8800-YYYYMMDD-N#' /data/app/lua-router/docker-compose.yml
+# 构建（现行发布路径）：script/build-image.sh——要求 HEAD 是绿锚点且已跟踪文件干净，
+# 标签 YYYYMMDD-<短sha>，推 ACR pub/，收尾 manifest inspect 自检。
+cd /home/aigc/ChatGPT/lua-router && script/build-image.sh
+docker pull <上面输出的镜像名>   # 或本机直接 build
+sed -i 's#pub/lua-router:[0-9a-z-]*#pub/lua-router:YYYYMMDD-<短sha>#' /data/app/lua-router/docker-compose.yml
 cd /data/app/lua-router && docker compose up -d --force-recreate
 # 验证清单（全绿才算完）：
 curl -s http://127.0.0.1:8800/health                       # OK
 curl -s http://127.0.0.1:8800/workers                      # Q38 healthy，无测试残留
+# /workers 与 /config/policy 两条：配了 SMG_ADMIN_AUTH_PASS 的实例要带 -u lua-router:<pass>；
+# 直连 127.0.0.1 且请求里不带 X-Real-IP / X-Forwarded-For / Forwarded 任一头名才免凭据。
 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/               # 200（管理台，admin 在根；旧 /a/ 302）
 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/u/             # 200（原版 webui，入口不变）
 curl -s http://127.0.0.1:8800/config/policy                # 生效链 JSON（数据面在根）
 # 一条真实流式 chat + 指标确认 tokens_total 增长；日志 grep '\[error\]' 应为 0
+# 切换前后各读一次 revision，相等 = 配置零漂移。
 ```
+
+**切换前必做的两条取证**（21.k:8800 生产实测的形状，2026-10-12；细节见 doc/deploy-8800prod-20261012-proxy-auth.md）：
+
+1. **备份要能恢复**。compose 与 `config/` 整目录拷进带时间戳的 `backup-<UTC>/`。配置权威是 **db**（`LMR_CONFIG_FILE` 是只读镜像，硬规则 11-1），所以要导 **WAL 安全的一致性快照**，不要直接 cp 活动库：用 `python3` 的 `sqlite3.Connection.backup()` 从活动库导出，导完 `PRAGMA integrity_check` 必须 ok。WAL 模式下 cp 出来的 `.db` 不是事务一致的：只能当证据，不能当恢复源。恢复时覆盖 `runtime.json.db*` 三件套再重建容器。
+2. **先确认验的是 db 不是文件降级**：`/metrics` 上必须见到 `lr_config_store_backend{backend="sqlite"} 1`（硬规则 11 的「另」条）。升级窗口内不做任何配置写操作——CAS 409 在 reload 期会变成噪声源。切换前后各读一次 `GET /config` 的 `revision`，相等 = 配置零漂移。
+
+**管理面口令的三条运维事实**（用户裁定 2026-10-12，口径 doc/gap-admin-auth.md）：
+
+1. 21.k:8800/8802 现在跑的是**测试口令**。正式化 = 在 compose 里改 `SMG_ADMIN_AUTH_PASS` 的值后 `docker compose up -d`。口令值不落文档、不进配置 db（只走 env 是刻意的：`/config` 那份 JSON 可以被读出来广播）。
+2. **经反代访问管理台不再匿名**，这是修复的目的不是副作用：21.k 的域名链路（APISIX → `127.0.0.1:880x`）实测写 `X-Real-IP` / `X-Forwarded-For`，前置否决据此收回 loopback 豁免。要给本机操作员留匿名，正确做法是在反代剥这三个头（APISIX `proxy-rewrite`）或用受信网段 realip，**不是在网关里解析代理头**。
+3. 浏览器验证的已知现象（**非网关缺陷**）：凭据嵌在页面 URL 里时，页面内相对 `fetch("/config")` 被浏览器拒（URL 带凭据不可构造），侧栏显示「网关不可达」；弹框输凭据与 `curl -u` 两条正常路径都 200。playwright 无头环境弹不了凭据框，看到 `ERR_INVALID_AUTH_CREDENTIALS` 是 401 挑战到达浏览器的证据，不是渲染故障。
+
+**fleet 对齐的顺序与风险**（2026-10-12 只读评估的结论，别重做一遍）：只为拿这道门而升级生产**不划算**——未配口令时整道门关闭，升级只带来 UI 与 `/v1/models` 形状的回归面。要滚 fleet 就一起滚：顺序是 **8802 测试通过才推生产**，验证矩阵按 doc/deploy-8800prod-20261012-proxy-auth.md 逐行复刻（匿名面不缩水 + `OPTIONS` 预检 200 + 伪造来源头 401 是硬三项）。**唯一真实的下游兼容风险是还有客户端拿 `owned_by` 判别入口行/真实行**（硬规则 9③ 已禁止该用法）。**没有等价替代判别位**：`created==0` 不是入口的充分判据（真实行无上游读数时也是 0），要判入口只能按 id 查声明层 `/config` 的 `virtual_models` 名册。旧 tag 保留在同机与 ACR，回滚是一条 sed 换镜像行 + `compose up -d`，秒级；回滚到无此功能的旧镜像时顺手删掉 `SMG_ADMIN_AUTH_PASS` 行（留着无害，按原样回滚）。
 
 ## 6. 活跃缺口与后续方向（按优先级）
 
@@ -371,26 +458,21 @@ curl -s http://127.0.0.1:8800/config/policy                # 生效链 JSON（�
       `{worker_id, model_id, url, health, load}`，`models` / 两个上限 / 组与入口信息都不过去，
       入口与上限因此都是**每网关独立**，多网关下同一入口的可见性不一致。
 
-## 7. 文档地图（doc/，28 份）
+## 7. 文档索引
 
-**现行权威**：README（入口）、architect.md（架构总览）、scope-trim.md（裁剪判定书+执行记录）、
-agent-handover.md（本文）、todo-deferred.md（TODO 口径）、gap-mesh.md、gap-mesh-final.md、
-gap-watcher-merge.md、gap-gpu-load.md、gap-routing-dyn.md、gap-token-accounting.md、
-gap-inflight-age.md、gap-metrics-final.md、gap-tls-chain.md、gap-virtual-models.md、
-gap-worker-caps.md（每服务并发/利用率上限：候选集硬排除、逐卡利用率口径）、
-gap-config-store.md（配置持久化：sqlite/postgres/file 三态后端、CAS、镜像与采纳）、
-gap-session-2026-10-04.md（上下文窗口语义翻转、/v1/models 形状、effort 三层继承、per-GPU 利用率、
-以及这一轮踩过的坑——**接手前建议先读这一份**）、
-refactor-arch-2026-10-05.md（**本轮 facade + 子模块拆分 + UI 入口迁移的执行契约与落地结果**，
-含实测计数表与四条 backlog 登记）、
-deploy-state.md（**五实例 fleet 现状**：镜像/compose/池/负载 env/管理面口令逐项实测、生效后端怎么查、已知漂移与处置、死代码清单）、
-deploy-fleet.md（历次部署与真机验证记录，含 2026-10-12 一轮的发布物与回滚顺序）与
-deploy-8800prod-20261012-proxy-auth.md / deploy-8802-20261012-proxy-auth.md（代理来源前置否决在
-生产与测试实例的真机验收矩阵 + 回滚手册，是 8800 下一次升级前的操作依据）、
-ui-trim-legacy-pages.md（管理台相对原版 webui 的页面差异）、parity-cpu-ablation.md。
+本仓 **唯一完整的文档索引在 README〈文档索引〉**（一份表覆盖全部 `doc/*.md`，逐份一行），本节不维护逐份清单、不钉份数，只做指针：新增/移动文档只改 README 那一处，改完跑
+`python3 script/check_docs_index.py`（逐份枚举 `doc/*.md`，漏收即退出 1；README 表内目标文件不存在同样
+退出 1），不靠计数对计数。
 
-**对拍与真实评测（数据留档，引用前注意树龄）**：parity-contract/routing/policy-extra/perf-v2、
-real-eval.md（prefix cache 97–99% 命中实证）。
+下面两段是索引表承载不了的信息：粗粒度主题指针（**不是清单，逐份以 README 表为准**）与清理史。
+
+**按任务取文档**：调度与容量 → gap-worker-caps / gap-gpu-load / gap-routing-dyn / gap-effort-ladder；
+入口与请求改写 → gap-virtual-models / gap-session-2026-10-04；配置持久化 → gap-config-store；
+管理面鉴权 → gap-admin-auth；发现与探针 → gap-watcher-merge / gap-watcher-deny-21k；
+集群与观测 → gap-mesh / gap-mesh-final / gap-metrics-final / gap-token-accounting / gap-inflight-age；
+TLS → gap-tls-chain；发布与运维 → deploy-state / deploy-fleet / operations-lessons-20261012
+与本轮清理记录 docs-cleanup-2026-10-12（**已移除文档的逐份落地 commit 与现行口径去处**见其 §1 表，
+2026-10-11 那五条 api-key 与能力字段裁定的并入文本见其 §1.1）；对拍数据 → parity-* / real-eval.md（引用前注意树龄）。
 
 **历史留档已清理（2026-10-01）**：裁剪前平面的 26 份文档（feature-gap、verification-*、impl-*、
 fix-majors、wasm-feasibility、parity-perf v1 与已删平面的 gap-*）已随文档精简删除，需要时查

@@ -1,5 +1,7 @@
 # 缺口闭合：`smg_http_inflight_request_age_count` 真实采样
 
+日期：2026-10-06 · 状态：**已落地，无后继裁定推翻**（现行口径就是本文）。
+
 对应 `doc/gap-metrics-final.md` 表 C 唯一一行。
 实现落点：`observability.lua`（登记表 + 采样 + 渲染）、`init.lua`（采样定时器 + log 阶段兜底）、
 `router.lua`（`finish_request` 注销 + 顶部注释债）。契约段 `inflight_age`（32 项）。

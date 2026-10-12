@@ -1,9 +1,9 @@
 # lua-router 系统架构与代码框架
 
 > 本文是架构总览：运行时模型、请求生命周期、模块地图、共享状态、策略子系统、周边集成、
-> 部署形态与测试框架。计数对应 2026-10-06 当前 main 树（`66a891f`）：`lualib/` 下 **75 个 Lua
-> 文件 / 34 608 行**（七个域拆成 facade + 子模块，见 §3）、单测 13 个文件、契约 691 项 / 24 段、
-> **22 门禁全绿**（锚点日志 `/data/tmp/lr-gates/gates-20261006-051452.log`，tier=full）。
+> 部署形态与测试框架。代码文件数与行数会随实现漂移，引用前用下方命令重取；单测 19 个 .lua + 1 个 .mjs、
+> 契约 765 项 / 24 段、**22 门禁全绿**（锚点日志
+> `/data/tmp/lr-gates/gates-20261012-160634.log`，tier=full，22 passed / 0 failed / 0 skipped）。
 > 本轮拆分的设计契约与执行记录见 [refactor-arch-2026-10-05.md](refactor-arch-2026-10-05.md)；
 > 裁剪判定与执行记录见 [scope-trim.md](scope-trim.md)；已删平面的描述在 git 历史，本文只描述现状。
 >
@@ -15,7 +15,7 @@
 lua-router 是 Rust 网关 smg（源码在上游 llm-router 仓库的 gateway/）的 **OpenResty/Lua 等价重写**：
 一个面向 LLM 推理后端的路由网关，负责多 worker 选路、流式透传、健康检查、熔断、并发限流、
 观测与控制面。它跑在 authz 同源镜像（OpenResty 1.31 + LuaJIT）上，不依赖任何原生扩展。
-对外行为以 Rust 版为契约基准做行为对拍（当前 24 段 691 项，裁剪前 841 项；新增的 `caps` 段钉每服务容量）。
+对外行为以 Rust 版为契约基准做行为对拍（当前 24 段 765 项，裁剪前 841 项；新增的 `caps` 段钉每服务容量）。
 
 ```mermaid
 flowchart LR
@@ -82,8 +82,9 @@ webui 静态包 + `ui/admin/` Quasar UMD 管理台四页）放进 `/usr/local/sh
 取代 2026-10-05 那轮的 `/a/` 入口）：admin 静态由模板的 `location /` 提供（root 落到
 `<LMR_UI_DIR>/admin/`，try_files 未命中回落 `@lmr_klib` 走 klib 路由表），旧入口 `/a` 与
 `/a/` 各 302 到 `/`（相对引用 + no-store）；`/_ui/*` 全部取消（无 302、无别名、
-无静态块，落 404 sink；唯一例外是 klib 路由表里的 `/_ui/logs`、`/_ui/stats`、
-`/_ui/logs/backends`，router.lua 未动）。管理台数据面在根上的 exact 别名族：
+无静态块，落 404 sink；klib 路由表里残留的 `/_ui/logs`、`/_ui/stats`、`/_ui/logs/backends`
+三条注册也随 `7e8bfff` 一并删除，`/_ui/*` 从此整片 404——三个 handler 本体仍在 `observability.lua`
+导出，供根别名与单测按原名取用）。管理台数据面在根上的 exact 别名族：
 `/config*` `/logs*` `/stats`（`ui/admin/api.js` 的路径契约）。
 
 ## 2. 请求生命周期（HTTP 推理面）
@@ -127,37 +128,38 @@ sequenceDiagram
 加载期能回指同一张表），实现逐字住在子模块里。**对外契约仍是 facade 的 `_M` 名册**——各 conf 的
 `*_by_lua`、单测的 `package.loaded` 换桩、五方借用点全部按原名从 facade 上取，逐名保留。
 
-`find lualib -name '*.lua' | xargs wc -l` 实测 **75 个文件 / 34 608 行**；单测对应
-`test/unit/test_*.lua`（**13 个文件**；门禁跑 luajit 12 个 + resty 4 个口径，其中
-tree / policies / hash 双口径各跑一次）。
+`find lualib -name '*.lua' | xargs wc -l` 实测 **76 个文件 / 37 778 行**；单测对应
+`test/unit/test_*.lua`（**19 个 .lua + 1 个 .mjs**；门禁跑 luajit 17 个 + resty 4 个口径
+（tree / policies / hash 双口径各跑一次，resty 侧第四个是 integration）+ node 1 个
+（`test_ui_merge.mjs`，从盘上 html 抽真函数跑，无端口无容器）。
+行数与文件数会随实现漂移，引用前用上面的命令重取；本节的定性结构（facade + 子模块 + 单文件）比数字稳定。
 
-### 3.1 七个拆分层（facade + 子模块，行数 wc -l 实测）
+### 3.1 七个拆分层（facade + 子模块）
 
-| 域 | facade（行数） | 子模块（一句话职责 · 行数） | 被谁接线 |
+| 域 | facade | 子模块（一句话职责） | 被谁接线 |
 |---|---|---|---|
-| **router** | `router.lua`（364）：klib 路由表 `build()` + `handle()` + server 级预检 + 全量 re-export | `jsonutil`(1000) 顶层精确改写族（`set_top_field` / `rewrite_model` / `merge_top_object` / `patch_response_metadata`）+ DP rank 注入 + 路由文本抽取 + usage + SSE + 会话指纹<br>`respond`(318) 错误应答 / CORS / request id / 请求头与标签白名单<br>`profiles`(305) config_store 之上的 profile 读层缝：`profile_model_group` 与两条恒 nil 停用缝 `profile_policy_name` / `profile_effort_value`<br>`candidates`(710) **热路径**：`policy_for` + `candidates_for` 门序（健康→白名单/绑定→模型许可→容量硬排除(full)→组门→**绿灯优先裁剪**）+ `group_key_name` / `group_policy_hint` + card_key 族<br>`pump`(189) cosocket 泵（`connect_target` / `read_response_head` / `send_attempt` / `discard_body` / `read_response_body`）<br>`forward`(878) streaming 泵 + 重试环 + `forward` 主循环（`lr_bound_model` → `rewrite_model` 的转发名在此落地，整组一致拒绝的 503 文案、**全池到顶的 429** 与显式 pin 读 `why.stepped_aside` 也在此）<br>`inference`(526) 推理面（别名解析、effort 三层继承、`output_budget_of` 纯读、两条恒「无改写」的 ctx 空壳）+ 公开面 health 族<br>`models_api`(969) `/v1/models` 合成（`models_handler` / `advertise_real_model` / `advertise_virtual_entry` / `fill_model_fields` / `inject_virtual_models` / `resolve_model_caps` / `common_acceptance` / `declared_max_output_tokens`）+「只广告虚拟入口」开关 + server_info<br>`metrics_ep`(430) metrics 聚合渲染 + engine_metrics / model_info（load-safe：entrypoint 独立进程直调）<br>`control`(483) 控制面（workers CRUD / flush_cache / v1/loads / model-map）+ 观测与 mesh handler + `preflight_guard`<br>`reqlog`(167) `log_inference_request` 组装一条 RequestRecord + `finish_request` 统一收尾<br>`host`(45) 进程级惰性访问器 `cfg()` / `limit()` / `store()`——**不进导出契约**，只被子模块 require | conf 三处 `*_by_lua` 只取 `preflight_guard` / `handle`；`ui.lua` 运行时硬依赖 `set_top_field` / `do_chat` / `do_completion` |
-| **config_store** | `config_store.lua`（132）：require + 逐名 re-export | `lexicon`(355) helper、词表、JSON 形状小工具、对端模块惰性取用<br>`env`(117) `ENV_NAMES` 名册 + `capture_env` / `env` + `LMR_UPSTREAMS_FILE` 种子<br>`profiles`(815) 池 / 候选 / 绑定 / 组装配：`build_target_group` / `target_group_of` / `build_context_window` / `profile_from_entry`（停用的 per-alias `policy` / `effort` 各在此打一条 warn）+ 两条别名链守卫（`assert_no_alias_chain`）<br>`upstreams`(704) 声明层校验与脱敏 + `upstream_drifts` / patch / `reconcile_upstreams`<br>`snapshot`(814) 空快照语义 + `sync_virtual_view` / `new_card` / `snapshot_of` / `cfg_from_document` / `cfg_from_env`（原配置期校验 `validate_declared_context_windows` 已于 2026-10-08 移除）<br>`persistence`(540) **硬边界：全模块只有本文件碰 shdict / 后端 / 文件 IO**（三层读写 + CAS 冲突 + `persist` + `migrate_once` + 四枚 revision token 读点）<br>`readers`(542) `current` / `ctx_cap` 族 / `virtual_ctx_cap` / 模态 / policy 热路径读 / `policy_document` / 档位三层查表<br>`mutators`(452) `apply_*` 家族 + 整表写 + `profile_policy` / `profile_effort`（活着的死 reader）<br>`httpc`(155) `raw_request`（唯一生产读者是 props 的 /props 代理）<br>`handlers`(389) watcher 桥 + `document` / `models_document` + 10 个 `handle_config_*` | router / init / policy / props / ui / observability / router-host |
-| **registry** | `registry.lua`（174） | `keys`(355) `lr_workers` 键格局（含 `gu:`）+ shdict 懒解析 + 锁 + worker id + 名单 + mesh 写钩子<br>`url`(118) url 规范化与拨号助手<br>`caps`(647) 上游能力采集（自包含纯域）<br>`records`(1145) 规格解析 + models 助手族 + `add` / `remove` + 读出视图 + `info`（含 `load_state` 与三个上限、两个实测读数）+ `candidate_allows_model` + `patch_record`<br>`health`(273) 健康位与熔断（open→half_open 唯一恢复 CAS）<br>`loads`(638) 负载折叠 + **每服务容量判定**：`cap_limit` / `util_limit` 两把归一尺子、私有 `capacity_verdict`（唯一判定体）、公开 `capacity_state`（**三态 idle/busy/full/nil**）与 `capacity_exclusion`（只对 full 返回排除）、`lo:` / **`gu:`** 两个读数的读写（`set_gpu_util` / `gpu_util`；读数未知→不排除，`set_gpu_util` 拒负值/NaN/±inf、只在上方夹到 1）<br>`discovery`(808) 探针与覆盖度（`probe_advertised_entries` / `refresh_models` / `model_caps` / `record_model_caps`）+ PUT update + 元数据发现 + DP 展开 + 作业队列 + 种子 | router / hb / mesh / watcher / gpu_load / config_store / policy / props / observability / init |
-| **watcher** | `watcher.lua`（65） | `env`(492) 26 枚 `SMG_WATCHER_*` + URL 规范化 + 自端口<br>`modelmap`(251) model-map 解析与 effective / apply<br>`probe`(176) 严格探针 `classify` / `probe_verdict` 三档判定<br>`discover`(784) 三源发现纯层 + docker `unix_get` / `collect`（**DENY_PORT 只在 proc 扫描分支生效**，就在 `collect` 的 deny 装配处）<br>`ledger`(229) 台账<br>`reconcile`(759) **内部不许再拆**：守卫的唯一判定点 + 分档摘除 + 单轮保险丝<br>`live`(514) live 入口 + `make_fetch` / `probe_pool` + registry 适配 + run_pass / tick / start | init 定时器（worker 0 + lr_locks 单飞）、router/control、config_store/handlers、config.lua、gpu_load/seams |
-| **gpu_load** | `gpu_load.lua`（80） | `parse`(765) exposition 解析族（负载 `max_gauge` / **利用率 `util_fraction` + `util_by_card`**，两份 gauge 名册 + `DEFAULT_UTIL_QUERY`）<br>`cards`(848) 卡归属与折叠（**四路利用率口径 `assign_util`**（认不出卡回退整机 max 并计 fallback）、`host_card_utils` / `util_fold`、`util_config`）<br>`prom`(209) Prom 客户端<br>`seams`(384) live seams（`default_write` / **`default_write_util`**）+ effective_load + warn_dedup<br>`runpass`(818) `run_pass` 主循环（**负载 / 利用率两通道** stats 字段口径单点定义 `new_stats`）<br>`export`(304) 指标导出（两族）+ 定时器 | hb 定时器挂载 |
-| **mesh** | `mesh.lua`（59） | `crdt`(1368) **不拆**：时钟 / LWW / 版本向量 + 成员表 + 分区检测 + `observe_worker` + 快照合并（幻影键修复的正确性依赖这些同域）<br>`wire`(151) 协议编解码<br>`rate`(127) 全局限流窗口<br>`handlers`(425) `/_mesh/internal/*` 四条 + 13 条 `/ha/*`<br>`sync`(481) cosocket `http_request` + `sync_with` + `ROUTES` / `dispatch` + `SMG_MESH_*` 装配 + 进程内单例 | init 定时器、router/control、registry/keys |
-| **observability** | `observability.lua`（1328）：写侧原语（counter / observe / gauge + 键文法）+ `record_*` 登记点 + **HELP 权威表** + `prometheus_text`——**与导出器同域不拆**（键文法是隐式契约，契约门只测最终文本） | `inflight`(246) 在飞年龄 tracker（lr_stats 的 1024 定长槽）<br>`logstore`(600) 请求日志环形缓冲 + 查询 DSL + `/_ui/logs` 三 handler + `stats()` | router / policy / hb / limit / init / store_dispatcher / gpu_load-export / watcher-live / registry-health |
+| **router** | `router.lua`：klib 路由表 `build()` + `handle()` + server 级预检 + 全量 re-export | `jsonutil` 顶层精确改写族（`set_top_field` / `rewrite_model` / `merge_top_object` / `patch_response_metadata`）+ DP rank 注入 + 路由文本抽取 + usage + SSE + 会话指纹<br>`respond` 错误应答 / CORS / request id / 请求头与标签白名单<br>`profiles` config_store 之上的 profile 读层缝：`profile_model_group` 与两条恒 nil 停用缝 `profile_policy_name` / `profile_effort_value`<br>`candidates` **热路径**：`policy_for` + `candidates_for` 门序（健康→白名单/绑定→模型许可→容量硬排除(full)→组门→**绿灯优先裁剪**）+ `group_key_name` / `group_policy_hint` + card_key 族<br>`pump` cosocket 泵（`connect_target` / `read_response_head` / `send_attempt` / `discard_body` / `read_response_body`）<br>`forward` streaming 泵 + 重试环 + `forward` 主循环（`lr_bound_model` → `rewrite_model` 的转发名在此落地，整组一致拒绝的 503 文案、**全池到顶的 429** 与显式 pin 读 `why.stepped_aside` 也在此）<br>`inference` 推理面（别名解析、effort 三层继承、`output_budget_of` 纯读、两条恒「无改写」的 ctx 空壳）+ 公开面 health 族<br>`models_api` `/v1/models` 合成（`models_handler` / `advertise_real_model` / `advertise_virtual_entry` / `fill_model_fields` / `inject_virtual_models` / `resolve_model_caps` / `common_acceptance` / `declared_max_output_tokens`）+「只广告虚拟入口」开关 + server_info<br>`metrics_ep` metrics 聚合渲染 + engine_metrics / model_info（load-safe：entrypoint 独立进程直调）<br>`control` 控制面（workers CRUD / flush_cache / v1/loads / model-map）+ 观测与 mesh handler + `preflight_guard`<br>`reqlog` `log_inference_request` 组装一条 RequestRecord + `finish_request` 统一收尾<br>`host` 进程级惰性访问器 `cfg()` / `limit()` / `store()`——**不进导出契约**，只被子模块 require | conf 三处 `*_by_lua` 只取 `preflight_guard` / `handle`；`ui.lua` 运行时硬依赖 `set_top_field` / `do_chat` / `do_completion` |
+| **config_store** | `config_store.lua`：require + 逐名 re-export | `lexicon` helper、词表、JSON 形状小工具、对端模块惰性取用<br>`env` `ENV_NAMES` 名册 + `capture_env` / `env` + `LMR_UPSTREAMS_FILE` 种子<br>`profiles` 池 / 候选 / 绑定 / 组装配：`build_target_group` / `target_group_of` / `build_context_window` / `profile_from_entry`（停用的 per-alias `policy` / `effort` 各在此打一条 warn）+ 两条别名链守卫（`assert_no_alias_chain`）<br>`upstreams` 声明层校验与脱敏 + `upstream_drifts` / patch / `reconcile_upstreams`<br>`snapshot` 空快照语义 + `sync_virtual_view` / `new_card` / `snapshot_of` / `cfg_from_document` / `cfg_from_env`（原配置期校验 `validate_declared_context_windows` 已于 2026-10-08 移除）<br>`persistence` **硬边界：全模块只有本文件碰 shdict / 后端 / 文件 IO**（三层读写 + CAS 冲突 + `persist` + `migrate_once` + 四枚 revision token 读点）<br>`readers` `current` / `ctx_cap` 族 / `virtual_ctx_cap` / 模态 / policy 热路径读 / `policy_document` / 档位三层查表<br>`mutators` `apply_*` 家族 + 整表写 + `profile_policy` / `profile_effort`（活着的死 reader）<br>`httpc` `raw_request`（唯一生产读者是 props 的 /props 代理）<br>`handlers` watcher 桥 + `document` / `models_document` + 10 个 `handle_config_*` | router / init / policy / props / ui / observability / router-host |
+| **registry** | `registry.lua` | `keys` `lr_workers` 键格局（含 `gu:`）+ shdict 懒解析 + 锁 + worker id + 名单 + mesh 写钩子<br>`url` url 规范化与拨号助手<br>`caps` 上游能力采集（自包含纯域）<br>`records` 规格解析 + models 助手族 + `add` / `remove` + 读出视图 + `info`（含 `load_state` 与三个上限、两个实测读数）+ `candidate_allows_model` + `patch_record`<br>`health` 健康位与熔断（open→half_open 唯一恢复 CAS）<br>`loads` 负载折叠 + **每服务容量判定**：`cap_limit` / `util_limit` 两把归一尺子、私有 `capacity_verdict`（唯一判定体）、公开 `capacity_state`（**三态 idle/busy/full/nil**）与 `capacity_exclusion`（只对 full 返回排除）、`lo:` / **`gu:`** 两个读数的读写（`set_gpu_util` / `gpu_util`；读数未知→不排除，`set_gpu_util` 拒负值/NaN/±inf、只在上方夹到 1）<br>`discovery` 探针与覆盖度（`probe_advertised_entries` / `refresh_models` / `model_caps` / `record_model_caps`）+ PUT update + 元数据发现 + DP 展开 + 作业队列 + 种子 | router / hb / mesh / watcher / gpu_load / config_store / policy / props / observability / init |
+| **watcher** | `watcher.lua` | `env` 枚 `SMG_WATCHER_*` + URL 规范化 + 自端口<br>`modelmap` model-map 解析与 effective / apply<br>`probe` 严格探针 `classify` / `probe_verdict` 三档判定<br>`discover` 三源发现纯层 + docker `unix_get` / `collect`（**DENY_PORT 只在 proc 扫描分支生效**，就在 `collect` 的 deny 装配处）<br>`ledger` 台账<br>`reconcile` **内部不许再拆**：守卫的唯一判定点 + 分档摘除 + 单轮保险丝<br>`live` live 入口 + `make_fetch` / `probe_pool` + registry 适配 + run_pass / tick / start | init 定时器（worker 0 + lr_locks 单飞）、router/control、config_store/handlers、config.lua、gpu_load/seams |
+| **gpu_load** | `gpu_load.lua` | `parse` exposition 解析族（负载 `max_gauge` / **利用率 `util_fraction` + `util_by_card`**，两份 gauge 名册 + `DEFAULT_UTIL_QUERY`）<br>`cards` 卡归属与折叠（**四路利用率口径 `assign_util`**（认不出卡回退整机 max 并计 fallback）、`host_card_utils` / `util_fold`、`util_config`）<br>`prom` Prom 客户端<br>`seams` live seams（`default_write` / **`default_write_util`**）+ effective_load + warn_dedup<br>`runpass` `run_pass` 主循环（**负载 / 利用率两通道** stats 字段口径单点定义 `new_stats`）<br>`export` 指标导出（两族）+ 定时器 | hb 定时器挂载 |
+| **mesh** | `mesh.lua` | `crdt` **不拆**：时钟 / LWW / 版本向量 + 成员表 + 分区检测 + `observe_worker` + 快照合并（幻影键修复的正确性依赖这些同域）<br>`wire` 协议编解码<br>`rate` 全局限流窗口<br>`handlers` `/_mesh/internal/*` 四条 + 13 条 `/ha/*`<br>`sync` cosocket `http_request` + `sync_with` + `ROUTES` / `dispatch` + `SMG_MESH_*` 装配 + 进程内单例 | init 定时器、router/control、registry/keys |
+| **observability** | `observability.lua`：写侧原语（counter / observe / gauge + 键文法）+ `record_*` 登记点 + **HELP 权威表** + `prometheus_text`——**与导出器同域不拆**（键文法是隐式契约，契约门只测最终文本） | `inflight` 在飞年龄 tracker（lr_stats 的 1024 定长槽）<br>`logstore` 请求日志环形缓冲 + 查询 DSL + `/logs` 三 handler（`ui_logs_handler`/`ui_stats_handler`/`ui_backends_handler`，2026-10-08 起挂在根别名上）+ `stats()` | router / policy / hb / limit / init / store_dispatcher / gpu_load-export / watcher-live / registry-health |
 
 ### 3.2 未拆的单文件模块
-
-| 模块 | 行数 | 职责 | 被谁接线 |
-|---|---:|---|---|
-| `hash.lua` | 964 | BLAKE3 环位（与 Rust 逐位兼容）、ketama 序、粘滞键 | consistent_hashing / prefix_hash |
-| `policy.lua` | 901 | 策略分发（random / round_robin / power_of_two / manual 内联于此）、policy hint、cache_aware 逃逸/快照 | router / init / registry-discovery / watcher-live |
-| `policies/*.lua` | 2314（6 文件） | tree（基数树+粘滞）/ cache_aware / bucket / consistent_hashing / prefix_hash 五个实现 + utils | policy |
-| `init.lua` | 547 | fork 前接线：env 快照、hb / watcher / mesh / 负载定时器（worker0 + lr_locks 单飞）、on_log 兜底 | nginx `init_by_lua` / `init_worker_by_lua` |
-| `hb.lua` | 417 | 健康巡检定时器 + 熔断计数 + /v1/loads 扇出 + gpu_load 定时器挂载点 | init 定时器、router、registry-discovery、watcher-live |
-| `config.lua` | 394 | env → 配置对象（含 watcher 子配置的可用性探测） | init |
-| `ui.lua` | 348 | 根数据面与 `/u` 的 API 别名 handler 族、`/props` 与根挂载的 webui 端点 | conf/ui.conf include |
-| `httpc.lua` | 181 | **本轮新增的公共传输库**：cosocket 连接池 + HTTP 原语（自旧 registry 的 E 块提升）。registry 保留 re-export，router / config_store / hb / mesh / watcher / gpu_load 的既有借用点全部不动 | 只有 `registry.lua` require 它，其余经 registry 按原名借用 |
-| `props.lua` | 225 | `/props` 快照与引擎代理；`with_ctx` 是 `ctx_cap`（模型卡 `ctx` / 平铺 `model_ctx`）唯一的生产读者，只换回显的 `n_ctx` / `n_ctx_train`，不参与任何转发字节 | ui.lua、config_store/readers |
-| `limit.lua` | 209 | 全局并发闸门 + 排队（shdict 计数） | router（经 router/host）、init、observability |
-| `store_dispatcher.lua` / `store_file.lua` / `store_sqlite.lua` / `store_postgres.lua` | 328 / 227 / 318 / 189 | 配置后端分派、镜像文件、sqlite、postgres | config_store/persistence |
+| 模块 | 职责 | 被谁接线 |
+|---|---|---|
+| `hash.lua` | BLAKE3 环位（与 Rust 逐位兼容）、ketama 序、粘滞键 | consistent_hashing / prefix_hash |
+| `policy.lua` | 策略分发（random / round_robin / power_of_two / manual 内联于此）、policy hint、cache_aware 逃逸/快照 | router / init / registry-discovery / watcher-live |
+| `policies/*.lua` | tree（基数树+粘滞）/ cache_aware / bucket / consistent_hashing / prefix_hash 五个实现 + utils | policy |
+| `init.lua` | fork 前接线：env 快照、hb / watcher / mesh / 负载定时器（worker0 + lr_locks 单飞）、on_log 兜底 | nginx `init_by_lua` / `init_worker_by_lua` |
+| `hb.lua` | 健康巡检定时器 + 熔断计数 + /v1/loads 扇出 + gpu_load 定时器挂载点 | init 定时器、router、registry-discovery、watcher-live |
+| `config.lua` | env → 配置对象（含 watcher 子配置的可用性探测） | init |
+| `ui.lua` | 根数据面与 `/u` 的 API 别名 handler 族、`/props` 与根挂载的 webui 端点 | conf/ui.conf include |
+| `httpc.lua` | **本轮新增的公共传输库**：cosocket 连接池 + HTTP 原语（自旧 registry 的 E 块提升）。registry 保留 re-export，router / config_store / hb / mesh / watcher / gpu_load 的既有借用点全部不动 | 只有 `registry.lua` require 它，其余经 registry 按原名借用 |
+| `props.lua` | `/props` 快照与引擎代理；`with_ctx` 是 `ctx_cap`（模型卡 `ctx` / 平铺 `model_ctx`）唯一的生产读者，只换回显的 `n_ctx` / `n_ctx_train`，不参与任何转发字节 | ui.lua、config_store/readers |
+| `limit.lua` | 全局并发闸门 + 排队（shdict 计数） | router（经 router/host）、init、observability |
+| `store_dispatcher.lua` / `store_file.lua` / `store_sqlite.lua` / `store_postgres.lua` | 配置后端分派、镜像文件、sqlite、postgres | config_store/persistence |
 
 依赖方向自上而下单向：conf → init → router →（policy / registry / hb / limit / watcher / gpu_load /
 mesh / config_store / observability）→ policies。除 mesh 成员表与 cache_aware 树外，模块间不共享
@@ -174,9 +176,9 @@ mesh / config_store / observability）→ policies。除 mesh 成员表与 cache
 | 平面 | 端点 | 鉴权 |
 |---|---|---|
 | 推理数据面 | /v1/chat/completions、/v1/completions、/v1/embeddings、/v1/rerank、/v1/classify、/v1/responses（纯透传+元数据回填）、/generate、/v1/models（HEAD 镜像） | 开放 |
-| 控制面 | /workers CRUD（幂等 id）、/flush_cache、/v1/loads、/model-map | 开放（信任边界=网络，见 §7） |
+| 控制面 | /workers CRUD（幂等 id）、/flush_cache、/v1/loads、/model-map | `/workers` `/model-map` `/flush_cache` 三条在管理面门内（`router.lua` 分发前的 `admin_auth.guard_klib()`，fail-open 前缀清单）；`/v1/loads` **刻意不进清单**（健康判定链逐秒读它）。未配口令时整道门关闭=开放 |
 | 公开面 | /health、/liveness、/readiness、/server_info、/model_info、/engine_metrics、/health_generate | 无 |
-| UI 面 | 页面入口 `/`（管理台，admin 静态在模板的 `location /`）与 `/u/`（原版 webui，不变）；旧入口 `/a`、`/a/` 各 302 到 `/`，`/_ui/*` 全部取消（落 404 sink，例外是 klib 表里的 `/_ui/logs`、`/_ui/stats`、`/_ui/logs/backends`）；管理台数据面在根上的 exact 别名族（`/config*`、`/logs*`、`/stats`）与 `/u/*` 同名别名族都在 ui.conf；另有原版 webui 所需端点的根挂载：`/props`、`/slots`、`/tools`、`/models/load`、`/models/unload`、`/models/sse`、`/v1/stream`、`/v1/streams/lookup`、`/v1/chat/completions/control`、`/properties`（全部复用 ui.lua 现有 handler） | 开放 |
+| UI 面 | 页面入口 `/`（管理台，admin 静态在模板的 `location /`）与 `/u/`（原版 webui，不变）；旧入口 `/a`、`/a/` 各 302 到 `/`，`/_ui/*` 全部取消（落 404 sink；klib 表里的 `/_ui/logs`、`/_ui/stats`、`/_ui/logs/backends` 三条注册已随 `7e8bfff` 删除，`/_ui/*` 整片 404）；管理台数据面在根上的 exact 别名族（`/config*`、`/logs*`、`/stats`）与 `/u/config*` 同名别名族都在 ui.conf；另有原版 webui 所需端点的根挂载：`/props`、`/slots`、`/tools`、`/models/load`、`/models/unload`、`/models/sse`、`/v1/stream`、`/v1/streams/lookup`、`/v1/chat/completions/control`、`/properties`（全部复用 ui.lua 现有 handler） | **管理面 Basic Auth（2026-10-12）**：`/` 入口文档与 `*.html`、`/config*` 全族、`/logs*`、`/stats`、`/slots`、`/tools`、`/u/config*` 全族在门内（`ui.conf` 24 条 exact location 各一行 `guard()` + 模板 `location /` 的 `guard_static`）；`/props`、`/u/props`、`/u/v1/*`、`/u/logs*`、`/u/stats`、`/u/slots`、`/u/tools` 与原版 webui 静态资源保持匿名（用户裁定：对话界面不是管理面）。见 [gap-admin-auth.md](gap-admin-auth.md) |
 | HA | /ha/* 13 条 + /_mesh/internal/* 4 条（mesh.ROUTES 共 17 条） | 缺省整面 503；开启后无鉴权，mesh 端口只能开在可信网络 |
 | 观测 | /metrics（主监听 + 独立 metrics 监听） | 无 |
 | 未实现 | /wasm 三条固定 501（TODO，见 [todo-deferred.md](todo-deferred.md)） | — |
@@ -255,9 +257,9 @@ per-alias 的 `policy`/`effort` 停用之后，「给这个入口换策略」只
 
 | 系统 | 方向 | 机制与注意 |
 |---|---|---|
-| 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | worker 0 三源发现（targets/dockersock/proc）、严格 `/v1/models` 探针、十条守卫、宽限期；独立容器已退役。探针确认不可用按分档摘除：确定性否定当轮摘、传输层未知攒 `SMG_WATCHER_PROBE_FAILURES`(2) 轮再摘、单轮摘除超 owned 一半降级为只 warn。测试 mock 仍会短暂入池，根治需端口黑白名单（见 [gap-watcher-merge.md](gap-watcher-merge.md)） |
+| 内建 watcher（原 llm-watcher，已合并） | router 进程内定时器 | worker 0 三源发现（targets/dockersock/proc）、严格 `/v1/models` 探针、十条守卫、宽限期；独立容器已退役。探针确认不可用按分档**处置**（2026-10-09 `9bf3c07` 起的现行口径）：**reject 三档**（读不出 `data[].id` / router 自指纹 / 超 `max_models`）当轮**临时禁用保行**——打 `td:` 键退出候选、行与健康位不动，探针恢复轮清位回池（`SMG_WATCHER_PROBE_TEMP_DISABLE=0` 退回删行）；**物理摘除只留两个信号**：传输层未知攒 `SMG_WATCHER_PROBE_FAILURES`(2) 轮再摘、发现源消失走 remove-grace/keep-last；单轮摘除超 owned 一半降级为只 warn，另有「禁用即摘」（条目 `disabled` 走同一个 `release()`）。测试 mock 仍会短暂入池，根治需端口黑白名单（完整分档见 [gap-watcher-merge.md](gap-watcher-merge.md) §1.1） |
 | GPU 负载源 | worker/监控 → registry | `gpu_load.lua` 两路负载（抓 worker `/metrics` 的 DCGM 类指标 + 远程 Prometheus 查询，写 `xl:`）+ **一条搭载通道**：**逐卡 GPU 利用率写 `gu:`**（准入门的数据源；`assign_util` 四路口径，认不出卡时回退整机 max 并计 `lr_gpu_load_util_fallback_total`，不做静默降级）。功率通道（绝对瓦特写 `pw:`）2026-10-06 退役为纯观测、2026-10-09 整体移除（用户裁定；21.k 实测八实例瓦特读数恒同值、零区分度）。这类**转发路径上的**探测失败只损失选路精度、不参与摘除判定（摘除分档只属于上一行的 watcher 严格探针，见 agent-handover.md §4），详见 [gap-gpu-load.md](gap-gpu-load.md) §10（功率移除史见其 §9） |
-| 每服务容量上限（2026-10-01 立项；**2026-10-06 三态重设计**） | 操作员配置 + 两个实时读数 → 选路 | 三个字段：`min_concurrency`（并发调度**下限**，缺席=1）/ `max_concurrency`（**上限**，≤32）/ `max_gpu_util`（GPU 利用率**上限**，0..100；**0 是最严档不是清除**，清除用负数）。`registry.capacity_state` 一处判 `idle`/`busy`/`full`/nil：full = 在飞 ≥ 上限 **或**新鲜 `gu:` ≥ 利用率上限；`capacity_exclusion` 只对 full 命中，在 `router.candidates_for` 装配候选时**硬排除**（即使 cache_aware 亲和命中也迁走）；有 idle 时黄灯让位（裁剪、非排除）。三 cap 全缺席 = 无门 = 零 shdict 读、行为逐字节同旧版。不摘 worker、不改健康。**利用率读数未知 → 不排除**（`gu:` 缺席=未知≠0，监控故障只许损失精度不许损失容量）。全池都到顶时答 **429** `no_available_workers`+「No available workers (N at their concurrency or GPU-util limit)」（用户裁定 2026-10-06：容量到顶不是服务不可用），熔断/不健康/组不服务保持 **503** 原句。指标 `smg_worker_capacity_excluded_total{reason="concurrency_max|gpu_util"}` 与 `smg_worker_capacity_preferred_idle_total`（Lua 独有超集，Rust 无此能力）。`max_power_w` 退役（warn 一次并丢弃、不回显、判定不读），功率通道 2026-10-09 已整体移除。见 [gap-worker-caps.md](gap-worker-caps.md) |
+| 每服务容量上限（2026-10-01 立项；**2026-10-06 三态重设计**） | 操作员配置 + 两个实时读数 → 选路 | 三个字段：`min_concurrency`（并发调度**下限**，缺席=1）/ `max_concurrency`（**上限**，≤32）/ `max_gpu_util`（GPU 利用率**上限**，0..100；**0 是最严档不是清除**，清除用负数）。`registry.capacity_state` 一处判 `idle`/`busy`/`full`/nil：full = 在飞 ≥ 上限 **或**新鲜 `gu:` ≥ 利用率上限；`capacity_exclusion` 只对 full 命中，在 `router.candidates_for` 装配候选时**硬排除**（即使 cache_aware 亲和命中也迁走）；有 idle 时黄灯让位（裁剪、非排除）。三 cap 全缺席 = 无门 = 零 shdict 读、行为逐字节同旧版。不摘 worker、不改健康。**利用率读数未知 → 不排除**（`gu:` 缺席=未知≠0，监控故障只许损失精度不许损失容量）。全池都到顶时答 **429** `no_available_workers`+「No available workers (N at their concurrency or GPU-util limit)」（用户裁定 2026-10-06：容量到顶不是服务不可用），熔断/不健康/组不服务保持 **503** 原句。指标 `smg_worker_capacity_excluded_total{reason="concurrency_max|gpu_util"}` 与 `smg_worker_capacity_preferred_idle_total`（Lua 独有超集，Rust 无此能力）。`max_power_w` 已退役，功率通道 2026-10-09 整体移除——声明层残留的该键按**未知字段静默忽略**（退役期的 warn-once 也随通道删除）、不回显、判定不读。见 [gap-worker-caps.md](gap-worker-caps.md) |
 | 虚拟服务入口 1 对多（2026-10-02 语义反转；2026-10-04 改输出预算口径） | config → 选路与声明 | 虚拟名是**对下游暴露的服务主入口**，`targets[]` 映射一组实际模型（1..N，可来自不同上游），由**调度策略在组内选路**；**策略 key 用入口名**，一入口一棵树（`policies/` 零改动），亲和与逃逸在这一组实际模型之间成立而非按模型名分裂。条目级只允许配 `context_window`：它是**对外声明的上下文总窗口（输入+输出）**，只让客户端据此决定何时压缩，**不参与任何 max_tokens 计算、不改写任何输出预算**（用户裁定 2026-10-04，旧「统一钳制」口径已废止，理由与故障形状见 gap-virtual-models.md §4.2）。单次输出预算记在模型卡 `max_output_tokens`（原名 `context_limit`，用户裁定 2026-10-08 改名；平铺 `model_max_output_tokens` / env `LMR_MODEL_MAX_OUTPUT_TOKENS`，卡片优先于平铺层）。它是**纯对外 advertisement**：唯一去处是 `/v1/models` 的 `capabilities.max_output_tokens`（操作员声明压过引擎自报），**不参与任何校验、钳制或 max_tokens 运算**，也不声称引擎的真实能力；`capabilities.context_length` 与它无关，只由操作员声明的窗口（卡片 `ctx` / 平铺 `model_ctx`，经 `config_store.ctx_cap`）优先于引擎自报决定。原先那条「声明值须严格小于组内各卡片读数最小值」的配置期校验 `config_store/snapshot.lua` 的 `validate_declared_context_windows` 连同 UI 同款前端预校验已于 2026-10-08 一并移除——条目的 `context_window` 是上下文总窗口、卡片的 `max_output_tokens` 是单次输出预算，两个量不可比。条目级 `context_window` 仍只做正整数解析与对外声明。per-alias `policy`/`effort` 停用（仍往返、热路径不读），改由 `model_policies`（按入口名）与模型卡承担。旧形状（`{model,target}` / candidates-only / env）由 `explicit_targets` 旗标保证逐字节不变。实现锚点（文件 + 函数名）：`router/profiles.lua` 的 `profile_model_group`、`router/candidates.lua` 的 `candidates_for` 组门、转发名取 `worker.lr_bound_model` 并在 `router/forward.lua` 的 `forward` 里交给 `router/jsonutil.lua` 的 `rewrite_model`（同函数顺手写日志字段 `ngx.ctx.lr_forwarded_model`，日志行组装在 `router/reqlog.lua` 的 `log_inference_request`）、条目级 `context_window` 解析 `config_store/profiles.lua` 的 `build_context_window`（由同文件的 `profile_from_entry` 调用）、输出预算只读探针 `router/inference.lua` 的 `output_budget_of`；已被废止为恒「无改写」空壳的 `apply_ctx_cap` / `entry_ctx_cap`（同在 `router/inference.lua`）与只读用途的 `config_store/readers.lua` 的 `ctx_cap` / `virtual_ctx_cap` 都还在，热路径无调用者。见 [gap-virtual-models.md](gap-virtual-models.md) |
 | 管理台页面合并（2026-10-02；页面入口 2026-10-05 迁到 `/a/`，2026-10-08 再迁到站点根 `/`） | 操作员 → / | **服务池 = 运行态池 + 声明层同页**：`ui/admin/workers.html` 把 `GET /workers`（3s 轮询）与 `GET /config` 的 `upstreams` 段（20s 轮询）按规范化 URL（折叠尾斜杠 + 大小写）全外合并，一个地址一行；原「远程服务/服务接入」（`ui/admin/upstreams.html`）缩成重定向占位以保住旧链接并消灭「同一份声明层被两个页面各自整表替换」的分叉。上限的**事实来源是声明层**：`cap_owner === 'declared'` 当且仅当有声明且（未入池或池行 `discovery === 'config'`）——因为 `config_store/upstreams.lua` 的 `reconcile_upstreams` 只 patch config 行，「同地址被 watcher 抢先认领 → 声明惰性」是稳态；这类行的**运行态编辑入口整体隐藏**（不止上限），理由是同文件的 `upstream_drifts` 连 priority/cost/labels 一起比较并写回。这类行打三态徽章 `cap_drift`（等自愈·与声明不一致）/`cap_shadowed`（声明管不到这行）/`key_inert`（声明里的 api_key 此刻没下发）。导航按使用频度重排为**模型管理 → 服务池 → 路由策略 → 日志**（`ui/admin/app.js` 的 `pages` 常量），历史锚点 `#upstreams.html` 经同文件的 `legacyPages` 落到合并页；模型页改名**「模型管理」**（`ui/admin/models.html`：虚拟模型入口页，也是全仓最常用的配置页，虚拟模型卡片排在页面最上面；2026-10-05 起虚拟条目改成「条目列表 + 点击编辑弹表单」，保存链路仍是整表替换 + 自键定位）。**控件纪律**：本仓 vendor 的 Quasar UMD（`ui/admin/vendor/quasar-umd.js`，内标 Vue 3.5.41 / Quasar 2.26.0）里 QToggle 与 QOptionGroup 都不经 BaseField 渲染，实测给它们写 `:hint` 不会生成 `.q-field__bottom`，说明文字**只能并进 `:label`**（服务池声明对话框的两个 toggle 就是按这条做的）。见 [gap-pool-merge.md](gap-pool-merge.md) |
 | mesh peer | router↔router | `SMG_MESH_PEERS` 种子 + gossip 同步 worker 视图；身份统一由 sync_with 并键（幻影键已修，mesh_two 门钉住）；`/_mesh/internal/*` 无鉴权，只能开在可信网络 |
@@ -289,7 +291,7 @@ scope-trim 删除，git 历史可恢复。
 
 `test/final_gates.sh` 是唯一入口（GATE_TIER=quick|full 缺省 quick、SKIP_ENV/GATE_ONLY/KEEP_GOING，
 串行硬门，**不可并发**——host 网络 + 固定容器名前缀会争用；发版/计数/生产替换必须 full 档）。
-22 门（锚点日志的运行序）：build、conf、unit、contract（24 段 691 项）、probes、
+22 门（锚点日志的运行序）：build、conf、unit、contract（24 段 765 项）、probes、
 e2e_stateful、e2e_policies、e2e_ui_bridge、e2e_errors、e2e_effort、head_routes、mesh_http、
 e2e_policy_parity、e2e_token_accounting、e2e_gpu_load、e2e_routing_dyn、e2e_profiles、
 e2e_caps、e2e_models_advertisement、e2e_watcher、mesh_two、e2e_tls_chain；逐门计数与覆盖见

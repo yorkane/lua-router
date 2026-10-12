@@ -4,10 +4,13 @@ local _M = require "resty.luarouter.watcher"
 local json_decode = cjson.decode
 
 -- watcher/probe.lua -- the strict probe and the three-way verdict (doc/
--- gap-watcher-merge.md 1.1, AGENTS.md hard rule 4): a deterministic
--- rejection evicts in the same pass, a transport-level unknown must
--- accumulate SMG_WATCHER_PROBE_FAILURES rounds before eviction, and
--- "no probe transport" / require_health neither evicts nor counts.
+-- gap-watcher-merge.md 1.1, AGENTS.md hard rule 4). The verdict is the
+-- classification only; the CONSEQUENCE of "reject" is decided by the caller
+-- (reconcile) since 2026-10-09 9bf3c07: reject -> temporary disable, row
+-- kept (K_TEMP_DISABLE, excluded from candidate assembly, cleared on the
+-- next good pass), physical eviction only for transport-level unknowns
+-- after SMG_WATCHER_PROBE_FAILURES rounds; "no probe transport" /
+-- require_health neither disable nor count.
 -- The reason strings are the document-locked contract with a single owner
 -- here; classify() reads the router fingerprint through the facade exactly
 -- as the monolith did.
@@ -138,8 +141,11 @@ end
 ---  * reject（确定性否定）：对方确实答了 HTTP，只是内容不合要求——有 2xx 却读不出
 ---    data[].id（node_exporter、Web UI、404 页）、advertises 几十个模型（聚合器/另一层
 ---    代理，路由过去等于多一跳甚至绕圈）、命中 router 自指纹（对端是 router，接进池会
----    成环）。这种行留在池里只会回 5xx 并广告一个它服务不了的模型，所以当轮摘除，
----    不等 remove_grace、也不受 keep-last 豁免。
+---    成环）。这种行留在选路里只会回 5xx 并广告一个它服务不了的模型，所以本轮就退出
+---    处置，不等 remove_grace、也不受 keep-last 豁免。**2026-10-09 9bf3c07 起的后果是
+---    「临时禁用保行」**（registry 行不动、打 td: 键让候选装配排除它，探针恢复轮显式清位
+---    回池，不进保险丝计数）；SMG_WATCHER_PROBE_TEMP_DISABLE=0 才退回本条写作当时的
+---    「当轮 release() 删行」。分档不变，变的只是这一档的后果。
 ---  * count（传输层未知）：连不上、超时、TLS 失败、keepalive 池里被对端半关闭的旧连接、
 ---    /v1/models 答非 2xx，以及 "/health 与 /metrics 双 5xx" 那条。前面几种在
 ---    hb.http_request 里都落成 "no /v1/models answer"，网关分不清是引擎在忙大 prefill

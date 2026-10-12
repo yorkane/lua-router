@@ -2,12 +2,19 @@
 
 日期：2026-10-01 · 子任务：feat_routing_dyn · 基线 HEAD：f1122d2
 
+> **端点名迁移标注（2026-10-12）**：本文写作时的策略端点 `/_ui/config/policy` 现名根上的
+`/config/policy`（`conf/ui.conf` 的 `location = /config/policy`，另有别名 `/u/config/policy`）。
+2026-10-08 的 admin 迁根（`7e8bfff`）把管理台数据面整片搬到站点根，`/_ui/*` 无 302、无别名，
+一律落 404 sink；照本文里的 `/_ui/` 路径去请求会得到 404。自 2026-10-12 起这两个端点还在
+管理面 Basic Auth 门内（无凭据 401，`SMG_ADMIN_AUTH_PASS` 未配置时整道门关闭），见
+doc/gap-admin-auth.md。语义（三段原子写、revision、405+Allow、下一次选路生效）逐字未变。
+
 ## 1. 问题与结论
 
 scope-trim 之后，选路策略由 `config.lua` 的 `one_of("SMG_POLICY", "cache_aware",
 POLICIES)` 在 init 阶段一次性读入，`policy.new` 按它建实例；想换策略必须改环境变量
 再重启容器。本特性把策略（全局 + per-model）接入 `config_store.lua` 已有的热配置
-通道（LMR_CONFIG_FILE 快照 + shdict），提供 `/_ui/config/policy` 的 GET/PUT 端点，
+通道（LMR_CONFIG_FILE 快照 + shdict），提供策略端点（现名 `/config/policy`）的 GET/PUT，
 并在管理控制台新增「路由策略」页 `ui/admin/routing.html`。改完策略，**下一次选路
 就走新策略**；不配时行为与改造前逐字节一致。
 
@@ -30,10 +37,10 @@ power_of_two, prefix_hash, manual, bucket, consistent_hashing`。三份名单
 
 ### 端点
 
-- `GET  /_ui/config/policy` → 策略链文档：`{policies[8], policy, env_policy,
+- `GET  /config/policy`（当时名 `/_ui/config/policy`）→ 策略链文档：`{policies[8], policy, env_policy,
   effective_default, model_policies[], models[{model, registered, override, hint,
   effective, source}], revision, persist}`
-- `PUT|POST /_ui/config/policy`，body 三段任意组合（一次原子写）：
+- `PUT|POST /config/policy`，body 三段任意组合（一次原子写）：
   - `{policy: "random"|null}` 改/清全局
   - `{model_policies: [{model, policy}, ...]}` 整表替换
   - `{model_policy: {model, policy|null}}` 单行 upsert/删除（保留其它行）
@@ -159,7 +166,7 @@ power_of_two, prefix_hash, manual, bucket, consistent_hashing`。三份名单
 | lualib/resty/luarouter/config_store.lua | POLICY_NAMES、normalize_policy、ENV_NAMES+SMG_POLICY、new_cfg/cfg_from_document/snapshot_of 的 policy 段、revision 令牌、resolve_policy 链、policy_document、apply_policy、handle_config_policy* |
 | lualib/resty/luarouter/policy.lua | require config_store（pcall）、chain_name、new/for_model 走链、reconfigure 原地换装、stamp_global（start_eviction + select 两个入口） |
 | lualib/resty/luarouter/ui.lua | config_policy_get / config_policy 桥 |
-| conf/ui.conf | location = /_ui/config/policy（GET/HEAD 读，PUT/POST 写，其余 405+Allow） |
+| conf/ui.conf | location = /config/policy（当时名 /_ui/config/policy；GET/HEAD 读，PUT/POST 写，其余 405+Allow；2026-10-12 起该 location 带 guard()） |
 | ui/admin/routing.html | 新页 |
 | ui/admin/app.js, i18n.js, api.js, index.html | 菜单项 + routing 词典块 + API + 版本号 |
 | test/unit/test_routing_dyn.lua | 新单测（122 checks，含 ui.lua 端点桥的 400/200/回显语义） |

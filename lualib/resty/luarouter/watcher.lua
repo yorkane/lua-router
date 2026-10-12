@@ -22,11 +22,14 @@
 --   8. survive a router restart       -> refresh_ids() re-reads the worker ids
 --   9. blind by design                -> no GPU reads, no service control, only
 --      /v1/models, /server_info, /get_server_info, /props, /metrics and /health
---  10. probe eviction is graded       -> probe_verdict() splits the classify()
---      rejections: a deterministic "this is not a worker" answer evicts in the
---      same pass, a transport-level unknown must repeat SMG_WATCHER_PROBE_FAILURES
---      rounds (default 2) before eviction, and reasons that say more about the
---      gateway than about the service never count at all; a per-pass fuse
+--  10. probe handling is graded       -> probe_verdict() splits the classify()
+--      rejections: a deterministic "this is not a worker" answer is handled in
+--      the same pass (since 2026-10-09 9bf3c07 that means TEMPORARY DISABLE --
+--      row kept, td: flag, excluded from candidate assembly, cleared on the next
+--      good pass; SMG_WATCHER_PROBE_TEMP_DISABLE=0 restores same-pass release()),
+--      a transport-level unknown must repeat SMG_WATCHER_PROBE_FAILURES rounds
+--      (default 2) before eviction, and reasons that say more about the gateway
+--      than about the service never count at all; a per-pass fuse
 --      (SMG_WATCHER_PROBE_FUSE) keeps one bad interval from emptying the pool.
 --
 -- Two layers, so the semantics are testable without nginx (same split as

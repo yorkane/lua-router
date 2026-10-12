@@ -6,8 +6,9 @@
 [router.lua](../lualib/resty/luarouter/router.lua)（`GET`/`HEAD`/`POST /model-map`）、
 [observability.lua](../lualib/resty/luarouter/observability.lua)（`lr_watch_*` 登记点）、
 三份 conf（`env` 声明 + `lua_shared_dict lr_watch`）。
-单测：[test_watcher.lua](../test/unit/test_watcher.lua)（385 checks）。
-e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（108 checks）。
+单测：[test_watcher.lua](../test/unit/test_watcher.lua)（461 checks，锚点
+`/data/tmp/lr-gates/gates-20261012-160634.log`）。
+e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（125 checks，同锚）。
 
 语义移植基准：`llm-router/watcher/llm_watcher.py`（1577 行）与同目录 `README.md`
 的守卫表。原守护进程通过 HTTP 控制面（`POST`/`DELETE` /workers，202=queued）间接
@@ -39,7 +40,7 @@ e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（108 checks）。
 前者未移植（见 §4），后者已移植：改名与所有权交接走 `ledger.unprotect` 那条路径，
 单测 `model map renames reach the pool` 覆盖。
 
-### 1.1 第 10 条守卫：探针分档摘除（确认不可用的服务不留池；2026-10-01 用户裁定，非 Python 移植）
+### 1.1 第 10 条守卫：探针分档处置（确认不可用的服务不留池；2026-10-01 用户裁定，2026-10-09 改 reject 档后果；非 Python 移植）
 
 守卫 2 只管**入口**：一个 URL 注册成功之后，旧实现里每轮探针再读不出 `data[].id`，也只是
 不把它写进 `desired`，删除仍旧走守卫 5/6 的宽限。于是池里会留下一行「广告着模型、请求过去
@@ -49,13 +50,21 @@ e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（108 checks）。
 健康位永远为真，请求会**继续被分到它头上**。用户裁定补的就是这一段：**注册要拿到真实模型信息，
 被判定不可用的服务就不该继续出现在服务池里**。
 
+**2026-10-09 用户裁定（`9bf3c07`）改了其中一档的后果**：探针「能应答 HTTP 却判它不是合格 worker」
+的 reject 三档不再物理删行，改为**临时禁用保行**——理由与 AGENTS.md 硬规则 4 同源：监控系统给出的
+是一份「它此刻不像合格 worker」的陈述，而 `registry.remove` 是不可逆的删除，删完要重新 `registry.add`、
+健康位与外部负载读数一起清零、重新攒 `health_success_threshold` 个巡检周期才接流。一台「起了但还没加载完
+模型」的引擎恰好就落在这一档的判据里，当轮删等于让每一次慢启动都付一次重建的代价。摘除因此只保留两个信号：
+**发现源不再报它**（走守卫 5/6 的宽限）与**传输层未知累计达标**（真连不通）。
+`SMG_WATCHER_PROBE_TEMP_DISABLE=0` 退回删行旧行为。
+
 关键是把「探针这一轮没给通过」拆成三档（外加「发现源不再报它」这条老路作对照），后果各不相同：
 **这套分档话术是全仓唯一口径**，[agent-handover.md](agent-handover.md) §4、`watcher.lua` 的文件头注释
 与日志文案必须与之保持一致。
 
-| 情形 | 判据 | 后果 |
+| 情形 | 判据 | 后果（缺省，2026-10-09 起） |
 |---|---|---|
-| **确定性否定** | 该 URL 本轮**仍是发现源候选**、探针确实拨通并拿到了 HTTP 回答，但内容不合要求：`/v1/models` 读不出 `data[].id`、`/server_info` 命中 router 自指纹、或报出的模型数超过 `max_models` | 本轮立即 `release()`，跳过 remove-grace 与 keep-last |
+| **确定性否定**（reject 三档） | 该 URL 本轮**仍是发现源候选**、探针确实拨通并拿到了 HTTP 回答，但内容不合要求：`/v1/models` 读不出 `data[].id`、`/server_info` 命中 router 自指纹、或报出的模型数超过 `max_models` | **临时禁用保行**：registry 行原样留着，只在 `lr_workers` 上打 `td:` 键（`registry/keys.lua` 的 `K_TEMP_DISABLE`，TTL = 3 × interval），`router/candidates.lua` 装配候选时排除它，探针恢复轮显式 `clear_temp_disable` 立刻回池；每轮 warn 一次（`entry.warned` 静音）。**不删行、不进保险丝计数**。`SMG_WATCHER_PROBE_TEMP_DISABLE=0` 退回本条的旧后果：本轮立即 `release()`、跳过 remove-grace 与 keep-last |
 | **传输层未知** | 探针连不上／超时／TLS 失败／接受 TCP 后无应答——拨号本身没给出可归因于对方的回答 | 计入该 owned 条目的连续失败数，达到 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）才摘；未达阈值保留原行，任一轮成功即清零 |
 | **不触发摘除** | `no probe transport`（网关自身缺 fetch，属自己故障而非对方证据）；`require_health` 未通过（那是**注册准入**开关，不是摘除理由） | 保留原行，既不摘也不计入连续失败数 |
 | 只是看不见 | 发现源本轮不再报它（进程停、容器删、监听关闭），探针根本没跑过 | 原路不变：`missing_since` + 守卫 5 grace + 守卫 6 keep-last |
@@ -72,7 +81,8 @@ e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（108 checks）。
 消失，容器一停就不再出现在 `/containers/json`，于是它落进最后一行的 grace 路径。反过来，本轮仍然拨
 它、仍然拿到了 HTTP 回答，却读不出一份模型列表，那就不是重启窗口，而是「挂着但不服务」：对它等
 300 s（grace）乃至 1800 s（keep-last）没有任何好处，那段时间里每个打到这个模型的请求都在拿 5xx，
-而调度器还以为这个模型有实例。传输层未知不当轮定罪，是因为「连不上」同样符合「对端正忙、conntrack
+而调度器还以为这个模型有实例。这一档**当轮就处置、不等任何宽限**——处置的内容按 2026-10-09 的裁定
+是「打 `td:` 键退出选路」，不是删行。传输层未知不当轮定罪，是因为「连不上」同样符合「对端正忙、conntrack
 掉了、网关自己的网络抖了一下」这组解释，而一次误判的代价比多留一轮 5xx 更贵：摘了要重新
 `registry.add`，健康位与外部负载读数一起清零。所以它攒够 `SMG_WATCHER_PROBE_FAILURES` 次**连续**失败
 才动手。守卫 5/6 与本条管的是两件不同的事：**「发现源消失」归守卫 5/6，「对方明确答了但不合要求」
@@ -82,19 +92,26 @@ e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（108 checks）。
 
 - 摘除仍然只作用于自己 ledger 里的 owned 条目（守卫 4 原封不动），且 `is_config_member` 的免疫判定
   排在本条之前：protected 条目与 config_store 声明的 upstream 不由 watcher 删除，探针结论也不例外。
-- 恢复走正常路径，没有旁路：下一轮又能读到 `data[].id`，就按新服务的同一套门槛（自端口、exclude、
-  `max_models`、router 指纹、add 失败退避）重新注册。`release()` 顺带清掉 backoff 与 pending，所以
-  恢复不会被上一轮的失败记账挡住。但「能回来」不等于「立刻接流」：`registry.add` 会把健康位与外部
-  负载读数一并重置，重新接流要等 `health_success_threshold` 个巡检周期把健康位翻回来，这期间该 URL
-  在 `GET /workers` 与管理台服务池页里以 unhealthy 出现。
+- 恢复走正常路径，没有旁路，且两档的恢复形状不同。**传输层未知那档被摘之后**：下一轮又能读到
+  `data[].id`，就按新服务的同一套门槛（自端口、exclude、`max_models`、router 指纹、add 失败退避）
+  重新注册。`release()` 顺带清掉 backoff 与 pending，所以恢复不会被上一轮的失败记账挡住。
+  但「能回来」不等于「立刻接流」：`registry.add` 会把健康位与外部负载读数一并重置，重新接流要等
+  `health_success_threshold` 个巡检周期把健康位翻回来，这期间该 URL 在 `GET /workers` 与管理台服务池页里
+  以 unhealthy 出现。**reject 那档被临时禁用之后**：探针恢复轮显式调 `clear_temp_disable` 摘掉 `td:` 键，
+  行从未被删、健康位从未被清，所以下一拍就回候选池，不付重建的代价（`td:` 键本身带 3 × interval 的 TTL，
+  显式清一次是为了让回归即时、不靠过期兜底；`registry/loads.lua` 的 `temp_disable` / `clear_temp_disable` /
+  `is_temp_disabled` 三个函数是这条链的唯一实现点）。
 - 单轮摘除保险丝：一次 reconcile 内因探针（含滞回达标）被摘的 owned 条目超过 owned 总数的一半时，
   本轮降级为只 warn 不摘，`SMG_WATCHER_PROBE_FUSE=0` 可关闭（回到逐条即时摘除）。动机是网关自身故障
   （配置写坏、到 worker 的网络整片断、docker.sock 读不到导致发现源集体异常）会让全部 owned 条目在同一
   批里集体失败，interval 15 s 下两轮滞回约 30 s 就能清空整个服务池，而清空全池比留几行僵尸严重得多。
   阈值取「超过一半」而不是绝对条数：owned 只剩一两条时任何一次摘除都算超半，这类小池子实际由滞回那一档
   兜住。实现上还有一个下限：本轮被摘数必须 **≥ 2** 才算数。否则单 worker 部署（owned=1、摘 1 条）
-  会因为「1 > 0.5」而永远摘不掉确定性否定——那正是这条守卫最该生效的场景。保险丝只降级探针摘除路径，
-  守卫 5/6 的 grace 删除不受它影响。
+  会因为「1 > 0.5」而永远摘不掉——那正是这条守卫最该生效的场景。保险丝只降级探针摘除路径，
+  守卫 5/6 的 grace 删除不受它影响。**reject 三档不进这个计数**：它当轮就生效且永不删行，喂进保险丝
+  分母等于虚报战果，也会让「网关整体故障」时本该熔断的场景被一堆没删任何东西的判定填满。
+  临时禁用与保险丝、与 `SMG_WATCHER_ALLOW_REMOVE=false` 三者**正交**：后两条管的都是删除，
+  禁用不受它们约束（`allow_remove=false` 时 reject 档照样禁用，操作员那句「只许加不许删」不被违反）。
 
 **双 5xx 那条判据刻意放在「传输层未知」，不当轮定罪。** 它只在引擎嗅探不到任何特征
 （`engine == "openai"`）时才生效，而 vLLM 与 llama.cpp 的身份标签恰恰来自 `/metrics` 正文里的
@@ -111,9 +128,20 @@ e2e：[e2e_watcher.py](../test/integration/e2e_watcher.py)（108 checks）。
 再提醒一次。理由是那个开关是「只许加不许删」的明确约定，探针结论再确定也不能替操作员做删除决定，
 否则严格探针就成了绕过保险丝的后门。
 
-**代价**：一个反复好坏的服务每轮会产生一次 remove + 一次 add 的 churn（以及 `registry.add` 带来的
-policy generation bump），每次 add 之后还要重新攒 `health_success_threshold` 个周期才恢复接流。这是
-有意的取舍——抖动比僵尸行便宜，僵尸行的代价是持续的 5xx 与一个假的「该模型仍有实例」视图。
+**代价**（两档分着算）。传输层未知那档：一个反复好坏的服务每轮会产生一次 remove + 一次 add 的 churn
+（以及 `registry.add` 带来的 policy generation bump），每次 add 之后还要重新攒 `health_success_threshold`
+个周期才恢复接流。reject 那档自 2026-10-09 起不再有这份 churn——代价换成池里多占一行（`GET /workers`
+与服务池页看得见它，`/v1/models` 也继续广告它名下的模型），而它一帧活都不接。两档都是有意取舍：
+抖动比僵尸行便宜，僵尸行的代价是持续的 5xx 与一个假的「该模型仍有实例」视图；而删行比禁用便宜这件事，
+只在「对方确实不再是那个服务」时成立——reject 判据恰恰证明它还活着、只是此刻不像合格 worker。
+
+**同一条守卫还捎带了一条「禁用即摘」（用户裁定 2026-10-09）**：条目带 `disabled` 的已注册行，watcher
+在 reconcile 里直接摘掉——操作员勾了「禁用这台实例」，它就退出池子，而不是留在里面靠候选门挡住。这条走
+`_M.release` 这**同一个**摘除出口（台账清理、`drop_pending` / `drop_backoff`、removes 计数、pass 日志
+全复用），与 `temp_disable` 的关键区别是**它是删除**：禁用的语义是「这台不再提供服务」，一行长期留在池里
+被候选门挡着的记录，会让 `GET /workers` 与 `/v1/models` 继续宣称它存在。它与 reject 三档共用「走同一个
+出口、只留一个判定点」这条纪律，理由与「reconcile 内部不许再拆」同一条：**「为什么那台 worker 走了」必须
+只有一个答点**，新增一条并行摘除路径等于给出第二个答案。
 
 与 activity probe（偏差 5）的关系：两者互补，不重叠。activity probe 抓的是「`/v1/models` 答得很好、
 但已经生成不出 token」（llama.cpp 权重没了还在报模型列表），本条抓的是「连模型列表都读不出来」；
@@ -157,8 +185,10 @@ activity probe 仍未移植，所以前一种僵尸目前无人管。
 
 新增（无 Python 对应）：`SMG_WATCHER_ENABLED`（总开关，默认 off）、
 `SMG_WATCHER_PROBE_FAILURES`（传输层未知的连续失败摘除阈值，缺省 2；1 等价于回到当轮即摘）、
-`SMG_WATCHER_PROBE_FUSE`（单轮摘除保险丝开关，缺省 on；`=0` 关闭）。后两个是第 10 条守卫（§1.1）
-的分档旋钮，只在探针摘除路径上生效，不影响守卫 5/6 的 grace 删除。
+`SMG_WATCHER_PROBE_FUSE`（单轮摘除保险丝开关，缺省 on；`=0` 关闭）、
+`SMG_WATCHER_PROBE_TEMP_DISABLE`（reject 三档的处置开关，缺省 on = 临时禁用保行；`=0` 退回当轮删行）。
+后三个是第 10 条守卫（§1.1）的分档旋钮：前两个只在探针**摘除**路径上生效，不影响守卫 5/6 的 grace 删除，
+也不影响临时禁用；`PROBE_TEMP_DISABLE` 只管 reject 三档的处置方式，传输层未知与「发现源消失」两档不受它影响。
 
 带 watcher 的两份 conf（`conf/lua-router.conf`、`conf/nginx.conf.template`）都补了上述 `env` 声明
 （含第 10 条守卫新增的两个探针旋钮）与 `lua_shared_dict lr_watch 64k;`。`env SMG_WATCHER_*` 的条数以
@@ -188,7 +218,9 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
 
 响应同时给两套字段：任务书要求的 `{"renamed":<map>,"status":"queued"}`，以及原版的
 `{"model_map":<map>,"note":"owned workers are re-registered on the next pass"}`。
-既有消费方 `config_store.lua` 的 `/_ui/config/model-map`（`LMR_WATCHER_URL` 指向
+既有消费方 `config_store.lua` 的 `/_ui/config/model-map`（**该端点现名 `/config/model-map`**，
+2026-10-08 `7e8bfff` 迁根，`/_ui/*` 整片 404；此处保留当时的名字——它记的是合并那一轮的兼容面形状）
+（`LMR_WATCHER_URL` 指向
 守护进程 metrics 口）因此只要把 URL 指到 router 主口就能继续用；请求侧改名不动，
 仍走 `config_store` 的 virtual-models 别名机制。
 
@@ -220,7 +252,7 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
 7. **mixed-model 警告未移植**：`model_signature()` 没有对应调用点。Python 版发这条
    警告是因为 Rust 在 single-router 模式下选 worker 时忽略请求里的 model（README 实测
    10/10 命名本地模型的请求被远端接走）；本 Lua router 的 `candidates_for(model)`
-   （router.lua:987）按 `record.model_id` 过滤候选，命名未注册的模型直接 404，不存在
+   （`router/candidates.lua` 的 `candidates_for`）按 `record.model_id` 过滤候选，命名未注册的模型直接 404，不存在
    混发路径，因此这条警告无从触发。e2e `[1] chat by the renamed model id routes to
    that worker` 把「按 model 过滤」这件事钉成了断言。
 8. **ledger 是 shdict 而不是磁盘 JSON**：容器重启即清零，这与 `lr_workers` 同为共享
@@ -238,11 +270,12 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
     （没有 reconcile 去回收），这是有意的。
 12. 一 URL 一模型、不展开 DP rank 这两条 README 里的 Limitations 原样成立，未在合并时改变。
     第三条（remote target 不可达后被 grace 摘掉）已被 §1.1 的第 10 条守卫改写：TARGETS 是静态清单，
-    不可达的 remote target 永远「仍在被发现源报告」，摘除理由因此一律走探针分档而不是 grace——对方答了
-    HTTP 却读不出 `data[].id` 属确定性否定，当轮摘；连不上／无应答属传输层未知，攒够
-    `SMG_WATCHER_PROBE_FAILURES`（缺省 2）轮连续失败才摘。两条都不等 remove-grace，服务恢复后由下一轮
-    正常重新注册回来（接流要再等 `health_success_threshold` 个巡检周期）。grace 路径从此只服务
-    「发现源不再报它」这一种情形。
+    不可达的 remote target 永远「仍在被发现源报告」，处置因此一律走探针分档而不是 grace——分档与后果
+    **以 §1.1 的表为唯一口径**（本文写作那轮 reject 档是「当轮摘」，2026-10-09 `9bf3c07` 起改为
+    「临时禁用保行」，`SMG_WATCHER_PROBE_TEMP_DISABLE=0` 才退回当轮删行）：确定性否定不占物理摘除，
+    传输层未知攒够 `SMG_WATCHER_PROBE_FAILURES`（缺省 2）轮连续失败才摘。两条都不等 remove-grace，
+    服务恢复后由下一轮正常重新注册回来（接流要再等 `health_success_threshold` 个巡检周期）。grace
+    路径从此只服务「发现源不再报它」这一种情形。
 13. **timer 阶段的 cosocket recv 失败会被 nginx 记 [error]，deny 清单是唯一消音手段**。
     探针走 `hb.http_request`，其首行读取是 `sock:receive("*l")`；对端接受 TCP 后不回
     HTTP/1.1 文本（gRPC 的二进制 HTTP/2 帧、rpcbind 直接 RST），这条读就以 ECONNRESET
@@ -271,8 +304,8 @@ curl -s -X POST .../model-map -d '{"map":""}'                                   
 |---|---|---|
 | 语法 | luajit `loadfile`（watcher/config/init/router/observability） | 5 份 |
 | 语法 | `openresty -t`（conf/lua-router.conf、test/conf/nginx-lua-router.conf、模板渲染） | 3 份 |
-| 单测 | `test/unit/test_watcher.lua`（luajit 与 apisix resty 两种口径，注入 fetch/reader/store，无 ngx） | 385 checks |
-| e2e | `test/integration/e2e_watcher.py`（真容器 + 真 mock + 真 docker.sock + 容器重启） | 108 checks |
+| 单测 | `test/unit/test_watcher.lua`（luajit 口径，注入 fetch/reader/store，无 ngx） | 461 checks |
+| e2e | `test/integration/e2e_watcher.py`（真容器 + 真 mock + 真 docker.sock + 容器重启） | 125 checks |
 
 单测覆盖：`parse_model_map` 四分隔符与坏输入、`parse_model_map_body` 四形态 + 坏
 body + 删除语义、`merge_map`、url 形态与 IPv6、`model_name`、`parse_ports`、
@@ -281,11 +314,14 @@ body + 删除语义、`merge_map`、url 形态与 IPv6、`model_name`、`parse_p
 v6 loopback）、docker 候选去重、`local_candidates` 与 allow/deny（含 case 22b：
 deny 是 default ∪ 操作员、allow 非空时 default 让位、显式 allow  outranks 两份 deny、`union_port_sets` 对 nil 参数与字符串键的健壮性）、ledger 全部键操作、
 候选在拨号前就被自端口与 exclude 拦掉、ledger 条目每轮续期、九条守卫各自的时序断言、`new_config` 缺省值与钳制、`collect` 三源合并。
-第 10 条守卫（§1.1）另有一组用例：确定性否定当轮即摘（含 ledger 条目一并清掉）、传输层未知第一轮只计数
-不摘、连续达到 `SMG_WATCHER_PROBE_FAILURES` 才摘、中途任一轮成功清零重算、`no probe transport` 与
-`require_health` 都不摘也不计数、keep-last 不豁免确定性否定、单轮摘除超过 owned 一半时保险丝降级为只
-warn、`SMG_WATCHER_PROBE_FUSE=0` 时保险丝不生效、`allow_remove=false` 时只警告一次、恢复时按正常 add
-门槛回来、以及「发现源不再报它」仍旧先走 grace 计时（防止把两种情形写混）。
+第 10 条守卫（§1.1）另有一组用例：reject 三档当轮打 `td:` 键保行（行不动、`temp_disabled` 置位、
+不进保险丝计数）、`SMG_WATCHER_PROBE_TEMP_DISABLE=0` 退回当轮删行、探针恢复轮显式清位并回候选、
+传输层未知第一轮只计数不摘、连续达到 `SMG_WATCHER_PROBE_FAILURES` 才摘、中途任一轮成功清零重算、
+`no probe transport` 与 `require_health` 都不摘也不计数、keep-last 不豁免探针处置、单轮摘除超过 owned
+一半时保险丝降级为只 warn、`SMG_WATCHER_PROBE_FUSE=0` 时保险丝不生效、`allow_remove=false` 时只警告一次
+（且 reject 档照常禁用）、恢复时按正常 add 门槛回来、以及「发现源不再报它」仍旧先走 grace 计时
+（防止把两种情形写混）。e2e 的 [8] 组就是这一族（真容器 + `td:` 键的真实读写），[6]/[7] 显式关掉
+temp-disable 以覆盖删行那一支。
 （本节用例清单随实现落地；`check` 数字仍以上方表格与门禁日志为准。）
 
 e2e 按 [1]–[5] 分五组、四个启动器（grace 与 keep-last 共用一个容器对，docker 发现与容器重启同理）：TARGET 注册 + env 改名 + 四形态 API + 改名回收 + 按 public id 真实路由；

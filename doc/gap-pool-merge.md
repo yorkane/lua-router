@@ -6,7 +6,9 @@
 
 原来两个页面看的是**同一批服务**的两种状态：
 - **服务池**（`workers.html`）：运行态，来自 `GET /workers`，即池里此刻真实存在的条目。
-- **远程服务**（`upstreams.html`）：声明态，来自 `/_ui/config` 的 `upstreams` 段，即希望长期存在的池成员。
+- **远程服务**（`upstreams.html`）：声明态，来自声明层 `/config` 的 `upstreams` 段，即希望长期存在的池成员
+  （本文写于 2026-10-02，当时的端点名是 `/_ui/config`；2026-10-08 `7e8bfff` 把管理面搬到站点根，
+  `/_ui/*` 整片落 404 sink，现行名册见 README〈端点面〉与 doc/architect.md §4）。
 
 分开时会出现两个编辑面看同一份声明、且各自的「事实来源」互相打架（见 §4）。合并后**一个地址一行**，
 归属用徽章讲清楚。
@@ -21,7 +23,7 @@
 
 | 归属 | 判定 | 显示 | 编辑入口 |
 |---|---|---|---|
-| `declared` | 有声明 **且**（未入池 或 池行 `discovery === 'config'`） | 声明值 | 「编辑声明条目」→ `POST /_ui/config/upstreams` |
+| `declared` | 有声明 **且**（未入池 或 池行 `discovery === 'config'`） | 声明值 | 「编辑声明条目」→ `POST /config/upstreams`（原名 `/_ui/config/upstreams`） |
 | `runtime` | `discovery` 不是 config（watcher / 手工 / bootstrap） | 池值 | 「编辑运行属性」→ `PUT /workers/{id}` |
 | `shadowed` | `cap_owner !== 'declared'` 但仍有声明 | 池值 + 按字段类别分档的归属徽章（见下） | 同 runtime |
 
@@ -65,7 +67,7 @@
 - `api_key` 三态：缺席=保持、`""`=清除、填值=设置；回显恒走存在位，两个密码输入框，
   手写存在位直接报错而非静默删。
 
-`POST /_ui/config/apply` 是**整表替换**语义：只发一段会把其它段清空。合并页的所有写路径
+`POST /config/apply`（原 `/_ui/config/apply`）是**整表替换**语义：只发一段会把其它段清空。合并页的所有写路径
 都基于刚拉取的整表，页面顶部横幅与 JSON 面板文案都明说了这点。
 
 ## 4. 上限的事实来源
@@ -101,4 +103,3 @@
 3. `mergeRows` 的归属判定已有 quick 档 node 单测覆盖（`test/unit/test_ui_merge.mjs`，从盘上
    html 抽真函数执行，判别性通道 `LR_UI_HTML` 可指向旧源码核实断言真会红）；`saveDecls` 的
    整表语义仍只有开发期自查脚本覆盖，仍值得补进 quick 档。
-

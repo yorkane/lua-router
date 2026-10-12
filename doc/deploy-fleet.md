@@ -5,6 +5,10 @@
 
 ## 结论
 
+> **本节是 2026-10-01 那一轮的记录，不是 fleet 现状**：池规模、访问路径（管理面现需基础凭据）、
+> 镜像 tag 规范（10-12 起 `YYYYMMDD-<短sha>`）与实例角色都已变化。fleet 现状只看
+> doc/deploy-state.md，角色真值只看 AGENTS.md 硬规则 3。
+
 lua-router 已部署在 21.k（gpu-pro6000-1，21.254.220.248）的 **8801** 端口，与既有 Rust 版
 sglang-router-all（:8800）并行运行，互不影响。全量验证通过：8/8 worker healthy、IGW 模型路由
 真实 chat 打通、Prometheus 指标增长、admin UI 200。
@@ -372,7 +376,7 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 8022–8027。容器名不带 `gpuN` 且命令行也没有卡号的部署，逐卡归属只能靠
 `lr_gpu_load_util_fallback_total` 显形（覆盖率看 `lr_gpu_load_util_per_card_workers` 与它的差）。
 
-最后一条纪律：这些改动只在 **21.k:8802（测试）** 上验，8801 是生产，未经用户明确要求不得更新。
+最后一条纪律：这些改动只在 **21.k 的测试实例（8801 / 8802）** 上验，未经用户明确要求不得推生产（8800 一族）。角色真值以 AGENTS.md 硬规则 3 与 doc/deploy-state.md 为准——本行写作时 8801 还记作生产，2026-10-09 已裁定改正为测试。
 
 > 另记一条已知残留：`observability` 的 gauge 没有 TTL 也没有删除原语，worker 被删掉之后它的
 > `lr_gpu_load_util_gpu{worker=...}` 会永久留在 `/metrics`
@@ -402,7 +406,7 @@ status（精确码或 4xx 类）、route_type、stream、since_ms/until_ms、ses
 
 1. 21.k:8802（测试）先滚：`docker-compose.yml` 镜像行 `20261012-b5130da → 20261012-69b5d53`，
    `pull && up -d`；矩阵全绿，浏览器 playwright-cli 复核管理台四页渲染。
-2. 21.k:8800（生产，用户授权）同一 digest 滚 + 新增 `SMG_ADMIN_AUTH_PASS`（本轮 `test123`，
+2. 21.k:8800（生产，用户授权）同一 digest 滚 + 新增 `SMG_ADMIN_AUTH_PASS`（本轮为临时测试口令，值不落文档，
    操作员换正式口令后 `docker compose up -d`）；其余 env 逐字未动（`SMG_MAX_TREE_SIZE 1e8`、
    watcher DENY_PORT、prom 负载通道、`LR_HTTP_INCLUDE`）。
    备份目录 `/data1/app/lua-router-8800/backup-20261012T163349Z/`（compose + config 全量 +

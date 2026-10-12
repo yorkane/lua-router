@@ -377,7 +377,9 @@ function _M.reconcile(state)
     -- the service cannot answer a request. What we must NOT do is treat every
     -- rejection as the same evidence, so the set carries classify()'s reason and the
     -- verdict derived from it (see probe_verdict): a deterministic "this is not a
-    -- worker" answer evicts in the same pass, a transport-level unknown accumulates
+    -- worker" answer is handled in the same pass -- since 9bf3c07 that means the
+    -- temporary-disable path (row kept, td: flag, no fuse count; =0 restores same-pass
+    -- release), a transport-level unknown accumulates
     -- entry.probe_fails and only evicts once it repeats.
     local probe_failed = {}
     -- Reasons that say more about the gateway than about the service (no transport,

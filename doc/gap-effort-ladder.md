@@ -15,7 +15,7 @@
 
 **基线只能取 detected。** 这是本节唯一容易写错、且写错后不会有任何报错的地方：advertised 一旦被勾就是勾选
 结果，若前端拿它当基线，操作员上一轮的勾选会伪装成「引擎说的」回来，于是**取消勾选永远回不到引擎原始那一组**
-——表现是「怎么取消都还留着」，而每一格看起来都合理。所以 `/_ui/config` 的 `models[]` 同时带
+——表现是「怎么取消都还留着」，而每一格看起来都合理。所以 `/config` 的 `models[]` 同时带
 `reasoning_efforts`（declared，null = 没勾过）与 `detected_reasoning_efforts`（引擎原话），两者永不合并，
 前端只在打开卡片对话框时用后者铺基线（`ui/admin/models.html` 的 `openCard` / `detectedLadder`）。
 
@@ -40,7 +40,7 @@
 
 ## 3. 三态与形状（写入层）
 
-卡片字段 `reasoning_efforts` 与 `ctx` / `context_limit` / `default_effort` / 五个 `supports_*` 同一套写入语义：
+卡片字段 `reasoning_efforts` 与 `ctx` / `max_output_tokens`（原名 `context_limit`，2026-10-08 改名）/ `default_effort` / 五个 `supports_*` 同一套写入语义：
 **absent = 别动**，**null = 清除回自动**，**数组 = 整条替换**。值的形状由 `config_store/lexicon.lua` 的
 `normalize_effort_ladder` 判定，两种拼法都接受并归一成 detected 阶梯的形状（`{value, label?, default}`）——
 归一成同一形状的意义是对外读数里「操作员说的」与「引擎自报的」在客户端不可区分，客户端不必知道这个数字是谁给的：
@@ -90,7 +90,8 @@
 
 ## 6. 与转发链的关系：一个字节都不动
 
-勾选只改 `/v1/models` 的对外声明与 `/_ui/config` 的编辑面。转发链上 `reasoning_effort` 的处理
+勾选只改 `/v1/models` 的对外声明与 `/config` 的编辑面（本文写于 2026-10-08 迁根之前，当时的名字是
+`/_ui/config`；`/_ui/*` 现已整片落 404 sink）。转发链上 `reasoning_effort` 的处理
 （`router/inference.lua` 的三层查表改写、`ui.lua` 的空串清理）一律不读 `card.reasoning_efforts`：客户端照
 picker 发什么，网关就照它的既有规则转什么，勾了引擎其实不收的档位，收到的是引擎自己的 400。这与 2026-10-04
 裁定「网关不改写调用方的输出预算 / 意图」同向，也复用了 `ui/admin` 里已有的能力位披露话术（`declarationDisclosure`）。
@@ -101,7 +102,7 @@ picker 发什么，网关就照它的既有规则转什么，勾了引擎其实�
 |---|---|---|
 | 存储 | `test/unit/test_profiles.lua` 12b 节（L1–L5，34 项） | absent/null/数组 三态写入；两种拼法归一；顺序不被词表重排；`default` 至多一枚 + 重复条目补标记；未知名整条拒且不落半截；空数组折回 nil；磁盘往返 + `card_effort_ladder` 返回拷贝；env 层装配 + `ENV_NAMES` 在册 |
 | 输出 | `test/unit/test_models_shape.lua` G11 节（20 项） | picker = 勾选表（含顺序）；label 继承 / 不编；预选定序与专职字段压过勾选；判定面只收窄、手动加的档不进判定面；引擎无读数时勾选成为唯一来源；清除回自动后与 G4 同形；组内一台勾过 → 入口行删键、不牵连成员行 |
-| 真 HTTP | `test/integration/e2e_models_advertisement.py` S12（20 项） | detected 经采集链路真的出现在 `/_ui/config` 卡片行（勾选框唯一的基线来源）；POST 勾选后对外字节真的变；400 不留半截状态；null 清除后逐字节退回引擎原话 |
+| 真 HTTP | `test/integration/e2e_models_advertisement.py` S12（20 项） | detected 经采集链路真的出现在 `/config` 卡片行（勾选框唯一的基线来源）；POST 勾选后对外字节真的变；400 不留半截状态；null 清除后逐字节退回引擎原话 |
 | env 名册 | `test/integration/probes.py` | `LMR_MODEL_EFFORT_LEVELS` 穿透到 worker（漏登记 `ENV_NAMES` 即红） |
 
 判别性（AGENTS.md 的「断言真会红」纪律）：同一组 G11 断言跑在改动前的 lualib 树
@@ -112,7 +113,7 @@ picker 发什么，网关就照它的既有规则转什么，勾了引擎其实�
 ## 8. 明确不做的
 
 * **不做条目级（虚拟入口）勾选**：组内一致口径已经决定入口行能说什么，条目级再开一张勾选表只会造出
-  「入口勾了但组内成员各自不同」的第三种状态。档位是**落点引擎自己的说法**，与 `default_effort` /`context_limit`
+  「入口勾了但组内成员各自不同」的第三种状态。档位是**落点引擎自己的说法**，与 `default_effort` / `max_output_tokens`
   一样住在卡片。
 * **不做 per-request 的档位校验 / 400**：见 §6。
 * **不替引擎补 label、不替引擎扩判定面、不按词表重排顺序**（§2 三条 `不猜`）。

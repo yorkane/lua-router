@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|---|---|
 | 235.t:8800 | **生产**（本机） | `pub/lua-router:20261011-fc037af` | `/data/app/lua-router/` | 29000 | sqlite | 306 条 / **20 healthy**（全 `router-watch`） | 无（匿名） |
 | 21.k:8800 | **生产** | `pub/lua-router:20261012-69b5d53` | `/data1/app/lua-router-8800/` | 29000 | sqlite | 8 healthy / 8 | **已配** |
-| 21.k:8801 | 生产（并行旧实例） | `pub/lua-router:20261011-fc037af` | `/data1/app/lua-router-8801/` | 29001 | sqlite | 9 | 无（匿名） |
+| 21.k:8801 | **测试**（并行旧实例） | `pub/lua-router:20261011-fc037af` | `/data1/app/lua-router-8801/` | 29001 | sqlite | 9 | 无（匿名） |
 | 21.k:8802 | **测试** | `pub/lua-router:20261012-69b5d53` | `/data1/app/lua-router-8802/` | 29002 | sqlite | 9 | **已配** |
 | 217.t:8800 | 生产 | `pub/lua-router:8800-20261011-89f0ad0` | **无 compose（裸 docker run）** | 29000 | sqlite | 4 | 无（匿名） |
 
@@ -21,7 +21,7 @@
 - **21.k 的落盘根是 `/data1/app/`，不是 `/data/app/`**；`/data/app/` 下没有 lua-router。
 - 三台的 `SMG_MAX_TREE_SIZE` 都是 `1e8`（2026-10-11 的 1M-token 长会话亲和定尺结论，不要缩）。
 - 五台 `lr_config_store_backend{backend="sqlite"} == 1`：全部走 db 权威路径，没有一台在文件降级上。
-- 口令列「已配」＝ compose 里有 `SMG_ADMIN_AUTH_PASS`。本轮用的是测试口令 `test123`，
+- 口令列「已配」＝ compose 里有 `SMG_ADMIN_AUTH_PASS`。本轮用的是临时测试口令（值不落文档），
   **操作员应换成正式口令后 `docker compose up -d`**（值不落文档）。「无」＝ 该env 缺席，
   整道 Basic Auth 门关闭、管理面匿名——缺省零行为变化，这是刻意的（见 gap-admin-auth.md）。
 
@@ -76,7 +76,7 @@
 ### 21.k:8800（生产，2026-10-12 升级）
 
 - 2026-10-08 由 lua-router 接管原 Rust `sglang-router-all` 的 8800；10-12 从 `8800-20261011-89f0ad0`
-  滚到 `20261012-69b5d53`，并新增 `SMG_ADMIN_AUTH_PASS`（本轮 `test123`）。其余 env 逐字未动。
+  滚到 `20261012-69b5d53`，并新增 `SMG_ADMIN_AUTH_PASS`（本轮为临时测试口令，值不落文档）。其余 env 逐字未动。
 - 负载通道现役：`SMG_LOAD_SOURCE: prom` + `SMG_LOAD_PROM_URL: http://127.0.0.1:9092` +
   `SMG_LOAD_PROM_QUERY: max by (Hostname,instance,gpu) (DCGM_FI_DEV_GPU_UTIL)`（**带 `gpu` 与 `instance`**，
   逐卡口径的正解）→ `lr_gpu_load_workers 8`。
@@ -93,7 +93,7 @@
   与公网 `8800-248.ws.gatepro.cn:99` 两个入口都取证到），即旧版 loopback 豁免在反代下会被无条件触发——
   这就是 10-12 那轮前置否决要堵的洞。
 
-### 21.k:8801（并行生产实例，本轮未动）
+### 21.k:8801（并行测试实例，本轮未动）
 
 - 镜像停在 `20261011-fc037af`，metrics 29001（旧惯例口，避开 8800 的 29000）。
 - 声明层：2 条虚拟入口 `q38fn-64k` / `qwen38fn-ab` + 3 张卡，`upstreams: []`（纯 env + watcher），rev `5`。

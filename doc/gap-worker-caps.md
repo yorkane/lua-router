@@ -389,7 +389,7 @@ Rust 侧没有每服务容量这个能力，`smg_worker_capacity_*` 是 **Lua �
    **每网关独立**的（在飞计数是本网关的，利用率是本网关采的），跨网关不聚合——两个网关各看一份在飞数、
    各摘各的候选，这是当前形态，不是待修的 bug。
 4. 手工 `POST /workers` 与 `SMG_WORKER_URLS` 种子进来的行属 protected（`discovery ~= config`），watcher
-   不摘；严格探针的确定性否定对它们同样不生效——这是「手填配置不能凭它判死一个健康实例」这条红线的
+   不摘；严格探针的**两种处置**对它们同样不生效（`watcher/reconcile.lua` 装配判定时先过 `is_config_member`，reject 三档的临时禁用与传输层达标的摘除都跳过 config 成员）——这是「手填配置不能凭它判死一个健康实例」这条红线的
    延伸。**但红线保护的对象是「身份与健康判定」**——discovery、`is_healthy`、探活结论、判死逻辑，以及
    `model_id` / `models` 这两份引擎读数，声明层一个字都改不动。**它不覆盖调度旋钮**：三个上限字段
    **允许**投影到 protected 行（`config_store/upstreams.lua` 的 caps-only 分支，2026-10-04 提交 `3728821`
