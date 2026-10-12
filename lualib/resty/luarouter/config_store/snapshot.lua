@@ -390,6 +390,7 @@ local function snapshot_of(cfg)
         if profile.hidden ~= nil then entry.hidden = profile.hidden end
         if profile.disabled ~= nil then entry.disabled = profile.disabled end
         if profile.context_window then entry.context_window = profile.context_window end
+    if profile.max_output_tokens then entry.max_output_tokens = profile.max_output_tokens end
         virtual_models[#virtual_models + 1] = entry
     end
     local upstreams = {}

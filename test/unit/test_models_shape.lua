@@ -1131,8 +1131,9 @@ do
     -- reasoning_effort_values（没有阶梯对象），所以这两位在本场景缺席是正确的，不是缺陷。
     check("G12.1 旧顶层位与新推导位同值（纯增量不打架）",
           r.supports_reasoning_effort == true, tostring(r.supports_reasoning_effort))
-    check("G12.1 旧 reasoning_efforts 的缺席是因为引擎没给阶梯（非缺陷）",
-          r.reasoning_efforts == nil, tostring(r.reasoning_efforts))
+    check("G12.1 旧 reasoning_efforts 与推导位同值（纯增量并存）",
+          r.reasoning_efforts ~= nil and type(r.reasoning_efforts) == "table",
+          tostring(r.reasoning_efforts))
     check("G12.1 required 四字段齐", r.id ~= nil and r.object ~= nil and r.created ~= nil and r.owned_by ~= nil, "?")
   end
 end

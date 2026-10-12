@@ -253,6 +253,20 @@ local function build_context_window(alias, raw)
     return n
 end
 
+--- 条目级的单次输出预算声明（用户裁定 2026-10-11）：声明给下游的 capabilities.max_output_tokens。
+--- 校验纪律与 context_window 相同（正整数），但语义不同——这不是窗口、不参与任何 max_tokens 校验。
+local function build_max_output_tokens(alias, raw)
+    if raw == nil or raw == JSON_NULL then return nil end
+    if raw == false or raw == true then
+        return nil, string.format("virtual model %s max_output_tokens must be a positive integer", alias)
+    end
+    local n = CS_LEXICON.parse_positive_int(raw)
+    if not n then
+        return nil, string.format("virtual model %s max_output_tokens must be a positive integer", alias)
+    end
+    return n
+end
+
 --- 条目级的档位/能力声明（用户裁定 2026-10-04：effort 放行到虚拟模型入口）。
 ---
 --- 为什么 2026-10-02 停用 per-alias effort 的裁定在这里不适用：那条理由是「一个入口跨
@@ -756,6 +770,9 @@ local function profile_from_entry(alias, entry, shadow, previous)
     local context_window, cwerr = build_context_window(alias, rawget(entry, "context_window"))
     if cwerr then return nil, cwerr end
     if context_window then profile.context_window = context_window end
+    local max_output_tokens, moterr = build_max_output_tokens(alias, rawget(entry, "max_output_tokens"))
+    if moterr then return nil, moterr end
+    if max_output_tokens then profile.max_output_tokens = max_output_tokens end
     if candidates then profile.candidates = candidates end
     local workers, werr = build_candidates(alias, rawget(entry, "workers"))
     if werr then return nil, werr end

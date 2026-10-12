@@ -1018,7 +1018,15 @@ local function fill_model_fields(entry, row)
         end
         -- default_effort 在场时旧版必定进入上面那个 if（它是派生条件之一），所以把它挪到
         -- 分支外是字节等价的——这个"分支外提"不改变任何未声明场景的输出。
-        if row.default_effort then entry.reasoning_effort = row.default_effort end
+        -- 配了 effort 映射时，旧名与新名保持同值（用户裁定 2026-10-11：
+        -- reasoning_efforts 与 supported_reasoning_efforts 一致），客户端读哪个都一样。
+        if row.effort_advertise then
+            local adv = row.effort_advertise
+            entry.reasoning_effort = adv.default or entry.reasoning_effort
+            if adv.levels then entry.reasoning_efforts = adv.levels end
+        elseif row.default_effort then
+            entry.reasoning_effort = row.default_effort
+        end
         if row.ladder then
             entry.reasoning_efforts = row.ladder
         end
