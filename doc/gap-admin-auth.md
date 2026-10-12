@@ -30,8 +30,31 @@
    注意纯空白（`" "`）**是**有效口令，不裁空白 —— 操作员填了什么就比什么。
 2. **来源是 loopback** → 免凭据。整段 127/8 加 IPv6 的 `::1`。前缀匹配要求带点
    （`127` 不算，`1127.0.0.1` 不算），拿不到地址时按「非 loopback」处理（fail closed）。
+   经反代访问时，判定地址是 `real_client_addr()` 还原出的原始客户端（§2.1），
+   不是反代自己的地址——8802 经 APISIX 转发时 remote_addr 恒 127.0.0.1，照原文判
+   等于豁免被反代无条件触发、门形同虚设（2026-10-12 生产实测踩实）。
 
 两条都不命中才要凭据。
+
+### 2.1 反代来源还原（用户裁定 2026-10-12 追加：proxy forwarded origin 检测）
+
+`admin_auth.real_client_addr()` 决定豁免判定用哪个地址，优先序：
+`X-Real-IP` → `X-Forwarded-For` 最左段 → `remote_addr`。直连（无代理头）路径
+逐字节不变。代理头**只在直连对端是 loopback 时才采信**（ngx_http_realip_module
+`set_real_ip_from` 同款信任条件）：8802 以 host 网络监听 0.0.0.0，局域网可直连，
+若无条件采信，`curl -H 'X-Real-IP: 127.0.0.1'` 就从局域网绕过整个鉴权。写了这条
+采信条件后，伪造头只可能来自直连（对端 IP 暴露为非 loopback → 忽略头 → 要凭据）
+或本机进程（本来就有豁免，伪造与否等价）。
+
+`XFF` 排在 `X-Real-IP` 之后也是刻意的：反代对 XFF 是追加不是覆写，客户端可以预填
+最左段；`X-Real-IP` 则是反代覆写的，才可信。残余风险如实记录：当前这条保护成立
+的前提是反代确实覆写 `X-Real-IP`（APISIX 默认行为）。若哪天反代只带 XFF、不写
+X-Real-IP，豁免面会跟着退化——届时删豁免或改走 authz 边缘鉴权，别拿 XFF 兜底。
+
+单测钉住四向：反代（loopback 对端）+ X-Real-IP 非环 → 401；只带 XFF 非环 → 401；
+loopback 对端无代理头 → 匿名（直连豁免不变）；直连非环自填 X-Real-IP: 127.0.0.1 →
+仍 401（伪造不采信）。反证：删掉代理头检测段 → 反代 401 断言红；删掉采信条件 →
+伪造 401 断言红。
 
 ## 3. 凭据与校验形状
 
@@ -58,9 +81,14 @@ loopback 豁免的边界同样要说清：网关跑 host 网络，同机任何�
 豁免区。它防得住跨机未授权访问，防不住本机任一进程的越权 —— 这是「网关零鉴权、只信
 边缘」既有信任模型的延伸，不是本文件新引入的洞。
 
+经同机反代访问（8802 形状）等价于把豁免面从 loopback 挪到「反代背后的真实客户端」：
+豁免跟着 X-Real-IP 走，边界与直连形状一致——反代覆写它才可信（§2.1）。若把端口直接
+暴露到不可信网络，任何「对端是环回 + 自报头」的豁免形状都不成立，该删豁免或上边缘。
+
 ## 5. 落点与实现形状
 
 - `lualib/resty/luarouter/admin_auth.lua`：`password` / `is_loopback` / `required` /
+  `real_client_addr`（§2.1 反代还原）/
   `check_header` / `const_eq` / `challenge` / `guard` / `static_challenge_worthy` /
   `guard_static`。
 - `conf/ui.conf`：24 条 exact location 各加一行 `access_by_lua_block { ... .guard() }`，
