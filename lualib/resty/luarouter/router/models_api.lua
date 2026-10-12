@@ -996,6 +996,9 @@ local function fill_model_fields(entry, row)
         entry.supported_reasoning_efforts = listed
         if type(advertised.default) == "string" and advertised.default ~= "" then
             entry.default_reasoning_effort = advertised.default
+        else
+            -- 用户裁定 2026-10-11：effort 配置存在但操作员没显式给缺省档时，默认 medium。
+            entry.default_reasoning_effort = "medium"
         end
     end
     -- 旧三位（reasoning_effort / reasoning_efforts / 顶层 supports_reasoning_effort）：
@@ -1023,7 +1026,21 @@ local function fill_model_fields(entry, row)
         if row.effort_advertise then
             local adv = row.effort_advertise
             entry.reasoning_effort = adv.default or entry.reasoning_effort
-            if adv.levels then entry.reasoning_efforts = adv.levels end
+            if adv.levels then
+                -- 与引擎 picker 一致的形状：{value=..., label=...}，缺省档标 ["default"]=true。
+                -- 用户裁定 2026-10-11：reasoning_efforts 需要包含 value（label 可以不需要），
+                -- 缺省档默认 medium。
+                local ladder = {}
+                for _, name in ipairs(adv.levels) do
+                    ladder[#ladder + 1] = { value = name }
+                end
+                -- 缺省档标记：显式配置了就用它，否则默认 medium。
+                local def = advertised.default or "medium"
+                for _, rung in ipairs(ladder) do
+                    if rung.value == def then rung["default"] = true end
+                end
+                entry.reasoning_efforts = ladder
+            end
         elseif row.default_effort then
             entry.reasoning_effort = row.default_effort
         end
