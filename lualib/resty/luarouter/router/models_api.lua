@@ -993,7 +993,6 @@ local function fill_model_fields(entry, row)
         for i = 1, #levels do listed[i] = levels[i] end
         -- 清单是**新表**而不是 row 里那份引用：响应条目会被下游改（切片单测与 props 链都有这么
         -- 干的），改了就把同一进程里下一份读数的字节也带跑 —— 字节稳定的纪律赔不起。
-        entry.supported_reasoning_efforts = listed
         if type(advertised.default) == "string" and advertised.default ~= "" then
             entry.default_reasoning_effort = advertised.default
         else
@@ -1059,7 +1058,12 @@ local function fill_model_fields(entry, row)
     if row.streaming ~= nil then out.supports_streaming = row.streaming end
     if row.reasoning ~= nil then out.supports_reasoning = row.reasoning end
     if row.vision ~= nil then out.supports_vision = row.vision end
-    if row.accepted then out.reasoning_effort = row.accepted end
+    if row.effort_advertise then
+        -- 配了 effort 映射时，capabilities.reasoning_effort 用映射推导的档位列表。
+        out.reasoning_effort = row.effort_advertise.levels
+    elseif row.accepted then
+        out.reasoning_effort = row.accepted
+    end
     if next(out) ~= nil then entry.capabilities = out end
 end
 

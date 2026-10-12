@@ -1122,7 +1122,11 @@ do
   if r then
     check("G12.1 supports_reasoning=true", r.supports_reasoning == true, tostring(r.supports_reasoning))
     check("G12.1 supports_reasoning_effort=true", r.supports_reasoning_effort == true, tostring(r.supports_reasoning_effort))
-    check("G12.1 supported_reasoning_efforts 词表序", join(r.supported_reasoning_efforts) == "low,high,xhigh", join(r.supported_reasoning_efforts))
+    check("G12.1 supported_reasoning_efforts 已移除（冗余，见 capabilities.reasoning_effort）",
+          r.supported_reasoning_efforts == nil, tostring(r.supported_reasoning_efforts))
+    check("G12.1 capabilities.reasoning_effort 词表序",
+          join(read(r,"capabilities","reasoning_effort")) == "low,high,xhigh",
+          join(read(r,"capabilities","reasoning_effort")))
     check("G12.1 default_reasoning_effort=high", r.default_reasoning_effort == "high", tostring(r.default_reasoning_effort))
     check("G12.1 image -> 视觉 true", read(r,"capabilities","supports_vision") == true, tostring(read(r,"capabilities","supports_vision")))
     -- 旧三位（reasoning_effort / reasoning_efforts / 顶层 supports_reasoning_effort）与四个新字段并存：
@@ -1166,7 +1170,7 @@ do
   local r = g12_row(M.models_handler(), "vm-t")
   if r then
     check("G12.4 仅text 视觉不报 true", read(r,"capabilities","supports_vision") ~= true, tostring(read(r,"capabilities","supports_vision")))
-    check("G12.4 levels 仍推导", join(r.supported_reasoning_efforts) == "low", join(r.supported_reasoning_efforts))
+    check("G12.4 levels 仍推导", join(read(r,"capabilities","reasoning_effort")) == "low", join(read(r,"capabilities","reasoning_effort")))
   else check("G12.4 行存在", false, "nil") end
 end
 caps_table = nil
