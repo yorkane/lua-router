@@ -175,9 +175,13 @@
                   <q-td key="cached" :props="props"><span class="mono">{{ cacheHitPct(props.row) }}</span></q-td>
                   <q-td key="model" :props="props">
                     <div class="model-cell">
-                      <strong>{{ props.row.model }}</strong>
-                      <span v-if="props.row.requested_model && props.row.requested_model !== props.row.model" class="muted mono">
-                        {{ props.row.requested_model }} →</span>
+                      <!-- 模型映射示意（用户裁定 2026-10-12）：映射时显示「实际模型→入口名」，
+                           如 swift-1.5-plefp8→Q38-Flash-Next。实际模型 = forwarded_model
+                           （网关转发给上游的绑定名），入口名 = requested_model（客户端寻址的
+                           名字）；两者相同（直连真实模型）时只显示一个词。 -->
+                      <span v-if="props.row.forwarded_model && props.row.forwarded_model !== props.row.requested_model" class="muted mono">
+                        {{ props.row.forwarded_model }}→</span>
+                      <strong>{{ props.row.requested_model || props.row.model }}</strong>
                     </div>
                   </q-td>
                   <q-td key="effort" :props="props"><span class="mono">{{ effortCell(props.row) }}</span></q-td>
