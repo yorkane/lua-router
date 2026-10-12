@@ -172,3 +172,57 @@ reasoning_effort_not_supported——该错误由**引擎 8200 直连也返回**�
 effort 解析代码在 5fa719d→fc037af 一行未动，非回归。这台 .tpl 的 LMR_MODEL_EFFORT 强制层 key 与转发用的引擎真名
 （Huihui-Ornith…）对不上时 high 会透传给引擎→400；日常流量 20 条里 14 条不带 effort（200）、4 条显式 none（200），
 high 那 2 条是本调查探针。属配置层 key 口径的既有小缺口，未在本次擅改（需重建带真实流量的生产，风险不对等）。
+## 单路 vs 双路聚合：受控基准（2026-10-11，21.k 本机，脚本 script/bench-swift-single-vs-dual.py）
+
+三方对照：single=全打 8034（基线，1 台 max-concurrency=2）；rr2=轮流直连两台（理想双路，无网关）；
+gateway=经 8801 真名入口由 cache_aware 调度。聚合口径 tok/s = Σcompletion / 批次墙钟；取 2 次最优。
+
+| 负载 | single 1→8x | rr2 1→8x | gateway 1→8x | 逐请求 tok/s（conc=4）single / gateway |
+|---|---|---|---|---|
+| decode | 1.39x（conc4 饱和318）| 2.69x | 2.66x | 118 / 175 |
+| prefill | 0.10x 塌方(131→13.5,TTFT12.9s) | 0.22x | 3.06x(→344) | 5.3 / 88 |
+| sharedprefill | 0.11x 塌方 | 0.23x（conc4=410最佳,conc8塌）| 0.10x 塌方(11.5) | 62.9 / 67.0（conc8两者皆11）|
+
+结论：
+1. 网关转发本身零额外损耗——decode 下 gateway(2.66x)≈理想双路 rr2(2.69x)，同 TTFT 量级。之前的速度大幅下降不是网关扣速度。
+2. 双路聚合是真收益，且恰好治塌方：prefill 单路负扩展 0.10x（长文 prefill 一满 2 车道就堵死一切），
+   双路 3.06x 正扩展救活。这就是该开双路的原因。
+3. sharedprefill（多路共享同一长前缀 = Codex 并行子代理/同 RAG 文档）是唯一双路打不过平摊的负载：
+   cache_aware 正确地把几乎相同的 prompt 聚到同一台复用它的 prefix KV，但 8 路挤 2 条车道 → 引擎内排队塌方
+   （conc8 逐请求 2.1 tok/s、TTFT 18.7s）。rr2 平摊在 conc4 达 410，但 conc8 也塌（0.23x）——共享前缀摊到两台
+   每台各缓存一份，并发一高同样超 2 车道。
+4. 两条对症缓解 A/B 均判负，不改：
+   - swift 策略 cache_aware→power_of_two：sharedprefill 更差（0.54x，且丢亲和命中）→ 保持 cache_aware。
+   - 引擎 --max-concurrency 2→4（canary gpu4）：ninfer 起不来，FATAL view element count mismatch: requested 36, available 12
+     （MTP/CUDA-graph 视图数与车道数绑定，此工件锁死 2 车道）→ 已回滚，compose 与备份 diff=IDENTICAL、双引擎 8034/8035 health 200、restarts=0。
+
+仍慢的方向（非网关配置项）：sharedprefill 高并发的根治要么加第三/四台 swift 单引擎副本（cache_aware 能把同前缀 fan-out 摊到更多 2-车道机器），
+要么降低单会话的并行 fan-out。当前 8034/8035 各只 2 车道是硬顶。
+## 最终部署状态与交接要点（2026-10-12 交接）
+
+### 全 fleet 配置（全部 health 200、cache_aware 生效）
+
+| 实例 | 镜像 | SMG_MAX_TREE_SIZE | 角色 |
+|---|---|---|---|
+| 21.k:8800 | pub/lua-router:20261011-fc037af | 100000000 | 生产（Q38 双路 swift-1.5） |
+| 21.k:8801 | pub/lua-router:20261011-fc037af | 100000000 | 测试（同样发现 8034/8035） |
+| 21.k:8802 | pub/lua-router:8802-20261011-89f0ad0 | 100000000 | 测试（89f0ad0 为更新构建，另有并行会话部署） |
+| 217.t:8800 | pub/lua-router:8800-20261011-89f0ad0 | 100000000 | 生产（Ornith-1.5-35B 线，非 swift） |
+| 235.t:8800 | pub/lua-router:20261011-fc037af | 100000000 | 生产（qwen3.8-27b fp8 pair + startlux，重建后 mock 池已清） |
+
+注意：8802/217.t 已被并行会话滚到 89f0ad0 构建（比 fc037af 新），8800/8801 在 fc037af——fleet 镜像版本混布，对齐时先 `git log` 确认 89f0ad0 内容。
+
+### swift 引擎（21.k GPU4/5，ninfer-serve 8034/8035）最终参数
+
+全部四台 ninfer 引擎（swift gpu4/5、radixark gpu6/7）已回滚并稳定在：
+`--max-concurrency 2 --max-pending-requests 64 --pending-timeout-ms 300000 --device-state-slots 2 --host-state-slots 32 --host-kv-mib 65536 --spec mtp --draft-tokens 3 --lm-head-draft --vision --preserve-thinking --prefill-chunk 8192`
+（host-state-slots 32 / host-kv-mib 65536 / max-private-continuations 12 / max-shared-prefixes 8 为本轮缓存扩容的净增改动，含在 /data/app/ninfer6000/docker-compose.yml，备份 .bak-20261011-hikv）
+实测 `--max-concurrency 4/8` 无法启动（FATAL view element count mismatch: requested 36, available 12——MTP/CUDA-graph 捕获形状与车道数绑定），2 是硬顶。
+
+### 交接速查（换网关/换实例时先看这几条）
+
+1. **亲和树字符闸定尺**：SMG_MAX_TREE_SIZE ≥ 单会话路由文本字符 × 并发会话数 × 余量。实测 5.5 chars/token → 1M-token 会话 ≈ 5.5-8M 字符；100M/租户 ≈ 12-15 条并发。条数不够会 LRU 甩机 → 前缀缓存作废。
+2. **内存防爆的真闸是节点数**：SMG_MAX_TREE_NODES 缺省 200000/树（每节点 ~200-400B，最坏 ~60MB/树）+ SMG_EVICT_BUDGET 增量淘汰。字符闸放大安全的前提是这两个在位。
+3. **快照预算**：SNAPSHOT_MAX_BYTES 缺省 3MB/实例；树大了会超限跳过（WARN），reload 后亲和冷启动重新 warm，运行期不受影响。
+4. **sharedprefill fan-out 高并发塌方**：cache_aware 把相似 prompt 聚到一台复用 KV（正确），但该台 2 车道被挤爆（conc≥4 TTFT 秒级→爆）。这是本次『慢』在高并发 fan-out 下的结构性残留，根治要加 swift 副本或改进调度分摊。
+5. **回滚**：每台 compose 有 .bak-20261011-* 备份；旧镜像 20261010-7b7d6cf / 20261009-* 均在 ACR 与本地盘。改回 image/env 行 + force-recreate 即可。
