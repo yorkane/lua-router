@@ -671,6 +671,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/gap-admin-auth.md](doc/gap-admin-auth.md) | 管理面 Basic Auth（用户裁定 2026-10-12）：保护/不保护清单、两条豁免 + 代理来源头前置否决「出现即认证」、401 形状与常量时间比对、`guard` / `guard_static` / `guard_klib` 三处落点、klib 侧刻意 fail-open 的后果不对称判据、真机验收矩阵 |
 | [doc/ui-trim-legacy-pages.md](doc/ui-trim-legacy-pages.md) | 管理台相对原版 webui 的页面差异与旧工具页移除记录 |
 | [doc/deploy-state.md](doc/deploy-state.md) | 五实例 fleet 现状（2026-10-12 实测：镜像/compose/池/负载 env/管理面口令）、生效后端怎么查、已知漂移与处置、死代码清单 |
+| [doc/deploy.md](doc/deploy.md) | **部署手册**：全新部署与滚动升级的完整操作链路——ACR 仓库与登录凭据、管理面 Basic Auth 用户名/口令与四条验收探针、基座 authz 取法、compose 模板与按机器环境的 DENY_PORT/负载 env、启动验收矩阵（含 sqlite 后端自检与 30–60s 暂态 503）、切换前 WAL 安全备份与 revision 零漂移取证、回滚与已知坑 |
 | [doc/deploy-fleet.md](doc/deploy-fleet.md) | 21.k:8801 与 235.t:8800 的 fleet 部署与验证记录（含部署后验证清单） |
 | [doc/deploy-8800prod-20261012-proxy-auth.md](doc/deploy-8800prod-20261012-proxy-auth.md) | 21.k:8800 生产升级（代理来源前置否决）真机验收矩阵与回滚手册 |
 | [doc/deploy-8802-20261012-proxy-auth.md](doc/deploy-8802-20261012-proxy-auth.md) | 同一构建在 21.k:8802 测试实例的先一轮验证（含 playwright 复核） |
