@@ -4,7 +4,7 @@
 -- 形状是对外契约）；sync_virtual_view 只在三条写路径上被显式调用，读时不派生。
 --
 -- 由 lualib/resty/luarouter/config_store.lua 拆分而来：函数体逐行原样搬家，只调整 require 与
--- 跨模块接线（doc/refactor-arch-2026-10-05.md §1–§2）。原文里经 _M.x() 的自调 → 经 CS_FACADE
+-- 跨模块接线（2026-10-05 facade 拆分）。原文里经 _M.x() 的自调 → 经 CS_FACADE
 -- 表调用（保住单测换桩的可拦截性逐点一致）；原文里的同文件 local 直调 → 直接 require 对端
 -- 子模块的共享表调用（不进 facade 导出面，_M 契约因此逐名不变）。
 local CS_FACADE = require "resty.luarouter.config_store"
@@ -410,8 +410,7 @@ local function snapshot_of(cfg)
         -- absent when nothing was declared (never an explicit null), which is what
         -- distinguishes "the probe decides" from "declared empty" on the way back in.
         if item.models then entry.models = { table.unpack(item.models) } end
-        -- Capacity gates round-trip the same way (doc/caps-redesign-2026-10-06.md §1,
-        -- which supersedes doc/gap-worker-caps.md): written only when the row declared a
+        -- Capacity gates round-trip the same way (doc/gap-worker-caps.md): written only when the row declared a
         -- usable limit, and *absent* (never an explicit null) for "unlimited". Writing
         -- an explicit null would make the snapshot carry a field no operator declared,
         -- and an old build reading it would have to know the key means nothing.

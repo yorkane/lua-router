@@ -2,7 +2,7 @@
 -- P11 声明层校验与脱敏 + P29 drift / patch / reconcile（声明层 → lr_workers 的投影）。
 --
 -- 由 lualib/resty/luarouter/config_store.lua 拆分而来：函数体逐行原样搬家，只调整 require 与
--- 跨模块接线（doc/refactor-arch-2026-10-05.md §1–§2）。原文里经 _M.x() 的自调 → 经 CS_FACADE
+-- 跨模块接线（2026-10-05 facade 拆分）。原文里经 _M.x() 的自调 → 经 CS_FACADE
 -- 表调用（保住单测换桩的可拦截性逐点一致）；原文里的同文件 local 直调 → 直接 require 对端
 -- 子模块的共享表调用（不进 facade 导出面，_M 契约因此逐名不变）。
 local CS_FACADE = require "resty.luarouter.config_store"
@@ -22,7 +22,7 @@ local UPSTREAMS_LIMIT = 256
 -- doorway faces must answer identically -- a ceiling the pool can store but the document
 -- cannot carry is the "live now, gone after a restart" shape measured on 21.k:8802 -- so
 -- this file asks the rulebook instead of restating 1..31 / 1..32 / 0..100 (AGENTS.md
--- forbids a second copy of the rules). doc/caps-redesign-2026-10-06.md section 1 pins the
+-- forbids a second copy of the rules). doc/gap-worker-caps.md pins the
 -- numbers: min 1..31 leaves room below a max of 32 so the strict-less-than rule always has
 -- a legal spelling, and util 0..100 is a whole percentage.
 local cap_rulebook
@@ -51,7 +51,7 @@ local function cap_rule()
     return cap_rulebook or nil
 end
 
--- Per-instance capacity gates (doc/caps-redesign-2026-10-06.md §1). The three fields share
+-- Per-instance capacity gates (doc/gap-worker-caps.md). The three fields share
 -- one field list so parse / defaults / drift / patch / create cannot drift apart, and one
 -- normalizer dispatch so a field's "unlimited" spelling is decided in exactly one place:
 -- the two concurrency tiers go through declared_cap (registry.cap_limit), the utilisation
@@ -105,7 +105,7 @@ end
 --- whole number through cap_limit / util_limit, because PUT /workers reports a live
 --- reading and the operator may open a gate wider than the document would ever declare
 --- it. The *document* carries only what cfg_from_document can read back: the three
---- limits above (doc/caps-redesign-2026-10-06.md §1). The gate therefore belongs to
+--- limits above (doc/gap-worker-caps.md). The gate therefore belongs to
 --- this doorway -- the crossing into the declaration layer -- and the pool side stays
 --- deliberately untouched.
 ---
@@ -193,7 +193,7 @@ end
 --- All-or-nothing by construction: nothing is written here, and the caller only touches
 --- the row once this answers. A batch whose tiers do not all pass leaves the document
 --- byte-identical -- a half-applied ceiling set is the invisible-mines shape this whole
---- path exists to avoid (doc/gap-worker-caps.md §11 item 4).
+--- path exists to avoid (doc/gap-worker-caps.md §10 第 4 项).
 ---@param canonical string @ the row url, for the error text
 ---@param row table @ the existing declared row; read only
 ---@param said table @ field -> *raw* value, for the tiers this batch named
@@ -341,8 +341,7 @@ local function upstream_from_entry(entry, index)
         out.disable_health_check = dhc
     end
 
-    -- Per-worker capacity gates (doc/caps-redesign-2026-10-06.md §1, which supersedes
-    -- doc/gap-worker-caps.md): the pool side accepts them on POST/PUT /workers, so a
+    -- Per-worker capacity gates (doc/gap-worker-caps.md): the pool side accepts them on POST/PUT /workers, so a
     -- declaration that cannot carry them is a field the console can set and the document
     -- cannot keep. Absent / null / "means unlimited" all store as *absent* (never an
     -- explicit null) exactly like the other optional fields, so a row that never mentions
@@ -652,7 +651,7 @@ end
 --- True when a declared row carries *nothing but* its url and capacity caps,
 --- i.e. it exists only to remember caps that the control plane set (the user
 --- ruling 2026-10-09 made PUT/POST /workers mirror the three ceilings into this
---- section so they survive a restart -- doc/gap-worker-caps.md §4). Two
+--- section so they survive a restart -- doc/gap-worker-caps.md §10 第 5 项). Two
 --- consumers: reconcile's add branch refuses to materialize such a row as a
 --- worker (it would resurrect a deleted pool row *and* claim ownership for it),
 --- and mutators.drop_upstream_caps / the clear path of apply_upstream_caps use
@@ -849,7 +848,7 @@ end
 -- ------------------------------------------------- 跨子模块直调的原文 local
 -- 这些函数在原文里是同文件 local 直调、从未挂在 _M 上；拆开后由调用方直接 require 本表
 -- 调用（不经 facade，所以既不是新增导出、也不给单测多开一个可替换点）。
--- 容量门字段名册：本波新增的共享件（doc/caps-redesign-2026-10-06.md §1）。snapshot.lua
+-- 容量门字段名册：本波新增的共享件（doc/gap-worker-caps.md）。snapshot.lua
 -- 的落盘段与 reconcile 的三条写路径都从这同一份名单取值，字段不在两个文件里各写一遍。
 -- 不是导出面契约的一部分（老 _M 契约逐名不变），只是跨子模块共用。
 _M.CAP_FIELDS = CAP_FIELDS

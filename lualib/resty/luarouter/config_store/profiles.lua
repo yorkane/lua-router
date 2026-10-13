@@ -2,7 +2,7 @@
 -- P8-P10：池 URL / 候选 / 绑定 / 组 / 条目声明装配，profile 装配与两条别名链守卫。
 --
 -- 由 lualib/resty/luarouter/config_store.lua 拆分而来：函数体逐行原样搬家，只调整 require 与
--- 跨模块接线（doc/refactor-arch-2026-10-05.md §1–§2）。原文里经 _M.x() 的自调 → 经 CS_FACADE
+-- 跨模块接线（2026-10-05 facade 拆分）。原文里经 _M.x() 的自调 → 经 CS_FACADE
 -- 表调用（保住单测换桩的可拦截性逐点一致）；原文里的同文件 local 直调 → 直接 require 对端
 -- 子模块的共享表调用（不进 facade 导出面，_M 契约因此逐名不变）。
 local CS_FACADE = require "resty.luarouter.config_store"
@@ -977,7 +977,7 @@ local function declared_cap(value, integer)
     return integer and math.floor(number) or number
 end
 
---- Utilisation ceiling for the declaration layer (doc/caps-redesign-2026-10-06.md section 1).
+--- Utilisation ceiling for the declaration layer (doc/gap-worker-caps.md).
 ---
 --- 它是 declared_cap 之外的**另一个档**，不是 declared_cap(value, true)：cap_limit 把一切
 --- <= 0 折成 nil，而 util 档必须保住 0 这个读数 —— 0 是「卡一有利用率就算到顶」的极严档，

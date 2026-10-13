@@ -1,10 +1,11 @@
 # 流经 token 核算：stream_options 注入 + usage 帧剥除 + 四路 token 指标
 
-> 范围：`router.lua`（转发泵 / 请求体顶层编辑 / SSE 帧切分与剥除判定 / 400 兜底）、
-> `observability.lua`（`smg_router_tokens_total` 四类 token_type、新家族
+> 范围：`router/forward.lua`（转发泵 / 注入判定 / SSE 帧切分与剥除 / 400 兜底）、
+> `router/jsonutil.lua`（`merge_top_object` / `sse_split` / `sse_event_droppable` /
+> `usage_from_object` / `usage_from_chunk`）、`router/reqlog.lua`（log 相位记账）、
+> `observability.lua`（`smg_router_tokens_total` 四类 token_type、
 > `smg_router_usage_injection_total`）、`test/unit/test_integration.lua`（第 6 节）、
-> `test/integration/e2e_token_accounting.py`（新）、`test/mock_llm_worker.py`
-> （流式 usage 形态开关）。对应 [scope-trim.md](scope-trim.md) §5.5 第 5 条。
+> `test/integration/e2e_token_accounting.py`、`test/mock_llm_worker.py`（流式 usage 形态开关）。
 >
 > 核心原则（本文一切取舍的出发点）：**网关不做 BPE**。精确值只来自后端自报的
 > usage；事前预估、启发式计数一律不做（见 §8 已知限制）。网关要做的只有一件事：
@@ -13,7 +14,7 @@
 
 ## 1. 缺口是什么
 
-`usage_from_object`（router.lua，本仓库既有）早已能读后端自报的
+`usage_from_object`（router/jsonutil.lua，本仓库既有）早已能读后端自报的
 prompt/completion/cached/reasoning（含 `prompt_tokens_details.cached_tokens`），
 TTFT/TPOT/generation duration 指标也在（observability.lua 的 `smg_router_*`）。
 非流式没有缺口：响应体整体缓冲，usage 就在 JSON 里。
@@ -21,9 +22,8 @@ TTFT/TPOT/generation duration 指标也在（observability.lua 的 `smg_router_*
 缺口只在流式：OpenAI 兼容引擎（vLLM/SGLang/llama.cpp 的 /v1 面）只有在请求体带
 `stream_options.include_usage` 时才发 usage 帧。普通客户端不设这个字段——于是
 每一条流经网关的 chat/completions 流都以 byte/4 估算收尾（`tokens_estimated: true`），
-计数器报的是网关的猜测而不是引擎的账。real-eval 报告（doc/real-eval.md）里
-cached/prompt ≈97–99% 那批精确数字能成立，靠的正是显式带 usage 的评测客户端；
-生产客户端不带，精确性就整体蒸发。
+计数器报的是网关的猜测而不是引擎的账。只有显式带 usage 的评测客户端才给得出精确的
+cached/prompt 比值；生产客户端不带这个字段，精确性就整体蒸发。
 
 ## 2. 方案总览（三件事，全部在 `forward()` 一条路径上）
 
@@ -136,18 +136,16 @@ CRLF 的混拼服务)。两个候选不可能同索引打平（第二字节不�
 - 已知代价：发现失败的那条请求本身没了（400 原样回给客户端，无重放）。契约
   禁止重试，这是本方案唯一花一条请求的地方，每 worker 一次。
 
-### 6.2 指标家族（命名沿用 smg_router_* 风格）
+### 6.2 指标家族
 
 | 家族 | 标签 | 语义 |
 |---|---|---|
-| `smg_router_tokens_total`（既有，扩四类） | router_type, backend_type, model, endpoint, token_type=**prompt\|completion\|cached\|reasoning** | prompt/completion 沿用旧行为：估算行照记（行上有 `tokens_estimated` 与 `/_ui/stats.tokens_estimated_share` 可辨）；cached/reasoning 只可能来自后端 usage 对象，非零序列必是引擎亲报 |
-| `smg_router_usage_injection_total`（新，Lua 侧超集） | model, endpoint, result=**stripped\|passed_through\|rejected** | 每条走了注入判定的流一行：帧读到了也剥掉了 / 帧留下（llama.cpp 融合帧或引擎压根没发）/ 该 worker 被 400 打回转入 sticky。它回答「这套 token 计数器可信吗」：stripped 占比就是精确核算覆盖率 |
+| `smg_router_tokens_total`（既有，扩四类） | router_type, backend_type, model, endpoint, token_type=**prompt\|completion\|cached\|reasoning** | prompt/completion 沿用旧行为：估算行照记（行上有 `tokens_estimated` 与根上的 `/stats` 读数 `tokens_estimated_share` 可辨）；cached/reasoning 只可能来自后端 usage 对象，非零序列必是引擎亲报 |
+| `smg_router_usage_injection_total` | model, endpoint, result=**stripped\|passed_through\|rejected** | 每条走了注入判定的流一行：帧读到了也剥掉了 / 帧留下（llama.cpp 融合帧或引擎压根没发）/ 该 worker 被 400 打回转入 sticky。它回答「这套 token 计数器可信吗」：stripped 占比就是精确核算覆盖率 |
 
-Rust 对齐说明：Rust 网关从不注入，`smg_router_usage_injection_total` 是 Lua 超集；
-`smg_router_tokens_total` 的 token_type 取 prompt/completion（Rust 用
-input/output 拼法，而本仓库先于本改动就导出 prompt/completion，序列名保持稳定优先
-于标签词对齐）；cached/reasoning 两路明细 Rust 只进不出日志、无独立序列，亦为
-Lua 超集。HELP 表两处都已登记。
+标签词取 prompt/completion（本仓库先于该家族就导出这两个名，序列名稳定优先于
+词对齐）；cached/reasoning 两路明细只在引擎亲报 usage 时产生。注入系列是本实现的
+超集：从不注入的网关没有这一族。HELP 表两处都已登记。
 
 ### 6.3 数据通路（泵 → 日志/指标）
 
@@ -163,33 +161,28 @@ usage_stripped)`；`forward()` 把四类计数与 estimated 旗装进 `ngx.ctx.l
 
 ## 7. 测试
 
-- **单测**：`test/unit/test_integration.lua` 第 6 节，沙箱 `load()` 抽取 router.lua
-  的 8 段纯函数（merge_top_object / usage_from_object / usage_from_chunk /
-  sse_event_droppable / sse_split / client_wants_usage / names_stream_options 等），
-  钉死注入合并、帧判定、剥除边界、400 归属共 59 项新断言。
-  **integration: 66 → 125 passed, 0 failed**（tree 67 / policies 118 / hash 795 不动，
-  luajit 门对 router.lua+observability.lua `loadfile` 通过；`py_compile` mock 与新 e2e 通过）。
-- **e2e（root 串行跑）**：`test/integration/e2e_token_accounting.py`，
-  预期 **62 checks / 0 failed**（清单在文件头）。六个场景：注入并剥除+两种客户端
-  自选（24）、llama.cpp 融合帧保护（9）、无 usage 后端估算回退+拒字段 worker 的
-  sticky 与一次性 WARN（10）、四路 token 明细（6）、路由作用域含 /generate 与
-  /v1/responses（6）、增量下发不被缓冲化+心跳透传（7）。
-  需要 root 在 `test/final_gates.sh` 的 GATE_ORDER 登记 `gate_e2e_token_accounting`。
-- **mock 侧**：`USAGE_MODE=always`（默认）逐字节保留历史流形状，契约
-  `stream chunk count == 7` 等既有断言不受扰；`on_request` 才是真实引擎形态。
-  场景 env 同时喂 mock 进程（宿主环境）与 router 容器——mock 由 `start_mock`
-  继承宿主 os.environ，`start_router` 的 env 只进容器，e2e 用
-  `start_mock_env()` 把 MOCK_KNOBS 搬运过去。
-- mock 另支持 `USAGE_ON_FINISH_CHUNK=1`（融合帧）、`USAGE_DETAILS=1`（cached/
-  reasoning 明细，含 responses 的 input/output 拼法）、`REJECT_STREAM_OPTIONS=1`
-  （400 文案点名字段）、`SSE_HEARTBEAT=1`（`: ping` 帧）；/generate 流式分支
-  透传 stream/stream_options，使「不注入 /generate」可被 e2e 用字节观测。
+- **单测**：`test/unit/test_integration.lua` 第 6 节，沙箱 `load()` 抽取转发面的纯函数
+  （merge_top_object / usage_from_object / usage_from_chunk / sse_event_droppable /
+  sse_split / client_wants_usage / names_stream_options 等，现居
+  `router/jsonutil.lua` 与 `router/forward.lua`），钉死注入合并、帧判定、剥除边界、
+  400 归属。
+- **e2e**：`test/integration/e2e_token_accounting.py`（门已登记，
+  `GATE_ONLY=e2e_token_accounting` 可单跑；期望 checks 数以文件头为准）。六个场景：
+  注入并剥除+两种客户端自选、llama.cpp 融合帧保护、无 usage 后端估算回退+拒字段
+  worker 的 sticky 与一次性 WARN、四路 token 明细、路由作用域含 /generate 与
+  /v1/responses、增量下发不被缓冲化+心跳透传。
+- **mock 侧**：`USAGE_MODE=always`（默认）逐字节保留朴素流形状，契约的
+  `stream chunk count` 等既有断言不受扰；`on_request` 才是真实引擎形态。
+  `USAGE_ON_FINISH_CHUNK=1`（融合帧）、`USAGE_DETAILS=1`（cached/reasoning 明细，
+  含 responses 的 input/output 拼法）、`REJECT_STREAM_OPTIONS=1`（400 文案点名字段）、
+  `SSE_HEARTBEAT=1`（`: ping` 帧）；/generate 流式分支透传 stream/stream_options，
+  使「不注入 /generate」可被 e2e 用字节观测。
 
 ## 8. 已知限制（都记在这，不许藏）
 
 1. **裸 /generate 无核算增强**：SGLang 原生流自带 usage_metadata，旧路径已读；
-   scope-trim §5.5 提到的「按模型从观测 usage 回归 chars/token、给裸 /generate 做
-   可校准启发式预估」本轮**不实现**，留作后续（预估行永远带 estimated 旗）。
+   「按模型从观测 usage 回归 chars/token、给裸 /generate 做可校准启发式预估」
+   不实现，留作后续（预估行永远带 estimated 旗）。
 2. **事前预算不做**：没有任何请求前的 token 预估/限流。
 3. /v1/responses 的注入收益是「计数精确」，不是「字节不可见」：completed 帧是
    协议，客户端会见到 usage。要它消失得改协议帧，越权。

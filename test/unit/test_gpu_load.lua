@@ -1022,11 +1022,11 @@ end
 gpu_load.stop()
 
 --------------------------------------------------------------------------
--- 16. GPU 利用率采集通道（doc/caps-redesign-2026-10-06.md §5）
+-- 16. GPU 利用率采集通道（doc/gap-worker-caps.md）
 --------------------------------------------------------------------------
 local function util_cases()
 new_case("util_fraction refuses the readings an admission gate cannot trust")
--- 打分侧的 normalize() 会把越界夹到 1；准入侧不行（caps-redesign §5 点名的缺口）。
+-- 打分侧的 normalize() 会把越界夹到 1；准入侧不行（doc/gap-worker-caps.md 点名的缺口）。
 near(gpu_load.util_fraction("65"), 0.65, "percent folded onto 0..1")
 near(gpu_load.util_fraction(65), 0.65, "a number in percent too")
 eq(gpu_load.util_fraction("0"), 0, "0 % is a legal reading (the 21.k idle-card case), not missing")

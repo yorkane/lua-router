@@ -1,5 +1,5 @@
 #!/usr/bin/env luajit
--- 亲和树体积上界与增量计数单测（doc/gap-cpu-idle-burn.md，分支 fix/cpu-idle-burn）。
+-- 亲和树体积上界与增量计数单测（2026-10-07，分支 fix/cpu-idle-burn）。
 --   运行：docker run --rm -e LUA_TEST_LIB=/repo/lualib -v "$PWD:/repo:ro" authz:latest \
 --          /usr/local/openresty/luajit/bin/luajit /repo/test/unit/test_tree_bounds.lua
 --

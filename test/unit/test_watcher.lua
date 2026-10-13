@@ -1941,7 +1941,7 @@ do
 end
 
 --------------------------------------------------------------------------
--- 24. 每轮探测的预算闸门（doc/gap-cpu-idle-burn.md CPU 线第 1 条）
+-- 24. 每轮探测的预算闸门（2026-10-07 cpu-idle 修复轮 CPU 线第 1 条）
 --------------------------------------------------------------------------
 new_case("the per-pass probe budget knobs have defaults, overrides and clamps")
 do

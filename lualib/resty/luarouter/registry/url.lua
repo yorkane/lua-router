@@ -1,7 +1,6 @@
 -- registry.url - url normalisation and dialing helpers.
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1, block D). Pure string helpers: no shared
+-- Cut verbatim out of registry.lua (refactor 2026-10-05, block D). Pure string helpers: no shared
 -- dict and no cosocket state, so any module can require them safely. The registry
 -- facade re-exports the public names (normalize_url / strip_rank / rank_of / split_url /
 -- tls_handshake) because router.lua, hb.lua, mesh.lua and watcher.lua borrow them

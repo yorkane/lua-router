@@ -21,7 +21,7 @@ local DEFAULT_METRIC_KEYS = {
 }
 _M.DEFAULT_METRIC_KEYS = DEFAULT_METRIC_KEYS
 
--- 利用率通道（doc/caps-redesign-2026-10-06.md §5）的 gauge 名册。它与上面的**负载**名册
+-- 利用率通道（doc/gap-worker-caps.md）的 gauge 名册。它与上面的**负载**名册
 -- 是两份，且刻意不包含两个 KV-cache 用量名：KV cache 占用率量的是「引擎装了多少 token」，
 -- 不是「卡有多忙」，把它喂给 GPU 利用率上限判定 = 一个把缓存塞满但卡闲着的引擎被当成满载
 -- 摘出候选集。准入判据只认 GPU 利用率这一族。
@@ -399,7 +399,7 @@ _M.MAX_PLAUSIBLE_UTIL_PERCENT = MAX_PLAUSIBLE_UTIL_PERCENT
 ---利用率是准入门（registry 的 gu: 键 -> capacity_state/capacity_exclusion）的读数，
 ---所以它不复用 normalize() 那条「>1 就当百分数、越界一律夹到 1」的打分启发式——
 ---lr-map-gpuload-2026.md §3.2 点名的缺口就在这一条：作为打分可以，作为准入太软。
----本函数的口径（doc/caps-redesign-2026-10-06.md §5 钉死）：
+---本函数的口径（doc/gap-worker-caps.md）：
 ---  * 非数 / NaN / ±inf：同 parse_number() 的口径，nil。
 ---  * **负数 -> nil**（绝不夹到 0）：0 % 是合法读数（21.k 的 dcgm 空载就报
 ---    DCGM_FI_DEV_GPU_UTIL{gpu="0"} 0），而负数是坏 exporter；夹成 0 等于给一台

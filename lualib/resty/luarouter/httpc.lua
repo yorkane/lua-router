@@ -1,7 +1,7 @@
 -- resty.luarouter.httpc - the gateway shared cosocket pool and HTTP primitives.
 --
 -- Raised verbatim out of the registry E block (registry.lua:328-482) per
--- doc/refactor-arch-2026-10-05.md section 1. These helpers were never
+-- 2026-10-05 facade 拆分 section 1. These helpers were never
 -- registry-specific: router.lua, config_store.lua, hb.lua, mesh.lua, watcher.lua and
 -- gpu_load.lua all borrow them, and they did so through the registry module table,
 -- which made the worker registry the de-facto transport library of the gateway.

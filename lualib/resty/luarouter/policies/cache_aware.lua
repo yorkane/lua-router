@@ -339,7 +339,7 @@ end
 --- 预算必须**传到 serialize 里去边走边估**：原先是先把整棵树拼成条目表 +
 --- cjson.encode 成一个几 MB 的字符串，**然后才**判 #text > max_bytes 并丢弃。也就是说
 --- 树越大，那一次注定被扔掉的分配就越大 —— 单 worker 进程每 120s 制造一次数百 MB 垃圾
---- 正是这个形状（doc/gap-cpu-idle-burn.md 的 CPU 线与内存线在这里交汇）。现在超预算的
+--- 正是这个形状（2026-10-07 cpu-idle 修复轮的 CPU 线与内存线在这里交汇）。现在超预算的
 --- 树在 DFS 阶段就被拒，条目表都不建，encode 只作用于预算内的结构。
 ---@param max_bytes number|nil
 ---@return string|nil

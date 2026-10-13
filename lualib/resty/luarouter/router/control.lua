@@ -32,7 +32,7 @@ local cors_apply = respond.cors_apply
 local cors_preflight = respond.cors_preflight
 local text_response = inference.text_response
 local policy_for = candidates.policy_for
--- 控制面三档容量上限的持久化镜像（用户裁定 2026-10-09，doc/gap-worker-caps.md §4）。
+-- 控制面三档容量上限的持久化镜像（用户裁定 2026-10-09，doc/gap-worker-caps.md §10 第 5 项）。
 -- host.store 是既有的惰性取用（拿不到 config_store 的裁剪构建只是少一层持久化，
 -- 控制面照旧 202），所以这里不新增 require。
 local store = host.store

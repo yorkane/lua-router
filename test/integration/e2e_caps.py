@@ -312,7 +312,7 @@ class UtilWorker(object):
         self.lock = threading.Lock()
         # self.utils is the per-card utilisation vector [(gpu_id, percent 0..100), ...]
         # in DCGM_FI_DEV_GPU_UTIL shape (the util channel of
-        # doc/caps-redesign-2026-10-06.md section 5). util_mode: "plain" = the two
+        # doc/gap-worker-caps.md). util_mode: "plain" = the two
         # legacy nvidia_gpu_utilization series only (what every pre-feature scenario
         # saw, byte for byte); "dcgm" = plus the DCGM-named per-card utils; "off" =
         # neither family in the body (collected as unknown, the red-line branch).
@@ -826,7 +826,7 @@ def scenario_concurrency():
           json.dumps({k: rows[url_b].get(k) for k in
                       ("min_concurrency", "max_concurrency", "max_gpu_util",
                        "load_state", "inflight_requests")}))
-    # Three-state echo (doc/caps-redesign-2026-10-06.md section 2): X declares only
+    # Three-state echo (doc/gap-worker-caps.md): X declares only
     # max_concurrency=1 (min absent = 1), so at rest it is the green light, and the
     # *absence* of a gate on Y means the **key is missing**, not null: an explicit
     # null would make an uncapped row look like a state the gateway refused to name.
@@ -892,7 +892,7 @@ def scenario_concurrency():
 def scenario_util_cap():
     """GPU 利用率读数超上限→迁走；读数缺失（未知）→不得排除。外加观测面断言。
 
-    2026-10-06 容量语义重设计（doc/caps-redesign-2026-10-06.md §1/§2/§5）把准入判据定为
+    2026-10-06 容量语义重设计（doc/gap-worker-caps.md）把准入判据定为
     **GPU 利用率百分比**：判定读的是 registry 的 gu: 键（0..1，逐卡归属，TTL'd），
     reason 是 "gpu_util"。
 
@@ -1869,7 +1869,7 @@ def scenario_affinity_vs_cap():
 def scenario_all_capped_503():
     """全部因达上限被排除：**429** + code 不变 + message 精确；对照 503 文案与老行为。
 
-    2026-10-06 容量语义重设计（doc/caps-redesign-2026-10-06.md §4，用户裁定覆盖
+    2026-10-06 容量语义重设计（doc/gap-worker-caps.md，用户裁定覆盖
     2026-10-01 的"全到顶 503"口径）：全池抵在并发/GPU 利用率上限不是"服务不可用"，是
     "暂时没法接单"→ 429 Too Many Requests，error.type 随状态码变；code 沿用
     no_available_workers（契约改动面最小）。熔断/不健康/组不服务**仍是 503 原文案**。

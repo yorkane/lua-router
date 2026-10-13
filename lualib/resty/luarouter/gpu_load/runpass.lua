@@ -31,7 +31,7 @@ local function new_stats(cfg)
         -- 合并计入，与 util 族同一口径）。两者并排读就是覆盖率；回退是**允许**的（打分
         -- 侧的保守方向，见 cards.lua assign_load 上方），允许而不显形就是复刻那次故障。
         load_per_card = 0, load_fallback = 0,
-        -- GPU 利用率通道（doc/caps-redesign-2026-10-06.md §5，registry 的 gu: 键）的独立
+        -- GPU 利用率通道（doc/gap-worker-caps.md，registry 的 gu: 键）的独立
         -- 计数：probed = metrics 路「正文可用并被扫过」的 worker 数 /
         -- prom 路「成功执行的利用率查询」数；matched = 真正写进 gu: 的读数数；failed =
         -- 扫过却取不到可用读数；errors = 查询没做成 / 响应不可解析 / 存储失败；rejected =
@@ -104,7 +104,7 @@ local function one(ctx, query, target)
 ---数值走 util_fraction()（经由 host_card_utils），而不是负载那一路的 normalize()。
 ---这是纪律要求的差别，不是笔误：利用率这条 vector 喂的是准入门，不能被
 ---normalize() 的「>1 就当百分数、越界一律夹到 1」的打分启发式折一遍
----（doc/caps-redesign-2026-10-06.md §5 点名的缺口正是这一条）。
+---（doc/gap-worker-caps.md 点名的缺口正是这一条）。
 ---
 ---它有自己独立的 vector、自己的逐卡表与自己的 card_hosts 集合：利用率
 ---查询是与负载查询**分开的**第二条 PromQL，两者永不合并（gauge 家族与聚合口径常常不同，
@@ -393,7 +393,7 @@ function _M.run_pass(cfg, opts)
     local workers = list_workers() or {}
     stats.workers = #workers
 
-    -- 利用率通道（缺省启用，doc/caps-redesign-2026-10-06.md §5）。它的判定开关不在这里：
+    -- 利用率通道（缺省启用，doc/gap-worker-caps.md）。它的判定开关不在这里：
     -- 采集只把读数写进 registry 的 gu: 键，只有 worker 记录上显式配了 max_gpu_util 才会有
     -- 人读它，所以缺省开不改变任何现有部署的选路行为（「读数未知 -> 不排除」）。prom 路是
     -- 否**多发**这条查询见下面 util_enabled 的口径。
@@ -402,7 +402,7 @@ function _M.run_pass(cfg, opts)
     -- 拨号，缺省开是纯赚。prom 路只认**操作员的显式意图**（写了 SMG_LOAD_UTIL_QUERY）：
     -- 缺省串人人都有（util.query 恒非空），拿它当意图的话，每个只配了负载查询的部署
     -- 都会凭空多出一条没人要求的 POST——那是「缺省零行为变化」这条红线
-    -- （caps-redesign §0 第 3 条）直接否掉的形状，单测里「一条 PromQL = 一个 tick
+    -- （doc/gap-worker-caps.md）直接否掉的形状，单测里「一条 PromQL = 一个 tick
     -- 一个 POST」的钉也一起塌掉。它同时挡住一种误导性的导出：util_enabled 为真却
     -- 导出 util_workers=0 / samples_total=0，看板读起来像「利用率在生效但一台都没
     -- 采到」，而真相是这条根本不该有读数。

@@ -22,7 +22,7 @@
 local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
 local legacy_src_path = os.getenv("LR_MODELS_TEST_LEGACY_SRC")
 
--- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：/v1/models 合成层逐字搬进
+-- 2026-10-05 facade 拆分：/v1/models 合成层逐字搬进
 -- lualib/resty/luarouter/router/models_api.lua，锚点字符串一个都不动，只换源码文件。
 -- 旧实现对照（LR_MODELS_TEST_LEGACY_SRC 指向改动前的 router.lua）与旧树对照走末尾的
 -- router.lua 回退。

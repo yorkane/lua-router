@@ -184,7 +184,7 @@ function _M.load()
         balance_abs_threshold = num("SMG_BALANCE_ABS_THRESHOLD", 64),
         balance_rel_threshold = num("SMG_BALANCE_REL_THRESHOLD", 1.5),
         max_tree_size = num("SMG_MAX_TREE_SIZE", 67108864),
-        -- 亲和树的**节点数**上限（doc/gap-cpu-idle-burn.md）。max_tree_size 管的是
+        -- 亲和树的**节点数**上限（2026-10-07 cpu-idle 修复轮）。max_tree_size 管的是
         -- 「每租户（= 每个 worker URL）的字符数」，同一批 worker 可以合法地各背满它，
         -- 于是总占用 = 树数 × 租户数 × max_tree_size，没有任何一维约束节点个数。
         -- 单 worker 进程里真正把转发核压住的是节点数（每节点一张表 + 一份 prompt 尾巴），
@@ -260,7 +260,7 @@ function _M.load()
         load_scale = num("SMG_LOAD_SCALE", 100),
 
         -- ==================== GPU utilization channel ====================
-        -- doc/caps-redesign-2026-10-06.md §5：gu: 键（逐卡 GPU 利用率 0..1，TTL'd）的唯一
+        -- doc/gap-worker-caps.md：gu: 键（逐卡 GPU 利用率 0..1，TTL'd）的唯一
         -- 写者通道，registry 的 max_gpu_util 上限判定读它。与负载那一路共用同一个定时器
         -- 与同一份抓取（metrics 路同一正文多扫一遍；prom 路最多再多一条 PromQL），所以
         -- SMG_LOAD_SOURCE 仍是总开关：它是 none 时这里设了也不会有任何读数（registry 侧

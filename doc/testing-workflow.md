@@ -1,9 +1,7 @@
-# 并发测试工作流（2026-10-12 裁定改写）
+# 并发测试工作流
 
-> 本文是测试与多代理并行验证的**唯一操作口径**。用户裁定 2026-10-12 推翻了旧规则「门与门之间严禁并发 /
-> 同一时刻只允许一份门禁在跑」：那条规则的意图是隔离（端口、容器名册、被中途编辑的源码树），而隔离现在由
-> 实现提供，所以约束从「人工串行」换成「同 manifest 的独立 run 可以并发」。
-> [doc/operations-lessons-20261012.md](operations-lessons-20261012.md) §4 的旧文案按本文替换，不改写历史。
+> 本文是测试与多代理并行验证的**唯一操作口径**。现行约束：隔离由实现提供，**同一份 manifest 下的独立 run
+> 可以并发**；串行只作为显式复现档（`GATE_JOBS=1`）保留。
 
 ## 1. 隔离由谁提供（实现位置，按「文件 + 函数名」引用）
 
@@ -14,11 +12,11 @@
 | 每 run / 每门命名空间 | `context.RunContext.gate_env`：`LR_RUN_ID` / `LR_GATE_TAG` / `LR_TEST_TMP` / `LR_RESULT_DIR`；容器名由 `test/integration/_lib.py` 的 `RUN` 与 `test/test_lua_router.sh` 的 `SUIT` 拼出 | 全局 `lr-*` 清理互踩、PID 同余撞目录 |
 | 机器级端口台账 | `test/port_allocator.py`：`free_port` / `reserve` / `release_pid`（`/data/tmp/lr-gates/ports.reserved`，flock + pid 存活回收 + 绑定探针） | bash 契约段与 python e2e 各拿各的端口 |
 | 声明式资源锁 | `test/gates/locks.py`：`acquire_gate_locks`；写者优先的观测窗 `obs:shared` / `obs:exclusive`，构建准备锁 `build:exclusive` | 「阶段栅栏 + 串行尾巴」 |
-| watcher 的 docker.sock 只读代理 | `test/integration/docker_test_proxy.py`：`DockerTestProxy.for_run` / `socket_path_for` / `allow` | watcher 独占机器观测窗（旧串行三门里的一个理由） |
+| watcher 的 docker.sock 只读代理 | `test/integration/docker_test_proxy.py`：`DockerTestProxy.for_run` / `socket_path_for` / `allow` | watcher 读过滤后的只读名册，不独占机器观测窗 |
 | 结果记录与聚合 | `test/gates/results.py`：`write` / `load` / `aggregate` / `report_lines` | 「跳过的门在报告里消失」= 假绿 |
 
 两条要点：**缓存只覆盖准备阶段**（快照与镜像按指纹复用），门结果永不复用——每个 run 都真跑被选中的每一门。
-**没有全局「同时只跑一份门禁」的 flock 了**（`test/final_gates.sh` 头部明写），`/data/tmp/lr-gates/.gates.lock` 是旧实现留下的空文件，不再被任何代码持有。
+**没有全局「同时只跑一份门禁」的锁**（`test/final_gates.sh` 头部明写），隔离全部由上表机制提供。
 
 ## 2. 先冻结，再并发：prepare 一次，多 agent 共用一份 manifest
 
@@ -79,7 +77,7 @@ GATE_DRY_RUN=1 GATE_TIER=full bash test/final_gates.sh      # 同上，兼容旧
 
 ## 4. 并发纪律（跑前 / 跑中 / 收尾）
 
-- **跑前**：`ps -ef | grep '[f]inal_gates.sh'` 看有没有别人的 run 在跑（有就并发跑，不排队——并发是本轮裁定），
+- **跑前**：`ps -ef | grep '[f]inal_gates.sh'` 看有没有别人的 run 在跑（有就并发跑，不排队），
   但要确认台账活着：`wc -l /data/tmp/lr-gates/ports.reserved`（行数是瞬时值，随 run 结束归零）。
 - **锁只锁真正共享的东西**：HTTP 门共享观测窗（`obs:shared`），构建走独立的准备锁（`build:exclusive`，
   conf/unit/contract/probes 不等构建）；`e2e_watcher` 声明**零锁**，因为它读的是只读代理的过滤名册。
@@ -121,12 +119,10 @@ bash test/final_gates.sh aggregate --tier full \
 # 只核一份报告时补 --gates "contract e2e_watcher"（缺 expected 集 = 22 门全量）
 ```
 
-  实测形状（本轮，同一 fingerprint `9d34ff48fcd5` + 同一镜像 `sha256:46ce63e2a113`，三门分属三个 run）：
-  三目录聚合（未显式 `--tier full`）→ `3 pass` / `release_green=True` / `full_anchor_eligible=False`，退出码 0；
-  把 expected 写成两门只喂一个目录 → `1 pass + 1 crash(no result record)`、`selection_green=False`、退出码 1。
-  少一门不会让聚合变绿，这是这套报告存在的理由。
-- **`SKIP_ENV` 出现在发版锚里就是假绿**（历史上外部依赖门被 SKIP 掩盖过 require 失败）：跳过只用于
-  「该门被无关改动确定阻塞」，且必须写进报告。
+聚合的行为口径（实测确认）：缺门按 `crash(no result record)` 计入 `selection_green=False` 且退出码非零，
+**少一门不会让聚合变绿**，这是这套报告存在的理由；未显式 `--tier full` 的聚合即便全 pass 也只报
+`release_green=True` / `full_anchor_eligible=False`，买不回发版锚点。
+- **`SKIP_ENV` 出现在发版锚里就是假绿**：跳过只用于「该门被无关改动确定阻塞」，且必须写进报告。
 
 ## 6. 改动 → 验证矩阵（协议，缺省按最小面）
 
@@ -136,30 +132,13 @@ bash test/final_gates.sh aggregate --tier full \
 | UI 纯函数 / 管理台页 | `GATE_GROUP=ui`（node 单测 + `e2e_ui_bridge`） |
 | config / 声明层 / `config_store` | `GATE_GROUP=config` + 相关 base（`conf`、`unit`） |
 | router / 策略选择 / 改写链 | `GATE_GROUP=routing` + `contract` |
-| 跨组件接线（facade + re-export、auth、mesh 协议） | 相关分组全跑 + `contract`（接线完整性只有真跑请求的门能证明，见 §3 教训） |
+| 跨组件接线（facade + re-export、auth、mesh 协议） | 相关分组全跑 + `contract`（接线完整性只有真跑请求的门能证明） |
 | 发版 / 构建脚本 / 生产镜像替换 | `GATE_TIER=full` 全 22 门，或同快照分组聚合的等价证明 |
 
-**不要自动追加测试范围**：文档 + 小面积可逆改动反复跑 full / contract 是本轮点名的慢因。
+**不要自动追加测试范围**：文档 + 小面积可逆改动反复跑 full / contract 是最常见的慢因。
 一次修改跑最小相关面，红了定位后只重跑受影响的门（`GATE_ONLY=<门>`），跑完整轮才更新计数锚点。
 
-## 7. 实测记录与未测项
-
-本轮已实测的并发样本（三 run 同一秒启动，`GATE_TIER=full GATE_JOBS=1`，各自 `GATE_ONLY`）：
-
-| 门 | checks | 结果 | 耗时 |
-|---|---|---|---|
-| contract | 765 / 2 notes | pass | 155.2s |
-| e2e_watcher | 125 | pass | 103.3s |
-| e2e_models_advertisement | 262 | pass | 65.8s |
-
-墙钟 156 秒（最长门 155.2s），三门串行相加 324s；watcher 在旁有 24 个外来 `lr-` 容器时读的是过滤后的代理名册，
-125 项照旧全绿。三份逐门记录：`/data/tmp/lr-gates/runs/20261012-185138-3257449-d358`（contract）、
-`…-3257453-d35c`（models_advertisement）、`…-3257457-d360`（watcher）的 `report.json`。
-收尾核对是**本 run 的容器名册归零**（按注入的 `LR_CONTAINER_NAMESPACE` 过滤，判据见 §4 清理边界）：
-当时顺带观测到全机 `docker ps -a --filter name=lr-` 恰好为 0——那是各 run 收尾后的瞬时状态，**不是判据**，
-并发下全机前缀计数既判不了对错也不许当清理依据。`/data/tmp/lr-gates/ports.reserved` 0 行。
-
-**这组数据只证明隔离机制生效 + 三门可并发**，不构成 full 档加速比。
+## 7. full 锚点
 
 fullbench（现行实现的 22 门全绿锚点，2026-10-13 root 补测）：
 
@@ -173,8 +152,6 @@ fullbench（现行实现的 22 门全绿锚点，2026-10-13 root 补测）：
 #   release_green=True  selection_green=True  full_anchor_eligible=True
 # 逐门前六：contract 167.1  e2e_policy_parity 107.1  e2e_caps 105.8  e2e_watcher 104.8
 #   e2e_profiles 74.3  e2e_models_advertisement 72.5；逐门 duration 之和 1005.5s
-# 历史留档（不同实现，不与上面换算加速比）：旧串行 917s（gates-20261012-164729.log）、
-#   旧并行池 GATE_JOBS=6 447s（gates-20261012-160634.log）
 ```
 
 逐门之和 1005.5s 对外层墙钟 167.5s 是 6.0x 的池内并行聚合，**不是加速比口径**：最长的 contract

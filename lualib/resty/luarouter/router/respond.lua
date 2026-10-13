@@ -1,7 +1,7 @@
 -- 应答 / CORS / request id / 请求头与标签（自 router.lua 逐字搬来）。
 --
 -- P3 错误应答 + P4 CORS + P5 request id + P10 请求/响应头白名单与标签。
--- HTTP 面逐字节不变是唯一验收口径（doc/refactor-arch-2026-10-05.md §0）。
+-- HTTP 面逐字节不变是唯一验收口径（2026-10-05 facade 拆分）。
 local cjson = require "cjson.safe"
 
 local host = require "resty.luarouter.router.host"

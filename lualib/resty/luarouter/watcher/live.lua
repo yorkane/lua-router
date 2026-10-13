@@ -467,7 +467,7 @@ function _M.run_pass(cfg, opts)
     -- What this protects is the single forwarding core. On 21.k the box has 128 LISTEN
     -- sockets and the deny list covers about 39 of them, so an unbudgeted pass dials
     -- 70-90 candidates x up to 6 serial GETs with a 4s timeout, every 15s, forever,
-    -- with no traffic involved at all (doc/gap-cpu-idle-burn.md, CPU line item 1).
+    -- with no traffic involved at all (2026-10-07 cpu-idle 修复轮, CPU line item 1).
     local budget_secs = tonumber(cfg.pass_budget_secs) or 0
     local deadline
     if budget_secs > 0 then

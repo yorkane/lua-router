@@ -4,7 +4,7 @@
 
   历史：本文件原名 logs-inject.js，同时注入 Logs 与 Admin 两个入口。根目录下的
   早期独立工具页 logs.html、metrics.html、config.html 已移除（功能与 admin 管理台
-  重叠，差异记录见 doc/ui-trim-legacy-pages.md），Logs 入口随之删除，只保留 Admin。
+  重叠，差异记录见 git 历史），Logs 入口随之删除，只保留 Admin。
 
   入口迁移（2026-10-08 admin 迁根）：管理台现在是站点根入口 /，webui 的规范入口是
   /u/。注入链接因此用绝对路径 /：页面无论从 /u/ 打开都落到同一个规范入口。

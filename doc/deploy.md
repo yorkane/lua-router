@@ -199,7 +199,7 @@ services:
 watcher 的 proc 扫描会把本机所有监听端口探测成 worker 候选。deny 名单收「接受连接后立刻 RST」
 的基础设施口与不该被代理进池的自身/边缘服务（235.t：`111,5432,11022,14389,42209`；
 21.k：外加 `22,80,443,3000,9080,9091,9092,9100,9180,9443,9912,15012,2379,2380`——authz/apisix 边缘
-会代理 `/v1/*`，不 deny 会被注册成 worker）。新机器照 `doc/gap-watcher-deny-21k.md` 的口径逐口核实。
+会代理 `/v1/*`，不 deny 会被注册成 worker）。新机器按 `doc/gap-watcher-merge.md` 的端口名单与探针预算逐口核实。
 
 ### 1.5 启动与验收
 
@@ -304,7 +304,7 @@ docker compose pull && docker compose up -d --force-recreate
 - 管理台浏览器复核四页渲染（playwright-cli，无头下 `ERR_INVALID_AUTH_CREDENTIALS` = 401 挑战到达，
   属预期）；
 - 外部域名形状：APISIX 链路（写 X-Real-IP）→ 配口令实例 401、未配实例 302（authz 登录墙）——
-  与 [deploy-8800prod-20261012-proxy-auth.md](deploy-8800prod-20261012-proxy-auth.md) 矩阵逐行对照。
+  按 [gap-admin-auth.md](gap-admin-auth.md) 的保护清单与匿名面逐项验收。
 
 ### 2.5 回滚
 
@@ -338,9 +338,8 @@ docker compose up -d --force-recreate        # 旧镜像本机在盘，秒级
 
 ## 4. 相关文档
 
-- 现状与漂移：[deploy-state.md](deploy-state.md)；历史部署记录：[deploy-fleet.md](deploy-fleet.md)
+- 现状与漂移：[deploy-state.md](deploy-state.md)；操作前重新核对实例
 - 口径权威：[gap-admin-auth.md](gap-admin-auth.md)（鉴权）、[gap-config-store.md](gap-config-store.md)（持久化）、
   [gap-worker-caps.md](gap-worker-caps.md)（容量上限）、[gap-virtual-models.md](gap-virtual-models.md)（虚拟入口）
-- 发布与门禁：[testing-workflow.md](testing-workflow.md)、[operations-lessons-20261012.md](operations-lessons-20261012.md)
-- 验收报告样例：[deploy-8800prod-20261012-proxy-auth.md](deploy-8800prod-20261012-proxy-auth.md)、
-  [deploy-8802-20261012-proxy-auth.md](deploy-8802-20261012-proxy-auth.md)
+- 发布与门禁：[testing-workflow.md](testing-workflow.md)
+- 验收标准：[gap-admin-auth.md](gap-admin-auth.md)、[gap-config-store.md](gap-config-store.md)

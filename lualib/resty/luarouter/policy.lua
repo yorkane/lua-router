@@ -67,7 +67,7 @@ local mt = { __index = _M }
 ---same LRU maintenance as the default one, and _M.for_model uses it as its cache.
 ---Entries used to stay for the life of the process (they carry affinity state) on the
 ---assumption that model cardinality is bounded by the worker set. That assumption is
----what let the leak through (doc/gap-cpu-idle-burn.md S2): router/candidates.lua builds
+---what let the leak through (2026-10-07 cpu-idle 修复轮 S2): router/candidates.lua builds
 ---the profile-forced and group-entry instances *outside* the for_model has_workers path,
 ---so a name that only ever existed in an operator profile — or that a client typed into
 ---a request body — kept its entry, and with it a whole affinity tree, until the process
@@ -879,7 +879,7 @@ local function sweep_standalone(inst, evict_only)
         -- is incremental, "this tick did not finish" is the normal case, not an error,
         -- and the caller decides whether to run another tick soon. The previous version
         -- drained the whole heap in one tick, which under worker_processes 1 is seconds
-        -- of the single forwarding core (doc/gap-cpu-idle-burn.md, CPU line item 2).
+        -- of the single forwarding core (2026-10-07 cpu-idle 修复轮, CPU line item 2).
         local cfg = inst.cfg or {}
         local ok, more = pcall(impl.evict_all, impl,
             cfg.max_tree_size, cfg.max_tree_nodes, cfg.evict_budget)
@@ -950,7 +950,7 @@ local function live_model_names()
     return set
 end
 
----Reclaim policy instances that nothing points at any more (doc/gap-cpu-idle-burn.md S2).
+---Reclaim policy instances that nothing points at any more (2026-10-07 cpu-idle 修复轮 S2).
 ---
 ---An instance is only dropped when **all four** hold, which is what makes this safe to
 ---run on the shared timer rather than behind a flag:

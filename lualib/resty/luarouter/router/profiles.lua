@@ -1,6 +1,6 @@
 -- 虚拟模型 profile 读层（自 router.lua 逐字搬来，只调整了 require 接线）。
 --
--- config_store 之上的 pcall + 类型守卫缝（doc/gap-virtual-models.md §3.3）。两条
+-- config_store 之上的 pcall + 类型守卫缝（doc/gap-virtual-models.md §3）。两条
 -- 恒 nil 停用缝（profile_policy_name / profile_effort_value，用户裁定 2026-10-02）
 -- 是刻意保留的兼容行为，**不是死代码清理对象**（AGENTS.md）。
 -- test/unit/test_caps_routing / test_profiles 11b / test_effort_layers 按字符串

@@ -23,7 +23,7 @@
 -- not guaranteed to ship.
 
 --
--- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：本文件是 facade，实现住在
+-- 2026-10-05 facade 拆分：本文件是 facade，实现住在
 -- resty.luarouter.config_store.{lexicon,env,profiles,persistence,upstreams,snapshot,
 -- readers,mutators,httpc,handlers}。函数体逐字搬家；这里只做 require 与 68 个导出的逐一
 -- re-export（_M 导出名集合、函数签名、返回值形状逐名保留，含按名字被 UI / 文档 / 单测
@@ -131,7 +131,7 @@ _M.apply_model_config = CS_MUTATORS.apply_model_config
 _M.apply_policy = CS_MUTATORS.apply_policy
 _M.apply_profiles = CS_MUTATORS.apply_profiles
 _M.apply_upstreams = CS_MUTATORS.apply_upstreams
--- 控制面 caps 的持久化镜像（用户裁定 2026-10-09，doc/gap-worker-caps.md §4）：
+-- 控制面 caps 的持久化镜像（用户裁定 2026-10-09，doc/gap-worker-caps.md §10 第 5 项）：
 -- PUT/POST /workers 把三档上限写进 lr_workers 后，由 router/control.lua 经这两个
 -- 入口镜像到 upstreams 段（行级 upsert，不整表替换），删 worker 时连带清除纯镜像行。
 _M.apply_upstream_caps = CS_MUTATORS.apply_upstream_caps

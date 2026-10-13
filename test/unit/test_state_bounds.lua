@@ -1,5 +1,5 @@
 #!/usr/bin/env luajit
--- 进程内累积状态的回收与预算单测（doc/gap-cpu-idle-burn.md，分支 fix/cpu-idle-burn）。
+-- 进程内累积状态的回收与预算单测（2026-10-07，分支 fix/cpu-idle-burn）。
 --   运行：docker run --rm -e LUA_TEST_LIB=/repo/lualib -v "$PWD:/repo:ro" \
 --          --entrypoint /usr/local/openresty/luajit/bin/luajit authz:latest \
 --          /repo/test/unit/test_state_bounds.lua

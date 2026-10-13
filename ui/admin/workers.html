@@ -178,7 +178,7 @@
                          第一段是并发区间 min–max（min 缺席按 1，max 缺席 = 不限），第二段是 GPU 利用率
                          上限（0..100 整数百分比，缺席 = 不限）。颜色不在这张列里 —— 它是状态列的三态灯，
                          判定只在后端。瓦特一族（pw: 读数、lr_gpu_load_power_* 指标族、power_w 字段）已于
-                         2026-10-09 整体移除（用户裁定；容量侧退役见 doc/caps-redesign-2026-10-06.md），
+                         2026-10-09 整体移除（用户裁定；容量侧退役见 doc/gap-worker-caps.md），
                          UI 不再有它的任何形状。 -->
                     <div style="display:flex;flex-direction:column;gap:2px">
                       <div class="route-cell" style="gap:6px">
@@ -567,7 +567,7 @@
         let declTimer
         let waitTimer
 
-        // 容量三门的预填口径（doc/caps-redesign-2026-10-06.md §1）：min 缺席等价 1、max 缺席 = 不限，
+        // 容量三门的预填口径（doc/gap-worker-caps.md）：min 缺席等价 1、max 缺席 = 不限，
         // 所以新增/编辑声明时先画上 1 / 8（操作员最常写的那组），清空上限输入框才撤回不限；
         // 利用率门一律留空 = 不限 —— 0 是合法的极严档，不能拿 0 当「没填」。
         const blankAdd = () => ({ url: '', model_id: '', api_key: '', priority: '', cost: '', min_concurrency: '1', max_concurrency: '8', max_gpu_util: '', modelsText: '', labelsText: '', disable_health_check: false })
@@ -863,7 +863,7 @@
         // gpu_util 是网关自己的在飞计数和监控采到的利用率。两者必须分行且视觉区分：实测值是只读的，
         // 一旦被当成配置回写，就等于让监控采样替操作员改了选路规则。
         // 读数缺席 = 未知（gpu_util 在没有新鲜采样时压根不出现），未知一律显示「未采集」而非 0，
-        // 与后端「未知不排除」同口径（doc/caps-redesign-2026-10-06.md §0 第 2 条）。
+        // 与后端「未知不排除」同口径（doc/gap-worker-caps.md）。
         // 瓦特读数（power_w）随 2026-10-06 的容量重设计退出判定，2026-10-09 整条观测链移除；UI 不画它、不发它的键。
         function capNumber (value) {
           const number = Number(value)

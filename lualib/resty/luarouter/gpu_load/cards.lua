@@ -304,7 +304,7 @@ _M.util_fold = util_fold
 ---Map the utilization vector onto workers, preferring each worker's own card.
 ---
 ---The four-way attribution rule, and why each branch is what it is
----(doc/caps-redesign-2026-10-06.md §5, deliberate and not an oversight):
+---(doc/gap-worker-caps.md, deliberate and not an oversight):
 ---  * 源根本没有逐卡标签（source_has_cards 假）-> 整机最热卡的利用率。这是老
 ---    数据源（node_exporter、operator 的 by(Hostname) 查询、只报一个整机 gauge 的引擎）
 ---    唯一可能的口径，逐字节保持改动前的行为，否则一直在用的数据源会在逐卡落地当天变黑。
@@ -551,7 +551,7 @@ end
 ---     env 声明时 os.getenv 那一路会静默失效，而 config 那一路不受影响。
 ---   * 这三个名字每 tick 现读并不比 init 期读一次更「热」：worker 环境在
 ---     fork 时固定，全仓没有 setenv/putenv，生效方式是重启容器。别把它承诺成可热改。
----   * 开关缺省 **1**（doc/caps-redesign-2026-10-06.md §5）。利用率缺省开的理由是它的
+---   * 开关缺省 **1**（doc/gap-worker-caps.md）。利用率缺省开的理由是它的
 ---     **判定**并不由这个开关决定
 ---     ——采集只把读数写进 registry 的 gu: 键，只有记录上显式配了 max_gpu_util 才有人读它，
 ---     所以缺省开不会改变任何现有部署的选路行为（红线「缺省零行为变化」由判定侧的「读数未知

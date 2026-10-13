@@ -1,7 +1,6 @@
 -- registry.loads - load folding, external samples and the capacity gates (block O).
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1).
+-- Cut verbatim out of registry.lua (refactor 2026-10-05).
 --
 -- Two shapes here are load-bearing for the parity gates and are deliberately left
 -- alone:
@@ -12,8 +11,7 @@
 --     reading means unknown: it never excludes. capacity_state is the one place the
 --     three-way verdict (idle/busy/full) is computed - the /workers echo and the
 --     router's green-light narrowing both read *that*, so no second caller can derive
---     the traffic-light from a different mix of readings (doc/caps-redesign-2026-10-06.md
---     section 2). xl:, sl: and gu: never share a field with each other or with the
+--     the traffic-light from a different mix of readings (doc/gap-worker-caps.md). xl:, sl: and gu: never share a field with each other or with the
 --     in-flight counter, because a score and an admission number are different kinds.
 
 local M = {}
@@ -171,7 +169,7 @@ end
 -- GPU is (the external gu: sample). Utilisation is the only busy-side reading
 -- there is: the third gauge that originally sat beside those two is gone, so
 -- nothing on this path reports an absolute busy-side magnitude any more.
--- doc/gap-worker-caps.md, reshaped by doc/caps-redesign-2026-10-06.md sections 1-2.
+-- doc/gap-worker-caps.md.
 
 ---Normalize one declared cap. Absent, blank, non-numeric, NaN, +/-inf or a value
 ---<= 0 all mean "no limit" and collapse to nil, so the selection path can test
@@ -201,7 +199,7 @@ end
 ---"no limit". The value is floored to an integer percent; a stored 0 must survive,
 ---and clearing the cap is spelled "absent" or any negative number, both of which
 ---fold to nil here and therefore to "no gate" at read time
----(doc/caps-redesign-2026-10-06.md section 1).
+---(doc/gap-worker-caps.md).
 ---@param value any
 ---@return number|nil limit @ integer percent, or nil for "unlimited"
 function M.util_limit(value)
@@ -246,7 +244,7 @@ end
 ---------------------------------------------------------------- declared ranges
 --
 -- The one rulebook for the three per-worker ceilings, and the only place their ranges are
--- written down (doc/caps-redesign-2026-10-06.md section 1). Two doorway faces read it, which
+-- written down (doc/gap-worker-caps.md). Two doorway faces read it, which
 -- is the whole reason it lives here instead of beside either caller:
 --   * the pool side: registry/discovery.lua's UPDATE_NUMBER_FIELDS loop, reached by
 --     PUT /workers/{id} (the 服务池 "编辑 worker" 弹窗);
@@ -361,7 +359,7 @@ end
 --
 -- Per-worker ceilings on the two things that actually run a serving instance out of
 -- headroom: requests in flight (this gateway's own counter) and how busy the GPU
--- actually is (an external sample). doc/caps-redesign-2026-10-06.md replaces the
+-- actually is (an external sample). doc/gap-worker-caps.md replaces the
 -- 2026-10-01 two-way gate with a three-way verdict, and the verdict - not the
 -- caller - is what owns the comparison:
 --

@@ -98,7 +98,7 @@ const app = Vue.createApp({
     const throughputOut = computed(() => throughput.value ? fmtTok(throughput.value.outputTokS) : t.value.dash)
     const throughputCache = computed(() => throughput.value ? fmtPct(throughput.value.cacheHitPct) : t.value.dash)
     const throughputHasErrors = computed(() => !!(throughput.value && Number(throughput.value.errorsWindow) > 0))
-    // 原版聊天界面的规范入口（doc/refactor-arch-2026-10-05.md §5.3）：旧地址 /_ui/
+    // 原版聊天界面的规范入口（2026-10-05 facade 拆分）：旧地址 /_ui/
     // 照旧可用，但壳里的链接统一指新入口 /u/。
     const chatHref = computed(() => '/u/')
 

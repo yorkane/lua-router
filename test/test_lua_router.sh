@@ -2253,7 +2253,7 @@ if section ui_fixed; then
         request "$UI_BASE" GET "$gone"
         assert_eq "$gone is removed (404)" "$STATUS" "404"
     done
-    # 旧根目录工具页随 doc/ui-trim-legacy-pages.md 一并移除（/logs.html 是现役管理台
+    # 旧根目录工具页随 2026-10-08 根页面收敛一并移除（/logs.html 是现役管理台
     # 页，由上面的静态入口与 e2e 覆盖，不在这里验）。
     for gone in /metrics.html /config.html /lmr-tabs.js; do
         request "$UI_BASE" GET "$gone"
@@ -2453,7 +2453,7 @@ fi
 
 # ==========================================================================
 if section caps; then
-    # 每服务容量上限的兜底契约（doc/caps-redesign-2026-10-06.md §4，用户裁定 2026-10-06
+    # 每服务容量上限的兜底契约（doc/gap-worker-caps.md，用户裁定 2026-10-06
     # 覆盖 2026-10-01 的「全到顶 503」口径）：全池都抵在并发/GPU 利用率上限上时答
     # **429**（容量到顶是"暂时没法接单"，不是服务不可用），code 沿用
     # no_available_workers（契约改动面最小），error.type 随状态码变 Too Many

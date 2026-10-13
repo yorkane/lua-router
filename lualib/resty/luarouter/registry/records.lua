@@ -2,8 +2,7 @@
 -- family, the pool structural writers (add/remove), the read-side views and the
 -- single record merge writer (patch_record).
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1, blocks F/G/H/I/L/M/P).
+-- Cut verbatim out of registry.lua (refactor 2026-10-05, blocks F/G/H/I/L/M/P).
 --
 -- Invariants this module owns:
 --   * add/remove are the only two entries that change pool membership, and both do
@@ -410,7 +409,7 @@ function M.add(req, cfg)
             model_caps = clone_model_caps(rawget(req, "model_caps")),
             priority = tonumber(req.priority) or 50,
             cost = tonumber(req.cost) or 1.0,
-            -- Per-worker capacity ceilings (doc/caps-redesign-2026-10-06.md section 1):
+            -- Per-worker capacity ceilings (doc/gap-worker-caps.md):
             -- stored only when a usable limit was declared, so a record built without
             -- them keeps its exact pre-feature shape and the verdict short-circuits on
             -- "all three absent" before it touches a dict. Every registration entry
@@ -619,8 +618,7 @@ function M.info(record, d)
         metadata = metadata,
         disable_health_check = record.disable_health_check or false,
         job_status = job,
-        -- The three ceilings and their live readings (doc/caps-redesign-2026-10-06.md
-        -- section 1-2). A ceiling that was never declared is *absent* rather than 0 --
+        -- The three ceilings and their live readings (doc/gap-worker-caps.md). A ceiling that was never declared is *absent* rather than 0 --
         -- 0 would read as "a limit of zero slots" to anything that does not know
         -- cap_limit's normalization, and the console has to tell "unlimited" apart from
         -- the one rung where 0 *is* a limit (max_gpu_util, folded by util_limit).
@@ -632,7 +630,7 @@ function M.info(record, d)
         max_concurrency = R.cap_limit(record.max_concurrency),
         min_concurrency = R.cap_limit(record.min_concurrency),
         max_gpu_util = R.util_limit(record.max_gpu_util),
-        -- The verdict itself (doc/caps-redesign-2026-10-06.md section 2): read-only, and
+        -- The verdict itself (doc/gap-worker-caps.md): read-only, and
         -- computed here rather than in the browser. The pool table colours with this
         -- value and the router trims its candidate array with the same call, so neither
         -- side can drift into a private definition of "full". Absent when the worker

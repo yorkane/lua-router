@@ -125,7 +125,7 @@ local function label_text(labels)
 end
 
 
---- model 标签的基数闸门（doc/gap-cpu-idle-burn.md S3）。
+--- model 标签的基数闸门（2026-10-07 cpu-idle 修复轮 S3）。
 --- lr_stats 的键是 c|/h|/g| + metric + labels，而全仓对这些行没有任何 delete
 ---（唯一的 delete 在 logstore.lua 与 inflight 自己的键上）。所以一个取值空间由客户端
 ---决定的标签，会把这个字典养到进程结束，/metrics 与每一趟 gauge 扫描都为它付费。
@@ -1035,7 +1035,7 @@ local HELP = {
     -- scraper is left with a blank description.
     smg_worker_capacity_excluded_total = "Candidates removed from selection by their configured concurrency limit or GPU-utilisation limit by reason",
     -- Sibling of the family above, and deliberately *not* part of it: the green-light
-    -- preference (doc/caps-redesign-2026-10-06.md section 3) hands the policy only the
+    -- preference (doc/gap-worker-caps.md) hands the policy only the
     -- idle subset when one exists, so busy workers yield without being excluded -- they
     -- stay selectable and nothing about them is "removed". A separate family is what
     -- keeps "the pool refused traffic" (excluded_total) readable apart from "the pool
@@ -1068,7 +1068,7 @@ local HELP = {
     smg_cache_aware_tenant_count = "Tenants tracked by the cache_aware policy trees",
     -- Same superset, and the reason this branch exists: the 21.k incident could only be
     -- read off smaps_rollup's Private_Dirty, because nothing said how much affinity
-    -- state the process was carrying. These three say it (doc/gap-cpu-idle-burn.md).
+    -- state the process was carrying. These three say it (2026-10-07 cpu-idle 修复轮).
     smg_cache_aware_tree_count = "cache_aware affinity trees held by this process",
     smg_cache_aware_tree_nodes = "Live prefix-tree nodes across this process (the memory driver)",
     smg_cache_aware_tree_chars = "Prompt characters retained by the cache_aware trees",

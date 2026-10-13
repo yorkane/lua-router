@@ -1591,7 +1591,7 @@ reset_env()
 --------------------------------------------------------------------------
 local function verify_hot_path_seams()
     local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
-    -- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：热路径的七块真实现分别
+    -- 2026-10-05 facade 拆分：热路径的七块真实现分别
     -- 住在 router/profiles.lua 与 router/candidates.lua，锚点字符串一个都不动，只换
     -- 源码文件；子模块不在时逐块回退整只 router.lua（旧树对照走的正是这条）。
     local function read_src(rel)

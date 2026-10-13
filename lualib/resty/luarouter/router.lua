@@ -1,7 +1,6 @@
 --
 -- 本文件是 facade：klib 路由表装配（build）、content_by_lua 入口（handle）、
--- server 级预检与全量 _M 导出。实现逐字搬进了 router/ 子模块（拆分设计书
--- doc/refactor-arch-2026-10-05.md §1–§2）：
+-- server 级预检与全量 _M 导出。实现逐字搬进了 router/ 子模块（2026-10-05 facade 拆分）：
 --   router/host        进程级惰性访问器 cfg()/limit()/store()
 --   router/jsonutil    顶层精确改写 / DP rank / 路由文本抽取 / usage / SSE / 会话指纹
 --   router/respond     错误应答 / CORS / request id / 请求头与标签
@@ -262,7 +261,7 @@ _M.handle = function()
     finish_request(started, method, path)
 end
 -- 全量导出区（= 原文件底部导出区 + 就近导出的汇总面；78 个名字逐名保留，
--- doc/refactor-arch-2026-10-05.md 不变量 2）。原处散布的就近导出仍留在各子模块
+-- 2026-10-05 facade 拆分不变量 2）。原处散布的就近导出仍留在各子模块
 -- 里（赋的是子模块自己的 _M），本区把子模块导出重新挂到 facade 表上。
 
 -- 应答 / CORS / request id / 请求头与标签（router/respond.lua）

@@ -125,7 +125,7 @@ function _M.listening_sockets(reader)
 end
 
 ------------------------------------------------------------------ gpu label
--- doc/caps-redesign-2026-10-06.md §9：给 proc 路径发现的实例补 GPU 归属标注。
+-- doc/gap-worker-caps.md：给 proc 路径发现的实例补 GPU 归属标注。
 --
 -- 这段是**纯 label 采集**，不参与任何判定：结果只写进候选自己的 gpu 字段，
 -- 后面由 reconcile 现成的 info.gpu / ledger.set_gpu_hint 那条链带给 /workers 与

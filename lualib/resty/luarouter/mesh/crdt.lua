@@ -4,7 +4,7 @@
 --
 -- 【不许再拆】幻影键修复的正确性依赖这条链同时看见六样东西：addr_keys 别名、
 -- used_addr、first_seen、peer_candidates 排序、member_key_for_address 的别名优先、
--- unify_identity→migrate_member、merge_membership 的自记录守卫（doc/gap-mesh-final.md
+-- unify_identity→migrate_member、merge_membership 的自记录守卫（2026-10-07 mesh 收尾轮
 -- §3 的变异表逐条证明「只摘其中一点就有 N 条断言红」）。observe_* 同源留下：
 -- local_write 需要 mesh.now / self_name / local_version。
 --

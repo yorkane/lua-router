@@ -34,7 +34,7 @@
 --   * 采不到就什么都不写，让 TTL 自然过期回到 registry.gpu_util() == nil，router 侧
 --     「未知 -> 不排除」。写 0 或沿用上一次的旧值都会让一个坏掉的 exporter 把 worker
 --     永久顶在利用率上限之外（或永远不受限），那是监控系统故障吃掉容量。
--- 采集缺省开（doc/caps-redesign-2026-10-06.md §5）：判定不由这个开关决定，只有记录上
+-- 采集缺省开（doc/gap-worker-caps.md）：判定不由这个开关决定，只有记录上
 -- 显式配了 max_gpu_util 才有人读 gu:，所以缺省开 = 现有部署零选路行为变化。
 --
 -- 分两层（与 watcher.lua / mesh.lua 同一形状）：
@@ -49,7 +49,7 @@
 -- PromQL 返回非法 JSON）都只是「这一 tick 没有样本」——不抛错、不记健康失败、
 -- 绝不摘 worker，同一条 WARN 一小时内只说一次。
 
--- 2026-10-05 (doc/refactor-arch-2026-10-05.md, worker w_bg): the implementation moved
+-- 2026-10-05 (worker w_bg): the implementation moved
 -- verbatim into lualib/resty/luarouter/gpu_load/ -- parse / cards / prom / seams /
 -- runpass / export.  What is left here is the file-header contract and this _M facade.
 -- Each submodule registers its own "function _M.x" against this pre-loaded table at

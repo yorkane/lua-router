@@ -1,8 +1,7 @@
 -- registry.keys - the lr_workers key layout, the lazily resolved shared dict, the
 -- registry lock, the worker id derivation, the ids roster and the mesh write hooks.
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1). The registry facade
+-- Cut verbatim out of registry.lua (refactor 2026-10-05). The registry facade
 -- (resty.luarouter.registry) re-exports every public name under its original spelling;
 -- nothing outside the registry domain should require this module directly.
 --
@@ -73,7 +72,7 @@ local K_HSEL = "isel:"
 --       是为了让「谁说了算」这件事在数据模型里就写清楚，而不是靠调用顺序。
 local K_XLOAD = "xl:"  -- external GPU sample, milli of a 0..1 load, TTL'd
 local K_SLOAD = "sl:"  -- engine self-report, same shape, lower priority
--- Per-worker GPU **utilisation** ceiling (doc/caps-redesign-2026-10-06.md section 2): the
+-- Per-worker GPU **utilisation** ceiling (doc/gap-worker-caps.md): the
 -- pure busy-fraction of the card this worker is pinned to, stored the same way as the
 -- other external readings - integer milli of a 0..1 fraction (percent x 10), TTL'd, so an
 -- expired key reads "no sample" = *unknown*, which never excludes a worker.
@@ -98,7 +97,7 @@ local K_TEMP_DISABLE = "td:" -- present = 该 worker 被 watcher 临时禁用; �
 -- authority, and the memo is what keeps the shipped shape (SMG_LOAD_SOURCE=none, no
 -- samples ever) at one shdict get per process per second instead of one per load()
 -- call -- that call runs once per candidate on every request, and per-request shdict
--- traffic is already the dominant CPU cost (doc/parity-cpu-ablation.md).
+-- traffic is already the dominant CPU cost (2026-10-06 CPU ablation 对拍轮).
 local K_XANY = "xany"   -- shared "some worker has a fresh sample" flag, TTL'd
 -- Numeric codes follow the Rust metric encoding (gateway/src/core/
 -- circuit_breaker.rs STATE_CLOSED=0, STATE_OPEN=1, STATE_HALF_OPEN=2) so

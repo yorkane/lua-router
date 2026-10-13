@@ -1,7 +1,6 @@
 -- registry.caps - upstream capability capture (block J of the original registry.lua).
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1). This is a self-contained pure domain:
+-- Cut verbatim out of registry.lua (refactor 2026-10-05). This is a self-contained pure domain:
 -- zero shdict, zero ngx, zero cosocket, so it is unit-testable by feeding it decoded
 -- JSON, and it cannot touch the forwarding plane.
 --

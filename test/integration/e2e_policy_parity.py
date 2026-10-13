@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """量化行为对拍门禁：prefix_hash / bucket / power_of_two / random（Lua vs Rust）。
 
-本文件是 policy-extra 对拍轮的仓库化版本（结论文档 doc/parity-policy-extra.md，
+本文件是 policy-extra 对拍轮的仓库化版本（结论文档已退役，
 原始数据 /data/tmp/parity/policy-extra/）。三条口径必须先讲清楚：
 
   1. 对拍的是**不变量**，不是逐次落点。两边哈希不同（Lua = blake3 over 前 N 个
@@ -142,7 +142,7 @@ def avoid_gate(counts, slow, th):
     theta=0.25 -> 8.5e-10、0.26 -> 6.4e-08、0.27 -> 2.8e-06、0.28 -> 6.9e-05、0.30 -> 9.2e-03。
     两个方向的错误要显式权衡：**放过真退化的代价是生产事故，偶发红的代价是门禁天天误报**。
     裁定取**更怕偶发红**（门禁天天跑），所以宁可让 theta 留余量：Rust 有 loads 的实测慢份额
-    区间 0.000~0.225（doc/parity-policy-extra.md 3.1 节），theta=0.27 时按 p=0.225 算偶发红
+    区间 0.000~0.225（policy-extra 对拍轮 3.1 节，结论文档已退役），theta=0.27 时按 p=0.225 算偶发红
     1.7e-04、放过真退化 2.8e-06；theta=0.28 时偶发红 6.7e-06、放过 6.9e-05。取 **theta=0.28**：
     偶发红压到 1e-05 量级（约 15 万轮一遇），放过概率仍在 1e-04 以下。
     旧判据 N=240 / theta=0.30 的放过率是 **0.187（约 1/5）**，那条基本等于没检。
@@ -607,7 +607,7 @@ def round_bucket(have_rust):
                                 "selection_counter": cnt},
                         "note": "chars_per_url 是 per-process 表：NGINX_WORKER_PROCESSES>1 时"
                                 "abs_diff 被进程数摊薄，is_imbalanced 不触发（量化见"
-                                "doc/parity-policy-extra.md）。"}
+                                "policy-extra 对拍轮，结论文档已退役）。"}
 
     if have_rust:
         rej, why = rust_cli_rejects("bucket")

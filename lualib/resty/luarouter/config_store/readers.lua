@@ -2,7 +2,7 @@
 -- P22-P26：current / ctx_cap 族 / 模态与能力声明 / policy 热路径读 / 虚拟视图 / 档位三层查表。
 --
 -- 由 lualib/resty/luarouter/config_store.lua 拆分而来：函数体逐行原样搬家，只调整 require 与
--- 跨模块接线（doc/refactor-arch-2026-10-05.md §1–§2）。原文里经 _M.x() 的自调 → 经 CS_FACADE
+-- 跨模块接线（2026-10-05 facade 拆分）。原文里经 _M.x() 的自调 → 经 CS_FACADE
 -- 表调用（保住单测换桩的可拦截性逐点一致）；原文里的同文件 local 直调 → 直接 require 对端
 -- 子模块的共享表调用（不进 facade 导出面，_M 契约因此逐名不变）。
 local CS_FACADE = require "resty.luarouter.config_store"

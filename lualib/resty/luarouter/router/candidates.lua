@@ -465,7 +465,7 @@ _M.group_policy_hint = group_policy_hint
 local function candidates_for(model, profile, counted)
     local records = registry.records()
     local out = {}
-    -- Green-light preference (doc/caps-redesign-2026-10-06.md section 3) works on two
+    -- Green-light preference (doc/gap-worker-caps.md) works on two
     -- side arrays indexed 1..live alongside out[i]: the capacity state a survivor was
     -- priced with, and the model name it was bound to. Parallel arrays rather than one
     -- table per candidate, because this loop is the selection hot path and the
@@ -713,7 +713,7 @@ local function candidates_for(model, profile, counted)
             end
         end
     end
-    -- Green-light preference (root ruling 2026-10-06, doc/caps-redesign-2026-10-06.md
+    -- Green-light preference (root ruling 2026-10-06, doc/gap-worker-caps.md
     -- section 3): when somebody in the surviving set sits below its lower concurrency
     -- rung, the yellows step aside for it. A *narrowing*, not an exclusion -- the
     -- stepped-aside candidates are healthy and under their ceiling, they are merely less

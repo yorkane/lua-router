@@ -459,7 +459,7 @@ function _M.new_config(getenv, self_ports, metrics_port)
         exclude_patterns = list_from(getenv, "SMG_WATCHER_EXCLUDE"),
         allow_ports = _M.parse_ports(getenv("SMG_WATCHER_ALLOW_PORT")),
         deny_ports = _M.parse_ports(getenv("SMG_WATCHER_DENY_PORT")),
-        -- 每一轮探测的**硬预算**（doc/gap-cpu-idle-burn.md CPU 线第 1 条）。
+        -- 每一轮探测的**硬预算**（2026-10-07 cpu-idle 修复轮 CPU 线第 1 条）。
         -- 21.k 的实测形状：/proc/net/tcp 有 128 个 LISTEN 端口，而 deny 清单只覆盖
         -- 约 39 个，于是每 15s 一轮要探约 70-90 个候选，每个候选最多 6 次串行 GET
         -- （/v1/models、/server_info、/get_server_info、/props、/metrics、/health），

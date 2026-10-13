@@ -36,7 +36,7 @@ local _M = { _VERSION = "0.1.0" }
 
 -- Pre-register the facade table so the submodules below can late-bind the
 -- original _M.x() self-calls against this very table (facade pattern,
--- doc/refactor-arch-2026-10-05.md section 2). A unit test that swaps the whole
+-- 2026-10-05 facade 拆分 section 2). A unit test that swaps the whole
 -- module for a stub through package.loaded therefore still sees exactly one
 -- module table, which is what test_profiles / test_integration /
 -- test_routing_dyn pin.

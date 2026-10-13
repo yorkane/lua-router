@@ -27,8 +27,10 @@
    调用方给多少转发多少，没给时网关也不替它决定（用户裁定 2026-10-04）。
    别名级的 `policy` / `effort` 覆盖已停用：策略归路由页的 `policy` / `model_policies`（按**入口名**配），
    落点档位归模型卡片（按选中候选的绑定名查）；入口对外的档位清单自 2026-10-11 裁定 A 起由条目层的
-   `effort_map` 推导（转发链上按选中候选的卡片/全局层查，两者是对外声明与落点改写的两层，见
-   doc/gap-virtual-models.md §2 与 doc/docs-cleanup-2026-10-12.md §1.1）。
+   `effort_map` 推导。对外声明与转发改写是两层，各画各的：转发链上按**模型卡片 → 虚拟条目 → 全局**
+   三层逐 `from` 查表，第一个给了这条映射的层赢（`default_effort` 同理取第一个非 nil 的层，
+   `model_effort` 强制行在所有层之上），三层都没给就原样透传；条目层没声明时只查卡片与全局两层，
+   转发字节与接线前一致。见 doc/gap-virtual-models.md §2。
 3. **UI 的配置与可视化**：站点根 `/` 的管理台四页（2026-10-08 admin 迁根；`/_ui/*` 已全部取消、落 404 sink）按使用频度排序：**模型管理**（虚拟模型入口页，
    这是最常用的配置，入口卡片在页面最上面）、服务池、路由策略、日志监控。原「远程服务 / 服务接入」页
    已并入服务池：运行态 `GET /workers` 与声明层 `/config` 的 upstreams 段按规范化 URL 全外合并，
@@ -42,51 +44,25 @@
 > 往返落盘、解析时 warn、热路径不读」是刻意的兼容行为，让老配置文档继续通过校验与回显，
 > **不要当 bug 修掉**。
 
-> ~~用户裁定 2026-10-02：条目级 `context_window` 是对下游统一的 max_tokens 钳制~~ —— **该定义已于
-> 2026-10-04 废止，由用户亲自推翻**（同一条裁定里 per-alias `policy` / `effort` 停用的部分仍然有效）。
-> 旧口径是：条目级 `context_window` 显式配置恒定生效、与策略选中哪台实例无关，未配置时取整组模型卡
-> `ctx` 的最小值，转发前用它钳制 `max_tokens`。废止的原因是它把三个不同的量当成了同一个数——
-> `context_window` 的本意是入口对外声明的**上下文总窗口（输入+输出）**，却被当作**单次输出预算**写进
-> `max_tokens`。21.k:8801（测试环境）的故障即由此而来：转发链上的 `apply_ctx_cap` 字段表只有
-> `{ max_tokens, max_completion_tokens }`，漏了 `/v1/responses` 用的 `max_output_tokens`，于是走 responses
-> 入口时 `body.max_tokens` 恒为 nil，命中「nil 就凭空写入 cap」那一支，网关替每一个 responses 请求造了
-> 一个 `max_tokens = 350000`（那条入口声明的 `context_window`），而服务的真实窗口只有 262144；
-> 524288 − 350000 = 174288 正好是失败阈值，故障体里「350000 tokens for the completion」恒定不变、只有
-> input 在变。这段历史刻意保留：`context_window` 这个字段名与散落各处文档的钳制话术还在，下一个人需要
-> 知道它为什么长这样、以及哪些说法已经作废。转发链上作废的实现是 `router.apply_ctx_cap`
-> 与 `entry_ctx_cap`（两者住在 `router/inference.lua`，由 `router.lua` facade re-export；本文一律按
-> 「文件 + 函数名」引用——2026-10-05 的 facade 拆分让全部「文件:行号」锚漂移，deploy-state.md 已自认这条债），
-> 两者现为恒「无改写」的空壳导出，只为保住 `_M` 导出契约而留；`config_store` 的 `ctx_cap` 与
-> `virtual_ctx_cap`（实现在 `config_store/readers.lua`）实现原样保留但**热路径无调用者**，
-> `ctx_cap` 的生产读者只有展示面两处：`props.lua` 的 `with_ctx`（挂载点 `/props` 与 `/u/props`，两者都在保护清单之外），
-> 作用是把回显的 `n_ctx` / `n_ctx_train` 换成操作员声明的值；以及 `router/models_api.lua` 的 `resolve_model_caps`，
-> 把它当 `capabilities.context_length` 的**声明层**读数（操作员声明优先于引擎自报）。两处都不影响任何转发字节。
-
-> **用户裁定 2026-10-04（现行，推翻上一条对 `context_window` 的定义）**：
-> 1. **网关不再改写调用方的输出预算**：`max_tokens` / `max_completion_tokens` / `max_output_tokens`
+> **用户裁定 2026-10-04（现行）**：
+> 1. **网关不改写调用方的输出预算**：`max_tokens` / `max_completion_tokens` / `max_output_tokens`
 >    一律原样透传，调用方给多少转发多少；调用方没给时网关也不替它填一个数。
-> 2. **`context_window` 回归本义**：入口**对外声明的上下文总窗口（输入+输出）**，作用是让客户端更早
->    触发压缩；不参与任何 max_tokens 计算，只保留解析 / 落盘 / 往返 / UI 展示。
->
-> 本裁定原先的第 3 / 4 条（模型卡片 `context_limit` 与它的配置期校验）**已由用户裁定 2026-10-08
-> 改写**，现行口径就是下面这两条：
->
+> 2. **`context_window` 是对外声明的上下文总窗口（输入+输出）**，作用只是让客户端更早触发压缩；
+>    它不参与输出预算计算，也不与模型卡片的 `max_output_tokens` 做大小比较。字段自身仍按配置 schema
+>    校验，并保留解析 / 落盘 / 往返 / UI 展示；它不改写任何转发字节。
 > 3. **模型卡片字段 `max_output_tokens`**（原名 `context_limit`，2026-10-08 改名）＝**声明给下游 agent 的
 >    单次最大输出 token 数**，是一份**纯对外 advertisement**：唯一去处是 `/v1/models` 的
 >    `capabilities.max_output_tokens`（操作员声明压过引擎自报），**不参与任何校验、钳制或 max_tokens 运算**，
->    也不声称引擎的真实能力（引擎能吐多少是引擎的事，这里说的是网关替它对外承诺多少）。平铺写法
->    `model_max_output_tokens`、env `LMR_MODEL_MAX_OUTPUT_TOKENS`，卡片优先于平铺层；写了卡片就清掉同模型的
->    平铺行，免得留一条谁都不再看作生效的隐形地雷。
->    `capabilities.context_length` 与此无关，它只由两档决定：操作员声明的窗口（卡片 `ctx` / 平铺
+>    也不声称引擎的真实能力。平铺写法 `model_max_output_tokens`、env `LMR_MODEL_MAX_OUTPUT_TOKENS`，
+>    卡片优先于平铺层；写了卡片就清掉同模型的平铺行。
+>    `capabilities.context_length` 与此无关，只由两档决定：操作员声明的窗口（卡片 `ctx` / 平铺
 >    `model_ctx`，经 `config_store.ctx_cap`）**优先于**引擎自报，两者都没有就整个键省略。
-> 4. **不再有「声明窗口 vs 输出上限」这类配置期校验**：条目的 `context_window` 是**上下文总窗口**，卡片的
->    `max_output_tokens` 是**单次输出预算**，两个量不可比，拿一个去判另一个就是重犯 2026-10-04 那次把三个
->    量当一个数的错误。因此原 `config_store.validate_declared_context_windows`（挂在 `apply_profiles` /
->    `apply_document` 两条写入路径上）连同 UI 侧同款的前端预校验（虚拟入口页的橙色徽章、编辑框报错、
->    保存按钮禁用）已于 2026-10-08 **一并移除**：`context_window` 只做解析 / 落盘 / 往返 / 展示，网关与 UI
->    都不据它拒绝任何东西。口径见 doc/gap-virtual-models.md §4。
+> 4. **不做「声明窗口 vs 输出上限」的大小比较校验**：条目的 `context_window` 是**上下文总窗口**，卡片的
+>    `max_output_tokens` 是**单次输出预算**，两个量不可比；字段各自仍按配置 schema 校验，
+>    `context_window` 不用于拒绝或改写请求。
+>    口径见 doc/gap-virtual-models.md §4。
 
-与 Rust 版的行为对拍是护住既有行为的手段，不是目标；排期与新功能优先对齐以上四点。
+新功能与排期优先对齐以上四点；本仓的行为口径以本文与 doc/ 现行文档为准，不与任何邻居实现对拍。
 
 以下是不可违反的硬规则：
 
@@ -106,15 +82,15 @@
    （用户裁定 2026-10-04，见上面的裁定块）；流式不缓冲；跨请求状态只走 shdict；
    新开关缺省零行为变化；**探针失败按分档定性，后果不同**——转发路径上的探测（hb 健康巡检、gpu_load 抓
    `/metrics` 与远程 Prom）失败只损失精度，绝不摘 worker；watcher 严格探针按用户裁定（2026-10-01 立，
-   2026-10-09 `9bf3c07` 改 reject 档的后果）分档处置：**reject 三档**（对方答了 HTTP 却读不出 `/v1/models`
+   2026-10-09 改 reject 档的后果）分档处置：**reject 三档**（对方答了 HTTP 却读不出 `/v1/models`
    的 `data[].id`、命中 router 自指纹、超 `max_models`）**当轮临时禁用保行**——registry 行不动，只打
    `td:` 键让候选装配排除它，探针恢复轮显式清位立刻回池，不进保险丝计数，`SMG_WATCHER_PROBE_TEMP_DISABLE=0`
    退回旧的当轮删行；**物理摘除只留两个信号**：传输层未知（连不上／超时／无应答）累计到
    `SMG_WATCHER_PROBE_FAILURES`（缺省 2）才摘，与「发现源不再报它」走 remove-grace/keep-last 宽限；
    `no probe transport` 与 `require_health` 未通过属「不触发处置」档，既不摘也不计数；摘除档同受单轮摘除
    保险丝（`SMG_WATCHER_PROBE_FUSE`）约束，同轮另有「禁用即摘」（条目 `disabled` 走同一个 `release()` 出口）。
-   完整口径见 doc/agent-handover.md §4 与 doc/gap-watcher-merge.md §1.1。**不得把这行红线写回成
-   「凡探测失败都不摘 worker」的一刀切表述**（那是第 10 条守卫之前的旧文案，照它改就会把守卫连根拔掉）。
+   完整口径见 doc/gap-watcher-merge.md §1.1（十条守卫与探针分档处置）。**不得把这行红线写回成
+   「凡探测失败都不摘 worker」的一刀切表述**（照它改会把摘除守卫连根拔掉）。
 5. **信任边界**：**全局调用方鉴权已于 2026-10-05 的范围裁剪停用**（doc/scope-trim.md；恢复只能 git revert 对应 commit，不要在 main 上重写，见硬规则 6）——推理面 `/v1/*` `/generate`、`/props`、`/ha` 与 `/_mesh/internal/*` 保持匿名，本服务只许部署在 authz 边缘之后或可信内网。**鉴权只有两处例外**：下面这条管理面 Basic Auth，与**按虚拟入口**的 api-key 门槛（`api_key` 三态，只认 `Authorization: Bearer <key>`，缺键与错键同一个 401；它是下游准入门，不是全局鉴权，未配密钥的入口照旧匿名）。除这两处外不得再加鉴权层。
    **管理面自 2026-10-12 起有一道独立的 Basic Auth**（用户裁定：不走 authz，网关自己校验；口径与落点见 doc/gap-admin-auth.md）：入口文档与 `*.html`、根数据面 `/config*` `/logs*` `/stats` `/slots` `/tools`、`/u/config*` 别名族，以及 klib 控制面 `/workers` `/model-map` `/flush_cache` 都在门内（单点 `admin_auth.lua`，三个挂点 `guard` / `guard_static` / `guard_klib`）。
    两条豁免：`SMG_ADMIN_AUTH_PASS` 未配置或空串 = 整道门关闭（缺省逐字节零行为变化，硬规则 4）；来源 loopback 免凭据。一条**前置否决**（用户裁定 2026-10-12，推翻按值还原的 v1 实现）：`X-Real-IP` / `X-Forwarded-For` / `Forwarded` 任一头名一出现就收回 loopback 豁免，**值一概不解析**——反代与网关同机时 remote_addr 恒 127.0.0.1，按值还原等于让 `-H 'X-Real-IP: 127.0.0.1'` 绕过整道门（21.k:8802 测试实例实测踩实，生产 8800 同链路取证）。名单是 `PROXY_ORIGIN_HEADERS`，扩名字要同步扩单测。
@@ -131,26 +107,23 @@
    命名空间与旁挂的 `supports_reasoning_effort` / `reasoning_effort` / `reasoning_efforts`，都不是官方字段）的来源
    优先级固定为**操作员 config 声明 > 引擎自报（`registry.model_caps`）> 整个键省略**，**宁可不报也不猜**；省略是删键，
    不写 `null`、不写空数组冒充「支持零个」。③ **`data[].id` 的取值集合与 `owned_by` 语义是老契约**——`owned_by`
-   **全表恒为 `"lua-router"`**（用户裁定 2026-10-11，对齐 opencodex 标准形状：不向任何能读 `/v1/models` 的客户端
-   暴露上游模型名）。旧口径已删除：单目标入口 `"llm-router-><model>"`、多目标入口 `"llm-router"` + 整组
-   `owned_by_models`、引擎自报的 `"local"` 都不再上外（引擎归属仍采进 `registry.model_caps` 留档）。入口行与真实行
+   **全表恒为 `"lua-router"`**（用户裁定 2026-10-11：不向任何能读 `/v1/models` 的客户端暴露上游模型名；
+   引擎自报的归属仍采进 `registry.model_caps` 留档，但不上外）。入口行与真实行
    的区分：客户端不许再拿 `owned_by` 当判别位（全表同值），也**不能把 `created==0` 当入口的充分判据**——入口行恒 0，真实行取不到上游读数时同样落 `MODEL_CREATED_UNKNOWN = 0`，0 只说明「这行没有引擎读数背书」；要区分入口行按 id 查声明层名册（`/config` 的 `virtual_models`）。`data[].id` 取值集合与
    `created` 契约不变；registry 的 worker 判定、watcher 的覆盖探针全按 id 建。管理台 picker
    （`/u/v1/models`，即 `ui.lua` 的 `ui.models()`）与 `/v1/models` **同口径指 `owned_by` 恒 `lua-router`**（2026-10-12 起）。
    两者的 `created` 不是一回事：picker 每行恒 0（它不采上游读数），`/v1/models` 的真实行取上游读数、取不到才落
    `MODEL_CREATED_UNKNOWN = 0`，入口行恒 0——别把「同口径」写成「两条连 created 都一样」。
-   另注：registry 采集能力时刻意**不读上游条目的顶层 `context_window`**（那是本网关配置层的字段名，混进引擎读数
-   就是重犯 2026-10-04 那次把声明总窗口当单次输出预算的事故）。
+   另注：registry 采集能力时刻意**不读上游条目的顶层 `context_window`**——那是本网关配置层的字段名，
+   配置层字段不冒充引擎能力读数。
 10. **门禁里的统计断言不许用「拟合优度没拒绝」当「等价成立」的证据。** χ² 检验的 `E[χ²] = df = k-1`，
    **公式里没有样本量**，所以 `P(χ² > 5.991) = 5.00%` 与 N 无关——**α=0.05 等于每轮全量门禁自带约 5% 的
    红概率预算，加大 N 一分不减**（实测 N=240→4800 稳定在 4.9%~5.1%）。要「证明与均匀不可区分」就得用
    **TOST 等价性检验**（`e2e_policy_parity.py` 的 `tost_uniform`），它的假红率随 N 变窄。两条配套纪律：
-   ① **等价边界 d 要按「实测到过的最差真实行为」定**，不是按统计最优定——d=0.055 在实测最差行为上仍红 4.4%，
-   发版门禁不能接受；现取 `d=0.065` 压到 0.62%，反漏检仍 4.2e-35。
-   ② **单侧阈值同样要标定**：`Rust with-loads` 旧的 `share < 0.30` 在 N=240 下**放过真退化 0.187（约 1/5）**，
-   等于没检。新增或调阈值前先算尾概率，别拍脑袋。
-   顺带：TOST 的软肋是**过散**（β-binomial ρ），iid 下假红 3.8e-10 但 ρ=0.01 时 N=1200 上红率升到 0.17；
-   所以它红了先怀疑环节流漂移，**加大 N 只会更糟**，对策是放宽 d。
+   ① **等价边界 d 要按「实测到过的最差真实行为」定**，不是按统计最优定；现取 `d=0.065`。
+   ② **单侧阈值同样要标定**：阈值太松等于没检（旧口径在 N=240 下放过约 1/5 份额的真退化）。
+   新增或调阈值前先算尾概率，别拍脑袋。
+   顺带：TOST 的软肋是**过散**（批相关 ρ），所以它红了先怀疑环节流漂移，**加大 N 只会更糟**，对策是放宽 d。
 11. **配置持久化有三条不可自作主张的事**（设计与取舍见 doc/gap-config-store.md）：
     ① **db 是权威源，`LMR_CONFIG_FILE` 是只读镜像**，不是第二个权威源。镜像的 revision 由 db 钉住，
        镜像被外部替换时由内容摘要判定并采纳；**摘要比对是「谁赢」的唯一依据**，不要改成优先级排序。

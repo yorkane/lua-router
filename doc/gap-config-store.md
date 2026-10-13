@@ -1,7 +1,6 @@
 # 配置持久化（sqlite / postgres / file）
 
-> 落地：2026-10-04/05。决策人：用户。基线提交 `c727cfa`（接线）、`89adbbe`（四个缺陷修复）、
-> `283c9ee`（env 名册）、`f7296dd`（可观测性）。全量门禁 22 门全绿。
+> 决策人：用户。本文登记现行口径、接线陷阱与验证口径；落地过程与提交历史看 git log。
 
 ## 1. 为什么做
 
@@ -18,7 +17,7 @@
 
 `LMR_CONFIG_STORE_BACKEND` = `sqlite`（缺省）/ `postgres` / `file`。
 
-**sqlite** 面向**单机单实例**（用户 2026-10-05 定案）。复用基座镜像里 `resty/authz/db/driver.lua`
+**sqlite** 面向**单机单实例**。复用基座镜像里 `resty/authz/db/driver.lua`
 的 FFI 形状（`open_v2` + WAL + `busy_timeout` + 参数化 bind）——**那是 authz 项目跑在生产上的代码**，
 不是我们自己发明的。
 
@@ -26,7 +25,7 @@
 
 **file** 是**显式回滚路径**，必须能逐字节复现存储层引入之前的行为。
 
-entrypoint 层的缺省（用户 2026-10-09）：`docker-entrypoint.sh` 对「既不设 `LMR_CONFIG_FILE`
+entrypoint 层的缺省：`docker-entrypoint.sh` 对「既不设 `LMR_CONFIG_FILE`
 也不设 `LMR_CONFIG_STORE_PATH`」的裸容器注入默认 `LMR_CONFIG_FILE=/data/lua-router/runtime.json`
 （并建父目录），使缺省 sqlite 真正开起来——后端缺省一直是 sqlite，缺的只是「有没有可派生的
 db 路径」这一步。操作员**显式** `LMR_CONFIG_STORE_BACKEND=file` 时不注入任何路径，保持老的
@@ -51,7 +50,7 @@ compose 已如此）。
 
 ## 4. 谁赢：db 还是文件
 
-靠**摘要比对**，不是靠「谁优先」这种模糊规则。
+靠**摘要比对**，不是靠「谁优先」这种模糊规则：内容摘要比对是「谁赢」的唯一依据，不许改成优先级排序。
 
 | 情形 | 判定 | 结果 |
 |---|---|---|
@@ -66,9 +65,9 @@ compose 已如此）。
 
 ## 5. CAS 与冲突语义
 
-写时带**期望 revision**，不匹配则拒绝。**不用 LWW**：配置编辑是低频、人手发起的动作，重试只花几秒；
-一次被静默吞掉的编辑会让操作员面对「磁盘上写的是一套、机器跑的是另一套」，和 2026-10-04 那次
-`context_window` 事故是同一类故障形态。冲突以 **409** 返回，带当前 revision，**UI 无需改动**。
+写时带**期望 revision**，不匹配则拒绝并报错。**不用 LWW**：配置编辑是低频、人手发起的动作，重试只花
+几秒；一次被静默吞掉的编辑会让操作员面对「磁盘上写的是一套、机器跑的是另一套」。冲突以 **409** 返回，
+带当前 revision，**UI 无需改动**。
 
 「只是后端连不上」不是冲突，走既有降级路径，不要混为一谈。
 
@@ -98,20 +97,18 @@ env 整层再没有机会生效——连「删掉文件回到 env 缺省」这�
 
 `/health` 是常量 200，**db 全挂也绿**，所以它不能承担这个职责。
 
-## 9. 接线的两个陷阱（都踩过）
+## 9. 接线的两个陷阱
 
-**`ENV_NAMES` 必须登记全族。** nginx 会把未登记的 env 从 worker 里剥掉，`capture_env` 也只按名册抓。
-漏了 `LMR_CONFIG_STORE_*` 整族的后果是：postgres 配置面和自定义 sqlite 路径**在 worker 里永远读不到**，
-而现象是「配了但静默走未配置降级」——极难查。两种拼写（带/不带 `PG_` 前缀）都登记了，
-因为 `store_postgres` 会先读带前缀的、再回退到短的。
+**`ENV_NAMES` 必须登记 `LMR_CONFIG_STORE_*` 全族。** nginx 会把未登记的 env 从 worker 里剥掉，
+`capture_env` 也只按名册抓。漏登记的后果是 postgres 配置面和自定义 sqlite 路径**在 worker 里永远读不到**，
+现象是「配了但静默走未配置降级」——极难查。两种拼写（带 / 不带 `PG_` 前缀）都要登记，
+因为 `store_postgres` 先读带前缀的、再回退到短的。
 
-**`store()` 只能在 worker 阶段解析。** `config_store` 首次被调用在 `init_by_lua`，那时 `ngx.worker`
-**是个 table 不是 nil**（`ngx.worker.id()` 返回 0），所以 `not (ngx and ngx.config and ngx.worker)`
-这个守卫从来没生效过。必须用 `ngx.get_phase() == "init"` 显式排除。
-
-代价是主进程打开的 `sqlite3*` 句柄会被 fork 给所有 worker，8 worker 实测 6 个开局 `database is locked`
-并永久降级到 file，**同一容器一半写库一半写文件**。`store_sqlite` 里那道「连接不属于别人」的守卫
-因 `opened_path` 同被继承而形同不存在。
+**`store()` 只能在 worker 阶段解析，必须用 `ngx.get_phase() == "init"` 显式排除 init 阶段。**
+`config_store` 首次被调用在 `init_by_lua`，那时 `ngx.worker` **是个 table 不是 nil**
+（`ngx.worker.id()` 返回 0），所以「`ngx.worker` 存在吗」这种守卫形同不存在。在 init 阶段打开的
+`sqlite3*` 句柄会被 fork 给所有 worker（`opened_path` 同被继承，`store_sqlite` 里「连接不属于别人」
+那道守卫看不见它），后果是同一容器里一半 worker 写库、一半永久降级写文件。
 
 ## 10. 验证口径
 

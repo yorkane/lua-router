@@ -334,13 +334,13 @@ gate_unit() {
     # 两份的判别性通道（LR_MODELS_TEST_LEGACY_SRC / LR_EFFORT_LEGACY_LUALIB）刻意不在门禁里
     # 设：那是手工核实「断言真会红」的反证手段，需要外挂改动前的旧源码树，门禁只跑 HEAD。
     # test_tree_bounds / test_state_bounds / test_observability：单 worker 空载烧核与进程内
-    # 累积状态的三条闸门（doc/gap-cpu-idle-burn.md）。它们钉的都是「以前只会涨、现在必须
+    # 累积状态的三条闸门（2026-10-07 cpu-idle 修复轮）。它们钉的都是「以前只会涨、现在必须
     # 能降」的形状 —— 亲和树的节点上界与增量预算、_M.instances 的空闲回收、lr_stats 的
     # model 标签基数与导出扫描上限 —— 回归时不会有任何 HTTP 面症状，只有这些断言会红。
     # test_tree_bounds 单列而不并进 test_tree：后者是对齐 Rust 的语义基线，新增维度是
     # Lua 侧的超集，分文件才看得清哪条断言属于哪一边。
     # test_caps_persist：控制面（PUT/POST /workers）设的三档上限经声明层镜像持久化
-    # 的判定层单测（用户裁定 2026-10-09，doc/gap-worker-caps.md §4）。它钉的四件事在
+    # 的判定层单测（用户裁定 2026-10-09，doc/gap-worker-caps.md §10 第 5 项）。它钉的四件事在
     # HTTP 面上都看不到症状 —— 镜像行的 建/改/清/删、「默认值=没说」这条能扛住
     # snapshot 往返的认得判据、孤儿镜像不被 reconcile 建成 config 行、删 worker 连带
     # 清除。e2e_caps S9 钉的是端到端那一半（真 docker restart 后上限真的挡流量）。

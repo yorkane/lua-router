@@ -1,8 +1,7 @@
-# 档位阶梯：探测 + 手动勾选（2026-10-08 执行契约）
+# 档位阶梯：探测 + 手动勾选
 
-> 用户诉求（2026-10-08）：「探测上游模型允许的 `reasoning_effort`: [low, medium, high, xhigh, max]，
-> 允许手动修改添加或者取消 checkbox，反馈到 `/v1/models` 信息中」。
-> 本节是这条诉求的实现口径；对外形状与优先级的一般纪律仍以 AGENTS.md 硬规则 9 与
+> 操作员可以勾选上游模型对外提供的 `reasoning_effort` 档位（增删成员、调顺序、标预选），
+> 结果反馈到 `/v1/models`。本文是实现口径；对外形状与优先级的一般纪律以 AGENTS.md 硬规则 9 与
 > doc/gap-virtual-models.md §5 为准，README〈档位阶梯：探测 + 手动勾选〉是面向操作员的一节。
 
 ## 1. 三份读数，各有其主
@@ -90,25 +89,21 @@
 
 ## 6. 与转发链的关系：一个字节都不动
 
-勾选只改 `/v1/models` 的对外声明与 `/config` 的编辑面（本文写于 2026-10-08 迁根之前，当时的名字是
-`/_ui/config`；`/_ui/*` 现已整片落 404 sink）。转发链上 `reasoning_effort` 的处理
+勾选只改 `/v1/models` 的对外声明与 `/config` 的编辑面。转发链上 `reasoning_effort` 的处理
 （`router/inference.lua` 的三层查表改写、`ui.lua` 的空串清理）一律不读 `card.reasoning_efforts`：客户端照
 picker 发什么，网关就照它的既有规则转什么，勾了引擎其实不收的档位，收到的是引擎自己的 400。这与 2026-10-04
 裁定「网关不改写调用方的输出预算 / 意图」同向，也复用了 `ui/admin` 里已有的能力位披露话术（`declarationDisclosure`）。
 
 ## 7. 测试
 
+计数由一次全绿门禁日志统一刷新，本文不登记数字。
+
 | 层 | 位置 | 钉什么 |
 |---|---|---|
-| 存储 | `test/unit/test_profiles.lua` 12b 节（L1–L5，34 项） | absent/null/数组 三态写入；两种拼法归一；顺序不被词表重排；`default` 至多一枚 + 重复条目补标记；未知名整条拒且不落半截；空数组折回 nil；磁盘往返 + `card_effort_ladder` 返回拷贝；env 层装配 + `ENV_NAMES` 在册 |
-| 输出 | `test/unit/test_models_shape.lua` G11 节（20 项） | picker = 勾选表（含顺序）；label 继承 / 不编；预选定序与专职字段压过勾选；判定面只收窄、手动加的档不进判定面；引擎无读数时勾选成为唯一来源；清除回自动后与 G4 同形；组内一台勾过 → 入口行删键、不牵连成员行 |
-| 真 HTTP | `test/integration/e2e_models_advertisement.py` S12（20 项） | detected 经采集链路真的出现在 `/config` 卡片行（勾选框唯一的基线来源）；POST 勾选后对外字节真的变；400 不留半截状态；null 清除后逐字节退回引擎原话 |
+| 存储 | `test/unit/test_profiles.lua` 12b 节 | absent/null/数组 三态写入；两种拼法归一；顺序不被词表重排；`default` 至多一枚 + 重复条目补标记；未知名整条拒且不落半截；空数组折回 nil；磁盘往返 + `card_effort_ladder` 返回拷贝；env 层装配 + `ENV_NAMES` 在册 |
+| 输出 | `test/unit/test_models_shape.lua` G11 节 | picker = 勾选表（含顺序）；label 继承 / 不编；预选定序与专职字段压过勾选；判定面只收窄、手动加的档不进判定面；引擎无读数时勾选成为唯一来源；清除回自动后与 G4 同形；组内一台勾过 → 入口行删键、不牵连成员行 |
+| 真 HTTP | `test/integration/e2e_models_advertisement.py` S12 | detected 经采集链路真的出现在 `/config` 卡片行（勾选框唯一的基线来源）；POST 勾选后对外字节真的变；400 不留半截状态；null 清除后逐字节退回引擎原话 |
 | env 名册 | `test/integration/probes.py` | `LMR_MODEL_EFFORT_LEVELS` 穿透到 worker（漏登记 `ENV_NAMES` 即红） |
-
-判别性（AGENTS.md 的「断言真会红」纪律）：同一组 G11 断言跑在改动前的 lualib 树
-（`/data/tmp/lr-legacy-s12-a`，`git archive HEAD lualib`）上 **14/20 红** —— picker 仍是引擎那 4 档、
-组行不删键、判定面不收窄。自动态那几条（G11「卡片没勾 = 跟随引擎」等）在旧实现下**应当**绿：它们钉的是
-不许被坏掉的老契约，与 S7 那九档同理。
 
 ## 8. 明确不做的
 

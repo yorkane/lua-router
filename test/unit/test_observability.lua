@@ -1,5 +1,5 @@
 #!/usr/bin/env luajit
--- observability 的键基数与扫描预算单测（doc/gap-cpu-idle-burn.md S3，分支 fix/cpu-idle-burn）。
+-- observability 的键基数与扫描预算单测（2026-10-07 cpu-idle 修复轮 S3，分支 fix/cpu-idle-burn）。
 --   运行：docker run --rm -e LUA_TEST_LIB=/repo/lualib -v "$PWD:/repo:ro" \
 --          --entrypoint /usr/local/openresty/luajit/bin/luajit authz:latest \
 --          /repo/test/unit/test_observability.lua

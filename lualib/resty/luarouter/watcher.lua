@@ -36,7 +36,7 @@
 -- mesh.lua): the pure functions below take an injected `fetch`/`getenv`/store,
 -- and the live wiring at the bottom resolves ngx, hb, registry and docker.
 
--- 2026-10-05 (doc/refactor-arch-2026-10-05.md, worker w_bg): the implementation moved
+-- 2026-10-05 (worker w_bg): the implementation moved
 -- verbatim into lualib/resty/luarouter/watcher/ -- env / ledger / probe / discover /
 -- reconcile / live / modelmap.  What is left here is the file-header contract, the two
 -- constants and this _M facade.  Each submodule registers its own "function _M.x"

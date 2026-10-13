@@ -1,5 +1,5 @@
 #!/usr/bin/env luajit
--- 控制面容量上限的持久化镜像单测（用户裁定 2026-10-09，doc/gap-worker-caps.md §4）。
+-- 控制面容量上限的持久化镜像单测（用户裁定 2026-10-09，doc/gap-worker-caps.md §10 第 5 项）。
 --
 -- 钉的是这条链的四个决定：
 --   1. apply_upstream_caps 的 建 / 改 / 清 / 删 四路，且**只动 caps**（身份字段一个
@@ -480,7 +480,7 @@ store.apply_upstream_caps(A, { max_gpu_util = -1 })
 -- 三档全空（并发已清、min 从未写、util 刚清）→ 镜像行什么也不记得了，按设计整行消失；
 eq(row_for(A), nil, "(2) a fully-cleared mirror row is dropped, not left empty")
 -- 声明层的清除**只下发不清除**存量（protected 行的 caps-only 投影那条纪律，
--- doc/gap-worker-caps.md §4）：控制面那条 PUT 已经先把池里的读数清成 nil，
+-- doc/gap-worker-caps.md §10 第 5 项）：控制面那条 PUT 已经先把池里的读数清成 nil，
 -- mutator 自己不碰记录 —— 于是「当场摘」由 registry.update 完成，
 -- 「以后不回来」由这一行的消失完成。
 check(pool_row(A) ~= nil, "(2) the pool row itself is not touched by the mutator")

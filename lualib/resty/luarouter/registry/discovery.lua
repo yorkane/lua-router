@@ -1,8 +1,7 @@
 -- registry.discovery - probes, coverage learning, PUT update, metadata discovery,
 -- DP expansion, the job queue and the SMG_WORKER_URLS seed (blocks Q/R/S/T/U/V).
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1).
+-- Cut verbatim out of registry.lua (refactor 2026-10-05).
 --
 -- Everything that dials an engine lives here and everything it touches is
 -- accuracy-only: a probe failure costs precision, never a worker (AGENTS.md hard

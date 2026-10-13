@@ -1,5 +1,5 @@
 #!/usr/bin/env luajit
--- 每服务并发/利用率硬上限（doc/caps-redesign-2026-10-06.md）+ 虚拟模型多绑定（需求 A）
+-- 每服务并发/利用率硬上限（doc/gap-worker-caps.md）+ 虚拟模型多绑定（需求 A）
 -- 的选路单测。
 -- 纯 luajit：不绑端口、不起容器，因此可与 host 网络门禁并发。
 --
@@ -36,7 +36,7 @@
 --     --entrypoint /usr/local/openresty/luajit/bin/luajit authz:latest \
 --     test/unit/test_caps_routing.lua
 local lib = os.getenv("LUA_TEST_LIB") or "./lualib"
--- 2026-10-05 拆分（doc/refactor-arch-2026-10-05.md §1）：实现搬进了
+-- 2026-10-05 facade 拆分：实现搬进了
 -- lualib/resty/luarouter/router/ 子模块，逐字搬家、锚点字符串一个都不动；
 -- 搬家的只是**源码文件路径**。旧实现对照通道（LR_*_LEGACY 指向改动前的
 -- lualib 树）没有子模块文件，读不到就回退读整只 router.lua。
@@ -137,7 +137,7 @@ registry.candidate_allows_model = function(rec, want)
     if registry.models_are_verified(rec) then return false end
     return true
 end
--- 三态判定桩（doc/caps-redesign-2026-10-06.md §2 的口径）。桩存在的意义只剩一件事：
+-- 三态判定桩（doc/gap-worker-caps.md 的口径）。桩存在的意义只剩一件事：
 -- 钉 candidates_for 怎么**使用**谓词（排除位置、计数、pcall、绿灯裁剪的数组与 why
 -- 形状）。判定本体的真覆盖在 G9 —— 那里 require 的是盘上的 registry，不经过这份桩。
 -- 口径与 registry/loads.lua 的 capacity_verdict 一致：full = inflight >= max_concurrency
@@ -641,7 +641,7 @@ eq(REG.capacity_state({ id = "g9", max_gpu_util = 0 }), "full",
 local util0 = REG.capacity_exclusion({ id = "g9", max_gpu_util = 0 })
 eq(util0 and util0.gpu_util, 0,
    "G9 real: the util verdict carries the fraction the gate read")
--- 双上限同触：并发先判（读序即口径，doc/caps-redesign-2026-10-06.md §2 的形状）。
+-- 双上限同触：并发先判（读序即口径，doc/gap-worker-caps.md 的形状）。
 dict_reset(); put_inflight("g9", 5); REG.set_gpu_util("g9", 0.99, 30)
 local both = REG.capacity_exclusion({ id = "g9", max_concurrency = 5, max_gpu_util = 50 })
 eq(both and both.reason or "?", "concurrency_max",
@@ -694,7 +694,7 @@ eq(REG.capacity_exclusion({ id = "g9s", max_concurrency = 5 }).reason,
    "concurrency_max", "G9 real: /workers colour and the gate cannot disagree")
 
 ---------------------------------------------------------------------------
--- G10 绿灯优先（doc/caps-redesign-2026-10-06.md §3）：candidates_for 在组门与
+-- G10 绿灯优先（doc/gap-worker-caps.md）：candidates_for 在组门与
 -- 绑定**之后**的数组裁剪。四种整池形状（全 idle / 混合 / 全 busy / 全 full）各自
 -- 的返回数组与 why 计数。钉五条口径：有 idle 只交 idle 子集；让位数进 why.idle、
 -- **不计入** why.capped；一次 counted pass 计一次 preferred-idle；全 busy 不动数组；

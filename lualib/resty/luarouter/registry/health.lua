@@ -1,7 +1,6 @@
 -- registry.health - the health bit and the circuit breaker (blocks N of registry.lua).
 --
--- Cut verbatim out of registry.lua (refactor 2026-10-05,
--- doc/refactor-arch-2026-10-05.md section 1).
+-- Cut verbatim out of registry.lua (refactor 2026-10-05).
 --
 -- Discipline that must not be rephrased:
 --   * counters that mean consecutive are charged with shdict:incr (charge_cb) and any

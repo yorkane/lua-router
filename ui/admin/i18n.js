@@ -64,7 +64,7 @@
         priorityField: '优先级', costField: '成本权重',
         priorityHint: '数值越小越先被选中，默认 50', costHint: '调度打分用的相对成本，默认 1',
         colCapacity: '容量上限 / 实测',
-        // 三道门（doc/caps-redesign-2026-10-06.md §1）：并发下限、并发上限、GPU 利用率上限。
+        // 三道门（doc/gap-worker-caps.md）：并发下限、并发上限、GPU 利用率上限。
         // 留空的语义各不相同，hint 必须把「留空 = 什么」说准：下限留空等价 1，上限留空 = 不限
         // （不是 0），利用率留空 = 不限（0 是合法的极严档，任何新鲜读数都判满）。
         minConcurrencyField: '并发下限', minConcurrencyHint: '在飞请求数低于该值算「闲」（绿灯优先选它）；整数 1–31，必填，必须小于上限；留空按 1',
@@ -340,7 +340,7 @@
         previewServingUnverified: '实例列表未经探针验证，暂按可路由处理', previewServingNone: '服务池里没有该模型的实例',
         previewServingGroupGap: '{models} 没有已验证实例，选中它的请求会被拒', previewChainCard: '模型卡片', previewChainEntry: '虚拟条目', previewChainGlobal: '全局',
         previewChainLegacy: '旧版强制档位', previewChainNone: '无（引擎默认）', globalSave: '保存全局策略',
-        // ── 虚拟模型「条目列表 + 编辑对话框」（refactor-arch 5.1，w_ui_models 2026-10-05）──
+        // ── 虚拟模型「条目列表 + 编辑对话框」（2026-10-05 拆分）──
         virtualEntriesEmpty: '还没有虚拟模型入口：点击右上角「添加服务入口」新建一条',
         virtualEditTitle: '编辑服务入口', virtualNewTitle: '新增服务入口',
         // 入口层的两位与卡片层各自独立，判定按「或」汇合（任一说了 true 即命中）：入口可以只藏自己
@@ -472,7 +472,7 @@
         priorityField: 'Priority', costField: 'Cost weight',
         priorityHint: 'Lower numbers are preferred, default 50', costHint: 'Relative cost used for scoring, default 1',
         colCapacity: 'Capacity caps / live',
-        // Three ceilings (doc/caps-redesign-2026-10-06.md §1). Each blank means something
+        // Three ceilings (doc/gap-worker-caps.md). Each blank means something
         // different, so the hints have to say exactly what: a blank floor equals 1, a blank
         // ceiling means unlimited (not 0), a blank utilisation ceiling means unlimited while
         // 0 is the legal strictest rung (any fresh reading counts as full).
@@ -782,7 +782,7 @@
         previewChainCard: 'model card', previewChainEntry: 'virtual entry', previewChainGlobal: 'global',
         previewChainLegacy: 'legacy forced effort',
         previewChainNone: 'none (engine default)', globalSave: 'Save global policy',
-        // ── Virtual model entry list + edit dialog (refactor-arch 5.1, w_ui_models 2026-10-05) ──
+        // ── Virtual model entry list + edit dialog (2026-10-05 拆分, w_ui_models 2026-10-05) ──
         virtualEntriesEmpty: 'No service entries yet: use "Add service entry" at the top right',
         virtualEditTitle: 'Edit service entry', virtualNewTitle: 'New service entry',
         // Entry layer of the two switches: each layer is independent and the verdicts OR together
