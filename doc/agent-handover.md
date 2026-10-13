@@ -190,15 +190,29 @@ conf/                nginx.conf.template（生产模板，envsubst）+ lua-route
 
 **纪律**：
 
-1. 门禁/e2e/契约**绝不并发**（host 网络 + 容器命名；两套房同跑必出假失败）。跑之前 `ps` 查一遍。
-2. luajit/resty 单测（docker run --rm，无端口绑定）可以并发。
-3. 精确 kill PID，禁止 pkill；测试容器名带 `lr-<套件>-<pid5>` 前缀，收尾 `docker ps -a | grep lr-` 清零。
+1. **门禁支持跨独立 run 并发（用户裁定 2026-10-12，推翻本条旧话「门禁/e2e/契约绝不并发」）**：隔离由实现提供——
+   `prepare` 冻结源码快照 + 不可变镜像 manifest、每 run/每门命名空间、机器级端口台账、声明式资源锁；
+   跑之前 `ps` 查一遍是了解现状，不是排队条件。口径与实测记录见 doc/testing-workflow.md。
+2. luajit/resty/node 单测（无端口绑定）可并发；`e2e_watcher` 的 docker 名册经 `test/integration/docker_test_proxy.py`
+   只读代理过滤，已进共享池（原 125 项断言不变）。
+3. 精确 kill 自己拥有的 PID，禁止 pkill；清理只限本 run 名册记录的容器/文件/ledger 行（`lr-*` 前缀不变），
+   **禁止全局 `lr-*` 清扫**——并发下那是最贵的误伤。收尾核对是**本 run 容器名册归零**（按注入的
+   `LR_CONTAINER_NAMESPACE` / `LR_GATE_LABEL` 过滤），不是全机 `docker ps -a --filter name=lr-` 的计数：
+   并发时别人的 run 也在用这个前缀，全机计数既判不了对错，也不许拿它当清理依据去删别人的容器。
 4. 临时产物一律 /data/tmp/；本仓代码改动每步一个 commit。
-5. 改完先语法门（luajit -bl / openresty -t）再跑对应门禁子集，最后 root 全量。
-6. 门禁验收只认 **0 skipped**：日志里出现 `SKIP_ENV` 就是假绿（历史上外部依赖门禁被 SKIP
-   掩盖过 require 失败的先例）。
-7. 两档门禁：缺省 quick（build/conf/unit/contract/probes，约 3 分钟）；发版、文档计数更新、
-   生产镜像替换必须 GATE_TIER=full 全量绿——快速档日志不作全绿锚点。
+5. 改完先过语法门（luajit -bl / openresty -t），再按改动面跑**最小相关门**（doc/testing-workflow.md §6 矩阵：
+   UI 纯函数 → `GATE_GROUP=ui`；声明层 / config_store → config + base；路由与改写 → routing + `contract`；
+   facade / re-export 这类跨组件接线 → 相关分组 + `contract`）。红了定位后只重跑受影响那一门（`GATE_ONLY=<门>`）。
+   **full 不是日常动作**：只在发版、文档计数更新、生产镜像替换时跑（或由同 manifest 的分组聚合补齐）——
+   每改一处就跑 full 是本轮点名的慢因。
+6. **full 锚点只认 0 skipped**：发版锚里出现 `SKIP_ENV` 就是假绿（历史上外部依赖门禁被 SKIP 掩盖过
+   require 失败的先例）。定向选择（如 `GATE_GROUP=ui`）会合法地把范围外的门记成 skip：它对自己的选择可以绿
+   （`selection_green=True`），但那份记录不是 full 锚。底线是「记进报告」，问题只出现在静默消失。
+7. 两档门禁：缺省 quick（build/conf/unit/contract/probes 五门，约 3 分钟）；发版、文档计数更新、
+   生产镜像替换必须有 full 锚点：一次 `GATE_TIER=full` 全部 22 门绿，或由 `aggregate --tier full` 在同一
+   manifest（同 fingerprint + 同 `image_id`/`authz_id`/`build_base_id`）下补齐 22 门且无 skip/missing/invalid 后判定等价。
+   `--tier full` 不能省：`full_anchor_eligible` 只在 full 档判定，quick 档聚合 22 门齐也只报 False。
+   快速档日志与定向绿（报告自带 `full_anchor_eligible=False`）都不作全绿锚点。
 8. **文档与代码的锚定纪律（2026-10-05 教训）**：引用代码一律「文件 + 函数名」，不钉行号。
    本轮把七个 2000+ 行文件拆成 facade + 子模块后，旧文档里 60 多处「文件:行号」全部漂移到
    错误的位置，只能按函数名重写。**拆分后跨模块接线遗漏**（`router/pump.lua` 漏 export
@@ -207,25 +221,31 @@ conf/                nginx.conf.template（生产模板，envsubst）+ lua-route
    一个名字」这类加载期缺陷，**contract/e2e 门是接线完整性的最终判官**：任何 facade + re-export
    形状的改动，验收必须落到真跑请求的门禁上，不能停在「逐字搬家核对通过」。
 
-**命令**：
-
+**命令与可复制流程**：见 doc/testing-workflow.md（按维度选门、prepare/manifest、聚合与实测记录都在那）。速查：
 ```bash
-cd /home/aigc/ChatGPT/lua-router
-bash test/final_gates.sh                     # 快速档（缺省 build/conf/unit/contract/probes 五门，约 3 分钟）——普通修改够用
-GATE_TIER=full bash test/final_gates.sh      # 全量 22 门（串行 13–14 分钟）——发版/计数/生产替换
+bash test/final_gates.sh prepare --manifest-out /data/tmp/lr-gates/manifest-<fp>.json   # 冻结一次，多 agent 共用一份 manifest
+bash test/final_gates.sh                                    # 快速档（缺省五门）
+GATE_TIER=full bash test/final_gates.sh                     # 全量 22 门（池宽缺省 min(8,CPU)）
+GATE_TIER=full GATE_GROUP=routing bash test/final_gates.sh  # 按维度选门（base/config/routing/observability/discovery/mesh/tls/ui）
+GATE_JOBS=1 bash test/final_gates.sh                        # 显式串行（复现只在串行下出现的红）
+bash test/final_gates.sh plan                               # 只打印选择/锁/依赖，不执行
 GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 TEST_ONLY=inflight_age bash test/test_lua_router.sh   # 契约单段
+```
+分组并发跑完后，发版口径用聚合判定（`--tier full` 不能省：`full_anchor_eligible` 只在 full 档判定；`--manifest` 用 build 之后的身份文件，判据见 doc/testing-workflow.md §5）：
+```bash
+bash test/final_gates.sh aggregate --tier full \
+  --manifest /data/tmp/lr-gates/manifest-<fp>.json \
+  --results "/data/tmp/lr-gates/runs/<run-A>/results /data/tmp/lr-gates/runs/<run-B>/results"
 ```
 
 **22 门**：build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge e2e_errors
 e2e_effort head_routes mesh_http e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
 e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_chain。
 
-门与门之间**已支持并行**：`GATE_TIER=full GATE_JOBS=6 bash test/final_gates.sh` 实测 6.5 分钟
-（串行 13.7 分钟，2.12 倍）；**不设 `GATE_JOBS` 时行为与原来逐字节一致**。`GATE_DRY_RUN=1` 只打印
-分组计划。新增门若未归入 pool-1 / pool-2 / serial-only，脚本 fail-closed 直接 `exit 2`——
-`e2e_watcher`（拍 docker 端口快照再拼排除表）、`mesh_two`（名册跨 18s 稳定窗）、`e2e_tls_chain`
-（硬编码 `SMG_PORT=31337`）这三门必须留串行，理由见 README〈测试〉。
+并发模型（2026-10-12 改写，取代旧的三段波次表 + 串行尾巴 + 「三门必须串行」）：池宽缺省 `min(8, CPU)`，只按依赖边调度——`conf`/`unit`/`contract`/`probes` 不等镜像构建，boot 镜像的套件等的是 **build 门**（依赖边）不是栅栏；锁按声明取（HTTP 门共享观测窗 `obs:shared`，构建取独立准备锁 `build:exclusive`，`e2e_watcher` 声明零锁）。旧串行三门的理由已各自消解：`e2e_watcher` 读的是 `docker_test_proxy.py` 过滤后的名册（原 125 项断言不变，实测见 doc/testing-workflow.md §7）；`mesh_two` 的 Lua mesh 是静态对端表、无 gossip 发现，外来 router 结构上进不了名册，18 秒稳定断言原样保留；`e2e_tls_chain` 的 31337 是 `openresty -t` 渲染场景、从不绑定，端口号在台账里持续规避。
+新增门在 `test/gates/catalog.py` 声明 group/tier/locks/depends/timeout，未归类则加载期 assert
+直接失败——fail-closed 的纪律没变，只是从脚本里的三档表变成 catalog 的必填字段。
 
 **已知 flake/坑**：
 
@@ -242,8 +262,8 @@ e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement mesh_two e2e_tls_
   （`GATE_JOBS=6`）Rust 首轮健康周期实测 75–120s**，90s 会在机器忙时误红。红之前先看日志里
   Rust 侧等待用了多久，再怀疑产品代码。
 - 新写的 e2e 套件首跑大概率红（前提/解包类错误），不要怀疑产品代码，先核对场景前提。
-- 生产机的 proc 扫描会把门禁轮的 mock（alpha/beta 等模型名）短暂注册进生产池：跑完门禁后清一次
-  （`GET /workers` 找 unhealthy 的测试模型名 → `DELETE /workers/{id}`）。结构性根治（端口黑白名单策略）未做。
+- 生产机的 proc 扫描会把门禁轮的 mock（alpha/beta 等模型名）短暂注册进生产池。清理事件属于生产写面，
+  按 AGENTS.md 硬规则 3 逐条判（不在本文给出口头命令）。结构性根治（端口黑白名单策略）未做。
 - watcher 探针读到「接受 TCP 后不回 HTTP」的口（qdrant gRPC 6334 类）会被 nginx 记 [error]；
   消音手段是 `SMG_WATCHER_DENY_PORT`（lua_socket_log_errors off 在 timer 阶段挡不住），机制见
   doc/gap-watcher-merge.md 偏差 13。

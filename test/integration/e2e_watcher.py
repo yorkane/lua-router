@@ -51,8 +51,31 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _lib import (REPO, TMP, RUN, IMAGE, CONTAINERS, RESULTS, free_port, http,
-                  check, start_mock, logs, cleanup)
+from _lib import (REPO, TMP, RUN, IMAGE, CONTAINERS, RESULTS, CONTAINER_LABELS,
+                  free_port, http, check, start_mock, logs, cleanup)
+from docker_test_proxy import DockerTestProxy
+import atexit
+
+# --- the read-only docker API proxy (docker_test_proxy.py) ------------------
+# Every watcher container that asks for "the docker socket" mounts THIS socket
+# instead of /var/run/docker.sock. The /containers/json reply it reads is the real
+# daemon's reply filtered to the fixture containers registered below, so a container
+# published by a gate running beside this suite is never a candidate and the suite no
+# longer needs the machine-wide exclusive scan window. Discovery itself is unchanged:
+# real docker source, real published ports, remove-container-takes-the-URL-out.
+# One proxy serves every watcher container in this run. Its socket path is bounded
+# by construction (docker_test_proxy.socket_path_for: fixed short root + SHA-256 of
+# the full TMP|RUN, so a deep LR_TEST_TMP can never overflow sockaddr_un and no two
+# runs share a listener); the file is trashed (not rm'd) on exit.
+PROXY = DockerTestProxy.for_run(TMP, RUN).start()
+atexit.register(PROXY.stop)
+
+# --- cleanup identity ------------------------------------------------------
+# The provenance labels are the RUNNER's protocol, minted once in _lib (lr-runner.*
+# keyed by LR_CONTAINER_NAMESPACE; [] on a manual run, which the suite's own
+# CONTAINERS list cleans). This suite only APPLIES them -- every docker run below
+# splices CONTAINER_LABELS -- so a run-scoped sweep matches exactly the containers
+# this run created, and a suite cannot drift from the naming the sweeper filters on.
 
 WATCHER_ENV = {
     "SMG_WATCHER_ENABLED": "1",
@@ -83,10 +106,13 @@ def start_watcher(env, name, mounts_docker=False, wait_secs=40, port=None):
     full.setdefault("SMG_HEALTH_CHECK_INTERVAL_SECS", "1")
     full.setdefault("SMG_POLICY", "round_robin")
     args = ["docker", "run", "-d", "--name", name]
+    args += CONTAINER_LABELS
     for key, value in full.items():
         args += ["-e", "%s=%s" % (key, value)]
     if mounts_docker:
-        args += ["-v", "/var/run/docker.sock:/var/run/docker.sock:ro"]
+        # The proxy socket plays the daemon: read-only, same in-container path, so
+        # the product's SMG_WATCHER_DOCKER_SOCKET default needs no override.
+        args += ["-v", "%s:/var/run/docker.sock:ro" % PROXY.socket_path]
     args += ["--network", "host", "--entrypoint", "/docker-entrypoint.sh", IMAGE,
              "/usr/local/openresty/bin/openresty", "-p", "/usr/local/openresty/nginx",
              "-g", "daemon off;"]
@@ -473,6 +499,7 @@ def start_mock_container(name, port, model):
     container is what makes discovery forget the URL.
     """
     subprocess.run(["docker", "run", "-d", "--name", name,
+                    *CONTAINER_LABELS,
                     "-p", "127.0.0.1:%d:8000" % port,
                     "-v", "%s:/repo:ro" % REPO, "-e", "MODEL=%s" % model,
                     "--entrypoint", "python3", "python:3.12-alpine",
@@ -480,6 +507,10 @@ def start_mock_container(name, port, model):
                     "--port", "8000", "--model", model],
                    check=True, capture_output=True)
     CONTAINERS.append(name)
+    # Register the fixture with the proxy so its record survives the filter; the
+    # allow-list is dynamic, so this container is visible from the moment it starts
+    # and any gate container that starts later stays out.
+    PROXY.allow(name)
     url = "http://127.0.0.1:%d" % port
     deadline = time.time() + 60
     while time.time() < deadline:
@@ -836,6 +867,7 @@ def scenario_docker_and_restart():
     # A real container publishing its port: the docker scanner reads the mapping
     # from the daemon instead of from /proc, and reports the container name.
     subprocess.run(["docker", "run", "-d", "--name", ctr,
+                    *CONTAINER_LABELS,
                     "-p", "127.0.0.1:%d:8000" % worker_port,
                     "-v", "%s:/repo:ro" % REPO, "-e", "MODEL=docker-model",
                     "--entrypoint", "python3", "python:3.12-alpine",
@@ -843,6 +875,7 @@ def scenario_docker_and_restart():
                     "--port", "8000", "--model", "docker-model"],
                    check=True, capture_output=True)
     CONTAINERS.append(ctr)
+    PROXY.allow(ctr)   # see start_mock_container: fixtures register with the proxy
     url = "http://127.0.0.1:%d" % worker_port
     ready = False
     for _ in range(60):

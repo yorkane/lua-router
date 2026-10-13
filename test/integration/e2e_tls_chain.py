@@ -25,7 +25,6 @@ change, and the single-pair limit is recorded in the doc.
 import json
 import os
 import re
-import shutil
 import socket
 import ssl
 import subprocess
@@ -35,7 +34,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from _lib import (IMAGE, RESULTS, RUN, TMP, check, cleanup, free_port,  # noqa: E402
-                  logs, start_mock)
+                  logs, start_mock, trash)
 
 D = os.path.join(TMP, "tls-chain-" + RUN)
 CERTS = os.path.join(D, "certs")
@@ -540,7 +539,11 @@ def finish():
     if not failed:
         # green run leaves nothing behind; a failing run keeps the PKI tree (and the
         # rendered fragments) under D for post-mortem.
-        shutil.rmtree(D, ignore_errors=True)
+        # Moved, not deleted: the tree is the evidence trail for this gate, and
+        # the box rule is that deletions go to /data/.trash. The suite-local
+        # subtree (TMP, keyed by RUN) makes a collision with another TLS run
+        # impossible, so keeping the last green tree costs a directory entry.
+        trash(D)
     else:
         print("PKI tree kept for inspection: %s" % D)
     sys.exit(1 if failed else 0)

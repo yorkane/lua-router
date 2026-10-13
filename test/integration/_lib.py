@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Integration e2e for lua-router: real openresty container + mock workers."""
-import fcntl, json, os, random, re, socket, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))          # .../test/integration
@@ -8,122 +8,88 @@ REPO = os.path.dirname(os.path.dirname(HERE))  # repo root
 IMAGE = os.environ.get("LR_IMAGE", "lua-router:integration")
 CONF_TEST = REPO + "/test/conf/nginx-lua-router.conf"
 CONF_UI = REPO + "/conf/ui.conf"
-TMP = os.environ.get("LR_TEST_TMP", "/data/tmp/lr")
-os.makedirs(TMP, exist_ok=True)
-# LR_GATE_TAG is set by test/final_gates.sh when GATE_JOBS>1: it puts the gate name
-# into every container name and every per-run temp path, so two gates that happen to
-# get PIDs congruent mod 100000 can no longer write each other's files. Unset (the
-# default, and every manual single-suite run) leaves RUN exactly as it was.
+# The shared bash/python port ledger lives in test/port_allocator.py: one flock
+# protocol, two front ends, so a python gate and the bash contract suite cannot be
+# handed the same number. free_port() below is a thin wrapper over it.
+# HERE is .../test/integration, so the allocator sits one level up.
+sys.path.insert(0, os.path.dirname(HERE))
+import port_allocator  # noqa: E402
+
+# --- run identity ----------------------------------------------------------
+# Every path and container name below is keyed by RUN, and RUN is built so that
+# two suites running at the same time on one box cannot write the same file, bind
+# a number the other one just reserved, or match each other's containers in a
+# cleanup sweep. Three inputs, in this order:
+#   LR_RUN_ID    the runner's per-run stamp (one temp tree per gate run, shared
+#                by every gate in that run);
+#   LR_GATE_TAG  the gate name, exported by final_gates.sh when GATE_JOBS>1, so
+#                two gates whose PIDs happen to be congruent mod 100000 can no
+#                longer write each other's files;
+#   os.getpid()  a manual single-suite run, where there is nothing to collide
+#                with and the historical shape is kept.
+# RUN feeds docker container names, so the alphabet is the container-name set
+# (lowercase letters, digits, underscore, dash) -- a run id carrying a dot or an
+# uppercase letter would make every start_router call fail on the name, which is
+# a harness bug that looks like a suite bug.
+RUN_ID = re.sub(r"[^a-z0-9_-]", "", os.environ.get("LR_RUN_ID", "").lower())[:40]
 GATE_TAG = re.sub(r"[^a-z0-9_-]", "", os.environ.get("LR_GATE_TAG", "").lower())[:14]
-RUN = (GATE_TAG + "-" if GATE_TAG else "") + (str(os.getpid()) if GATE_TAG
-                                                else str(os.getpid())[-5:])
+RUN = (RUN_ID + "-" if RUN_ID else "") + (GATE_TAG + "-" if GATE_TAG else "") + str(os.getpid())
+
+# TMP is the per-SUITE scratch directory, not a shared pile: mock logs, the TLS PKI
+# tree, config-store files and the profile seed all land here, and in one flat
+# directory two suites overwrite each other as soon as a port number repeats.
+# LR_TEST_TMP names the parent (the runner passes one per gate run); the leaf is
+# RUN, so one suite's files stay separable from every other suite's.
+TMP_ROOT = os.environ.get("LR_TEST_TMP", "/data/tmp/lr")
+TMP = os.path.join(TMP_ROOT, RUN)
+os.makedirs(TMP, exist_ok=True)
+
+# --- container provenance labels -----------------------------------------
+# The runner sweeps strays by LABEL (docker --filter label=lr-runner.namespace=
+# ...), which is precise in a way no name pattern can be: a name embeds a pid
+# that a peer run can, in principle, share, and a suffix match breaks the moment
+# a suite spells a name differently. Labels are minted per run, so a sweep can
+# only ever match containers this run created. Applied when the runner names a
+# namespace; a manual run adds no runner labels and is cleaned by its own
+# CONTAINERS list, which is exactly as scoped as it has to be.
+def _label_args():
+    """docker --label args, or [] when no runner namespace was handed to us."""
+    ns = re.sub(r"[^A-Za-z0-9_.-]", "",
+                os.environ.get("LR_CONTAINER_NAMESPACE", ""))[:64]
+    if not ns:
+        return []
+    return ["--label", "lr-runner.namespace=" + ns,
+            "--label", "lr-runner.gate=" + (GATE_TAG or "suite"),
+            "--label", "lr-runner.run-pid=%d" % os.getpid()]
+
+
+CONTAINER_LABELS = _label_args()
 RESULTS = []
 PIDS = []
 CONTAINERS = []
 
 
-# Ports that are NOT handed out by free_port(): 29000 is the Rust gateway's scrape
-# listener on this box, 30000 is the in-container SMG_PORT the contract suite
-# publishes, and 31337 is the fixed listener e2e_tls_chain names in one scenario.
-# Without this list a parallel gate could reserve one of those numbers microseconds
-# before the suite that hardcodes it tries to bind it.
-_AVOID_PORTS = {29000, 30000, 31337}
-# Reservations are drawn only from this band, deliberately BELOW
-# net.ipv4.ip_local_port_range (32768-60999 here). Two allocators share a gate
-# run: free_port() picks the router listeners and the mocks, and the docker
-# daemon picks on its own for every "-p 127.0.0.1::8080" publish (that is how
-# probe_container exposes the router). The ledger below synchronises only the
-# first of the two, so if both drew from the ephemeral range, a docker publish
-# could be handed a number that free_port() had reserved and not yet bound.
-# Staying out of that range makes them disjoint by construction.
-_PORT_BAND = range(20001, 32000)
-
-
-def _reserve_file():
-    """The shared ledger path, or None meaning "serial mode".
-
-    Only the parallel branch of test/final_gates.sh exports LR_PORT_RESERVE.
-    Unset -- the default, and every manual single-suite run -- free_port() keeps
-    its original shape exactly: bind(0), read the port, close, return. That is
-    what keeps GATE_JOBS=1 behaviourally identical to the pre-pool script.
-    """
-    return os.environ.get("LR_PORT_RESERVE")
-
-
-def _claim(ledger, p):
-    """Take port p in the shared ledger; False if a live process already holds it.
-
-    Rows are tagged with the owner pid and rewritten under one exclusive flock, so
-    a run killed mid-flight stops reserving its ports rather than leaking them.
-    An unreadable ledger degrades to the pre-pool behaviour instead of failing
-    the gate on plumbing.
-    """
-    try:
-        os.makedirs(os.path.dirname(ledger), exist_ok=True)
-        with open(ledger, "a+") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.seek(0)
-            keep, taken = [], set()
-            for line in fh:
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                try:
-                    owner, port = int(parts[0]), int(parts[1])
-                except ValueError:
-                    continue
-                try:
-                    os.kill(owner, 0)
-                except OSError:
-                    continue              # dead owner -> its port is public again
-                keep.append("%d %d\n" % (owner, port))
-                taken.add(port)
-            if p in taken:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-                return False
-            keep.append("%d %d\n" % (os.getpid(), p))
-            fh.seek(0)
-            fh.truncate()
-            fh.writelines(keep)
-            fcntl.flock(fh, fcntl.LOCK_UN)
-    except OSError:
-        return True
-    return True
-
-
+# Port allocation: one ledger for the whole box, shared with the bash contract
+# suite, which reaches the same module through its CLI. The band, the avoided
+# numbers (29000 = the Rust gateway scrape listener on this box, 30000 = the
+# in-container SMG_PORT the contract suite publishes, 31337 = the TLS
+# render-only literal), the live-owner pruning and the bind probe all live in
+# test/port_allocator.py; see there for why the band stays below
+# net.ipv4.ip_local_port_range -- the docker daemon picks its own publishes
+# from that range and is not in the ledger, so the two are disjoint by
+# construction, which is the only thing that keeps a "-p 127.0.0.1::8080"
+# publish from landing on a number this suite just reserved.
+#
+# Two behaviour changes against the previous in-file allocator, both deliberate.
+# The ledger is now ALWAYS used: a standalone single-suite run shares the box
+# with gate runs, and a ledger that exists only inside a gate run protects
+# nothing there. And an unreadable / unwriteable ledger is a hard failure
+# instead of a silent fall back to bind(0): a harness that quietly stops
+# reserving is the bug that produced the original collisions, and it surfaces
+# as an unrelated red several gates later.
 def free_port():
-    """Pick a free loopback port; under GATE_JOBS>1, reserve it across processes.
-
-    Serial mode is the untouched original: bind(0), read, close, return. The
-    parallel branch adds the two things a bare bind(0) cannot give when gates
-    share the box -- the number survives the window between close() and the
-    docker/python bind that finally uses it, and candidates come from a band the
-    docker daemon never allocates from. Every candidate still has to bind, so a
-    port already held by a real service is skipped.
-    """
-    ledger = _reserve_file()
-    if not ledger:
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        p = s.getsockname()[1]
-        s.close()
-        return p
-    order = list(_PORT_BAND)
-    random.shuffle(order)
-    for p in order:
-        if p in _AVOID_PORTS:
-            continue
-        probe = socket.socket()
-        try:
-            probe.bind(("127.0.0.1", p))
-        except OSError:
-            continue                      # held by a service or a docker proxy
-        finally:
-            probe.close()
-        if _claim(ledger, p):
-            return p
-    raise RuntimeError("could not reserve a free loopback port in %d-%d"
-                     % (_PORT_BAND.start, _PORT_BAND.stop))
+    """Reserve a free loopback port through the shared ledger."""
+    return port_allocator.free_port()
 
 
 def http(method, url, body=None, headers=None, timeout=15):
@@ -180,6 +146,7 @@ def start_router(env, name):
     args = ["docker", "run", "-d", "--name", name]
     for k, v in env.items():
         args += ["-e", "%s=%s" % (k, v)]
+    args += CONTAINER_LABELS
     args += ["-e", "SMG_PORT=%d" % port, "--network", "host",
              "--entrypoint", "/docker-entrypoint.sh", IMAGE,
              "/usr/local/openresty/bin/openresty", "-p", "/usr/local/openresty/nginx",
@@ -228,11 +195,55 @@ def chat(port, model, text="hello world", stream=False, extra=None, path="/v1/ch
     return http("POST", "http://127.0.0.1:%d%s" % (port, path), body, headers)
 
 
+# Trash root for the suite's own scratch tree. The box-wide rule is "deletions
+# move to /data/.trash", and for a suite it is also the better default: the
+# tree is the post-mortem evidence for a red gate, and a red run is exactly when
+# nobody wants it already gone.
+TRASH = "/data/.trash"
+
+
+def trash(path):
+    """Move a file or tree into $TRASH under a run-unique name. Never rm -rf."""
+    if not os.path.exists(path):
+        return None
+    dest_root = os.path.join(TRASH, "lua-router-" + RUN)
+    os.makedirs(dest_root, exist_ok=True)
+    dest = os.path.join(dest_root, os.path.basename(path))
+    if os.path.exists(dest):
+        dest = dest + "." + str(os.getpid())
+    os.rename(path, dest)
+    return dest
+
+
 def cleanup():
+    """Release THIS suite's resources only.
+
+    Scoped by construction, not by pattern: PIDS and CONTAINERS are the lists
+    this process built, so nothing here can touch another suite's mock worker,
+    and there is deliberately no "docker rm -f $(docker ps -q --filter
+    name=lr-)" sweep -- under GATE_JOBS>1 that sweep would kill the containers
+    of the gates running beside this one, which is the failure the naming scheme
+    exists to prevent. The ledger rows are released by owner pid, so a suite
+    that exits cleanly hands its ports straight back instead of waiting for the
+    liveness sweep.
+    """
+    # Contract with the runner's timeout/abort path (SIGTERM, 1 s grace, SIGKILL):
+    # terminate the mock workers we started, give them a second to close, and
+    # only then force-kill survivors, so a suite that is being torn down cannot
+    # leave a mock holding a ledger port while its owner is already gone.
     for p in PIDS:
         p.terminate()
+    if PIDS:
+        time.sleep(1.0)
+    for p in PIDS:
+        if p.poll() is None:
+            p.kill()
     for c in CONTAINERS:
         subprocess.run(["docker", "rm", "-f", c], capture_output=True)
+    try:
+        port_allocator.release_pid(port_allocator.owner_pid())
+    except Exception:
+        pass                            # a dead ledger must not mask test results
 
 
 
@@ -504,6 +515,7 @@ def probe_container(env, name, port_in_container=8080):
             "-p", "127.0.0.1::%d" % port_in_container, "-v", REPO + ":/repo:ro"]
     for k, v in env.items():
         args += ["-e", "%s=%s" % (k, v)]
+    args += CONTAINER_LABELS
     args += ["--entrypoint", "openresty", os.environ.get("LR_BASE_IMAGE", "authz:latest"),
              "-p", "/usr/local/openresty/nginx/", "-c", "/repo/test/conf/nginx-lua-router.conf",
              "-g", "daemon off;"]

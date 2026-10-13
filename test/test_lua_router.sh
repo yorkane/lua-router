@@ -28,14 +28,55 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 IMAGE=${OPENRESTY_TEST_IMAGE:-authz:latest}
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lua-router-contract.XXXXXX")
+# One scratch tree per RUN, under /data/tmp (the box rule for test temporaries),
+# keyed by LR_RUN_ID + LR_GATE_TAG + this pid so a parallel gate and a manual
+# run cannot share a directory. The container mounts it read-only at /gen, so
+# the path has to exist before start_container.
+# RUN feeds docker container names: the alphabet is the container-name set
+# (lowercase, digits, underscore, dash), because a run id with a dot or an
+# uppercase letter would make every start_container fail on the name.
+RUN_ID=$(printf '%s' "${LR_RUN_ID:-}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+GATE_TAG=$(printf '%s' "${LR_GATE_TAG:-}" | tr -cd 'a-z0-9_-')
+RUN="${RUN_ID:+${RUN_ID}-}${GATE_TAG:+${GATE_TAG}-}$$"
+TMP_ROOT=${LR_TEST_TMP:-/data/tmp/lr}
+TMP_DIR="$TMP_ROOT/contract-$RUN"
+# A stale tree under this exact name can only be ours (the name carries the pid),
+# so it is moved aside rather than deleted: box rule, and the previous contents
+# are the evidence for whatever just failed.
+if [[ -d "$TMP_DIR" ]]; then
+    mkdir -p /data/.trash/lua-router-contract 2>/dev/null || true
+    mv "$TMP_DIR" /data/.trash/lua-router-contract/stale-"$RUN" 2>/dev/null || true
+fi
+mkdir -p "$TMP_DIR"
 BASE_CONF=/repo/test/conf/nginx-lua-router.conf
 UI_CONF=$BASE_CONF
 
 PASSED=0
 FAILS=0
 NOTE_COUNT=0
-SUIT=$$
+# SUIT is the namespace half of every container name in this suite, and it is
+# the full RUN (run id + gate tag + pid) rather than the bare pid: two gate runs
+# whose pids happen to be congruent mod 100000 used to be able to select each
+# other's containers in a cleanup sweep, and a bare pid gives the port ledger no
+# more identity than a manual run has.
+SUIT=$RUN
+# SUIT_PID is the numeric identity the port ledger needs -- SUIT carries letters
+# once the run tag is in it, so the two roles cannot share one variable.
+SUIT_PID=$$
+# Container provenance labels. The runner sweeps strays by LABEL (docker
+# --filter label=lr-runner.namespace=...), which is precise in a way no name
+# pattern is: a name embeds a pid a peer run can in principle share. The
+# namespace value is the runner's hash (LR_CONTAINER_NAMESPACE), minted per
+# run, so a sweep can only ever match containers this run created. A manual
+# run sets no namespace and adds no labels; its containers are cleaned by the
+# CONTAINER_NAMES list, which is exactly as scoped as it has to be.
+LR_NS=$(printf '%s' "${LR_CONTAINER_NAMESPACE:-}" | tr -cd 'A-Za-z0-9_.-' | cut -c1-64)
+LR_LABEL_ARGS=()
+if [[ -n "$LR_NS" ]]; then
+    LR_LABEL_ARGS=(--label "lr-runner.namespace=$LR_NS"
+                   --label "lr-runner.gate=${GATE_TAG:-suite}"
+                   --label "lr-runner.run-pid=$SUIT_PID")
+fi
 CONTAINER_NAMES=""
 MOCK_PIDS=""
 
@@ -179,6 +220,11 @@ request_method_gate() {
 }
 
 # ------------------------------------------------------------------ fixtures
+# Cleanup is scoped to what THIS process started: the two lists below, plus the
+# ledger rows owned by this pid. There is deliberately no
+# "docker ps --filter name=lr-" sweep -- under GATE_JOBS>1 that would kill the
+# containers of the gates running beside this one, which is the whole reason
+# container names carry the run tag.
 cleanup() {
     local name pid
     for name in ${CONTAINER_NAMES:-}; do
@@ -187,16 +233,34 @@ cleanup() {
     for pid in ${MOCK_PIDS:-}; do
         kill "${pid:-}" >/dev/null 2>&1 || true
     done
-    rm -rf "$TMP_DIR"
+    # Same teardown contract the runner's timeout/abort path uses: SIGTERM, one
+    # second of grace, then SIGKILL the survivors. A mock that lags past its
+    # suite would keep holding a ledger port for a pid that is already gone.
+    sleep 1
+    for pid in ${MOCK_PIDS:-}; do
+        kill -0 "${pid:-}" 2>/dev/null && kill -9 "${pid:-}" 2>/dev/null || true
+    done
+    # Hand the reserved ports straight back instead of waiting for the liveness
+    # sweep to notice this pid is gone.
+    python3 "$SCRIPT_DIR/port_allocator.py" --release "$SUIT_PID" >/dev/null 2>&1 || true
+    # Deletions move to /data/.trash; the tree doubles as the post-mortem
+    # evidence for a red contract run, which is exactly when it must survive.
+    if [[ -d "$TMP_DIR" ]]; then
+        mkdir -p /data/.trash/lua-router-contract-"$RUN" 2>/dev/null || true
+        mv "$TMP_DIR" /data/.trash/lua-router-contract-"$RUN"/ 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
+# Ports come from the shared machine-level ledger (test/port_allocator.py) --
+# the same file the python e2e suites write, so a bash container publish and a
+# python mock worker cannot be handed the same number microseconds apart. The
+# owner written to the ledger is this suite's bash pid ($SUIT_PID), NOT the
+# short-lived python3 that runs the probe: that interpreter exits a moment
+# later, and a row owned by a dead pid expires immediately, which is a bind(0)
+# with extra steps. LR_PORT_OWNER_PID is the contract the allocator reads.
 free_port() {
-    python3 -c 'import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()'
+    LR_PORT_OWNER_PID="$SUIT_PID" python3 "$SCRIPT_DIR/port_allocator.py"
 }
 
 start_mock() {
@@ -592,7 +656,7 @@ start_container() {
     if [[ -n "${FIXPORT:-}" ]]; then
         published="127.0.0.1:${FIXPORT}:8080"
     fi
-    docker run -d --name "$name" -p "$published" "${envargs[@]}" \
+    docker run -d "${LR_LABEL_ARGS[@]}" --name "$name" -p "$published" "${envargs[@]}" \
         --entrypoint openresty \
         -v "$REPO_ROOT:/repo:ro" -v "$TMP_DIR:/gen:ro" \
         "$IMAGE" -p /usr/local/openresty/nginx/ -c "$conf" -g 'daemon off;' \
@@ -2567,7 +2631,7 @@ if section prometheus; then
     MP=$(free_port)
     docker rm -f lr-prom-$SUIT >/dev/null 2>&1 || true
     CONTAINER_NAMES="$CONTAINER_NAMES lr-prom-$SUIT"
-    docker run -d --name lr-prom-$SUIT \
+    docker run -d "${LR_LABEL_ARGS[@]}" --name lr-prom-$SUIT \
         -p 127.0.0.1:0:30000 -p "127.0.0.1:$MP:29000" \
         -e SMG_METRICS_PORT=29000 -e LR_METRICS_PORT=29000 \
         -e SMG_PORT=30000 -e SMG_HEALTH_CHECK_INTERVAL_SECS=1 \
@@ -2614,7 +2678,7 @@ if section prometheus; then
     # tree, and SMG_UI_DIR mapped onto the LMR_UI_DIR the UI fragment reads.
     docker rm -f lr-entry-$SUIT >/dev/null 2>&1 || true
     CONTAINER_NAMES="$CONTAINER_NAMES lr-entry-$SUIT"
-    docker run -d --name lr-entry-$SUIT \
+    docker run -d "${LR_LABEL_ARGS[@]}" --name lr-entry-$SUIT \
         -p 127.0.0.1:0:30000 \
         -e SMG_PORT=30000 -e SMG_HEALTH_CHECK_INTERVAL_SECS=1 \
         -e SMG_LOG_LEVEL=info -e SMG_UI_DIR=/repo/ui \
@@ -2650,7 +2714,7 @@ if section prometheus; then
     # suites need on a host that already runs a gateway on 29000.
     docker rm -f lr-entry-off-$SUIT >/dev/null 2>&1 || true
     CONTAINER_NAMES="$CONTAINER_NAMES lr-entry-off-$SUIT"
-    docker run -d --name lr-entry-off-$SUIT \
+    docker run -d "${LR_LABEL_ARGS[@]}" --name lr-entry-off-$SUIT \
         -p 127.0.0.1:0:30000 \
         -e SMG_PORT=30000 -e SMG_METRICS_PORT=0 -e NGINX_WORKER_PROCESSES=1 \
         -e OPENRESTY_TEMPLATE_DIR=/repo/conf \
@@ -3542,7 +3606,7 @@ if section tls_server; then
 
         docker rm -f lr-tlssrv-$SUIT >/dev/null 2>&1 || true
         CONTAINER_NAMES="$CONTAINER_NAMES lr-tlssrv-$SUIT"
-        docker run -d --name lr-tlssrv-$SUIT \
+        docker run -d "${LR_LABEL_ARGS[@]}" --name lr-tlssrv-$SUIT \
             -p 127.0.0.1:0:30000 \
             -e SMG_PORT=30000 -e SMG_METRICS_PORT=0 \
             -e NGINX_WORKER_PROCESSES=1 \
@@ -3611,7 +3675,7 @@ if section tls_server; then
         # ---- without the cert envs the plain listener is unchanged ----
         docker rm -f lr-tlsplain-$SUIT >/dev/null 2>&1 || true
         CONTAINER_NAMES="$CONTAINER_NAMES lr-tlsplain-$SUIT"
-        docker run -d --name lr-tlsplain-$SUIT \
+        docker run -d "${LR_LABEL_ARGS[@]}" --name lr-tlsplain-$SUIT \
             -p 127.0.0.1:0:30000 \
             -e SMG_PORT=30000 -e SMG_METRICS_PORT=0 -e NGINX_WORKER_PROCESSES=1 \
             -e OPENRESTY_TEMPLATE_DIR=/repo/conf -e LR_UI_CONF=off \

@@ -67,6 +67,18 @@
 
 ## 4. 门禁的并发与串扰（AGENTS 第 1 条的落地细节）
 
+> **[2026-10-12 追加：本节两条串行规则已由用户裁定推翻，现行口径见 doc/testing-workflow.md]**
+> 本节照原样留档（它是这一轮的事实记录），下一个人按这条读：隔离的意图（端口、容器名册、被中途编辑的
+> 源码树）现已由实现提供——`prepare` 冻结源码快照与不可变镜像 manifest、每 run/每门命名空间、
+> 机器级 flock 端口台账、`test/gates/catalog.py` 的声明式锁，所以**跨独立 run 的并发是允许的**，
+> 全局 flock 与「门与门严禁并发」一起退役（`test/final_gates.sh` 头部明写「no global
+> one-gate-run-at-a-time flock any more」）。清理边界同步收紧为「只清自己名册里的容器/文件/ledger 行」,
+> 全局 `lr-*` 清扫在并发下是最贵的误伤。
+>
+> 两条补充（现行口径）：**收尾核对看本 run 的容器名册（按 `LR_CONTAINER_NAMESPACE` / `LR_GATE_LABEL` 过滤），
+> 本节末尾那条「全机 `docker ps --filter name=lr-` 必须为空」在并发下不成立**——别人 run 的容器也用这个前缀；
+> 聚合与 full 锚点判定的现行规则见 doc/testing-workflow.md §5（`aggregate` 必须显式 `--tier full`）。
+
 - 同一时刻只跑**一份**门禁（脚本内 flock，第二个 run 直接被拒）。门与门严禁并发是因为端口/名册/快照
   互踩；`GATE_JOBS=6` 是脚本内部并行互不干扰的门，不违反这条。
 - 注释里的门数会漂：本轮 `test/final_gates.sh` 注释写 `all 21 gates`，`GATE_ORDER` 实为 22 门。

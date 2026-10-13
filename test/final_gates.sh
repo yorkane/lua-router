@@ -1,33 +1,60 @@
 #!/usr/bin/env bash
 # ============================================================================
-# lua-router final gate — one serial command for the whole release check
+# lua-router final gate - single entry point for the release check
 # ============================================================================
-#仓库化的最终门禁（取代 /data/tmp/lr-core2/final_gates.sh 那个一次性脚本）。
-# 与旧脚本的差异：补齐了 probes.py、e2e_errors.py、e2e_effort.py、
-# 未接线模块的单测（mesh）以及新增的两个
-# HTTP 面集成测试（test_head_routes.py、test_mesh_http.py），并改成
-# 首个失败即退出。
+# This file is two things:
+#   1. the 22 gate BODIES (gate_build .. gate_e2e_tls_chain below), unchanged;
+#   2. the CLI compat layer that forwards scheduling to test/gates/runner.py.
 #
-# Usage:
-#   bash test/final_gates.sh                    # quick tier (default, ~3 min)
-#   GATE_TIER=full bash test/final_gates.sh     # all 22 gates (release/count/
-#                                               # pre-production changes)
-#   SKIP_ENV=mesh_http GATE_TIER=full bash ...  # skip named gates (recorded)
-#   GATE_ONLY=unit bash test/final_gates.sh     # single gate (any tier)
-#   KEEP_GOING=1 bash test/final_gates.sh       # run all selected, count fails
-#   LR_GATE_LOG=/path/log bash ...              # log location
-#   GATE_JOBS=4 bash test/final_gates.sh        # run the safe gates in parallel
-#   GATE_DRY_RUN=1 GATE_TIER=full bash ...      # print the plan, run nothing
+# Scheduling, locking, run identity, source freezing and result recording moved
+# into the python package under test/gates/ (see the module docstrings):
+#   catalog.py     the 22 gates: group (base/config/routing/observability/
+#                  discovery/mesh/tls), tier, locks, dependencies, timeouts
+#   locks.py       writer-preferring observation RW lock + build prepare lock
+#   context.py     frozen source snapshot, fingerprints, image cache, run dirs
+#   bodies.py      how a body is launched (re-entry into this script)
+#   results.py     atomic per-gate JSON records + same-version aggregation
+#   scheduler.py   dependency-aware pool; no phase barrier
 #
-# Concurrency (GATE_JOBS, default 1 = the historical serial run):
-#   GATE_JOBS>1 only parallelises gates that passed the machine-state audit in the
-#   PHASE comments below. Membership is not a knob: GATE_JOBS=8 cannot promote a
-#   gate that reads machine-wide state into the pool.
-#   A parallel run implies keep-going: every selected gate runs, the exit code is
-#   1 if any one of them is red, and each red gate prints its own 25 tail lines.
-#   Two gate RUNS at once are refused by an flock, so a parallel run can never
-#   overlap another run whether that one is parallel or serial.
+# Usage (the historical surface is unchanged):
+#   bash test/final_gates.sh                     # quick tier, default pool
+#   GATE_TIER=full bash test/final_gates.sh      # all 22 gates
+#   GATE_JOBS=1 bash test/final_gates.sh         # explicit serial, GATE_ORDER
+#   GATE_JOBS=6 GATE_TIER=full bash ...          # pool width 6
+#   GATE_GROUP=routing,mesh GATE_TIER=full ...   # group selection
+#   GATE_DRY_RUN=1 GATE_TIER=full bash ...       # print the plan, run nothing
+#   SKIP_ENV=mesh_http GATE_TIER=full bash ...   # skip named gates (recorded)
+#   GATE_ONLY=unit bash test/final_gates.sh      # single gate (any tier)
+#   KEEP_GOING=1 bash test/final_gates.sh        # accepted; now the behaviour
+#   LR_GATE_LOG=/path/log bash ...               # merged log location
+#   bash test/final_gates.sh prepare             # freeze + build, print manifest
+#   bash test/final_gates.sh plan                # selection/group/lock plan
 #
+# Keep-going is unconditional now: the pool has no first failure to stop at, and
+# every gate is recorded, so the report always states exactly what is red.
+#
+# Concurrency model (supersedes the old three-wave table):
+#   GATE_JOBS is a pool width, default min(8, nproc). Gate membership is no
+#   longer a hand-kept list: each gate declares LOCKS and DEPENDENCIES in
+#   catalog.py and the scheduler honours them. conf/unit/contract/probes never
+#   wait for build; the image-booting suites wait for the build GATE.
+#   e2e_watcher takes NO lock at all: its docker.sock port-table snapshot used to
+#   be the one thing that needed an exclusive machine window, and the snapshot now
+#   ships test/integration/docker_test_proxy.py, which filters socket events to
+#   this run's fixture containers while preserving the raw port fields, so the
+#   suite no longer sees foreign publishes. Every HTTP gate shares the observation
+#   window. mesh_two and
+#   e2e_tls_chain joined the pool after an audit showed their serial reasons
+#   were wall-clock fidelity, not machine-wide state: the Lua mesh is a static
+#   peer list (no gossip discovery, so no foreign router can join a roster), and
+#   the 31337 'listener' is an openresty -t config render that never binds. The
+#   per-gate durations in the result JSON are how you check that claim here.
+#
+# There is deliberately no global 'one gate run at a time' flock any more. Runs
+# are independent by construction: unique LR_RUN_ID, per-run log/tmp/result dirs,
+# per-gate LR_GATE_TAG namespaces, and one machine-wide port ledger
+# (/data/tmp/lr-gates/ports.reserved, flock'd, reclaimed by pid liveness). Two
+# runs may overlap; the ledger is what makes that safe for loopback ports.
 #
 # Gate ids, in run order (SKIP_ENV takes a comma/space separated list of these):
 #   build          docker build lua-router:integration (the e2e suites boot it)
@@ -128,14 +155,35 @@
 # Skipping is only legitimate when the gate is known-blocked by an unrelated
 # change; the run log records every skip so a green run cannot silently shrink.
 #
-# Requirements: docker (+ authz:latest, apache/apisix:3.11.0-debian, and the
-# built lua-router:integration), curl, jq and python3. test/local.env is still
-# sourced for local overrides (none are required by the shipped gates).
-# Only ever run one copy at a time: a second invocation exits 3 while the first
-# holds /data/tmp/lr-gates/.gates.lock. GATE_JOBS parallelises gates INSIDE one
-# run; it is not a licence to start two runs, and it does not make the suites
-# cheaper to share the box with -- each container suite still wants docker and
-# CPU, so a very large GATE_JOBS buys nothing past the point of saturation.
+# Requirements: docker (+ authz:latest and apache/apisix:3.11.0-debian; the gate
+# image is built by the build GATE from the frozen snapshot and tagged
+# lua-router:gate-<fingerprint>, never a shared mutable tag), curl, jq, python3.
+# test/local.env is still sourced for local overrides (none are required by the
+# shipped gates).
+#
+# Overlapping runs are allowed: there is no global run lock, and two runs are
+# independent because each has its own run id, snapshot, log/result/tmp dirs and
+# per-gate namespaces, sharing only the machine-wide port ledger. Sharing the
+# box is still not free -- every container suite wants docker and CPU, so a very
+# large GATE_JOBS buys nothing past saturation, and the observation lock makes
+# e2e_watcher's machine scan wait for the pool rather than race it.
+#
+# Prepared artifacts (all under /data/tmp/lr-gates/):
+#   snapshots/<fingerprint>/   frozen tree the gates actually mount
+#   images/<fingerprint>.json  fingerprint -> immutable image id
+#   runs/<run-id>/             logs/, results/<gate>.json, manifest.json,
+#                              report.json, gates.log (the merged log)
+#   ports.reserved             the shared loopback ledger (see _lib.py,
+#                              port_allocator.py: same rows, same flock rules)
+# Modes:
+#   plan                        print the selection/group/lock/deps plan
+#   prepare                     freeze + build now, write a manifest to reuse
+#   run (default)               freeze, schedule, record, aggregate
+#   --aggregate --manifest M --results "dirA dirB" [--gates "..."]
+#                               decide several runs at once: same-version rules
+#                               apply, so an aggregate is only as trustworthy as
+#                               the manifests you pass it
+
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -146,386 +194,67 @@ REPO_ROOT=$LUA_ROUTER   # standalone repo: repo root == this dir
 AUTHZ_IMAGE=${OPENRESTY_TEST_IMAGE:-authz:latest}
 RESTY_IMAGE=${LR_RESTY_IMAGE:-apache/apisix:3.11.0-debian}
 E2E_IMAGE=${LR_IMAGE:-lua-router:integration}
-STAMP=$(date -u +%Y%m%d-%H%M%S)
-LOG_DIR=${LR_GATE_LOG_DIR:-/data/tmp/lr-gates}
-LOG=${LR_GATE_LOG:-$LOG_DIR/gates-$STAMP.log}
-KEEP_GOING=${KEEP_GOING:-0}
-GATE_ONLY=${GATE_ONLY:-}
-mkdir -p "$LOG_DIR"
-# LR_GATE_LOG may name a path outside LOG_DIR (the original script derived the
-# default log from LR_GATE_LOG_DIR, so the two could disagree). Create the
-# directory of the file actually used, or every gate dies on the redirect.
-mkdir -p "$(dirname "$LOG")"
 
-# ------------------------------------------------------------------ concurrency
-# GATE_JOBS>1 turns the serial run into a worker pool over PARALLEL_GATES, with
-# WAVE_PRE before it and WAVE_TAIL strictly after it. Only the pool is concurrent;
-# the split is what keeps the machine-wide readers (the docker.sock port snapshot,
-# the mesh roster, a fixed listener) from observing another gate containers.
-GATE_JOBS=${GATE_JOBS:-1}
-GATE_DRY_RUN=${GATE_DRY_RUN:-0}
-if ! [[ "$GATE_JOBS" =~ ^[0-9]+$ ]] || [[ "$GATE_JOBS" -lt 1 ]]; then
-    printf "GATE_JOBS must be a positive integer (got: %s)\n" "$GATE_JOBS" >&2
-    exit 2
-fi
-
-# The run is split into three phases; only phases 1 and 2 are pools, and
-# membership is decided by what a gate reads from the machine, never by how
-# long it takes.
-#
-# PHASE 1 (pool) -- these four may share the pool because between them only
-# contract ever binds a host port:
-#   build            writes lua-router:integration; the other three read only
-#                    the two pre-existing images (authz:latest, apisix), so no
-#                    tag is produced and consumed inside the same phase. It
-#                    sits here, not in phase 2, because every e2e suite boots
-#                    the image it writes.
-#   conf             docker run --rm, no --network host, no published port.
-#   unit             luajit/resty --rm runs, no network at all.
-#   contract         carries the caveat that shapes phase 1: it publishes host
-#                    ports picked by its OWN free_port() (test_lua_router.sh:194,
-#                    a plain bind(0)) which does not consult the shared reserve
-#                    file. It is safe only beside gates that bind no host port,
-#                    and these three do. Put any phase-2 gate next to it and the
-#                    suite dies on "container failed to start" for a reason that
-#                    has nothing to do with the code under test.
-#
-# PHASE 2 (pool) -- every gate here takes its host port from
-# _lib.free_port(), which reserves numbers across processes through a shared
-# file, and pins SMG_METRICS_PORT=0 so the 29000 scrape listener never competes.
-#
-# PHASE 3 (serial, one at a time) -- each of these reads state that belongs to
-# the whole machine, so they may not even overlap each other:
-#   e2e_watcher      snapshots "docker ps --format {{.Ports}}" to build its
-#                    SMG_WATCHER_EXCLUDE list (e2e_watcher.py:501 and :732) and
-#                    mounts /var/run/docker.sock. A container another gate
-#                    starts after that snapshot is an unaccounted published port,
-#                    so its "exactly one worker" assertions fail for an unrelated
-#                    reason.
-#   mesh_two         asserts the mesh roster across an 18 s stability window and
-#                    a stop/heal partition window (test_mesh_two.py:132-137);
-#                    roster timing only means anything with no other router
-#                    answering on the box LAN address.
-#   e2e_tls_chain    names one fixed listener (31337, e2e_tls_chain.py:942) and
-#                    checks SNI selection on it, so nothing else may be binding
-#                    near that range while it runs.
-WAVE_PRE=(build conf unit contract)
-WAVE_TAIL=(e2e_watcher mesh_two e2e_tls_chain)
-
-# Parallel-safe pool (phase 2).
-# Every gate below takes its host port from _lib.free_port(), which now reserves
-# numbers across processes through the shared $RESULT_DIR/ports.reserved file, and
-# pins SMG_METRICS_PORT=0 so the 29000 scrape listener never competes. The mock
-# workers bind ports the same way, and their logs live under $TMP keyed by port.
-PARALLEL_GATES=(probes e2e_stateful e2e_policies e2e_ui_bridge
-                e2e_errors e2e_effort head_routes mesh_http e2e_policy_parity
-                e2e_token_accounting e2e_gpu_load e2e_routing_dyn e2e_profiles
-                e2e_caps e2e_models_advertisement)
-
-# Fail closed, and only sound because it runs after GATE_ORDER is defined (see
-# the call site below): an
-# unclassified gate is a hard error rather than a silent fall-through to serial.
-check_gate_classification() {
-    local _g _h _seen
-    for _g in "${GATE_ORDER[@]}"; do
-        _seen=0
-        for _h in "${WAVE_PRE[@]}" "${PARALLEL_GATES[@]}" "${WAVE_TAIL[@]}"; do
-            [[ "$_h" == "$_g" ]] && _seen=1
-        done
-        if [[ "$_seen" != "1" ]]; then
-            printf "gate %s is not classified as parallel or exclusive\n" "$_g" >&2
-            exit 2
-        fi
-    done
-}
-
-parallel_active() {
-    if [[ "$GATE_JOBS" -gt 1 && -z "$GATE_ONLY" ]]; then return 0; fi
-    return 1
-}
-
-# A pool has no "first failure" to stop at, so the parallel run always keeps
-# going and lets summary decide the exit code. Set here, before the log header,
-# so the recorded KEEP_GOING line matches what actually happened.
-if parallel_active; then KEEP_GOING=1; fi
-
-# One gate run at a time: an flock held for the life of the process, so a second
-# run (parallel or serial) is refused instead of overlapping the first.
-# The lock path is FIXED, deliberately not $LOG_DIR: LR_GATE_LOG_DIR lets a caller
-# move the log anywhere, and if the lock moved with it, two runs pointed at
-# different log dirs would each find their own lock free and both start -- the
-# exact overlap this exists to prevent. A dry run takes no lock: it prints the
-# plan and touches nothing.
-if [[ "$GATE_DRY_RUN" != "1" ]]; then
-    mkdir -p /data/tmp/lr-gates
-    exec 9>/data/tmp/lr-gates/.gates.lock
-    if ! flock -n 9; then
-        printf "another final_gates run holds the gates lock; refusing to start a\n" >&2
-        printf "second one (hard rule: only one gate run at a time)\n" >&2
-        exit 3
-    fi
-fi
-
-# gate order; keep in sync with the SKIP_ENV table in the header
-GATE_ORDER=(build conf unit contract probes e2e_stateful e2e_policies e2e_ui_bridge
-            e2e_errors e2e_effort head_routes mesh_http
-            e2e_policy_parity e2e_watcher e2e_token_accounting e2e_gpu_load
-            e2e_routing_dyn e2e_profiles e2e_caps e2e_models_advertisement
-            mesh_two e2e_tls_chain)
-
-# quick tier: only the gates that verify in seconds-to-minutes without the
-# slow e2e container suites. The default for ordinary changes.
-QUICK_GATES=(build conf unit contract probes)
-GATE_TIER=${GATE_TIER:-quick}
-case "$GATE_TIER" in
-    quick|full) ;;
-    *) printf 'GATE_TIER must be quick or full (got: %s)\n' "$GATE_TIER" >&2; exit 2 ;;
+case "${1:-}" in
+    --help|-h)
+        sed -n "1,100p" "${BASH_SOURCE[0]}"
+        exit 0 ;;
+    --gate-body)
+        ;;                                   # handled after the gate bodies load
+    plan|prepare|run|aggregate)
+        exec python3 "$SCRIPT_DIR/gates/runner.py" "$1" "${@:2}" ;;
+    --plan|--prepare|--run|--aggregate)
+        # flag form: the flag is the mode, the rest belongs to the runner, so
+        # --aggregate --manifest M --results "dir1 dir2" reaches argparse intact
+        mode="${1#--}"; shift
+        exec python3 "$SCRIPT_DIR/gates/runner.py" "$mode" "$@" ;;
 esac
 
-in_tier() {
-    local g=$1 want
-    [[ "$GATE_TIER" == "full" ]] && return 0
-    for want in "${QUICK_GATES[@]}"; do [[ "$want" == "$g" ]] && return 0; done
-    return 1
-}
+# ------------------------------------------------------------------ gate bodies
+# The 22 bodies below are the historical release checks, unchanged: they are what
+# a green anchor certifies. The runner launches each through --gate-body, with
+# this script resolved from inside the frozen snapshot, so REPO_ROOT points at
+# the snapshot and every -v "$REPO_ROOT:/repo" mount, every python3
+# test/integration/*.py and every luajit unit run reads frozen bytes - not the
+# live worktree a parallel agent may be editing underneath.
 
-# Runs here rather than where the wave tables are declared: it walks GATE_ORDER,
-# which is defined above this point and not below it. An unclassified gate is a
-# hard error, so adding a gate without classifying it cannot silently serialise.
-check_gate_classification
-
-declare -A SKIP=()
-raw_skips=${SKIP_ENV:-}
-for want in ${raw_skips//,/ }; do
-    SKIP["$want"]=1
-done
-matched=0
-for want in "${!SKIP[@]}"; do
-    matched=0
-    for g in "${GATE_ORDER[@]}"; do [[ "$g" == "$want" ]] && matched=1; done
-    [[ "$matched" == "1" ]] || { echo "SKIP_ENV: unknown gate '$want' (known: ${GATE_ORDER[*]})" >&2; exit 2; }
-done
-
-PASSED_GATES=0
-FAILED_GATES=0
-SKIPPED_GATES=0
-FAILURES=()
-
-is_selected() {
-    local g=$1
-    [[ -n "$GATE_ONLY" && "$GATE_ONLY" != "$g" ]] && return 1
-    [[ -n "${SKIP[$g]:-}" ]] && return 1
-    in_tier "$g" || return 1
-    return 0
-}
-
-# gate NAME [command...] — runs the command, tees into $LOG, and records the
-# result. A gate is a shell function name defined below (gate_<name>).
-gate() {
-    local name=$1; shift
-    if [[ -z "$GATE_ONLY" ]] && ! in_tier "$name"; then
-        # not in this tier and not singled out: simply not part of this run.
-        # Deliberately NOT recorded as a skip — a quick log must not read as
-        # a shrunk full log.
-        return 0
-    fi
-    if [[ -n "${SKIP[$name]:-}" ]]; then
-        SKIPPED_GATES=$((SKIPPED_GATES + 1))
-        printf '\n== gate: %-14s SKIPPED (SKIP_ENV) ==\n' "$name"
-        printf '   see the header comment for what this skip leaves unverified\n'
-        { echo; echo "== gate: $name SKIPPED by SKIP_ENV =="; } >>"$LOG"
-        return 0
-    fi
-    if [[ -n "$GATE_ONLY" && "$GATE_ONLY" != "$name" ]]; then
-        return 0
-    fi
-    printf '\n== gate: %-14s ' "$name"
-    { echo; echo "===== gate: $name  $(date -u +%H:%M:%S) ====="; } >>"$LOG"
-    local started=$SECONDS rc=0
-    if [[ $# -gt 0 ]]; then
-        "$@" >>"$LOG" 2>&1
-        rc=$?
+# Group selection over the shared unit gate: LR_GATE_UI_ONLY=1 (set by the
+# runner when the selection is exactly group=ui) narrows gate_unit to the node
+# UI badge test and turns gate_contract into a recorded skip. A group filter has
+# to be real: 'ui' must not silently run the whole luajit/resty/contract tree.
+unit_subset() {
+    local all=(test_tree test_tree_bounds test_state_bounds test_observability test_policies test_hash test_mesh test_watcher test_gpu_load test_routing_dyn test_profiles test_caps_persist test_caps_routing test_models_shape test_models_advertise test_effort_layers test_admin_auth)
+    if [[ "${LR_GATE_UI_ONLY:-0}" == "1" ]]; then
+        printf '%s\n' test_ui_merge.mjs
     else
-        run_gate_body "$name" "$LOG"
-        rc=$?
-    fi
-    local took=$((SECONDS - started))
-    if [[ "$rc" == "0" ]]; then
-        PASSED_GATES=$((PASSED_GATES + 1))
-        printf 'PASS  (%3ss)\n' "$took"
-    else
-        FAILED_GATES=$((FAILED_GATES + 1))
-        FAILURES+=("$name (rc=$rc, ${took}s)")
-        printf 'FAIL  (%3ss, rc=%s)\n' "$took" "$rc"
-        printf '   last lines of %s:\n' "$LOG"
-        tail -n 25 "$LOG" | sed 's/^/   | /'
-    fi
-    if [[ "$rc" != "0" && "$KEEP_GOING" != "1" && -z "$GATE_ONLY" ]]; then
-        printf '\nstopping at the first failing gate (%s)\n' "$name"
-        printf 'full log: %s\n' "$LOG"
-        exit 1
-    fi
-    return 0
-}
-
-# run_gate_body NAME LOGFILE NAMESPACE — the single place a gate body is
-# executed. NAMESPACE=1 (parallel only) also hands the suite a gate-scoped tag,
-# which _lib.py folds into every container name, every mock log path and every
-# per-run temp file, plus the one reserve file the pool shares so two suites
-# cannot be handed the same loopback port. With NAMESPACE=0 nothing is exported,
-# so the default serial run is the historical byte-for-byte behaviour.
-run_gate_body() {
-    local name=$1 logfile=$2 namespace=${3:-0}
-    if [[ "$namespace" == "1" ]]; then
-        export LR_GATE_TAG="$name"
-        # One reserve file for the whole pool: a per-gate file would let two
-        # suites be handed the same port, which is the race this closes.
-        export LR_PORT_RESERVE="$RESULT_DIR/ports.reserved"
-    fi
-    # 9>&- drops the run-wide lock before the gate body runs. It is inherited by
-    # every child otherwise, so one gate that leaks a stray background process --
-    # an orphaned mock worker, say -- would keep the lock alive after this script
-    # exits and block every later run. The parent still holds it, so the run
-    # remains exclusive; only the descendants stop advertising that they hold it.
-    "gate_$name" >>"$logfile" 2>&1 9>&-
-}
-
-# Parallel bookkeeping. Jobs report through $RESULT_DIR/<gate>.rc (rc, seconds,
-# start stamp) and never touch the shared counters, which stay parent-only.
-declare -A JOB_PID=()
-
-start_gate_job() {
-    local name=$1
-    local plog="$PER_GATE_DIR/$name.log"
-    : >"$plog"
-    rm -f "$RESULT_DIR/$name.rc"
-    # 9>&- so a gate that leaks a stray background process cannot keep the
-    # run-wide flock alive after this script exits and wedge every later run.
-    (
-        local started=$SECONDS rc
-        run_gate_body "$name" "$plog" 1
-        rc=$?
-        # write-then-rename so the parent never reads a half-written result
-        printf "%s %s %s\n" "$rc" "$((SECONDS - started))" "$(date -u +%H:%M:%S)" \
-            >"$RESULT_DIR/$name.rc.part"
-        mv -f "$RESULT_DIR/$name.rc.part" "$RESULT_DIR/$name.rc"
-    ) 9>&- &
-    JOB_PID["$name"]=$!
-}
-
-# collect_finished — print + count every job that reported, in completion order
-# so a red gate shows its own context the moment it lands.
-collect_finished() {
-    local name rc took
-    for name in "${!JOB_PID[@]}"; do
-        [[ -f "$RESULT_DIR/$name.rc" ]] || continue
-        read -r rc took <<<"$(cut -d" " -f1,2 "$RESULT_DIR/$name.rc")" || continue
-        [[ -n "$rc" && -n "$took" ]] || continue
-        unset "JOB_PID[$name]"
-        if [[ "$rc" == "0" ]]; then
-            PASSED_GATES=$((PASSED_GATES + 1))
-            printf '\n== gate: %-14s PASS  (%3ss)\n' "$name" "$took"
-        else
-            FAILED_GATES=$((FAILED_GATES + 1))
-            FAILURES+=("$name (rc=$rc, ${took}s)")
-            printf '\n== gate: %-14s FAIL  (%3ss, rc=%s)\n' "$name" "$took" "$rc"
-        fi
-        if [[ "$rc" != "0" ]]; then
-            printf '   last lines of %s:\n' "$PER_GATE_DIR/$name.log"
-            tail -n 25 "$PER_GATE_DIR/$name.log" | sed 's/^/   | /'
-        fi
-    done
-}
-
-# run_wave — the pool over the gates named in the arguments; blocks are
-# appended to $LOG in GATE_ORDER afterwards, so the log keeps the serial shape
-# (one ===== gate: NAME HH:MM:SS ===== block per gate, in run order).
-run_wave() {
-    local -a queue=("$@")
-    local -a requested=("$@")
-    local name; local -a finished=()
-    while [[ ${#queue[@]} -gt 0 || ${#JOB_PID[@]} -gt 0 ]]; do
-        while [[ ${#JOB_PID[@]} -lt "$GATE_JOBS" && ${#queue[@]} -gt 0 ]]; do
-            name=${queue[0]}
-            queue=("${queue[@]:1}")
-            if [[ -n "${SKIP[$name]:-}" ]]; then
-                SKIPPED_GATES=$((SKIPPED_GATES + 1))
-                printf '\n== gate: %-14s SKIPPED (SKIP_ENV) ==\n' "$name"
-                printf '   see the header comment for what this skip leaves unverified\n'
-                finished+=("$name")
-                continue
-            fi
-            if ! is_selected "$name"; then
-                continue
-            fi
-            start_gate_job "$name"
-        done
-        [[ ${#JOB_PID[@]} -gt 0 ]] || break
-        collect_finished
-        [[ ${#JOB_PID[@]} -gt 0 ]] && sleep 0.5
-    done
-    collect_finished
-    for name in "${finished[@]}"; do
-        { echo; echo "===== gate: $name  SKIPPED by SKIP_ENV ====="; } >>"$LOG"
-    done
-    # Only the gates this wave actually ran, in GATE_ORDER. A second wave must
-    # not re-append the first wave blocks, which is why the queue itself (not the
-    # whole result dir) decides what to merge.
-    for name in "${GATE_ORDER[@]}"; do
-        # merge only this wave gates, and only those that really ran
-        local hit=0
-        for _r in "${requested[@]}"; do [[ "$_r" == "$name" ]] && hit=1; done
-        [[ "$hit" == "1" ]] || continue
-        [[ -f "$RESULT_DIR/$name.rc" ]] || continue
-        { echo; echo "===== gate: $name  parallel ====="; cat "$PER_GATE_DIR/$name.log"; } >>"$LOG"
-    done
-}
-
-summary() {
-    printf '\n----------------------------------------\n'
-    printf 'final gates [tier=%s]: %d passed, %d failed, %d skipped (SKIP_ENV=%s)\n' \
-        "$GATE_TIER" "$PASSED_GATES" "$FAILED_GATES" "$SKIPPED_GATES" "${raw_skips:-none}"
-    [[ ${#FAILURES[@]} -eq 0 ]] || printf 'failed: %s\n' "${FAILURES[*]}"
-    [[ ${#SKIP[@]} -eq 0 ]] || printf 'skipped: %s\n' "${!SKIP[*]}"
-    printf 'log: %s\n' "$LOG"
-    { echo; echo "== summary: $PASSED_GATES passed, $FAILED_GATES failed, $SKIPPED_GATES skipped (tier=$GATE_TIER) =="; } >>"$LOG"
-    [[ "$FAILED_GATES" == "0" ]] || exit 1
-    return 0
-}
-
-# ------------------------------------------------------------------ preflight
-preflight() {
-    local missing=()
-    command -v docker >/dev/null || missing+=(docker)
-    command -v curl  >/dev/null || missing+=(curl)
-    command -v jq    >/dev/null || missing+=(jq)
-    command -v python3 >/dev/null || missing+=(python3)
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        printf 'missing tools: %s\n' "${missing[*]}" >&2
-        exit 2
-    fi
-    docker image inspect "$AUTHZ_IMAGE" >/dev/null 2>&1 || {
-        printf 'image %s is not present (needed by conf/unit/contract)\n' "$AUTHZ_IMAGE" >&2
-        exit 2; }
-    # Only check an image when a gate that needs it is actually selected, so
-    # SKIP_ENV=unit works on a box without the apisix image.
-    if is_selected unit; then
-        docker image inspect "$RESTY_IMAGE" >/dev/null 2>&1 || {
-            printf 'image %s is not present (needed by the resty-based unit runs)\n' \
-                "$RESTY_IMAGE" >&2
-            exit 2; }
-    fi
-    if is_selected e2e_stateful || is_selected head_routes || is_selected mesh_http ||
-       is_selected e2e_tls_chain; then
-        docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || {
-            printf 'image %s is not present (the e2e suites boot it; drop SKIP_ENV=build)\n' \
-                "$E2E_IMAGE" >&2
-            exit 2; }
+        printf '%s\n' "${all[@]}"
     fi
 }
-
-# ------------------------------------------------------------------ gates
+ui_only_skip() {
+    if [[ "${LR_GATE_UI_ONLY:-0}" == "1" ]]; then
+        printf 'UI-only selection: %s not part of the ui group; recorded as a skip by the runner\n' "$1"
+        exit 5
+    fi
+}
 gate_build() {
+    # The base comes from the FROZEN MANIFEST, never from the Dockerfile's
+    # mutable FROM tag: a plain 'docker build -f Dockerfile' resolves
+    # authz:latest at build time, so a base retagged between freeze and build
+    # builds on the new image while the run's manifest reports the old one --
+    # the build gate would certify an identity the registry disproves, and the
+    # on_build backfill now refuses exactly that (it checks the registry's base
+    # evidence, not a self-declared field).
+    # The context module owns the CLI: 'build --manifest PATH' runs
+    # build_for_manifest -- registry-first under the cache-key lock, FROM pinned
+    # to a private tag bound to the manifest's build_base_id -- prints the
+    # identity json and exits 0. LR_GATE_MANIFEST is the manifest the
+    # RunContext wrote atomically at run start (ctx.manifest_path).
+    # No LR_GATE_MANIFEST = a standalone direct run: nothing froze this tree, so
+    # there is no pinned base to honour and the historical plain build stands.
+    if [[ -n "${LR_GATE_MANIFEST:-}" && -f "${LR_GATE_MANIFEST}" ]]; then
+        ( cd "$REPO_ROOT" && python3 test/gates/context.py build --manifest "$LR_GATE_MANIFEST" )
+        return $?
+    fi
     ( cd "$REPO_ROOT" && docker build -t "$E2E_IMAGE" -f Dockerfile . )
 }
 
@@ -573,7 +302,16 @@ run_unit_node() {
 }
 
 gate_unit() {
+    # UI-only selection (LR_GATE_UI_ONLY=1, set by the runner when the selection
+    # is exactly group=ui): run the node UI badge test and nothing else. The
+    # luajit/resty lists and the contract gate belong to other groups, and a
+    # group filter has to be real - the ui group must not quietly run the tree.
     local rc=0 t
+    if [[ "${LR_GATE_UI_ONLY:-0}" == "1" ]]; then
+        printf '\n-- node test_ui_merge (ui-only subset)\n'
+        run_unit_node test_ui_merge.mjs || rc=1
+        return "$rc"
+    fi
     # test_caps_routing：并发/利用率上限与 candidates 交集的纯 luajit 单测（无端口，
     # 与其余 luajit 组同档）；它钉的判定在 router.lua/registry.lua 里，HTTP 面只有
     # e2e_caps 一份门禁，二者缺一就会漏掉"上限写成排序项"这类回归。
@@ -619,10 +357,49 @@ gate_unit() {
     # —— 把已经生效的上限读成失效配置，HTTP 面没有任何症状，只能钉纯函数。
     printf '\n-- node test_ui_merge\n'
     run_unit_node test_ui_merge.mjs || rc=1
+    # test_gate_runner.py: the release runner's own self-test, against a fake
+    # gate backend (no docker, no HTTP, no ports), so it can join the unit gate
+    # without changing what any other unit run observes. It pins the scheduling
+    # contract this script now depends on: selection and group filters, the
+    # dependency edges that replace the old wave barrier, the observation lock
+    # (shared for HTTP gates, exclusive for the watcher), per-run namespaces,
+    # and the result rules - a missing record is a crash, a red body is never
+    # rescued by its marker, a foreign fingerprint/image id is refused, and a
+    # targeted run may not claim a full anchor.
+    printf '\n-- python3 test_gate_runner.py (gate runner self-test)\n'
+    ( cd "$REPO_ROOT" && timeout 300 python3 test/test_gate_runner.py ) || rc=1
+    # The two runner-module self-tests that live in their own files, for the two
+    # modules the scheduler cannot certify alone: results.py (coverage/scope rules
+    # - a UI-node pass is not full unit coverage, a subset selection can never be
+    # a full anchor, duplicate full-scope passes dedup but a fail is never
+    # overwritten by a later pass) and context.py (the snapshot publish race, the
+    # (fingerprint, authz base id) image-cache key, manifest validation). They are
+    # pure python - fake docker, no ports, no HTTP - so they run in-process like
+    # test_gate_runner.py.
+    #
+    # Missing file is a RED unit gate, not a skip: these files are part of the
+    # harness tree, and a gate that quietly passes when its self-test vanished
+    # would certify a runner nobody tested. The unit gate must not be the place
+    # where an absent harness test reads as green.
+    for t in test_gate_results test_gate_context; do
+        if [[ ! -f "$REPO_ROOT/test/$t.py" ]]; then
+            printf '!! test/%s.py missing: unit gate is RED, not skipped\n' "$t" >&2
+            rc=1
+            continue
+        fi
+        printf '\n-- python3 %s.py (runner module self-test)\n' "$t"
+        ( cd "$REPO_ROOT" && timeout 300 python3 "test/$t.py" ) || rc=1
+    done
     return "$rc"
 }
 
 gate_contract() {
+    # Under UI-only group selection the wire contract is outside the selected subset.
+    # rc=5 is a recorded SKIP, not a green contract result.
+    if [[ "${LR_GATE_UI_ONLY:-0}" == "1" ]]; then
+        printf 'ui-only selection: contract belongs to base, not ui\n'
+        exit 5
+    fi
     ( cd "$REPO_ROOT" && timeout 2400 bash test/test_lua_router.sh )
 }
 
@@ -652,77 +429,24 @@ gate_e2e_routing_dyn() { run_integration e2e_routing_dyn.py 900; }
 gate_mesh_two()        { run_integration test_mesh_two.py 900; }
 gate_e2e_tls_chain()   { run_integration e2e_tls_chain.py 1500; }
 
-preflight
-{
-    echo "lua-router final gates  $STAMP"
-    echo "repo=$REPO_ROOT authz=$AUTHZ_IMAGE resty=$RESTY_IMAGE e2e=$E2E_IMAGE"
-    echo "KEEP_GOING=$KEEP_GOING GATE_ONLY=${GATE_ONLY:-none} SKIP_ENV=${raw_skips:-none}"
-} >>"$LOG"
-
-
-run_all_gates() {
-    if ! parallel_active; then
-        # Default: the historical serial run, one shared $LOG, first failure stops.
-        gate build; gate conf; gate unit; gate contract; gate probes
-        gate e2e_stateful; gate e2e_policies; gate e2e_ui_bridge; gate e2e_errors
-        gate e2e_effort; gate head_routes; gate mesh_http; gate e2e_policy_parity
-        gate e2e_watcher; gate e2e_profiles; gate e2e_caps
-        gate e2e_models_advertisement; gate e2e_token_accounting; gate e2e_gpu_load
-        gate e2e_routing_dyn; gate mesh_two; gate e2e_tls_chain
-        return 0
+# ------------------------------------------------------------------ body mode
+# --gate-body NAME: the runner's per-gate re-entry point. Runs exactly one gate
+# body, writing to stdout/stderr for the runner to capture, and publishes the
+# result marker. Exit 0 WITHOUT the marker is recorded as crash: a body killed
+# by a signal, or one whose tail was bypassed, must not be able to read green.
+if [[ "${1:-}" == "--gate-body" ]]; then
+    gate_name=${2:-}
+    gate_fn="gate_${gate_name}"
+    if ! declare -F "$gate_fn" >/dev/null; then
+        printf 'gate body: unknown gate %s\n' "$gate_name" >&2
+        exit 2
     fi
-    PER_GATE_DIR="$LOG_DIR/per-gate-$STAMP"
-    RESULT_DIR="$LOG_DIR/results-$STAMP"
-    rm -rf "$PER_GATE_DIR" "$RESULT_DIR"
-    mkdir -p "$PER_GATE_DIR" "$RESULT_DIR"
-    export LR_PORT_RESERVE="$RESULT_DIR/ports.reserved"
-    : >"$LR_PORT_RESERVE"
-    # Phase 1: the portless four. build writes the image every e2e suite boots,
-    # and contract is the only member that publishes a host port (an unreserved
-    # bind(0) of its own), which is safe only because the other three bind none.
-    run_wave "${WAVE_PRE[@]}"
-    # If build is red, the 15 suites that boot its image would all fail for the
-    # same unrelated reason, so stop there. A red contract does not stop the run:
-    # it is independent of the container suites, and seeing all of them in one
-    # pass is the point of running them together.
-    if [[ -f "$RESULT_DIR/build.rc" && "$(cut -d" " -f1 "$RESULT_DIR/build.rc")" != "0" ]]; then
-        printf "\nstopping: the build gate is red, the e2e pool cannot be trusted\n"
-        summary
+    "$gate_fn"
+    gate_rc=$?
+    if [[ "$gate_rc" == "0" && -n "${LR_GATE_RESULT:-}" ]]; then
+        : >"$LR_GATE_RESULT"
     fi
-    printf "\n== phase 2 (pool, %s at a time, %s gates eligible)\n" \
-        "$GATE_JOBS" "${#PARALLEL_GATES[@]}"
-    run_wave "${PARALLEL_GATES[@]}"
-    # Phase 3 uses gate(), never the pool: these read machine-wide state, so
-    # they must not even overlap each other. gate() appends to $LOG directly,
-    # which is why no merge step is needed for them.
-    for _name in "${WAVE_TAIL[@]}"; do
-        gate "$_name"
-    done
-    printf "\nper-gate logs: %s\n" "$PER_GATE_DIR"
-}
-
-if [[ "$GATE_DRY_RUN" == "1" ]]; then
-    printf "lua-router final gates — plan only (nothing executed)\n"
-    printf "tier=%s  GATE_JOBS=%s  selected tier gates:\n" "$GATE_TIER" "$GATE_JOBS"
-    for g in "${GATE_ORDER[@]}"; do
-        if is_selected "$g"; then tag="run"; else tag="off"; fi
-        # Which pool the gate belongs to, so the plan reads like the scheduler.
-        mode=serial-only
-        for _p in "${WAVE_PRE[@]}"; do [[ "$_p" == "$g" ]] && mode=pool-1; done
-        for _p in "${PARALLEL_GATES[@]}"; do [[ "$_p" == "$g" ]] && mode=pool-2; done
-        for _p in "${WAVE_TAIL[@]}"; do [[ "$_p" == "$g" ]] && mode=serial-only; done
-        if [[ -n "${SKIP[$g]:-}" ]]; then tag="skip"; fi
-        printf "  %-24s %-6s %s\n" "$g" "$tag" "$mode"
-    done
-    printf "\nphase 1 (pool, %s at a time): %s\n" "$GATE_JOBS" "${WAVE_PRE[*]}"
-    printf "phase 2 (pool, %s at a time): %s\n" "$GATE_JOBS" "${PARALLEL_GATES[*]}"
-    printf "phase 3 (serial, one at a time): %s\n" "${WAVE_TAIL[*]}"
-    exit 0
+    exit "$gate_rc"
 fi
 
-run_all_gates
-
-if [[ "$KEEP_GOING" == "1" && "$FAILED_GATES" != "0" ]]; then
-    summary
-fi
-summary
+exec python3 "$SCRIPT_DIR/gates/runner.py" run "$@"

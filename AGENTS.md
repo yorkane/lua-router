@@ -60,7 +60,7 @@
 > `virtual_ctx_cap`（实现在 `config_store/readers.lua`）实现原样保留但**热路径无调用者**，
 > `ctx_cap` 的生产读者只有展示面两处：`props.lua` 的 `with_ctx`（挂载点 `/props` 与 `/u/props`，两者都在保护清单之外），
 > 作用是把回显的 `n_ctx` / `n_ctx_train` 换成操作员声明的值；以及 `router/models_api.lua` 的 `resolve_model_caps`，
-> 把它当 `capabilities.context_length` 的**声明层**读数（操作员声明优先于引擎自报）。两处都不影响任何转发字节）。
+> 把它当 `capabilities.context_length` 的**声明层**读数（操作员声明优先于引擎自报）。两处都不影响任何转发字节。
 
 > **用户裁定 2026-10-04（现行，推翻上一条对 `context_window` 的定义）**：
 > 1. **网关不再改写调用方的输出预算**：`max_tokens` / `max_completion_tokens` / `max_output_tokens`
@@ -90,14 +90,11 @@
 
 以下是不可违反的硬规则：
 
-1. **测试纪律**：`test/final_gates.sh` / `test/test_lua_router.sh` / `test/integration/e2e_*.py` 全部
-   host 网络 + 容器名前缀，**门与门之间严禁并发**（跑前 `ps` 查）——这条约束的是「一门的容器别踩到另一门
-   的端口 / 名册 / 快照」，不是「永远只能单门跑」；`GATE_JOBS=N` 正是为此把互不干扰的门并行跑（口径与
-   留串行的三门见 README〈门禁〉，**缺省不设 `GATE_JOBS` 时行为与原来逐字节一致**）。luajit/resty 单测
-   （无端口绑定）可并发。同一时刻仍只允许**一份**门禁在跑（脚本内 `flock` 保证）。
-   精确 kill PID，禁止 pkill。测试容器全部 `lr-*` 前缀，收尾必须清零。门禁两档：
-   `GATE_TIER=quick`（缺省，build/conf/unit/contract/probes 约 3 分钟）供普通修改快速验证；
-   发版、文档计数更新、生产镜像替换必须 `GATE_TIER=full` 全量 22 门全绿（快速档绿不算全绿锚点）。
+1. **测试纪律**：测试门禁支持**跨独立 run 并发**；隔离依赖冻结源码快照/镜像 manifest、每 run/gate 命名空间、共享机器端口台账及声明式资源锁，不依赖人工串行。跑前仍检查已有测试和端口占用，确保资源账本可用。详细可复制流程和各验证维度见 [doc/testing-workflow.md](doc/testing-workflow.md)。默认 `GATE_JOBS` 为 `min(8, CPU 数)`，`GATE_JOBS=1` 是显式串行；各 run 同时受本机 Docker/CPU 资源限制。
+   精确 kill 自己拥有的 PID，禁止 `pkill`；只清理由本 run 名册记录的容器、文件和 ledger 行，**禁止全局清理 `lr-*`**——收尾按**本 run 的容器名册**核对归零，不是全机 `lr-*` 计数（并发下别人的 run 也在用这个前缀）。
+   改动按最小面验证（doc/testing-workflow.md §6 的矩阵：UI 走 `GATE_GROUP=ui`、声明层走 config、路由走 routing、跨组件接线必须带 `contract`），不要默认每次都跑 full。
+   门禁两档：`GATE_TIER=quick`（build/conf/unit/contract/probes 五门）供快速反馈；发版与生产镜像替换要求完整 22 门 full 锚点。分组聚合只可在同一版本身份（同 `fingerprint` + 同 `image_id`/`authz_id`/`build_base_id`）下补齐 22 门且无 skip/missing/invalid 时成立，且聚合必须显式 `--tier full`（`full_anchor_eligible` 只在 full 档判定）。
+   **并行委派纪律**：root 先 `prepare` 出一份 manifest 并随任务下发；每个 agent 只认领互不重叠的文件所有权，回报 run id、fingerprint、tier/group 与 `report.json` 路径；不同源码快照/不同镜像的结果禁止混进同一次聚合。
 2. **临时文件一律 /data/tmp/**；生产验证文档更新进 doc/。
 3. **生产容器白名单**：本仓只许动 `lua-router-8800`（compose 在 /data/app/lua-router/）；
    **所有 8800 都是生产**（本机 `lua-router-8800`、21.k:8800、217.t:8800），未经用户明确要求一律不得更新；

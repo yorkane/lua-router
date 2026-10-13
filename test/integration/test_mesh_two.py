@@ -33,7 +33,12 @@ assertions therefore read /ha/stats and nodes[].status for the partition
 window, not the partition label.
 
 Both routers are launched on explicit ports because _lib.start_router allocates
-its own: mutual seeds have to name a port that is already known.
+its own: mutual seeds have to name a port that is already known. Container
+names carry _lib.RUN (not a bare pid suffix), so the run namespace owns them:
+cleanup only touches this run's containers and a concurrent run's containers
+cannot be matched by the same suffix. The mesh self names stay the fixed
+lr-mesh2a / lr-mesh2b: peers are addressed by port (allocated from the shared
+ledger), so two runs sharing the node names cannot see each other.
 
 Nothing is authenticated any more (doc/scope-trim.md): the sync dials travel
 to the LAN address (host network) open, and /ha/*, /_mesh/internal/* and the
@@ -42,8 +47,8 @@ credential. The two-suite history of key-gated mesh access is kept in git.
 """
 import json, os, socket, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _lib import (IMAGE, CONTAINERS, free_port, http, check, start_mock,
-                  logs, stop_router, cleanup, RESULTS)
+from _lib import (RUN, IMAGE, CONTAINERS, free_port, http, check, start_mock,
+                  logs, stop_router, cleanup, RESULTS, CONTAINER_LABELS)
 
 
 def start_router_at(env, name, port):
@@ -51,7 +56,7 @@ def start_router_at(env, name, port):
     full = {"SMG_METRICS_PORT": "0"}
     full.update(env)
     full["SMG_PORT"] = str(port)
-    args = ["docker", "run", "-d", "--name", name]
+    args = ["docker", "run", "-d", "--name", name] + CONTAINER_LABELS
     for k, v in full.items():
         args += ["-e", "%s=%s" % (k, v)]
     args += ["--network", "host", "--entrypoint", "/docker-entrypoint.sh", IMAGE,
@@ -125,8 +130,8 @@ MESH_ENV = {"SMG_ENABLE_MESH": "1",
 pa = free_port()
 start_mock(pa, "alpha")
 port_a, port_b = free_port(), free_port()
-name_a = "lr-mesh2a-" + str(os.getpid())[-5:]
-name_b = "lr-mesh2b-" + str(os.getpid())[-5:]
+name_a = "lr-mesh2a-" + RUN
+name_b = "lr-mesh2b-" + RUN
 
 # The reported shape: SELF loopback, seed by LAN address of the other instance.
 start_router_at(dict(MESH_ENV, SMG_MESH_SELF_NAME="lr-mesh2a",

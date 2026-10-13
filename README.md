@@ -553,35 +553,33 @@ engine 仍是单条 base 记录。关时逐字节不变。
 ```bash
 cd /path/to/lua-router
 bash test/final_gates.sh                     # 快速档（缺省）：build/conf/unit/contract/probes，约 3 分钟
-GATE_TIER=full bash test/final_gates.sh      # 全量 22 门（串行 13–14 分钟）
-GATE_TIER=full GATE_JOBS=6 bash test/final_gates.sh   # 全量并行（实测 6.5 分钟，2.12 倍）
-GATE_DRY_RUN=1 GATE_JOBS=6 bash test/final_gates.sh  # 只打印分组计划，不执行
+GATE_TIER=full bash test/final_gates.sh      # 全量 22 门（池宽缺省 min(8,CPU)；现行锚点一轮外层墙钟 167.5s，见 doc/testing-workflow.md §7；旧串行实现的 917s 是历史数字，gates-20261012-164729.log）
+GATE_TIER=full GATE_JOBS=6 bash test/final_gates.sh   # 显式池宽 6（新实现未单独测过 6 宽；旧并行池 447s 是旧实现的历史数字，gates-20261012-160634.log）
+bash test/final_gates.sh plan                        # 只打印选择/锁/依赖计划，不执行（GATE_DRY_RUN=1 同效）
 GATE_ONLY=contract bash test/final_gates.sh  # 单门（不受档位限制）；GATE_ORDER 见脚本头
 KEEP_GOING=1 bash test/final_gates.sh        # 跑完并计数
 
-bash test/test_lua_router.sh                 # 契约套件单独调试（独占约 2.5 min）
+bash test/test_lua_router.sh                 # 契约套件单独调试（约 2.5 min；端口与容器名走共享台账，可与门禁并发）
 TEST_ONLY=workers bash test/test_lua_router.sh   # 单段调试
 ```
 
-**两套门禁脚本不能同时跑**（`flock` 锁写死在 `/data/tmp/lr-gates/.gates.lock`，第二份直接 `exit 3`）。
-单份内部的**门与门**已经可以并行：各门的容器名、端口台账、临时目录与日志都按 RUN 隔离，
-`GATE_JOBS=N` 即可。跑之前 `ps` 查一遍；测试容器名带 `lr-` 前缀，收尾 `docker ps -a | grep lr-` 清零。
+**并发口径（用户裁定 2026-10-12，推翻上一段旧话「两套门禁脚本不能同时跑：`flock` 锁写死在
+`/data/tmp/lr-gates/.gates.lock`，第二份直接 `exit 3`」）**：门禁的隔离现在由实现提供，不再靠人工串行。每轮
+`prepare` 冻结源码快照与不可变镜像（`lua-router:gate-<指纹>`），每个 run 有独立 run id 与日志/结果/临时目录，
+每门有独立容器名与临时路径，全机共用一份 flock 端口台账（`test/port_allocator.py`），锁只声明在真正共享的资源上
+（HTTP 门共享观测窗、构建走独立准备锁、`e2e_watcher` 零锁）。**多个 run 可以并发**；跑前 `ps` 查一遍是了解现状，
+不是排队条件。可复制命令、按维度选门、聚合规则与实测记录见 [doc/testing-workflow.md](doc/testing-workflow.md)。
 
-分组是**写死在脚本里的表，不是旋钮**——新增门若未归类，脚本 fail-closed 直接 `exit 2`，
-所以加门时必须同时决定它进 pool-1 / pool-2 / serial-only。**这三门必须留串行**，理由各不相同，
-是下一个人加门时的判断依据：
-
-| 门 | 为什么不能并行 |
-|---|---|
-| `e2e_watcher` | 先拍 `docker ps` 端口快照再拼排除表并挂 docker.sock；快照之后别人起的容器是没被排除的发布口，「恰好一个 worker」会因无关原因红 |
-| `mesh_two` | 18 秒稳定窗 + stop/heal 分区窗内验名册；机器上有别的 router 应答时，名册和收敛时间都没有意义 |
-| `e2e_tls_chain` | 硬编码 `SMG_PORT=31337` 并在该口上验 SNI |
-
-生产机上 proc 扫描会把门禁轮的 mock 短暂注册进生产池，跑完清一次（`GET /workers` 找 unhealthy
-测试模型名 → `DELETE /workers/{id}`）。
+旧「三门必须串行」的理由已各自消解：`e2e_watcher` 的 docker 名册由只读代理过滤
+（`test/integration/docker_test_proxy.py`，原 125 项断言不变）；`mesh_two` 的 Lua mesh 是静态对端表、无 gossip
+发现，外来 router 结构上进不了名册，18 秒稳定断言原样保留；`e2e_tls_chain` 的 31337 是 `openresty -t` 渲染场景、
+从不绑定，该端口号在台账里持续规避。分组不再是写死在脚本里的表：`GATE_GROUP=base,config,routing,observability,
+discovery,mesh,tls,ui` 是真旋钮，门若在 `test/gates/catalog.py` 未归类则加载期 assert 直接失败。
 
 快速档绿只证明核心面（语法、单测、wire 契约、探针）；README/交接文档的计数更新、发版与生产
-镜像替换必须以 `GATE_TIER=full` 的全绿日志为锚点。
+镜像替换必须以 `GATE_TIER=full` 的全绿日志为锚点，或由 `aggregate --tier full` 在同一 manifest 下补齐 22 门后判定等价
+（`--tier full` 不能省：`full_anchor_eligible` 只在 tier=full 时判定，quick 档聚合就算 22 门齐也只报 False；
+定向绿的报告同样自带这条 False，两者都不得引为全绿锚）。
 
 单测两个口径（门禁已包含，用于调试单个模块）：
 
@@ -678,6 +676,7 @@ test-gates}、wasm-feasibility、parity-perf v1）已于 2026-10-01 随文档精
 | [doc/deploy-8802-20261012-proxy-auth.md](doc/deploy-8802-20261012-proxy-auth.md) | 同一构建在 21.k:8802 测试实例的先一轮验证（含 playwright 复核） |
 | [doc/docs-cleanup-2026-10-12.md](doc/docs-cleanup-2026-10-12.md) | 本轮文档清理执行记录：移出工作树的 8 项与逐份落地 commit/门禁锚、锚点债（行号→函数名）改造范围、口径与数字修正清单 |
 | [doc/operations-lessons-20261012.md](doc/operations-lessons-20261012.md) | 运维与协作 lessons（2026-10-12 沉淀）：绿锚点→镜像→compose→测试实例→生产的发布链、SQLite 在线备份与 revision 自检、admin 口令三条纪律、门禁 flock/注释门数/被钉注释的边界、文档计数与行号锚的维护规律、21.k 可达性与角色真值 |
+| [doc/testing-workflow.md](doc/testing-workflow.md) | 并发测试工作流（用户裁定 2026-10-12）：隔离机制落点（冻结快照/不可变镜像/命名空间/端口台账/声明式锁）、prepare→manifest 共享、按维度选门的可复制命令、并发纪律与清理边界、定向绿/同版本聚合/full 锚点的判定规则、改动→验证矩阵、实测记录与未测项 |
 | [doc/scope-trim.md](doc/scope-trim.md) | 范围收敛判定书：模块 KEEP/DELETE/TRIM、量化收益、执行记录 |
 | [doc/todo-deferred.md](doc/todo-deferred.md) | TODO 档（MCP、wasm）的唯一口径与启用时的最小方案 |
 | [doc/gap-mesh.md](doc/gap-mesh.md) | mesh / HA 的 CRDT 设计、带宽代价与围栏 |

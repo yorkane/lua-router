@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """effort 的转发链：强制层（原有）+ 三层继承（卡片 → 条目 → 全局）过一遍真 HTTP。
 
-跑法（门禁纪律：lr- 前缀容器 + host 侧 mock，门与门严禁并发；本文件自己抢
-/data/tmp/lr-e2e.lock，抢不到就排队等）：
+跑法（门禁纪律：lr- 前缀容器 + host 侧 mock；跨 run 并发隔离由 runner 的
+LR_RUN_ID/LR_GATE_TAG 唯一 RUN 命名空间与共享端口台账保证——用户明确隔离后，
+并发测试覆盖旧的「门与门严禁并发」约束。本文件不再抢全局 /data/tmp/lr-e2e.lock：
+runner 的 unique RUN 已保证同 run 不重复，无须锁，也不再有 10 分钟排队换假 SKIP）：
     python3 test/integration/e2e_effort.py
 
 与 test/unit/test_effort_layers.lua 的分工（那份纯 luajit，无端口、可并发）：单测钉**三层
@@ -33,7 +35,6 @@ set_top_field 写进转发体。任何一环断掉，转发的 reasoning_effort 
           POST /config/virtual {entries:[{model,target,default_effort,
           effort_map:[{from,to}]}]}
 """
-import fcntl
 import json
 import os
 import subprocess
@@ -42,7 +43,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (RUN, RESULTS, REPO, CONTAINERS, free_port, http, check,
-                  start_mock, logs, cleanup)
+                  start_mock, logs, cleanup, CONTAINER_LABELS)
 
 # 与 e2e_caps / e2e_models_advertisement 同一形态：跑**盘上的 lualib**（CONF_TEST 的
 # lua_package_path 第一位就是 /repo/lualib），不必重建镜像，也不会把并行 agent 未完成的
@@ -56,7 +57,7 @@ GATEWAY_FALLBACK = "172.17.0.1"
 BASE_IMAGE = os.environ.get("OPENRESTY_TEST_IMAGE", "authz:latest")
 LEGACY_LUALIB = os.environ.get("LR_EFFORT_LEGACY_LUALIB",
                                os.environ.get("LR_LEGACY_LUALIB", ""))
-LOCK_PATH = "/data/tmp/lr-e2e.lock"
+
 
 MODEL = "effmod"
 ALIAS = "eff-alias"
@@ -65,31 +66,12 @@ PROBE = "effort probe"
 
 # ------------------------------------------------------------------ 容器与工具
 
-def acquire_gate_lock(seconds=600):
-    """抢门禁全局锁（AGENTS.md 硬规则 1：门与门严禁并发）。抢不到就排队等。
-
-    句柄必须一直持有到进程结束（flock 归持有进程），所以调用方保存返回值。超时返回 None。
-    """
-    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
-    handle = open(LOCK_PATH, "a+")
-    deadline = time.time() + seconds
-    while True:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return handle
-        except OSError:
-            if time.time() >= deadline:
-                handle.close()
-                return None
-            time.sleep(2)
-
-
 def start_conf(env, tag):
     """Serve test/conf/nginx-lua-router.conf; return (port, name, gw)."""
     name = "lr-%s-%s" % (tag[:24], RUN)
     full = dict(BASE_ENV)
     full.update({k: str(v) for k, v in (env or {}).items()})
-    args = ["docker", "run", "-d", "--name", name,
+    args = ["docker", "run", "-d", "--name", name] + CONTAINER_LABELS + [
             "-p", "127.0.0.1::8080", "-v", REPO + ":/repo:ro"]
     if LEGACY_LUALIB:
         # 判别性通道：把改动前的整棵 lualib 盖在盘上那份之上。
@@ -515,11 +497,6 @@ def scenario_declaration_round_trip():
 
 
 def main():
-    handle = acquire_gate_lock()
-    if handle is None:
-        print("SKIP: /data/tmp/lr-e2e.lock held by another gate for >10 min; "
-              "no container started in this run")
-        sys.exit(2)
     print("mode: %s" % (("LEGACY lualib = " + LEGACY_LUALIB) if LEGACY_LUALIB
                         else "HEAD (盘上 lualib)"))
     failed = []
@@ -538,10 +515,6 @@ def main():
         for _, name, detail in failed:
             print("FAILED: %s | %s" % (name, str(detail)[:400]))
         cleanup()
-        try:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        finally:
-            handle.close()
     sys.exit(1 if failed else 0)
 
 
