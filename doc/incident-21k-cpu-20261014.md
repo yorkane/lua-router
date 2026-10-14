@@ -79,3 +79,27 @@
 - 真实 handler A/B：`/data/tmp/lr-chain-1014/root-abort/` 的 `run.py`、原版/修正 `logstore` 副本、`result-old.json`、`result-fixed.json`。验证以这些原始数据和本文汇总为准；旁支研究中未有原始证据支持的 GDB/reload/链长推算等描述未采纳。
 
 上述取证阶段未修改生产代码；后续已按授权完成 full 门禁、8802 验证与 8800 发布，版本与备份身份见上线节。
+## 235.t 部署
+
+- 时间：2026-10-14 16:0x UTC，本机 235.t，生产容器 `lua-router-8800`（compose `/data/app/lua-router/docker-compose.yml`）。
+- 镜像：`pub/lua-router:20261011-fc037af` → `pub/lua-router:20261014-fb6b0d0`（SSE 断连清理修复版）。compose 仅改 `image:` 一行，备份 `docker-compose.yml.bak-20261014-sse`，diff 确认单行变更。旧镜像 20261011-fc037af 保留未删。
+- 容器状态：新容器 `de7f927663ee` Up (healthy)，`restart=unless-stopped` 不变。
+- health：`GET /health` 连续 5 次 200，耗时 0.7–16 ms。
+- 指标：`:29000/metrics` 有 16 条 `lr_` 指标；`lr_config_store_backend{backend="sqlite"}=1`（sqlite 后端为权威源）。
+- 清单：`GET /v1/models` 正常返回 1 条（`startlux-decision-35b-a3b`，`owned_by=lua-router`）。`/workers` 显示 1 个健康 worker（127.0.0.1:18490，router-watch 发现）。
+- SSE 断连验证：管理面未配置 `SMG_ADMIN_AUTH_PASS`，`GET /logs/stream` 匿名 200。两轮 `curl -N -m 3` 与 `-m 8` 拉流后主动断开，均正常退出。断连后 `docker stats --no-stream` 连续 3 次采样（间隔 5s）：0.03% / 0.10% / 0.02%；断连前基线采样 0.02% / 2.24% / 0.08%。无 nginx worker 持续 100% 现象。
+- 冒烟：最小 chat completion（model=`startlux-decision-35b-a3b`，`max_tokens=8`）返回 200，正常 8 token 续写，309.6 tok/s decode。
+
+## 217.t 部署
+
+- 时间：2026-10-14 16:03 UTC，217.t（10.252.25.217），生产容器 `lua-router-8800`。
+- 部署方式说明：该机 `/data/app/lua-router/` 原本**没有 compose 文件**（旧容器是 docker run 起的，目录里只有 config/）。本次按旧容器 `docker inspect` 逐项等价生成 `/data/app/lua-router/docker-compose.yml`（host 网络、restart=unless-stopped、双 bind：config→/data/lua-router:rw 与 docker.sock:ro、全量 env 31 项、shm 64MB、无 healthcheck——与线上完全一致），原 inspect 快照存 `inspect-8800-20261011-89f0ad0.json` 作备份。备份文件名按要求 `docker-compose.yml.bak-20261014-sse` 因无原文件可备份而不适用，以 inspect 快照 + 旧镜像保留代替回滚材料；回滚 = 把 image 行改回 `8800-20261011-89f0ad0` 后 `docker compose up -d`。
+- 镜像：`pub/lua-router:8800-20261011-89f0ad0` → `pub/lua-router:20261014-fb6b0d0`（ACR 直接 pull 成功，digest sha256:249bfcb5…，已登录凭据在 ~/.docker/config.json）。旧镜像保留未删。
+- 容器状态：新容器 Up，`restart=unless-stopped`；`docker compose ls` 已登记 /data/app/lua-router/docker-compose.yml。
+- health：`GET /health` 200；`GET /v1/models` 正常（`Ornith-1.5-35B-A3B`，`owned_by=lua-router`，`created=0`）。`/workers` 显示 4 个 worker 全部 `is_healthy=true`（18490 startlux、18492 orca、8200/8201 Ornith）。
+- 指标：`:29000/metrics` 有 16-17 条 `lr_` 指标（SMG_METRICS_PORT=29000 在 compose env 内）。
+- SSE 断连验证：`SMG_ADMIN_AUTH_PASS` 未配置，`GET /logs/stream` 匿名 200。`curl -m 3` 拉流后断开，容器日志可见对应 `writev() failed (32: Broken pipe)` 收尾行后连接结束；断连后 `docker stats --no-stream` 连续 3 次（间隔 5s）：**0.30% / 0.03% / 0.35%**，全机 loadavg 0.37。无持续高 CPU。
+- 冒烟：`POST /v1/chat/completions`（Ornith-1.5-35B-A3B，max_tokens=16）200 正常续写，309 tok/s decode；上游 8200 直连对照一致。
+- 503 说明：刚替换的 16:03:48–16:04:31 窗口有 9 条 503（no_available_workers，来自 235 的 OpenAI/JS 客户端），为容器重启瞬间 worker 探针尚未恢复所致；16:04:38 起恢复 200，最近 3 分钟窗口 503 计数为 0、chat 200 计 13 条。属预期冷启动，非新缺陷。
+- 未触碰：`lua-router-8802`（该机当前无此容器在运行，仅 /data/app 下有目录）、llm-router、strata-*、ninfer-* 等一切其它容器。
+
