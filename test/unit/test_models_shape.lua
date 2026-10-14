@@ -1177,5 +1177,89 @@ end
 caps_table = nil
 store_tbl = nil
 caps_table = nil
+
+print("=== G13 可见性分别控制（用户裁定 2026-10-15）：成员 hidden 不抹入口行 ===")
+-- 判别性：217.t 线上缺陷——给虚拟入口唯一落点的卡片勾 hidden，整行入口从
+-- /v1/models 消失。旧口径（name_unadvertised 过滤成员 + #tail>0 门）下
+-- G13.1 / G13.2 必红；G13.3 钉住 disabled 的门仍在（不许顺手拆掉）。
+local function g13_store(vms, hidden_set, disabled_set, cards)
+  local function hit(set, name)
+    return type(set) == "table" and set[name] == true
+  end
+  return {
+    virtual_models_list = function() return vms end,
+    current = function()
+      return { model_configs = cards or {}, model_max_output_tokens = {},
+               model_effort = {} }
+    end,
+    modalities_for = function() return nil end,
+    ctx_cap = function() return nil end,
+    profile_for = function() return nil end,
+    any_hidden = function() return next(hidden_set or {}) ~= nil end,
+    any_disabled = function() return next(disabled_set or {}) ~= nil end,
+    model_is_hidden = function(name) return hit(hidden_set, name) end,
+    model_is_disabled = function(name) return hit(disabled_set, name) end,
+  }
+end
+-- 唯一落点被 hidden：入口行必须照常产出，且能力照常聚合那台引擎的读数
+-- （hidden 只管名字自己那行的广告位，落点照常服务）。
+models_list = { "solo-engine" }
+caps_table = advertise_listing({ { id = "solo-engine", object = "model",
+  created = 1700000000, owned_by = "local",
+  capabilities = { context_length = 131072, max_output_tokens = 8192 } } })
+store_tbl = g13_store({ { "solo-vip", "solo-engine" } },
+  { ["solo-engine"] = true }, nil)
+local rep_h = M.models_handler()
+local e_h = find(rep_h, "solo-vip")
+check("G13.1 唯一落点被 hidden 时入口行仍产出【判别 217.t 缺陷】",
+      e_h ~= nil, ids_of(rep_h))
+check("G13.1 入口行能力照常聚合被藏那台引擎的读数",
+      e_h ~= nil and read(e_h, "capabilities", "context_length") == 131072
+      and read(e_h, "capabilities", "max_output_tokens") == 8192,
+      encode(e_h and block(e_h, "capabilities") or {}))
+check("G13.1 被藏的成员自己那行不出现（广告门照常）",
+      count_id(rep_h, "solo-engine") == 0, ids_of(rep_h))
+check("G13.1 入口行 required 四字段齐",
+      e_h ~= nil and #missing_required(e_h) == 0,
+      e_h and join(missing_required(e_h)) or "<entry gone>")
+
+-- 多成员里一台被 hidden：入口行留住，聚合把藏起来的这台也算进去——
+-- 两台读数不齐时 length 走「组内有一台没开口就删键」那条口径的前提是它
+-- 说了话；这里两台都说了话（131072 / 1048576），取最窄。
+caps_table = advertise_listing({
+  { id = "solo-engine", object = "model", created = 1700000000, owned_by = "local",
+    capabilities = { context_length = 131072, max_output_tokens = 8192 } },
+  { id = "other-engine", object = "model", created = 1700000000, owned_by = "local",
+    capabilities = { context_length = 1048576, max_output_tokens = 8192 } } })
+models_list = { "solo-engine", "other-engine" }
+store_tbl = g13_store({ { "multi-vip", "solo-engine", "other-engine" } },
+  { ["solo-engine"] = true }, nil)
+local rep_m = M.models_handler()
+check("G13.2 组内一台被 hidden：入口行产出",
+      find(rep_m, "multi-vip") ~= nil, ids_of(rep_m))
+check("G13.2 hidden 成员照常进聚合（两台取最窄 131072，不是只聚合可见那台）",
+      read(find(rep_m, "multi-vip"), "capabilities", "context_length") == 131072,
+      encode(block(find(rep_m, "multi-vip") or {}, "capabilities") or {}))
+check("G13.2 可见那台成员自己照旧单独广告",
+      count_id(rep_m, "other-engine") == 1, ids_of(rep_m))
+
+-- 唯一落点被 disabled：入口行不产出——disabled 是真不进候选，与 hidden 分家。
+store_tbl = g13_store({ { "solo-vip", "solo-engine" } },
+  nil, { ["solo-engine"] = true })
+local rep_d = M.models_handler()
+check("G13.3 唯一落点被 disabled：入口行不产出（门仍在，不许顺手拆）",
+      find(rep_d, "solo-vip") == nil, ids_of(rep_d))
+
+-- 入口自己 hidden：整行不产出（这条与修复前一致，钉它不被改动波及）。
+store_tbl = g13_store({ { "solo-vip", "solo-engine" } },
+  { ["solo-vip"] = true }, nil)
+local rep_self = M.models_handler()
+check("G13.4 入口自己声明 hidden：整行不产出（自己的开关管自己）",
+      find(rep_self, "solo-vip") == nil, ids_of(rep_self))
+check("G13.4 入口被藏不影响成员那行（solo-engine 照常广告）",
+      count_id(rep_self, "solo-engine") == 1, ids_of(rep_self))
+
+caps_table = nil
+store_tbl = nil
 print(string.format("\n%d checks, %d failed", checks, fails))
 os.exit(fails == 0 and 0 or 1)

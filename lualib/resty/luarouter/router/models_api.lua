@@ -1455,21 +1455,24 @@ local function inject_virtual_models(data, sources)
         local tail = {}
         for j = 2, #aliases[i] do
             local name = tostring(aliases[i][j])
-            -- 广告门的组内成员过滤：被藏起来或被禁掉的**组内成员**不进这一份名册。理由与遮蔽
-            -- 规则同一条 —— 这一行说的就是「这个入口替这几个实际模型服务」，而 disabled 的模型
-            -- 在选路侧根本不成候选，留着它就是「对外说服务、每个请求都被拒」的自相矛盾广告
-            -- （2026-10-07 那次故障的正是那句）。hidden 的成员同样不出现在这份对外名册里（hidden
-            -- 只管广告面）；它不进的是这份**清单**，而候选门仍按 disabled 收成员 —— 被藏的模型
-            -- 依然可作为落点被服务，那是 2026-10-09 收窄后的口径。
-            -- 判据与候选门同源：config_store 的 model_is_hidden / model_is_disabled。
-            if not name_unadvertised(store_mod, name) then
+            -- 组内成员过滤只认 disabled（用户裁定 2026-10-15：虚拟服务与实际模型的
+            -- 可见性分别控制）。disabled 的落点在选路侧根本不成候选，留着它聚合就是
+            -- 「对外说服务、每个请求都被拒」的自相矛盾读数（2026-10-07 故障那句）；
+            -- hidden 的成员**照常进聚合**——被藏的模型仍进候选池、仍可作为该入口的
+            -- 落点被服务（readers.lua 2026-10-09 收窄：hidden 只管名字自己那行的广告
+            -- 位），它不进的是对外清单，而入口行自 2026-10-11 起本就不带成员名单，
+            -- tail 只剩能力聚合的输入。217.t 的线上故障正是旧口径把「唯一成员被藏」
+            -- 放大成「整行入口消失」：藏一台引擎顺手抹掉了它服务的入口。
+            -- 判据与候选门同源：config_store 的 model_is_disabled。
+            if not name_disabled(store_mod, name) then
                 tail[#tail + 1] = name
             end
         end
-        -- 入口自己被藏 = 整行不产出；整组成员都被藏 = 这个入口已经没有还能服务的落点，
-        -- 同样不产出。与「一个入口一行、绝不静默少一条」不冲突：那条纪律护的是**没被操作员
-        -- 藏过**的入口（少一条会让客户端以为服务消失），这里少的每一条正是操作员亲手要抹掉的
-        -- 名字。原本就不带成员名的脏行（#row<=1）照旧产出，保持它今天的形状。
+        -- 入口行的可见性只由入口自己决定（hidden/disabled 查入口名，广告门
+        -- name_unadvertised 照旧两条都问）；#tail > 0 那一支只挡「全组都被 disabled」
+        -- ——那时入口确实没有还能服务的落点，与「藏起来照常服务」的 hidden 无涉。
+        -- 与「一个入口一行、绝不静默少一条」不冲突：那条纪律护的正是**没被操作员
+        -- 藏过**的入口。原本就不带成员名的脏行（#row<=1）照旧产出。
         if not seen[alias] and not name_unadvertised(store_mod, alias)
             and (#tail > 0 or #aliases[i] <= 1) then
             -- 入口赢：同名时上面已经把真实那一行摘掉，这里无条件补出入口那一行
