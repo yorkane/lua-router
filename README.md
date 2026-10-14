@@ -661,6 +661,8 @@ dated 的单轮勘察与部署验收记录）不常驻工作树，需要时查 g
 | [doc/gap-token-accounting.md](doc/gap-token-accounting.md) | 流式 token 核算：include_usage 注入/剥帧、四类 token 指标 |
 | [doc/gap-inflight-age.md](doc/gap-inflight-age.md) | 在途请求年龄采样：槽表、TTL 与在途计数口径 |
 | [doc/incident-21k-cpu-20261014.md](doc/incident-21k-cpu-20261014.md) | 21.k 生产 CPU 取证：nginx 输出缓冲链尾遍历热点与在途计数漏减 |
+| [doc/verify-235-8800-20261014.md](doc/verify-235-8800-20261014.md) | 235.t:8800 SSE 修复版验收记录 + 重启后池收敛为 1 worker 的原因（10100 聚合网关被拒收） |
+| [doc/verify-217-8800-20261014.md](doc/verify-217-8800-20261014.md) | 217.t:8800 SSE 修复版验收记录 + 裸容器迁 compose 的等价性说明 |
 | [doc/design-dual-openresty.md](doc/design-dual-openresty.md) | 双 OpenResty 管理负载分离：单一状态 owner、有限日志游标查询与管理 SSE 隔离 |
 | [doc/gap-tls-chain.md](doc/gap-tls-chain.md) | 证书链 / SNI / 握手负例门与入口预检缺口 |
 | [doc/gap-virtual-models.md](doc/gap-virtual-models.md) | 虚拟模型服务主入口（1 对多 `targets` + 条目级 `context_window`＝对外声明的上下文总窗口：字段自身按 schema 校验，不参与输出预算、不与卡片 `max_output_tokens` 比大小）与 upstreams 持久化接入 |
