@@ -1,5 +1,18 @@
 # lua-router fleet 部署快照（2026-10-12 实测）
 
+## 2026-10-14 增量更新：21.k SSE 断连修复
+
+仅以下两个实例已重新实测并升级，其余条目仍是下方 2026-10-12 快照，不据此声称整个 fleet 已更新。
+
+| 实例 | 现行镜像 | 镜像 ID | 验收 |
+|---|---|---|---|
+| 21.k:8802 测试 | `pub/lua-router:20261014-fb6b0d0` | `47b546c2c7aa` | 13/13 日志 SSE 断连收尾，HTTP/1.0/1.1 与 15s/30s 心跳通过，真实小 chat 成功 |
+| 21.k:8800 生产 | 同上（8802 验收后替换） | 同上 | sqlite=1、8/8 healthy、模型/UI/管理认证正常，配置摘要未变 |
+
+修复提交 `fb6b0d0`；完整发布锚点 run `20261014-041805-2711586-7f11-b3f6d5`，fingerprint `bc9d845d931b…`，22 pass/0 fail/0 skip，`full_anchor_eligible=true`。原始 `report.json` 位于 `/data/tmp/lr-gates/runs/20261014-041805-2711586-7f11-b3f6d5/`。
+
+回滚镜像 `pub/lua-router:20261012-69b5d53` 留在盘上；compose/runtime/SQLite 一致性备份在 21.k 的 `/data1/app/lua-router-8800/backup-sse-20261014-042906/` 和 `/data1/app/lua-router-8802/backup-sse-20261014-041953/`。本轮配置不迁移，镜像摘要前后相同。修复机制和完整验证记录见 [incident-21k-cpu-20261014.md](incident-21k-cpu-20261014.md)。
+
 > 本文是 **2026-10-12 的只读快照**（探针：`docker inspect` + `GET /health` + `GET /workers`
 > + `GET /config` + `GET /metrics` + compose 原文），**不是今天的 live 状态**：动手前先按
 > [deploy.md](deploy.md) 的取证步骤重新 inspect。部署、升级与回滚的操作流程一律见

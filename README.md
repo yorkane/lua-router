@@ -660,6 +660,8 @@ dated 的单轮勘察与部署验收记录）不常驻工作树，需要时查 g
 | [doc/gap-routing-dyn.md](doc/gap-routing-dyn.md) | 路由动态变更：policy/model_policies 热配置与优先级链 |
 | [doc/gap-token-accounting.md](doc/gap-token-accounting.md) | 流式 token 核算：include_usage 注入/剥帧、四类 token 指标 |
 | [doc/gap-inflight-age.md](doc/gap-inflight-age.md) | 在途请求年龄采样：槽表、TTL 与在途计数口径 |
+| [doc/incident-21k-cpu-20261014.md](doc/incident-21k-cpu-20261014.md) | 21.k 生产 CPU 取证：nginx 输出缓冲链尾遍历热点与在途计数漏减 |
+| [doc/design-dual-openresty.md](doc/design-dual-openresty.md) | 双 OpenResty 管理负载分离：单一状态 owner、有限日志游标查询与管理 SSE 隔离 |
 | [doc/gap-tls-chain.md](doc/gap-tls-chain.md) | 证书链 / SNI / 握手负例门与入口预检缺口 |
 | [doc/gap-virtual-models.md](doc/gap-virtual-models.md) | 虚拟模型服务主入口（1 对多 `targets` + 条目级 `context_window`＝对外声明的上下文总窗口：字段自身按 schema 校验，不参与输出预算、不与卡片 `max_output_tokens` 比大小）与 upstreams 持久化接入 |
 | [doc/gap-effort-ladder.md](doc/gap-effort-ladder.md) | 档位阶梯：探测 + 手动勾选（卡片 `reasoning_efforts` / env `LMR_MODEL_EFFORT_LEVELS`）——三份读数（引擎原话 / 操作员勾选 / 对外读数）各有其主、勾选接管 picker 而判定面只收窄、空数组折回「没说」的三态口径、UI 契约与测试锚点 |
