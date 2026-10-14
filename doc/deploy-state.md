@@ -9,6 +9,7 @@
 | 217.t:8800 生产 | `pub/lua-router:20261015-a9d8fce`（compose 单行改镜像，备份 `docker-compose.yml.bak-20261015-hidfix`，旧镜像 `20261014-fb6b0d0` 保留回滚） | /health 200；4/4 worker healthy；`q38fn-ab` 回到 /v1/models（其唯一落点卡片 hidden=true 保持不动，成员行不再广告），入口行能力照常聚合那台引擎（context 262000 / vision / effort 全推导）；经 `q38fn-ab` 真实 chat 200，转发体 model=被藏引擎名 |
 | 21.k:8802 测试 | `pub/lua-router:8802-20261015-hidfix`（同 commit a9d8fce） | 隐藏场景真机复现与修复验证（唯一落点 hidden → 入口行保留 + 推理 200） |
 | 21.k:8800 生产 | `pub/lua-router:20261015-a9d8fce`（compose 单行改镜像，备份 `docker-compose.yml.bak-20261015-hidfix`，旧镜像 `20261014-fb6b0d0` 保留回滚） | sqlite backend=1；重启后 8/8 worker healthy；`/config` 声明层未变（四张卡片 hidden/disabled 全 null、入口 `Q38-Flash-Next`→`swift-1.5-plefp8` 原样）；隐藏解耦现场复核：藏唯一落点卡片 → 入口行保留（ctx 384000 / vision）、成员行消失、撤销后复原；经入口真实 chat 200 |
+| 235.t:8800 生产 | 同上镜像（本机直接 compose） | sqlite backend=1；1/1 worker healthy（`smg_worker_health=1`，重启后约一轮巡检内恢复，重启初期的 503 是巡检尚未跑完的暂态）；真实 chat 200（`startlux-decision-35b-a3b`，GPU2 llama.cpp）；**池仍只有 1 worker**，与 2026-10-14 的旧发现同因（10100 聚合网关被 max-models 判定拒收），非本次升级引入；本实例没有虚拟入口，藏卡片时 /v1/models 如实变空（无入口行可保留），撤销后复原 |
 
 修复提交 `a9d8fce`（组内成员 hidden 不再抹掉虚拟入口行，口径见 doc/gap-virtual-models.md §2 与 test_models_shape G13）；发布锚点日志 `/data/tmp/gates-20261015-full.log`，22 pass/0 fail/0 skip，`full_anchor_eligible=true`。
 
