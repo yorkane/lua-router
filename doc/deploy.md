@@ -31,8 +31,8 @@
 | 235.t:8800 | 生产 | `/data/app/lua-router` | 29000 | `20261014-fb6b0d0`，未配置口令 |
 | 21.k:8800 | 生产 | `/data1/app/lua-router-8800` | 29000 | `20261012-69b5d53`，`lua-router / test123` |
 | 21.k:8801 | 测试 | `/data1/app/lua-router-8801` | 29001 | 旧镜像，未配置口令 |
-| 21.k:8802 | 测试 | `/data1/app/lua-router-8802` | 29002 | `20261012-69b5d53`，`lua-router / test123` |
-| 217.t:8800 | 生产 | compose 接管（/data/app/lua-router） | 29000 | `20261014-fb6b0d0`，未配置口令 |
+| 21.k:8802 | 测试 | `/data1/app/lua-router-8802` | 29002 | `8802-20261015-hidfix`（a9d8fce），`lua-router / test123` |
+| 217.t:8800 | 生产 | compose 接管（/data/app/lua-router） | 29000 | `20261015-a9d8fce`，未配置口令 |
 
 旧镜像没有 `admin_auth.lua`，仅添加密码环境变量不能启用认证。不要把本表当实时资产清单，操作前重新 inspect；历史细节见 [deploy-state.md](deploy-state.md)。
 

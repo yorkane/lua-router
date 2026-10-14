@@ -1,5 +1,16 @@
 # lua-router fleet 部署快照（2026-10-12 实测）
 
+## 2026-10-15 增量更新：217.t:8800 升级隐藏解耦修复
+
+仅以下条目为 2026-10-15 实测，其余条目仍是下方快照。
+
+| 实例 | 现行镜像 | 验收 |
+|---|---|---|
+| 217.t:8800 生产 | `pub/lua-router:20261015-a9d8fce`（compose 单行改镜像，备份 `docker-compose.yml.bak-20261015-hidfix`，旧镜像 `20261014-fb6b0d0` 保留回滚） | /health 200；4/4 worker healthy；`q38fn-ab` 回到 /v1/models（其唯一落点卡片 hidden=true 保持不动，成员行不再广告），入口行能力照常聚合那台引擎（context 262000 / vision / effort 全推导）；经 `q38fn-ab` 真实 chat 200，转发体 model=被藏引擎名 |
+| 21.k:8802 测试 | `pub/lua-router:8802-20261015-hidfix`（同 commit a9d8fce） | 隐藏场景真机复现与修复验证（唯一落点 hidden → 入口行保留 + 推理 200） |
+
+修复提交 `a9d8fce`（组内成员 hidden 不再抹掉虚拟入口行，口径见 doc/gap-virtual-models.md §2 与 test_models_shape G13）；发布锚点日志 `/data/tmp/gates-20261015-full.log`，22 pass/0 fail/0 skip，`full_anchor_eligible=true`。
+
 ## 2026-10-14 增量更新：21.k SSE 断连修复
 
 仅以下两个实例已重新实测并升级，其余条目仍是下方 2026-10-12 快照，不据此声称整个 fleet 已更新。
