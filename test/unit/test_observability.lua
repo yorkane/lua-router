@@ -282,6 +282,167 @@ do
     end
 end
 
+-- 真 SSE handler 的断连回归：pcall 成功不等于写出成功。
+do
+local saved_ngx = _G.ngx
+local saved_config = package.loaded["resty.luarouter"]
+local MAX_POLLS = 3
+local dict
+local function push_record(seq)
+    dict["q:" .. seq] = "{\"id\":" .. seq .. "}"
+    dict.head = seq
+end
+
+local shdict = {
+    get = function(_, k) return dict[k] end,
+    set = function(_, k, v) dict[k] = v; return true end,
+    incr = function(_, k, dv, init)
+        dict[k] = (dict[k] or init or 0) + dv; return dict[k]
+    end,
+    delete = function(_, k) dict[k] = nil end,
+    get_keys = function() return {} end,
+}
+
+---behaviour(what, ctx) -> value(s) to return from the ngx call, or nil for
+---"all calls succeed". The runner raises from sleep once ctx.polls hits
+---MAX_POLLS, which is how a request ends in a real nginx worker too.
+local function run(handler, behaviour)
+    dict = { head = 0 }
+    local ctx = { exit = 0, printed = 0, flushed = 0, polls = 0, pushed = false }
+    _G.ngx = {
+        shared = { lr_request_log = shdict, lr_stats = shdict },
+        log = function() end,
+        now = function() return 1000 end,
+        WARN = 1, ERR = 2, INFO = 3, NOTICE = 4,
+        ctx = {}, var = {},
+        status = 0, header = {},
+        HTTP_OK = 200, HTTP_NOT_FOUND = 404, HTTP_BAD_REQUEST = 400,
+        HTTP_SERVICE_UNAVAILABLE = 503, HTTP_INTERNAL_SERVER_ERROR = 500,
+        send_headers = function(...) return behaviour("send_headers", ctx) end,
+        print = function(...)
+            ctx.printed = ctx.printed + 1
+            return behaviour("print", ctx)
+        end,
+        flush = function(...)
+            ctx.flushed = ctx.flushed + 1
+            return behaviour("flush", ctx)
+        end,
+        sleep = function(...)
+            ctx.polls = ctx.polls + 1
+            if ctx.polls == 1 and not ctx.pushed then
+                ctx.pushed = true
+                push_record(1)
+            end
+            if ctx.polls >= MAX_POLLS then error("nginx terminated the request") end
+            return behaviour("sleep", ctx)
+        end,
+        say = function(...) return behaviour("print", ctx) end,
+        exit = function(status)
+            ctx.exit = ctx.exit + 1
+            error({ exit = true, status = status })
+        end,
+    }
+    local ok, err = pcall(handler)
+    if ok then return ctx, false, err end
+    if type(err) == "table" and err.exit then return ctx, true, err.status end
+    return ctx, false, err
+end
+
+local function all_ok(what)
+    if what == "sleep" then return nil end
+    return 1
+end
+local function failed_write(what)
+    if what == "print" or what == "flush" then return nil, "closed" end
+    return true
+end
+
+package.loaded["resty.luarouter"] = {
+    config = function() return { request_log_capacity = 16, stats_window_s = 10 } end,
+}
+local ui = require "resty.luarouter.ui"
+require "resty.luarouter.observability"
+local obs = require "resty.luarouter.observability"
+local old_enabled, old_capacity = obs.log_enabled, obs.log_capacity
+obs.log_enabled = function() return true end
+obs.log_capacity = function() return 16 end
+local function logs() return obs.handle_logs_stream() end
+
+local ctx, exited, status
+
+-- ------------------------------------------------------------ models_sse
+ctx, exited, status = run(ui.models_sse, all_ok)
+check(exited and status == 200, "ui: healthy stream ends with exit(200)")
+check(ctx.printed >= 1, "ui: ping written before the stream ends")
+
+ctx, exited = run(ui.models_sse, function() return 1 end)
+check(exited and ctx.printed >= 1, "ui: numeric 1 success is not a disconnect")
+
+ctx, exited, status = run(ui.models_sse, function(what)
+    if what == "send_headers" then return nil, "headers already sent" end
+    return true
+end)
+check(exited and status == 200, "ui: headers-already-sent keeps the stream open")
+check(ctx.printed >= 1, "ui: headers-already-sent still writes a ping")
+
+ctx, exited, status = run(ui.models_sse, failed_write)
+check(exited and status == 200, "ui: write error ends the stream")
+check(ctx.polls == 0, "ui: initial flush failure exits before the loop")
+
+-- ------------------------------------------------------------ logs stream
+ctx, exited, status = run(logs, all_ok)
+check(exited and status == 200, "logs: healthy stream ends with exit(200)")
+check(ctx.printed >= 1, "logs: injected record written")
+
+ctx, exited, status = run(logs, failed_write)
+check(exited and status == 200, "logs: write error ends the stream")
+check(ctx.polls <= 1, "logs: write error ends before the next poll")
+
+local first_flush = true
+ctx, exited, status = run(logs, function(what)
+    if what == "flush" then
+        if first_flush then first_flush = false; return true end
+        return nil, "closed"
+    end
+    return true
+end)
+check(exited and status == 200, "logs: in-loop flush failure ends the stream")
+
+ctx, exited = run(logs, function(what)
+    if what == "send_headers" then return nil, "headers already sent" end
+    return 1
+end)
+check(exited and ctx.printed >= 1, "logs: headers-already-sent + numeric 1 streams")
+
+
+for _, handler in ipairs({ui.models_sse, logs}) do
+    local c, ended = run(handler, function(what)
+        if what == "print" then return nil, "nginx output filter error" end
+        if what == "sleep" then return nil end
+        return 1
+    end)
+    check(ended and c.printed == 1 and c.polls <= 1,
+        "SSE: non-throwing print error exits without another poll")
+    for _, operation in ipairs({"print", "flush", "send_headers"}) do
+        local calls = 0
+        local c, ended = run(handler, function(what)
+            if what == operation then calls = calls + 1; error("write exception") end
+            if what == "sleep" then return nil end
+            return 1
+        end)
+        check(ended and calls == 1 and c.polls <= 1,
+            "SSE: output exception exits without another poll: " .. operation)
+    end
+end
+obs.log_enabled = function() return false end
+local disabled, closed, disabled_status = run(logs, all_ok)
+check(not closed and ngx.status == 503 and disabled.flushed == 0,
+    "SSE: disabled log store keeps its JSON response without opening a stream")
+obs.log_enabled, obs.log_capacity = old_enabled, old_capacity
+
+_G.ngx = saved_ngx
+package.loaded["resty.luarouter"] = saved_config
+end
 io.write("\nobservability: " .. passed .. " passed, " .. failed .. " failed\n")
 if failed > 0 then
     for i = 1, #failures do io.write("  FAIL " .. failures[i] .. "\n") end

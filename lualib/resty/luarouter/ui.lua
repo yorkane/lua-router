@@ -270,6 +270,16 @@ function _M.model_unload()
         "模型由 router 后的实例常驻提供，聊天界面不能卸载；要摘除请在 watcher / 服务侧操作")
 end
 
+--- pcall only proves the call did not raise. ngx.print / ngx.flush also
+--- report write errors as (nil, err), which is the path a client disconnect
+--- takes. A successful ngx output call returns a non-nil, non-false value.
+local function sse_write(fn, ...)
+    local ok, result, err = pcall(fn, ...)
+    if not ok then return false end
+    if result ~= nil and result ~= false then return true end
+    return fn == ngx.send_headers and err == "headers already sent"
+end
+
 --- GET /_ui/models/sse — the stock UI polls for load progress; behind a
 --- router nothing changes, so keep the stream open with 30s ping comments.
 function _M.models_sse()
@@ -277,14 +287,20 @@ function _M.models_sse()
     ngx.header.content_type = "text/event-stream"
     ngx.header["Cache-Control"] = "no-cache"
     ngx.header["X-Accel-Buffering"] = "no"
-    ngx.flush(true)
+    if not sse_write(ngx.send_headers)
+        or not sse_write(ngx.flush, true)
+    then
+        return ngx.exit(ngx.HTTP_OK)
+    end
     while true do
-        local ok = pcall(ngx.print, ": ping\n\n")
-        if not ok then return ngx.exit(ngx.HTTP_OK) end
-        local flushed = pcall(ngx.flush, true)
-        if not flushed then return ngx.exit(ngx.HTTP_OK) end
-        local slept = pcall(ngx.sleep, 30)
-        if not slept then return ngx.exit(ngx.HTTP_OK) end
+        if not sse_write(ngx.print, ": ping\n\n")
+            or not sse_write(ngx.flush, true)
+        then
+            return ngx.exit(ngx.HTTP_OK)
+        end
+        if not pcall(ngx.sleep, 30) then
+            return ngx.exit(ngx.HTTP_OK)
+        end
     end
 end
 

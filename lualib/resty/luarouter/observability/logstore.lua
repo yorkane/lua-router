@@ -547,6 +547,19 @@ end
 --- still sees requests served by other processes. A client that falls behind
 --- jumps forward (the Rust stream drops frames the same way and lets the browser
 --- re-sync with a cursor poll).
+--- pcall only proves the call did not raise: ngx.print / ngx.flush also report a
+--- write failure as (nil, err), which is the path a client disconnect takes and
+--- the reason a dead stream would otherwise poll lr_request_log forever. For
+--- send_headers / print / flush return a non-nil, non-false value on success;
+--- nil plus an error is a genuine write failure. Only send_headers may report
+--- the benign "headers already sent" condition.
+local function sse_write(fn, ...)
+    local ok, result, err = pcall(fn, ...)
+    if not ok then return false end
+    if result ~= nil and result ~= false then return true end
+    return fn == ngx.send_headers and err == "headers already sent"
+end
+
 function _M.handle_logs_stream()
     if not _M.log_enabled() then
         return log_disabled()
@@ -556,7 +569,11 @@ function _M.handle_logs_stream()
     ngx.header["Content-Type"] = "text/event-stream"
     ngx.header["Cache-Control"] = "no-cache"
     ngx.header["X-Accel-Buffering"] = "no"
-    ngx.flush(true)
+    if not sse_write(ngx.send_headers)
+        or not sse_write(ngx.flush, true)
+    then
+        return ngx.exit(ngx.HTTP_OK)
+    end
 
     local cursor = d:get("head") or 0
     local capacity = _M.log_capacity()
@@ -574,8 +591,7 @@ function _M.handle_logs_stream()
             cursor = cursor + 1
             local raw = d:get("q:" .. cursor)
             if raw then
-                local ok = pcall(ngx.print, "data: " .. raw .. "\n\n")
-                if not ok then
+                if not sse_write(ngx.print, "data: " .. raw .. "\n\n") then
                     return ngx.exit(ngx.HTTP_OK)
                 end
             end
@@ -583,12 +599,11 @@ function _M.handle_logs_stream()
         since_ping = since_ping + POLL_S
         if since_ping >= PING_S then
             since_ping = 0
-            local ok = pcall(ngx.print, ": ping\n\n")
-            if not ok then
+            if not sse_write(ngx.print, ": ping\n\n") then
                 return ngx.exit(ngx.HTTP_OK)
             end
         end
-        if not pcall(ngx.flush, true) then
+        if not sse_write(ngx.flush, true) then
             return ngx.exit(ngx.HTTP_OK)
         end
         if not pcall(ngx.sleep, POLL_S) then
