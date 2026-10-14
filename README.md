@@ -650,7 +650,7 @@ dated 的单轮勘察与部署验收记录）不常驻工作树，需要时查 g
 | [doc/gap-config-store.md](doc/gap-config-store.md) | 配置持久化：sqlite/postgres/file 三态后端、CAS、镜像与采纳 |
 | [doc/gap-admin-auth.md](doc/gap-admin-auth.md) | 管理面 Basic Auth（用户裁定 2026-10-12）：保护/不保护清单、两条豁免 + 代理来源头前置否决「出现即认证」、401 形状与常量时间比对、`guard` / `guard_static` / `guard_klib` 三处落点、klib 侧刻意 fail-open 的后果不对称判据、真机验收矩阵 |
 | [doc/deploy-state.md](doc/deploy-state.md) | 五实例 fleet 现状（2026-10-12 实测：镜像/compose/池/负载 env/管理面口令）、生效后端怎么查、已知漂移与处置、死代码清单 |
-| [doc/deploy.md](doc/deploy.md) | **部署手册**：全新部署与滚动升级的完整操作链路——ACR 仓库与登录凭据、管理面 Basic Auth 用户名/口令与四条验收探针、基座 authz 取法、compose 模板与按机器环境的 DENY_PORT/负载 env、启动验收矩阵（含 sqlite 后端自检与 30–60s 暂态 503）、切换前 WAL 安全备份与 revision 零漂移取证、回滚与已知坑 |
+| [doc/deploy.md](doc/deploy.md) | **部署手册**：全新部署与单实例升级、现用管理认证名/密码、Docker/Compose 前置、ACR/NAS 镜像获取、持久化配置、认证与推理/UI 验收、SQLite 一致性备份与回滚、217.t 裸容器迁移、full 门禁与发布前置 |
 | [doc/testing-workflow.md](doc/testing-workflow.md) | 并发测试工作流（用户裁定 2026-10-12）：隔离机制落点（冻结快照/不可变镜像/命名空间/端口台账/声明式锁）、prepare→manifest 共享、按维度选门的可复制命令、并发纪律与清理边界、定向绿/同版本聚合/full 锚点的判定规则、改动→验证矩阵、实测记录与未测项 |
 | [doc/scope-trim.md](doc/scope-trim.md) | 范围收敛判定书：模块 KEEP/DELETE/TRIM、量化收益、执行记录 |
 | [doc/todo-deferred.md](doc/todo-deferred.md) | TODO 档（MCP、wasm）的唯一口径与启用时的最小方案 |
