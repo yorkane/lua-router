@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "8423ada7-2e0b-45b9-9ca9-8d973e44e793",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/candidate.json",
+  "output": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/request-lifecycle.html",
+  "specification": {
+    "sha256": "8b7a3660d769fabccf2349efd4647bfdf92b7c2ac6d5d591d49c640b2e8fc49d",
+    "bytes": 6640
+  },
+  "artifact": {
+    "sha256": "5007c05438b0c46a5f47fc2243beb3794b5150017c24f8126375ae5214a69a93",
+    "bytes": 827786
+  }
+}

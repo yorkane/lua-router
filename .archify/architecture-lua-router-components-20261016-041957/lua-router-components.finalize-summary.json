@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/aigc/ChatGPT/lua-router/.archify/architecture-lua-router-components-20261016-041957/candidate.json",
+    "sha256": "c651d53d084d4bb209704e3167fcd2eb98a9980496c7a21b5460546acd9482ff",
+    "bytes": 6312
+  },
+  "artifact": {
+    "path": "/home/aigc/ChatGPT/lua-router/.archify/architecture-lua-router-components-20261016-041957/lua-router-components.html",
+    "sha256": "48035323da3adea958997feda9c294626689098cccd6da946a7910ae403a6dad",
+    "bytes": 836565
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/aigc/ChatGPT/lua-router/.archify/architecture-lua-router-components-20261016-041957/lua-router-components.finalize.json",
+    "summaryReceipt": "/home/aigc/ChatGPT/lua-router/.archify/architecture-lua-router-components-20261016-041957/lua-router-components.finalize-summary.json",
+    "browserCheckReceipt": "/home/aigc/ChatGPT/lua-router/.archify/architecture-lua-router-components-20261016-041957/lua-router-components.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.1.0",
+    "availableVersion": "3.1.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-15T16:02:08.739Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 6252
+}

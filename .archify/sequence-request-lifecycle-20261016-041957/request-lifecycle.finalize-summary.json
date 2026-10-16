@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "sequence",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/candidate.json",
+    "sha256": "8b7a3660d769fabccf2349efd4647bfdf92b7c2ac6d5d591d49c640b2e8fc49d",
+    "bytes": 6640
+  },
+  "artifact": {
+    "path": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/request-lifecycle.html",
+    "sha256": "5007c05438b0c46a5f47fc2243beb3794b5150017c24f8126375ae5214a69a93",
+    "bytes": 827786
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/request-lifecycle.finalize.json",
+    "summaryReceipt": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/request-lifecycle.finalize-summary.json",
+    "browserCheckReceipt": "/home/aigc/ChatGPT/lua-router/.archify/sequence-request-lifecycle-20261016-041957/request-lifecycle.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.1.0",
+    "availableVersion": "3.1.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-15T16:02:08.739Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 6079
+}

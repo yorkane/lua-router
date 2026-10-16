@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "推理请求生命周期（POST /v1/chat/completions）",
+    "locale": "zh-CN",
+    "output": ".archify/sequence-request-lifecycle-20261016-041957/request-lifecycle.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/yorkane/lua-router.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "6684727101414adf12b36f404118b1ce11b74ace"
+    }
+  },
+  "participants": [
+    { "id": "client", "type": "external", "label": "客户端", "sublabel": "OpenAI SDK", "sources": [{ "path": "lualib/resty/luarouter/router.lua", "line": 125, "end_line": 135 }] },
+    { "id": "nginx", "type": "cloud", "label": "OpenResty", "sublabel": ":8800 klib.router", "sources": [{ "path": "conf/nginx.conf.template", "line": 247, "end_line": 251 }] },
+    { "id": "router", "type": "backend", "label": "推理面", "sublabel": "inference.lua", "sources": [{ "path": "lualib/resty/luarouter/router/inference.lua", "line": 455, "end_line": 462 }] },
+    { "id": "store", "type": "database", "label": "热配置与台账", "sublabel": "sqlite + shdict", "sources": [{ "path": "lualib/resty/luarouter/store_dispatcher.lua", "line": 4, "end_line": 12 }] },
+    { "id": "forwarder", "type": "backend", "label": "转发循环", "sublabel": "forward.lua", "sources": [{ "path": "lualib/resty/luarouter/router/forward.lua", "line": 532, "end_line": 534 }] },
+    { "id": "selector", "type": "backend", "label": "候选与策略", "sublabel": "candidates + policy", "sources": [{ "path": "lualib/resty/luarouter/router/candidates.lua", "line": 465, "end_line": 467 }] },
+    { "id": "engine", "type": "backend", "label": "上游引擎", "sublabel": "SGLang / llama.cpp", "sources": [{ "path": "lualib/resty/luarouter/watcher/discover.lua", "line": 10, "end_line": 13 }] },
+    { "id": "log", "type": "messagebus", "label": "观测面", "sublabel": "日志 + 指标", "sources": [{ "path": "lualib/resty/luarouter/observability.lua", "line": 548, "end_line": 554 }] }
+  ],
+  "segments": [
+    { "from": 150, "to": 302, "label": "准入与解析" },
+    { "from": 302, "to": 522, "label": "候选与选路" },
+    { "from": 522, "to": 662, "label": "转发与重试" },
+    { "from": 662, "to": 790, "label": "响应与记账" }
+  ],
+  "messages": [
+    { "id": "m1", "from": "client", "to": "nginx", "y": 160, "label": "POST /v1/chat/completions", "variant": "emphasis" },
+    { "id": "m2", "from": "nginx", "to": "router", "y": 190, "label": "handle() 路由表分发", "variant": "default" },
+    { "id": "m3", "from": "router", "to": "store", "y": 222, "label": "入口 api-key 门 + 别名解析", "variant": "security", "note": "缺键与错键同一个 401" },
+    { "id": "m4", "from": "store", "to": "router", "y": 290, "label": "profile / targets / 卡片", "variant": "return" },
+    { "id": "m5", "from": "router", "to": "forwarder", "y": 318, "label": "forward(route, body, raw, resolved)", "variant": "emphasis" },
+    { "id": "m6", "from": "forwarder", "to": "selector", "y": 346, "label": "candidates_for + 策略 select", "variant": "default", "note": "容量闸硬排除候选" },
+    { "id": "m7", "from": "selector", "to": "store", "y": 414, "label": "worker 台账 + 容量与利用率读数", "variant": "default" },
+    { "id": "m8", "from": "store", "to": "selector", "y": 442, "label": "候选集 + why{capped, refused}", "variant": "return" },
+    { "id": "m9", "from": "selector", "to": "forwarder", "y": 470, "label": "选中 worker", "variant": "return", "note": "候选空才落 429 或 503" },
+    { "id": "m10", "from": "forwarder", "to": "engine", "y": 538, "label": "POST（model 顶层精确改写）", "variant": "emphasis", "note": "输出预算零改写透传" },
+    { "id": "m11", "from": "engine", "to": "forwarder", "y": 606, "label": "SSE 流 / JSON 响应", "variant": "return", "note": "可重试则退避换候选" },
+    { "id": "m12", "from": "forwarder", "to": "router", "y": 674, "label": "响应回写", "variant": "return" },
+    { "id": "m13", "from": "router", "to": "nginx", "y": 702, "label": "2xx（/v1/responses 补 metadata）", "variant": "return" },
+    { "id": "m14", "from": "nginx", "to": "client", "y": 730, "label": "流式零缓冲直拷", "variant": "return" },
+    { "id": "m15", "from": "forwarder", "to": "log", "y": 758, "label": "请求日志 + 指标", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "nginx", "from": 182, "to": 734, "type": "cloud" },
+    { "participant": "router", "from": 186, "to": 708, "type": "backend" },
+    { "participant": "store", "from": 216, "to": 454, "type": "database" },
+    { "participant": "forwarder", "from": 302, "to": 670, "type": "backend" },
+    { "participant": "selector", "from": 330, "to": 484, "type": "backend" },
+    { "participant": "engine", "from": 518, "to": 620, "type": "backend" },
+    { "participant": "log", "from": 752, "to": 774, "type": "messagebus" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "四个阶段",
+      "items": [
+        "准入：本机并发闸（满即 429）→ model 字段校验 → 入口 api-key 门 → 别名与 profile 解析",
+        "api-key 门 fail-closed：读点在场且条目配了密钥时，比对函数缺失或出错一律拒绝",
+        "选路：候选四道门装配出候选集，策略在候选集里选一台",
+        "四道门依次是健康 → 白名单/绑定 → 模型许可 → 容量（并发上限、GPU 利用率上限）",
+        "x-smg-target-worker 头优先于策略，但不能复活已被容量闸排除的 worker",
+        "转发：effort 卡片按选中实例的绑定名逐次改写，失败退避换候选重试，次数耗尽答 502",
+        "响应：流式不缓冲边收边拷；非流式读完把 socket 还回共享连接池"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "拒绝与重试在哪发生",
+      "items": [
+        "闸满 429 与 api-key 401 都发生在选路之前，请求不进候选装配",
+        "429 与 503 的分叉点在转发循环：前者是全池容量到顶，后者是熔断或不健康",
+        "重试只在拿到响应之后判定，不消耗额定的尝试次数以外的状态"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "网关刻意不碰的东西",
+      "items": [
+        "输出预算原样透传：给多少转发多少，没给也不代填",
+        "推理体只做顶层精确改写，不整表重编码",
+        "跨请求状态只走 ngx.shared，请求之间不共享 Lua 对象"
+      ]
+    }
+  ]
+}

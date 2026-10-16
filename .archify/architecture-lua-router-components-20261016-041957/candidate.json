@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "lua-router 系统组件与部署拓扑",
+    "locale": "zh-CN",
+    "output": ".archify/architecture-lua-router-components-20261016-041957/lua-router-components.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/yorkane/lua-router.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "6684727101414adf12b36f404118b1ce11b74ace"
+    }
+  },
+  "components": [
+    { "id": "client", "type": "external", "label": "下游客户端", "sublabel": "OpenAI SDK / agent", "pos": [40, 380], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/router.lua", "line": 125, "end_line": 135 }] },
+    { "id": "nginx", "type": "cloud", "label": "OpenResty 路由面", "sublabel": ":8800 静态 + klib", "pos": [240, 380], "size": [140, 64], "sources": [{ "path": "conf/nginx.conf.template", "line": 218, "end_line": 251 }] },
+    { "id": "inference", "type": "backend", "label": "推理面 handler", "sublabel": "限流 / api-key", "pos": [455, 380], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/router/inference.lua", "line": 455, "end_line": 462 }] },
+    { "id": "candidates", "type": "backend", "label": "候选装配", "sublabel": "四道门 + 容量", "pos": [670, 380], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/router/candidates.lua", "line": 465, "end_line": 467 }] },
+    { "id": "policy", "type": "backend", "label": "策略选路", "sublabel": "cache_aware / 树", "pos": [885, 380], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/policy.lua", "line": 8, "end_line": 16 }] },
+    { "id": "forward", "type": "backend", "label": "转发与重试", "sublabel": "改写 / SSE 直拷", "pos": [1100, 380], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/router/forward.lua", "line": 532, "end_line": 534 }] },
+    { "id": "engines", "type": "backend", "label": "上游推理引擎", "sublabel": "SGLang / llama.cpp", "pos": [1100, 540], "size": [140, 80], "sources": [{ "path": "lualib/resty/luarouter/watcher/discover.lua", "line": 10, "end_line": 13 }] },
+    { "id": "admin_ui", "type": "frontend", "label": "管理台四页", "sublabel": "模型/服务池/路由/日志", "pos": [240, 60], "size": [140, 64], "sources": [{ "path": "conf/nginx.conf.template", "line": 218, "end_line": 242 }] },
+    { "id": "watcher", "type": "backend", "label": "Watcher", "sublabel": "发现 + 摘除分档", "pos": [670, 60], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/watcher/reconcile.lua", "line": 598, "end_line": 606 }] },
+    { "id": "gpu_load", "type": "backend", "label": "负载采集", "sublabel": "/metrics · PromQL", "pos": [880, 60], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/gpu_load.lua", "line": 6, "end_line": 16 }] },
+    { "id": "config_store", "type": "database", "label": "热配置存储", "sublabel": "sqlite 权威 · file 镜像", "pos": [455, 210], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/store_dispatcher.lua", "line": 4, "end_line": 12 }] },
+    { "id": "registry", "type": "database", "label": "Worker 台账", "sublabel": "shdict lr_workers", "pos": [670, 210], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/registry.lua", "line": 1, "end_line": 13 }] },
+    { "id": "observability", "type": "database", "label": "观测面", "sublabel": "环形缓冲 · Prometheus", "pos": [885, 210], "size": [140, 64], "sources": [{ "path": "lualib/resty/luarouter/observability.lua", "line": 548, "end_line": 554 }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "OpenResty 单容器（宿主：235.t / 21.k / 217.t）", "wraps": ["admin_ui", "config_store", "watcher", "gpu_load", "registry", "observability", "nginx", "inference", "candidates", "policy", "forward"], "pad": 20 }
+  ],
+  "connections": [
+    { "from": "client", "to": "nginx", "label": "请求", "variant": "emphasis" },
+    { "from": "nginx", "to": "inference", "label": "分发" },
+    { "from": "inference", "to": "candidates", "label": "装配" },
+    { "from": "candidates", "to": "policy", "label": "筛选" },
+    { "from": "policy", "to": "forward", "label": "选中" },
+    { "from": "forward", "to": "engines", "label": "流式直拷", "variant": "emphasis" },
+    { "from": "admin_ui", "to": "nginx", "label": "管理面", "variant": "security" },
+    { "from": "admin_ui", "to": "config_store", "label": "配置读写" },
+    { "from": "config_store", "to": "inference", "label": "热配置读取" },
+    { "from": "registry", "to": "candidates", "label": "台账读数" },
+    { "from": "watcher", "to": "registry", "label": "写台账" },
+    { "from": "gpu_load", "to": "registry", "label": "利用率" },
+    { "from": "forward", "to": "observability", "label": "请求日志", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "运行时与权威源",
+      "items": [
+        "db 是配置权威源，LMR_CONFIG_FILE 只是只读镜像；CAS 冲突答 409，不用 LWW",
+        "跨请求状态只走 ngx.shared：lr_workers / lr_policy / lr_request_log / lr_limit",
+        "持久化后端 sqlite（缺省）/ postgres（多实例）/ file（显式回滚），开不成就 warn 一次降级 file"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "选路与失败语义",
+      "items": [
+        "候选四道门：健康 → 白名单/绑定 → 模型许可 → 容量（并发上限、GPU 利用率上限）硬排除",
+        "池内候选全被容量闸排除答 429，熔断/不健康答 503；code 恒为 no_available_workers",
+        "输出预算（max_tokens / max_completion_tokens / max_output_tokens）原样透传，网关一个字节都不改"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "旁路与可选能力",
+      "items": [
+        "watcher 三发现源：docker published ports > 配置声明 > 进程监听套接字；reject 三档只临时禁用保行，不删台账",
+        "GPU 利用率两路读数：worker 自身 /metrics 与远程 PromQL；读数未知时不排除候选",
+        "集群 mesh（CRDT，经 /ha/*）与本机并发闸默认不启用，缺省零行为变化"
+      ]
+    }
+  ]
+}

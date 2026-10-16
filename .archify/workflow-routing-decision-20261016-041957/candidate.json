@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "选路决策流程：从一次请求到一台实例",
+    "locale": "zh-CN",
+    "output": ".archify/workflow-routing-decision-20261016-041957/routing-decision.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/yorkane/lua-router.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "6684727101414adf12b36f404118b1ce11b74ace"
+    }
+  },
+  "lanes": [
+    { "id": "gateway", "label": "准入与解析" },
+    { "id": "select", "label": "候选与选路" },
+    { "id": "forward", "label": "转发与结果" },
+    { "id": "observe", "label": "观测" },
+    { "id": "reject", "label": "拒绝与兜底", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "admit", "label": "准入与解析", "fromCol": 0, "toCol": 2 },
+    { "id": "route", "label": "选路", "fromCol": 3, "toCol": 4, "variant": "emphasis" },
+    { "id": "deliver", "label": "交付", "fromCol": 5, "toCol": 5, "variant": "dashed" }
+  ],
+  "nodes": [
+    { "id": "limit", "lane": "gateway", "col": 0, "type": "security", "label": "本机并发闸", "sublabel": "请求入口 · 满即 429", "tag": "SMG_MAX_CONCURRENT_REQUESTS", "sources": [{ "path": "lualib/resty/luarouter/limit.lua", "line": 1, "end_line": 10 }] },
+    { "id": "apikey", "lane": "gateway", "col": 1, "type": "security", "label": "入口 api-key 门", "sublabel": "缺/错键 401", "tag": "fail-closed", "sources": [{ "path": "lualib/resty/luarouter/router/inference.lua", "line": 350, "end_line": 357 }] },
+    { "id": "resolve", "lane": "gateway", "col": 2, "type": "backend", "label": "入口解析", "sublabel": "别名 + profile", "tag": "虚拟入口是对下游的主入口", "sources": [{ "path": "lualib/resty/luarouter/router/inference.lua", "line": 396, "end_line": 403 }] },
+    { "id": "candidates", "lane": "select", "col": 3, "type": "backend", "label": "候选装配", "sublabel": "健康→白名单→模型→容量", "tag": "四道门", "sources": [{ "path": "lualib/resty/luarouter/router/candidates.lua", "line": 465, "end_line": 467 }] },
+    { "id": "policy", "lane": "select", "col": 4, "type": "backend", "label": "策略选路", "sublabel": "cache_aware / 亲和树", "tag": "8 种策略", "sources": [{ "path": "lualib/resty/luarouter/policy.lua", "line": 8, "end_line": 16 }] },
+    { "id": "rewrite", "lane": "forward", "col": 4, "type": "backend", "label": "逐次改写", "sublabel": "effort 卡片 / 预算透传", "tag": "顶层精确改写", "sources": [{ "path": "lualib/resty/luarouter/router/forward.lua", "line": 695, "end_line": 705 }] },
+    { "id": "engine", "lane": "forward", "col": 5, "type": "backend", "label": "上游引擎", "sublabel": "SGLang / llama.cpp", "tag": "流式零缓冲", "sources": [{ "path": "lualib/resty/luarouter/watcher/discover.lua", "line": 10, "end_line": 13 }] },
+    { "id": "journal", "lane": "observe", "col": 5, "type": "database", "label": "请求日志", "sublabel": "环形缓冲 + 指标", "sources": [{ "path": "lualib/resty/luarouter/observability.lua", "line": 548, "end_line": 554 }] },
+    { "id": "local429", "lane": "reject", "col": 0, "type": "security", "label": "429 闸满", "sublabel": "本机闸直接拒绝", "sources": [{ "path": "lualib/resty/luarouter/router/inference.lua", "line": 458, "end_line": 462 }] },
+    { "id": "auth401", "lane": "reject", "col": 1, "type": "security", "label": "401 缺/错键", "sublabel": "缺键与错键同一个码", "sources": [{ "path": "lualib/resty/luarouter/router/inference.lua", "line": 350, "end_line": 357 }] },
+    { "id": "noinst", "lane": "reject", "col": 3, "type": "security", "label": "429 / 503", "sublabel": "池满 vs 熔断", "tag": "code 恒 no_available_workers", "sources": [{ "path": "lualib/resty/luarouter/router/forward.lua", "line": 644, "end_line": 666 }] }
+  ],
+  "mainPath": ["limit", "apikey", "resolve", "candidates", "policy", "rewrite", "engine"],
+  "edges": [
+    { "id": "e2", "from": "limit", "to": "apikey", "label": "放行", "variant": "emphasis" },
+    { "id": "e3", "from": "limit", "to": "local429", "label": "闸满", "variant": "security", "role": "error" },
+    { "id": "e4", "from": "apikey", "to": "resolve", "label": "通过" },
+    { "id": "e5", "from": "apikey", "to": "auth401", "label": "拒", "variant": "security", "role": "error" },
+    { "id": "e6", "from": "resolve", "to": "candidates", "label": "profile 与 targets", "variant": "emphasis" },
+    { "id": "e7", "from": "candidates", "to": "policy", "label": "候选集" },
+    { "id": "e8", "from": "candidates", "to": "noinst", "label": "候选空", "variant": "security", "role": "error" },
+    { "id": "e9", "from": "policy", "to": "rewrite", "label": "选中 worker", "variant": "emphasis" },
+    { "id": "e10", "from": "rewrite", "to": "engine", "label": "转发", "variant": "emphasis" },
+    { "id": "e11", "from": "engine", "to": "candidates", "label": "可重试 → 退避换下一候选", "role": "branch", "route": "up-channel", "fromSide": "top", "toSide": "top" },
+    { "id": "e13", "from": "engine", "to": "journal", "label": "记录", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "候选四道门",
+      "items": [
+        "依次是健康 → 白名单/绑定 → 模型许可 → 容量，顺序即短路顺序",
+        "容量是硬排除而不是排序项：被排除的 worker 策略根本看不见",
+        "并发上限与 GPU 利用率上限都在这里判；读数未知时不排除"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "两个 429 与一个 503",
+      "items": [
+        "本机并发闸满：请求还没进选路就 429",
+        "池内所有实例都被容量闸排除：429（不是 503），含义是暂时接不了单",
+        "熔断打开、不健康、或组内没有引擎服务这个模型：503"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "网关不替调用方决定的事",
+      "items": [
+        "输出预算原样透传：给多少转发多少，没给也不代填",
+        "虚拟入口的 effort 映射只改写档位，不碰输出预算",
+        "被藏（hidden）的实际模型照常作为入口落点被服务，只是不在 /v1/models 里广告"
+      ]
+    }
+  ]
+}

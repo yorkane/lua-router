@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "workflow",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/aigc/ChatGPT/lua-router/.archify/workflow-routing-decision-20261016-041957/candidate.json",
+    "sha256": "c042289c20bedabca2922be0021b4a14a5e74235c60fd93366496f8127dffc62",
+    "bytes": 6335
+  },
+  "artifact": {
+    "path": "/home/aigc/ChatGPT/lua-router/.archify/workflow-routing-decision-20261016-041957/routing-decision.html",
+    "sha256": "51b46ec7665575da0bfb7c475ce2d55dfcd2e0160e5b1d8fe58e2b91577d8b18",
+    "bytes": 830641
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/aigc/ChatGPT/lua-router/.archify/workflow-routing-decision-20261016-041957/routing-decision.finalize.json",
+    "summaryReceipt": "/home/aigc/ChatGPT/lua-router/.archify/workflow-routing-decision-20261016-041957/routing-decision.finalize-summary.json",
+    "browserCheckReceipt": "/home/aigc/ChatGPT/lua-router/.archify/workflow-routing-decision-20261016-041957/routing-decision.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.1.0",
+    "availableVersion": "3.1.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-15T16:02:08.739Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 3953
+}
